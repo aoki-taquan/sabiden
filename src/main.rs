@@ -3,6 +3,7 @@
 mod config;
 #[allow(dead_code)]
 mod dhcp;
+mod health;
 #[allow(dead_code)]
 mod rtp;
 #[allow(dead_code)]
@@ -61,7 +62,9 @@ async fn main() -> Result<()> {
         Commands::Register {
             config: config_path,
         } => {
-            let config = Arc::new(Config::load(&config_path)?.sip);
+            let full_config = Config::load(&config_path)?;
+            let health_addr = full_config.health.bind_addr;
+            let config = Arc::new(full_config.sip);
             info!(
                 "設定読み込み完了: {}@{}",
                 config.phone_number, config.domain
@@ -76,6 +79,15 @@ async fn main() -> Result<()> {
             // RFC 3261 §17 トランザクション層を起動 (受信ループを spawn)
             let (layer, _inbound_rx) = TransactionLayer::spawn(socket);
             let registrar = Registrar::new(config.clone(), layer, config.server_addr);
+
+            // health server と REGISTER ループで AtomicBool を共有する
+            let health_state = health::HealthState::new(registrar.registered_handle());
+            tokio::spawn(async move {
+                if let Err(e) = health::run(health_addr, health_state).await {
+                    tracing::error!("health server 終了: {}", e);
+                }
+            });
+
             info!("REGISTER 開始 → {}", config.server_addr);
             registrar.run().await?;
         }

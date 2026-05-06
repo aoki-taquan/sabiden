@@ -147,6 +147,12 @@ impl ExtensionUas {
         self.registrar.clone()
     }
 
+    /// 受信ソケットへの参照。テストや、内線網用 UAC の構築時に
+    /// 同じ bind addr を使い回したいケースで利用する。
+    pub fn socket(&self) -> &Arc<UdpSocket> {
+        &self.socket
+    }
+
     /// 受信ループ。`Ctrl-C` などで中断されるまで終了しない。
     pub async fn run(mut self) -> Result<()> {
         // 期限切れエントリを掃除するタスクを並走させる

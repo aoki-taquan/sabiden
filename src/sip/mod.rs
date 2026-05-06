@@ -1,3 +1,4 @@
+pub mod addr;
 pub mod auth;
 pub mod dialog;
 pub mod message;

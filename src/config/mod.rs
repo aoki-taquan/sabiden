@@ -27,8 +27,21 @@ pub struct Config {
 pub struct SipConfig {
     /// SIP サーバ IP (DHCP Option 120 で取得した値)
     pub server_addr: SocketAddr,
-    /// ローカルアドレス (NGN IPv6 インタフェースのアドレス)
-    pub local_addr: SocketAddr,
+    /// NGN UDP ソケットの bind アドレス (Issue #35)。
+    ///
+    /// 省略時は `[::]:5060` (IPv4/IPv6 デュアルスタック listen)。
+    /// K8s 等で pod IP が起動毎に変わる環境では `0.0.0.0:5060` でも可。
+    /// `bind_addr` のポートは Via/Contact の sent-by ポートとしても使われる。
+    #[serde(default)]
+    pub bind_addr: Option<SocketAddr>,
+    /// Via/Contact ヘッダ用のローカルアドレス (NGN 側に見える source IP:port)。
+    ///
+    /// 省略時は起動時に `server_addr` 宛のダミー UDP socket で
+    /// カーネルが選ぶ source IP を取得し、ポートは `bind_addr` のポートを使う
+    /// (Issue #35)。明示指定したい場合 (NAT 越しで外部 IP を載せたい等) は
+    /// 設定 or 環境変数 `SABIDEN_SIP_LOCAL_ADDR` で上書きできる。
+    #[serde(default)]
+    pub local_addr: Option<SocketAddr>,
     /// 電話番号 (例: 0312345678)
     pub phone_number: String,
     /// SIP ドメイン (例: ntt-east.ne.jp)
@@ -38,6 +51,28 @@ pub struct SipConfig {
     /// REGISTER の Expires 値 (秒)
     #[serde(default = "default_expires")]
     pub register_expires: u32,
+}
+
+impl SipConfig {
+    /// `bind_addr` の解決済み値。未設定時は `[::]:5060` を返す。
+    pub fn resolved_bind_addr(&self) -> SocketAddr {
+        self.bind_addr.unwrap_or_else(default_sip_bind_addr)
+    }
+
+    /// `local_addr` の解決済み値を返す (Option::expect)。
+    ///
+    /// `Config::load` / `Config::resolve_local_addr` を経由していれば必ず
+    /// `Some` になっている前提。直接 `SipConfig` を構築したテストコード等で
+    /// `None` のまま参照すると panic する。
+    pub fn expect_local_addr(&self) -> SocketAddr {
+        self.local_addr.expect(
+            "SipConfig::local_addr unresolved (call Config::load() or resolve_local_addr first)",
+        )
+    }
+}
+
+fn default_sip_bind_addr() -> SocketAddr {
+    "[::]:5060".parse().expect("default sip bind addr")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -189,7 +224,24 @@ impl Config {
             Config::from_env_only()?
         };
         config.apply_env_overrides();
+        config.resolve_local_addr()?;
         Ok(config)
+    }
+
+    /// `sip.local_addr` が未設定 (Option::None) なら `server_addr` を基に
+    /// 自動検出する (Issue #35)。明示指定が既にある場合は何もしない。
+    ///
+    /// テストや差し替え用に分離した public API。`Config::load` から自動で
+    /// 呼ばれる。
+    pub fn resolve_local_addr(&mut self) -> Result<()> {
+        if self.sip.local_addr.is_some() {
+            return Ok(());
+        }
+        let bind_port = self.sip.resolved_bind_addr().port();
+        let detected = crate::sip::addr::detect_local_addr(self.sip.server_addr, bind_port)
+            .context("auto-detect local_addr (Issue #35)")?;
+        self.sip.local_addr = Some(detected);
+        Ok(())
     }
 
     fn from_env_only() -> Result<Self> {
@@ -198,9 +250,14 @@ impl Config {
                 server_addr: env_required("SABIDEN_SIP_SERVER_ADDR")?
                     .parse()
                     .context("parse SABIDEN_SIP_SERVER_ADDR")?,
-                local_addr: env_required("SABIDEN_SIP_LOCAL_ADDR")?
-                    .parse()
-                    .context("parse SABIDEN_SIP_LOCAL_ADDR")?,
+                bind_addr: std::env::var("SABIDEN_SIP_BIND_ADDR")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                // local_addr は省略可: 後段の `resolve_local_addr` で
+                // 自動検出する (Issue #35)。明示指定がある場合のみ採用。
+                local_addr: std::env::var("SABIDEN_SIP_LOCAL_ADDR")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
                 phone_number: env_required("SABIDEN_SIP_PHONE_NUMBER")?,
                 domain: env_required("SABIDEN_SIP_DOMAIN")?,
                 password: env_required("SABIDEN_SIP_PASSWORD")?,
@@ -226,9 +283,14 @@ impl Config {
                 self.sip.server_addr = addr;
             }
         }
+        if let Ok(v) = std::env::var("SABIDEN_SIP_BIND_ADDR") {
+            if let Ok(addr) = v.parse() {
+                self.sip.bind_addr = Some(addr);
+            }
+        }
         if let Ok(v) = std::env::var("SABIDEN_SIP_LOCAL_ADDR") {
             if let Ok(addr) = v.parse() {
-                self.sip.local_addr = addr;
+                self.sip.local_addr = Some(addr);
             }
         }
         if let Ok(v) = std::env::var("SABIDEN_SIP_PHONE_NUMBER") {
@@ -296,8 +358,12 @@ impl Config {
         r#"[sip]
 # DHCP Option 120 で取得した SIP サーバアドレス
 server_addr = "[2001:A7FF:2101:6::F]:5060"
-# この機器の NGN 側 IPv6 アドレス
-local_addr = "[2001:xxxx:xxxx::1]:5060"
+# NGN UDP ソケットの bind アドレス (省略時 [::]:5060)
+# bind_addr = "[::]:5060"
+# この機器の NGN 側 IPv6 アドレス。省略すると起動時に server_addr 宛の
+# ダミー UDP socket でカーネルが選ぶ source IP を自動検出する (Issue #35)。
+# K8s 等で pod IP が動的な環境では未指定推奨。
+# local_addr = "[2001:xxxx:xxxx::1]:5060"
 # ひかり電話の電話番号
 phone_number = "0312345678"
 # NTT ドメイン
@@ -351,4 +417,96 @@ max_expires = 3600
 
 fn env_required(key: &str) -> Result<String> {
     std::env::var(key).with_context(|| format!("environment variable {} not set", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_sip(local: Option<&str>, bind: Option<&str>) -> SipConfig {
+        SipConfig {
+            server_addr: "127.0.0.1:5060".parse().unwrap(),
+            bind_addr: bind.map(|s| s.parse().unwrap()),
+            local_addr: local.map(|s| s.parse().unwrap()),
+            phone_number: "0312345678".to_string(),
+            domain: "example.test".to_string(),
+            password: "p".to_string(),
+            register_expires: 3600,
+        }
+    }
+
+    /// Issue #35: `local_addr` が明示指定されている場合は変更しない (互換性)。
+    #[test]
+    fn resolve_keeps_explicit_local_addr() {
+        let mut cfg = Config {
+            sip: base_sip(Some("[2001:db8::1]:5060"), None),
+            health: HealthConfig::default(),
+            uas: None,
+            extensions: Vec::new(),
+            trace: TraceConfig::default(),
+            webrtc: WebRtcConfig::default(),
+        };
+        cfg.resolve_local_addr().expect("resolve");
+        assert_eq!(
+            cfg.sip.local_addr.unwrap(),
+            "[2001:db8::1]:5060".parse().unwrap()
+        );
+    }
+
+    /// Issue #35: `local_addr` 省略時は server_addr 宛のルーティングから自動検出する。
+    #[test]
+    fn resolve_auto_detects_when_missing() {
+        let mut cfg = Config {
+            sip: base_sip(None, None),
+            health: HealthConfig::default(),
+            uas: None,
+            extensions: Vec::new(),
+            trace: TraceConfig::default(),
+            webrtc: WebRtcConfig::default(),
+        };
+        cfg.resolve_local_addr().expect("resolve");
+        let local = cfg.sip.local_addr.expect("auto-detected");
+        // 127.0.0.1:5060 サーバ宛なので IPv4 source / port は bind_addr (default :5060) のポート。
+        assert!(local.is_ipv4(), "expected v4 source for v4 server");
+        assert_eq!(local.port(), 5060);
+    }
+
+    /// `bind_addr` のポートが反映されること (Via sent-by ポート決定)。
+    #[test]
+    fn resolve_uses_bind_addr_port_for_via() {
+        let mut cfg = Config {
+            sip: base_sip(None, Some("0.0.0.0:15060")),
+            health: HealthConfig::default(),
+            uas: None,
+            extensions: Vec::new(),
+            trace: TraceConfig::default(),
+            webrtc: WebRtcConfig::default(),
+        };
+        cfg.resolve_local_addr().expect("resolve");
+        assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
+    }
+
+    /// `bind_addr` 省略時のデフォルトは `[::]:5060`。
+    #[test]
+    fn default_bind_addr_is_dual_stack_ipv6() {
+        let cfg = base_sip(None, None);
+        let bind = cfg.resolved_bind_addr();
+        assert_eq!(bind.port(), 5060);
+        assert!(bind.is_ipv6());
+    }
+
+    /// TOML から `local_addr` を完全に省略してもパースできること (Issue #35)。
+    #[test]
+    fn toml_parses_without_local_addr() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "example.test"
+password = "p"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.sip.local_addr.is_none());
+        assert!(cfg.sip.bind_addr.is_none());
+    }
 }

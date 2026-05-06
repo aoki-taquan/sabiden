@@ -1,8 +1,13 @@
 [sip]
 # DHCP Option 120 で取得した SIP サーバアドレス
 server_addr = "[2001:A7FF:2101:6::F]:5060"
-# この機器の NGN 側 IPv6 アドレス
-local_addr = "[2001:xxxx:xxxx::1]:5060"
+# NGN UDP ソケットの bind アドレス (省略時 [::]:5060。K8s で IPv4 のみ使うなら 0.0.0.0:5060)
+# bind_addr = "[::]:5060"
+# この機器の NGN 側 IPv6 アドレス。
+# 省略時は起動時に server_addr 宛のダミー UDP socket でカーネルが選ぶ source IP を
+# 自動検出する (Issue #35)。K8s 等で pod IP が動的なら未指定推奨。
+# 明示指定したい場合 (NAT 越しで外部 IP を載せたい等) のみ設定する。
+# local_addr = "[2001:xxxx:xxxx::1]:5060"
 # ひかり電話の電話番号
 phone_number = "0312345678"
 # NTT ドメイン

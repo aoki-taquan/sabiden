@@ -59,7 +59,9 @@ sabiden 本体は `/run/sabiden/sip-servers` から読み取る前提。
 ## Step 3: ホストアドレス確認
 
 sabiden は SIP REGISTER の Contact ヘッダに NGN 側 global IPv6 を入れる。
-そのため固定で local アドレスを把握しておく必要がある。
+通常は **local_addr の設定を省略可能** で、起動時に
+`server_addr` 宛のダミー UDP socket でカーネルが選ぶ source IP を
+自動検出して Via/Contact に載せる (Issue #35)。
 
 ```sh
 ip -6 addr show dev eth0 scope global
@@ -69,6 +71,12 @@ ip -6 addr show dev eth0 scope global
 DHCPv6-PD で /56 を取得し、その中から /64 を切って NIC に設定する運用が一般的。
 RA (Router Advertisement) を NGN 側が送ってこない構成では `radvd` 等で
 自前生成する必要がある。
+
+> **K8s デプロイ等で pod IP が動的に変わる場合は `local_addr` を空のまま
+> にしておく**ことで、ノード固定 (nodeSelector) せずに動かせる。
+> NAT 越しで外部 IP を Via に載せたいなど、明示指定が必要な場合のみ
+> `config.toml` の `sip.local_addr` または環境変数 `SABIDEN_SIP_LOCAL_ADDR`
+> で設定する。
 
 ---
 
@@ -83,7 +91,9 @@ sudo $EDITOR /etc/sabiden/config.toml
 最低限編集する項目:
 
 - `sip.server_addr`: `/run/sabiden/sip-servers` の値、または起動時に DHCP モジュールで自動解決
-- `sip.local_addr`: Step 3 で確認した自ホスト global IPv6
+- `sip.local_addr`: **省略可** (自動検出)。Step 3 で確認した自ホスト global IPv6 を
+  明示したい場合のみ設定する
+- `sip.bind_addr`: **省略可** (デフォルト `[::]:5060`)。listen ポートを変える場合のみ設定
 - `sip.phone_number`: ひかり電話で割当てられた電話番号
 - `sip.domain`: NTT 提供ドメイン (例: `ntt-east.ne.jp`)
 - `password`: 環境変数 `SABIDEN_SIP_PASSWORD` 経由で渡すこと推奨 (Step 5a/5b 参照)

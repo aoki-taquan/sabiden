@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
+use crate::observability::Metrics;
 use crate::rtp::set_rtp_dscp;
 
 /// 1 つのリレー方向 (片側ソケット → 反対側) を表す共有状態。
@@ -64,6 +65,8 @@ pub struct BridgeConfig {
     pub ngn_peer: Option<SocketAddr>,
     /// SDP から判明している内線側 RTP ピア。
     pub ext_peer: Option<SocketAddr>,
+    /// プロセス全体で共有する観測カウンタ。`None` なら計測なし。
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl RtpBridge {
@@ -74,6 +77,7 @@ impl RtpBridge {
             ext_socket,
             ngn_peer,
             ext_peer,
+            metrics,
         } = cfg;
 
         // NGN 要件: RTP ソケットに DSCP 32 を立てる。失敗しても致命的ではない
@@ -102,6 +106,7 @@ impl RtpBridge {
             ext_state.clone(), // 送信先
             state.clone(),
             true,
+            metrics.clone(),
         ));
 
         // 内線 -> NGN 方向
@@ -113,6 +118,7 @@ impl RtpBridge {
             ngn_state,
             state.clone(),
             false,
+            metrics,
         ));
 
         Ok(Self {
@@ -160,6 +166,7 @@ impl Drop for RtpBridge {
 /// `from_state.peer` は受信したパケットの送信元で update され、`to_state.peer`
 /// に書き込み先を求める。`to_state.peer` が None なら destination 未知のため
 /// 黙って drop する (相手側ループで peer が判明し次第転送が始まる)。
+#[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     direction: &'static str,
     from_socket: Arc<UdpSocket>,
@@ -168,8 +175,12 @@ async fn forward_loop(
     to_state: Arc<LegState>,
     state: Arc<BridgeState>,
     increment_to_ext: bool,
+    metrics: Option<Arc<Metrics>>,
 ) {
     use std::sync::atomic::Ordering;
+    // RTP ホットパスは hot loop だが、`tracing::Span` の発行は最初の 1 回のみ。
+    let span = tracing::trace_span!("rtp_bridge", direction);
+    let _enter = span.enter();
     let mut buf = vec![0u8; 1500];
     loop {
         let (n, src) = match from_socket.recv_from(&mut buf).await {
@@ -202,8 +213,14 @@ async fn forward_loop(
         }
         if increment_to_ext {
             state.forwarded_to_ext.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = metrics.as_ref() {
+                m.add_rtp_ngn_to_ext(1);
+            }
         } else {
             state.forwarded_to_ngn.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = metrics.as_ref() {
+                m.add_rtp_ext_to_ngn(1);
+            }
         }
     }
 }
@@ -237,6 +254,7 @@ mod tests {
             ext_socket: ext_sock,
             ngn_peer: Some(ngn_peer_addr),
             ext_peer: Some(ext_peer_addr),
+            metrics: None,
         })
         .unwrap();
 
@@ -298,6 +316,7 @@ mod tests {
             ext_socket: ext_sock,
             ngn_peer: None,
             ext_peer: None,
+            metrics: None,
         })
         .unwrap();
 

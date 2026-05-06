@@ -15,6 +15,9 @@ pub struct Config {
     /// 内線一覧 (UAS が REGISTER を受け付ける際の Digest 認証情報)。
     #[serde(default)]
     pub extensions: Vec<ExtensionConfig>,
+    /// SIP メッセージファイルダンプ (Issue #20)。`dir` 未設定なら無効。
+    #[serde(default)]
+    pub trace: TraceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -39,6 +42,18 @@ pub struct HealthConfig {
     /// ヘルスチェック HTTP サーバの bind アドレス
     #[serde(default = "default_health_addr")]
     pub bind_addr: SocketAddr,
+}
+
+/// SIP メッセージダンプ設定 (Issue #20)。
+///
+/// `dir` を指定すると `<dir>/<unix_ms>_<dir>_<method>_<call_id>.txt` 形式で
+/// 全 SIP メッセージ (送受信) を記録する。1000 ファイル超 / 100MB 超で
+/// 自動ローテーション。CLI `--trace-dir` で上書き可能。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TraceConfig {
+    /// 出力先ディレクトリ。未設定 (`None`) なら無効。
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 /// 内線 UAS (スマホ受付) の設定。
@@ -144,6 +159,7 @@ impl Config {
             health: HealthConfig::default(),
             uas: None,
             extensions: Vec::new(),
+            trace: TraceConfig::default(),
         })
     }
 
@@ -185,6 +201,10 @@ impl Config {
         if let Ok(v) = std::env::var("SABIDEN_UAS_REALM") {
             self.uas.get_or_insert_with(UasConfig::default).realm = v;
         }
+        if let Ok(v) = std::env::var("SABIDEN_TRACE_DIR") {
+            // 空文字列はトレース無効化として扱う (k8s で値だけ消したいケース対応)。
+            self.trace.dir = if v.is_empty() { None } else { Some(v) };
+        }
     }
 
     pub fn example() -> String {
@@ -220,6 +240,10 @@ max_expires = 3600
 # [[extensions]]
 # username = "android"
 # password = "android_password"
+
+# SIP メッセージファイルダンプ (任意)
+# [trace]
+# dir = "/var/log/sabiden/sip"
 "#
         .to_string()
     }

@@ -1,12 +1,17 @@
 //! ヘルスチェック HTTP サーバ
 //!
-//! Kubernetes の liveness / readiness probe 用エンドポイントを提供する。
+//! Kubernetes の liveness / readiness probe 用エンドポイントと、
+//! Prometheus 互換のメトリクス エンドポイントを提供する。
 //!
 //! - `GET /healthz`: プロセス生存確認 (常に 200)
 //! - `GET /readyz`:  REGISTER 成功時のみ 200、それ以外は 503
-//! - `GET /metrics`: Prometheus 形式のメトリクス (現状は最小限)
+//! - `GET /metrics`: Prometheus text exposition format
 //!
 //! REGISTER 状態は `Arc<AtomicBool>` で SIP レイヤと共有する。
+//! メトリクス本体は [`crate::observability::Metrics`] を共有することで、
+//! SIP / RTP / Call レイヤから atomic 加算するだけで Prometheus に
+//! 反映される。`prometheus` クレートを引き込まないため依存は変わらない。
+//!
 //! `axum` (hyper ベース) を採用したのは、追加依存が tokio/hyper 系に閉じており
 //! 軽量かつ非同期 main にそのまま乗るため。
 
@@ -23,16 +28,23 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::observability::Metrics;
+
 /// ヘルスサーバが参照する共有状態
 #[derive(Clone)]
 pub struct HealthState {
     /// REGISTER 成功フラグ。SIP レイヤから書き込まれる
     pub registered: Arc<AtomicBool>,
+    /// 観測カウンタ。各層と Arc 共有する。
+    pub metrics: Arc<Metrics>,
 }
 
 impl HealthState {
-    pub fn new(registered: Arc<AtomicBool>) -> Self {
-        Self { registered }
+    pub fn new(registered: Arc<AtomicBool>, metrics: Arc<Metrics>) -> Self {
+        Self {
+            registered,
+            metrics,
+        }
     }
 }
 
@@ -73,18 +85,8 @@ async fn readyz(State(state): State<HealthState>) -> impl IntoResponse {
 }
 
 async fn metrics(State(state): State<HealthState>) -> impl IntoResponse {
-    // Prometheus text exposition format. 将来項目を増やす想定。
-    let registered = if state.registered.load(Ordering::SeqCst) {
-        1
-    } else {
-        0
-    };
-    let body = format!(
-        "# HELP sabiden_sip_registered SIP REGISTER 成功状態 (0/1)\n\
-         # TYPE sabiden_sip_registered gauge\n\
-         sabiden_sip_registered {}\n",
-        registered
-    );
+    let registered = state.registered.load(Ordering::SeqCst);
+    let body = state.metrics.render_prometheus(registered);
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
@@ -95,13 +97,14 @@ async fn metrics(State(state): State<HealthState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::InviteResult;
     use axum::body::to_bytes;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
 
     fn make_state(registered: bool) -> HealthState {
-        HealthState::new(Arc::new(AtomicBool::new(registered)))
+        HealthState::new(Arc::new(AtomicBool::new(registered)), Metrics::new())
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -189,5 +192,33 @@ mod tests {
             .unwrap();
         let body = body_string(resp).await;
         assert!(body.contains("sabiden_sip_registered 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_includes_extended_series() {
+        let state = make_state(true);
+        state.metrics.record_register(true);
+        state.metrics.record_invite_ngn(InviteResult::Answered);
+        state.metrics.add_rtp_ngn_to_ext(3);
+        state.metrics.set_extension_registered(2);
+        state.metrics.inc_call_active();
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+        // 新規追加のメトリクスが /metrics に出ることを確認
+        assert!(body.contains("sabiden_sip_register_total{result=\"success\"} 1"));
+        assert!(body.contains("sabiden_sip_invite_total{direction=\"ngn\",result=\"answered\"} 1"));
+        assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ngn_to_ext\"} 3"));
+        assert!(body.contains("sabiden_extension_registered 2"));
+        assert!(body.contains("sabiden_call_active 1"));
     }
 }

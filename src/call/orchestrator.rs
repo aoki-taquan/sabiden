@@ -34,13 +34,14 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::bridge::{BridgeConfig, RtpBridge};
 use super::manager::{
     extract_rtp_endpoint, fork_to_extensions, CallManager, ForkResult, LegInviter, UacForker,
 };
 use super::CallId;
+use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::rewrite_rtp_endpoint;
 use crate::sip::message::{SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::ExtensionRegistrar;
@@ -89,11 +90,14 @@ pub struct NgnInboundHandler {
     cfg: NgnInboundConfig,
     /// Call-ID → ServerTransaction (BYE/ACK で再利用するため保持する)。
     pending: Arc<Mutex<HashMap<String, Arc<Mutex<ServerTransaction>>>>>,
-    /// 確立済み通話の Call-ID → `CallId` 対応。BYE 時にブリッジ停止に使う。
-    active: Arc<Mutex<HashMap<String, CallId>>>,
+    /// 確立済み通話の Call-ID → `Option<CallId>` 対応。BYE 時にブリッジ停止に使う。
+    /// `None` の値は「確立済みだが RTP ブリッジ未起動 (透過モード)」を意味する。
+    active: Arc<Mutex<HashMap<String, Option<CallId>>>>,
     /// RTP ブリッジを管理する Call Manager。`None` なら SDP 透過モードで動く
     /// (Issue #15 互換)。
     call_manager: Option<Arc<CallManager>>,
+    /// 観測カウンタ。Issue #20。
+    metrics: Arc<Metrics>,
 }
 
 impl NgnInboundHandler {
@@ -103,6 +107,17 @@ impl NgnInboundHandler {
         extensions: Arc<ExtensionRegistrar>,
         cfg: NgnInboundConfig,
     ) -> Arc<Self> {
+        Self::with_metrics(socket, inviter, extensions, cfg, Metrics::new())
+    }
+
+    /// メトリクス付きコンストラクタ。
+    pub fn with_metrics(
+        socket: Arc<UdpSocket>,
+        inviter: ExtInviter,
+        extensions: Arc<ExtensionRegistrar>,
+        cfg: NgnInboundConfig,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             socket,
             inviter,
@@ -111,6 +126,7 @@ impl NgnInboundHandler {
             pending: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
             call_manager: None,
+            metrics,
         })
     }
 
@@ -122,6 +138,25 @@ impl NgnInboundHandler {
         cfg: NgnInboundConfig,
         call_manager: Arc<CallManager>,
     ) -> Arc<Self> {
+        Self::with_call_manager_and_metrics(
+            socket,
+            inviter,
+            extensions,
+            cfg,
+            call_manager,
+            Metrics::new(),
+        )
+    }
+
+    /// `CallManager` + メトリクス付きコンストラクタ。
+    pub fn with_call_manager_and_metrics(
+        socket: Arc<UdpSocket>,
+        inviter: ExtInviter,
+        extensions: Arc<ExtensionRegistrar>,
+        cfg: NgnInboundConfig,
+        call_manager: Arc<CallManager>,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             socket,
             inviter,
@@ -130,6 +165,7 @@ impl NgnInboundHandler {
             pending: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
+            metrics,
         })
     }
 
@@ -195,87 +231,120 @@ impl NgnInboundHandler {
             .get("call-id")
             .ok_or_else(|| anyhow!("Call-ID なし"))?
             .to_string();
-        info!(%remote, %call_id, "NGN 着信 INVITE");
+        // call_id / direction を span に持たせて、フォーク中の各種ログを横断検索可能に。
+        let span = info_span!(
+            "ngn_inbound_invite",
+            call_id = %call_id,
+            direction = "ngn",
+        );
+        async move {
+            info!(%remote, "NGN 着信 INVITE");
 
-        let stx = ServerTransaction::new(request.clone(), remote, self.socket.clone())?;
-        let stx = Arc::new(Mutex::new(stx));
-        // pending に登録 (ACK / BYE 受信時に同じ ServerTransaction を引けるよう)
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(call_id.clone(), stx.clone());
-        }
+            let stx = ServerTransaction::new(request.clone(), remote, self.socket.clone())?;
+            let stx = Arc::new(Mutex::new(stx));
+            // pending に登録 (ACK / BYE 受信時に同じ ServerTransaction を引けるよう)
+            {
+                let mut pending = self.pending.lock().await;
+                pending.insert(call_id.clone(), stx.clone());
+            }
 
-        // RFC 3261 §17.2.1: INVITE に対して 100 Trying を即送信。
-        {
-            let mut tx = stx.lock().await;
-            let trying = build_response_skeleton(tx.request(), 100, "Trying");
-            tx.respond(trying).await?;
-        }
-
-        // 登録済み内線の AOR 一覧を取得し target URI に変換する
-        let bindings = self.extensions.snapshot().await;
-        if bindings.is_empty() {
-            warn!("登録内線なし → 480 Temporarily Unavailable");
-            self.respond(&stx, 480, "Temporarily Unavailable").await?;
-            self.pending.lock().await.remove(&call_id);
-            return Ok(());
-        }
-        let targets: Vec<String> = bindings
-            .iter()
-            .map(|(_, b)| b.contact_uri.clone())
-            .collect();
-
-        // フォーク
-        let sdp = request.body.clone();
-        let result =
-            fork_to_extensions(self.inviter.clone(), targets, sdp, self.cfg.fork_timeout).await;
-
-        match result {
-            ForkResult::Answered {
-                winner_uri,
-                response,
-            } => {
-                info!(%winner_uri, "NGN 側に 200 OK を返す");
-                // RTP ブリッジを起動できるなら起動し、200 OK の SDP を sabiden 側に書き換える。
-                // 起動失敗 / CallManager 未接続なら従来どおり SDP 透過モードで返す。
-                let body_for_ngn = match self
-                    .start_bridge_for_inbound(&request.body, &response.body, &call_id)
-                    .await
-                {
-                    Ok(rewritten) => rewritten,
-                    Err(e) => {
-                        warn!(error=%e, "RTP ブリッジ起動失敗 → SDP 透過で続行");
-                        response.body.clone()
-                    }
-                };
-
+            // RFC 3261 §17.2.1: INVITE に対して 100 Trying を即送信。
+            {
                 let mut tx = stx.lock().await;
-                let mut resp_to_ngn = build_response_skeleton(tx.request(), 200, "OK");
-                if !body_for_ngn.is_empty() {
-                    resp_to_ngn.body = body_for_ngn;
-                    resp_to_ngn.headers.set("Content-Type", "application/sdp");
+                let trying = build_response_skeleton(tx.request(), 100, "Trying");
+                tx.respond(trying).await?;
+            }
+
+            // 登録済み内線の AOR 一覧を取得し target URI に変換する
+            let bindings = self.extensions.snapshot().await;
+            if bindings.is_empty() {
+                warn!("登録内線なし → 480 Temporarily Unavailable");
+                self.respond(&stx, 480, "Temporarily Unavailable").await?;
+                self.pending.lock().await.remove(&call_id);
+                // 着信は受け付けたが内線不在で確立に至らず → error 計上
+                self.metrics.record_invite_ngn(InviteResult::Error);
+                return Ok::<(), anyhow::Error>(());
+            }
+            let targets: Vec<String> = bindings
+                .iter()
+                .map(|(_, b)| b.contact_uri.clone())
+                .collect();
+
+            // フォーク (内線レッグ)
+            let sdp = request.body.clone();
+            let result =
+                fork_to_extensions(self.inviter.clone(), targets, sdp, self.cfg.fork_timeout).await;
+
+            match result {
+                ForkResult::Answered {
+                    winner_uri,
+                    response,
+                } => {
+                    info!(%winner_uri, "NGN 側に 200 OK を返す");
+                    // RTP ブリッジを起動できるなら起動し、200 OK の SDP を sabiden 側に書き換える。
+                    // 起動失敗 / CallManager 未接続なら従来どおり SDP 透過モードで返す。
+                    let body_for_ngn = match self
+                        .start_bridge_for_inbound(&request.body, &response.body, &call_id)
+                        .await
+                    {
+                        Ok(rewritten) => rewritten,
+                        Err(e) => {
+                            warn!(error=%e, "RTP ブリッジ起動失敗 → SDP 透過で続行");
+                            response.body.clone()
+                        }
+                    };
+
+                    let mut tx = stx.lock().await;
+                    let mut resp_to_ngn = build_response_skeleton(tx.request(), 200, "OK");
+                    if !body_for_ngn.is_empty() {
+                        resp_to_ngn.body = body_for_ngn;
+                        resp_to_ngn.headers.set("Content-Type", "application/sdp");
+                    }
+                    // To に tag を必ず付与 (RFC 3261 §8.2.6.2)
+                    ensure_to_tag(&mut resp_to_ngn);
+                    // sabiden の Contact (NGN 側ローカル) を載せる
+                    resp_to_ngn.headers.set(
+                        "Contact",
+                        format!("<sip:sabiden@{}>", self.socket.local_addr()?),
+                    );
+                    tx.respond(resp_to_ngn).await?;
+                    // 観測: NGN レッグも内線レッグも応答済みとして記録
+                    self.metrics.record_invite_ngn(InviteResult::Answered);
+                    self.metrics.record_invite_extension(InviteResult::Answered);
+                    // 通話確立として call_active を +1
+                    // RTP ブリッジが起動できなかった場合 (透過モード) は active に
+                    // エントリが無い可能性があるので、ここで `None` として登録して
+                    // BYE 受信時に必ず call_active を 1 つ減算できるようにする。
+                    {
+                        let mut active = self.active.lock().await;
+                        active.entry(call_id.clone()).or_insert(None);
+                    }
+                    self.metrics.inc_call_active();
                 }
-                // To に tag を必ず付与 (RFC 3261 §8.2.6.2)
-                ensure_to_tag(&mut resp_to_ngn);
-                // sabiden の Contact (NGN 側ローカル) を載せる
-                resp_to_ngn.headers.set(
-                    "Contact",
-                    format!("<sip:sabiden@{}>", self.socket.local_addr()?),
-                );
-                tx.respond(resp_to_ngn).await?;
+                ForkResult::AllFailed { last_status } => {
+                    let code = last_status.unwrap_or(486);
+                    let reason = if code == 486 { "Busy Here" } else { "Declined" };
+                    self.respond(&stx, code, reason).await?;
+                    self.pending.lock().await.remove(&call_id);
+                    let result = if code == 486 {
+                        InviteResult::Busy
+                    } else {
+                        InviteResult::Error
+                    };
+                    self.metrics.record_invite_extension(result);
+                    self.metrics.record_invite_ngn(result);
+                }
+                ForkResult::Timeout => {
+                    self.respond(&stx, 408, "Request Timeout").await?;
+                    self.pending.lock().await.remove(&call_id);
+                    self.metrics.record_invite_extension(InviteResult::Timeout);
+                    self.metrics.record_invite_ngn(InviteResult::Timeout);
+                }
             }
-            ForkResult::AllFailed { last_status } => {
-                let code = last_status.unwrap_or(486);
-                let reason = if code == 486 { "Busy Here" } else { "Declined" };
-                self.respond(&stx, code, reason).await?;
-                self.pending.lock().await.remove(&call_id);
-            }
-            ForkResult::Timeout => {
-                self.respond(&stx, 408, "Request Timeout").await?;
-                self.pending.lock().await.remove(&call_id);
-            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     async fn handle_bye(&self, request: SipRequest, remote: SocketAddr) -> Result<()> {
@@ -288,7 +357,12 @@ impl NgnInboundHandler {
             self.pending.lock().await.remove(cid);
             // 確立済みなら RTP ブリッジを停止する (CallManager::terminate)。
             let removed = { self.active.lock().await.remove(cid) };
-            if let (Some(call_id), Some(mgr)) = (removed, self.call_manager.as_ref()) {
+            // active に居れば 200 OK 経由で確立済み (= inc_call_active 済み)。
+            // BYE で通話終了として call_active を -1。
+            if removed.is_some() {
+                self.metrics.dec_call_active();
+            }
+            if let (Some(Some(call_id)), Some(mgr)) = (removed, self.call_manager.as_ref()) {
                 if let Err(e) = mgr.terminate(call_id).await {
                     warn!(error=%e, "BYE 受信時の通話終了に失敗");
                 }
@@ -343,11 +417,15 @@ impl NgnInboundHandler {
             ext_socket: ext_bridge_sock,
             ngn_peer: Some(ngn_peer),
             ext_peer: Some(ext_peer),
+            metrics: Some(self.metrics.clone()),
         })?;
 
         let cid = mgr.create_call().await;
         mgr.attach_bridge(cid, bridge).await?;
-        self.active.lock().await.insert(call_id.to_string(), cid);
+        self.active
+            .lock()
+            .await
+            .insert(call_id.to_string(), Some(cid));
         Ok(rewritten)
     }
 
@@ -405,12 +483,19 @@ pub struct UasEventHandler {
     bridge_ngn_bind_ip: Option<IpAddr>,
     /// 内線発信時の RTP ブリッジ用内線側 bind IP。`None` なら loopback。
     bridge_ext_bind_ip: Option<IpAddr>,
-    /// 確立済み Call-ID → CallId
-    active: Arc<Mutex<HashMap<String, CallId>>>,
+    /// 確立済み Call-ID → Option<CallId> (None は透過モード)
+    active: Arc<Mutex<HashMap<String, Option<CallId>>>>,
+    /// 観測カウンタ。内線発信 INVITE の結果を記録する。
+    metrics: Arc<Metrics>,
 }
 
 impl UasEventHandler {
     pub fn new(ngn_uac: Arc<Uac>) -> Arc<Self> {
+        Self::with_metrics(ngn_uac, Metrics::new())
+    }
+
+    /// メトリクス付きコンストラクタ。
+    pub fn with_metrics(ngn_uac: Arc<Uac>, metrics: Arc<Metrics>) -> Arc<Self> {
         Arc::new(Self {
             ngn_uac,
             _dialogs: Arc::new(Mutex::new(HashMap::new())),
@@ -418,6 +503,7 @@ impl UasEventHandler {
             bridge_ngn_bind_ip: None,
             bridge_ext_bind_ip: None,
             active: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         })
     }
 
@@ -428,6 +514,23 @@ impl UasEventHandler {
         bridge_ngn_bind_ip: Option<IpAddr>,
         bridge_ext_bind_ip: Option<IpAddr>,
     ) -> Arc<Self> {
+        Self::with_call_manager_and_metrics(
+            ngn_uac,
+            call_manager,
+            bridge_ngn_bind_ip,
+            bridge_ext_bind_ip,
+            Metrics::new(),
+        )
+    }
+
+    /// `CallManager` + メトリクス付きコンストラクタ。
+    pub fn with_call_manager_and_metrics(
+        ngn_uac: Arc<Uac>,
+        call_manager: Arc<CallManager>,
+        bridge_ngn_bind_ip: Option<IpAddr>,
+        bridge_ext_bind_ip: Option<IpAddr>,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             ngn_uac,
             _dialogs: Arc::new(Mutex::new(HashMap::new())),
@@ -435,6 +538,7 @@ impl UasEventHandler {
             bridge_ngn_bind_ip,
             bridge_ext_bind_ip,
             active: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         })
     }
 
@@ -462,94 +566,133 @@ impl UasEventHandler {
                 remote,
                 responder,
             } => {
-                info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
-                // 宛先 URI は INVITE Request-URI をそのまま使う (Phase 1 単純化)。
-                let target = request.uri.clone();
                 let call_id = request
                     .headers
                     .get("call-id")
                     .map(str::to_string)
-                    .unwrap_or_default();
-                let ext_offer = request.body.clone();
+                    .unwrap_or_else(|| "<no-call-id>".to_string());
+                let span = info_span!(
+                    "uas_invite",
+                    call_id = %call_id,
+                    aor = %from_aor,
+                    direction = "extension",
+                );
+                async move {
+                    info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
+                    // 宛先 URI は INVITE Request-URI をそのまま使う (Phase 1 単純化)。
+                    let target = request.uri.clone();
+                    let ext_offer = request.body.clone();
 
-                // CallManager があれば RTP ブリッジ用ソケットを先に確保し、
-                // NGN へ送る INVITE の SDP を sabiden 側に書き換える。
-                let (bridge_ctx, sdp_for_ngn) = match self.prepare_outbound_bridge(&ext_offer).await
-                {
-                    Ok(Some((ctx, rewritten))) => (Some(ctx), Some(rewritten)),
-                    Ok(None) => (
-                        None,
-                        if ext_offer.is_empty() {
-                            None
-                        } else {
-                            Some(ext_offer.clone())
-                        },
-                    ),
-                    Err(e) => {
-                        warn!(error=%e, "NGN 側 RTP ブリッジ準備失敗 → SDP 透過");
-                        (
-                            None,
-                            if ext_offer.is_empty() {
-                                None
-                            } else {
-                                Some(ext_offer.clone())
-                            },
-                        )
-                    }
-                };
-
-                let plan = self
-                    .ngn_uac
-                    .build_invite(&target, sdp_for_ngn.as_deref(), None);
-                let outcome = self.ngn_uac.invite(plan, sdp_for_ngn).await;
-                match outcome {
-                    Ok(InviteOutcome::Established(call)) => {
-                        // NGN 側 200 OK の SDP answer を内線に返す。
-                        // ブリッジを起動できるなら sabiden 側 ext ソケットを指すよう書き換える。
-                        let body_for_ext = match self
-                            .finalize_outbound_bridge(
-                                bridge_ctx,
-                                &ext_offer,
-                                &call.response.body,
-                                &call_id,
-                            )
-                            .await
-                        {
-                            Ok(body) => body,
+                    // CallManager があれば RTP ブリッジ用ソケットを先に確保し、
+                    // NGN へ送る INVITE の SDP を sabiden 側に書き換える。
+                    let (bridge_ctx, sdp_for_ngn) =
+                        match self.prepare_outbound_bridge(&ext_offer).await {
+                            Ok(Some((ctx, rewritten))) => (Some(ctx), Some(rewritten)),
+                            Ok(None) => (
+                                None,
+                                if ext_offer.is_empty() {
+                                    None
+                                } else {
+                                    Some(ext_offer.clone())
+                                },
+                            ),
                             Err(e) => {
-                                warn!(error=%e, "NGN 側 RTP ブリッジ確立失敗 → SDP 透過");
-                                call.response.body.clone()
+                                warn!(error=%e, "NGN 側 RTP ブリッジ準備失敗 → SDP 透過");
+                                (
+                                    None,
+                                    if ext_offer.is_empty() {
+                                        None
+                                    } else {
+                                        Some(ext_offer.clone())
+                                    },
+                                )
                             }
                         };
-                        if body_for_ext.is_empty() {
-                            responder.quick(200, "OK").await?;
-                        } else {
-                            responder
-                                .respond_with_body(200, "OK", "application/sdp", body_for_ext)
-                                .await?;
+
+                    let plan = self
+                        .ngn_uac
+                        .build_invite(&target, sdp_for_ngn.as_deref(), None);
+                    let outcome = self.ngn_uac.invite(plan, sdp_for_ngn).await;
+                    match outcome {
+                        Ok(InviteOutcome::Established(call)) => {
+                            // NGN 側 200 OK の SDP answer を内線に返す。
+                            // ブリッジを起動できるなら sabiden 側 ext ソケットを指すよう書き換える。
+                            let body_for_ext = match self
+                                .finalize_outbound_bridge(
+                                    bridge_ctx,
+                                    &ext_offer,
+                                    &call.response.body,
+                                    &call_id,
+                                )
+                                .await
+                            {
+                                Ok(body) => body,
+                                Err(e) => {
+                                    warn!(error=%e, "NGN 側 RTP ブリッジ確立失敗 → SDP 透過");
+                                    call.response.body.clone()
+                                }
+                            };
+                            if body_for_ext.is_empty() {
+                                responder.quick(200, "OK").await?;
+                            } else {
+                                responder
+                                    .respond_with_body(
+                                        200,
+                                        "OK",
+                                        "application/sdp",
+                                        body_for_ext,
+                                    )
+                                    .await?;
+                            }
+                            // 観測: NGN レッグも内線レッグも応答済みとして記録
+                            self.metrics.record_invite_ngn(InviteResult::Answered);
+                            self.metrics
+                                .record_invite_extension(InviteResult::Answered);
+                            // 通話確立として call_active を +1。透過モード (active に
+                            // エントリ無し) でも BYE で必ず減算できるよう `None` を入れる。
+                            if !call_id.is_empty() && call_id != "<no-call-id>" {
+                                let mut active = self.active.lock().await;
+                                active.entry(call_id.clone()).or_insert(None);
+                            }
+                            self.metrics.inc_call_active();
+                            let _ = call.dialog;
+                            Ok(())
                         }
-                        let _ = call.dialog;
-                        Ok(())
-                    }
-                    Ok(InviteOutcome::Failed { response }) => {
-                        warn!(code = response.status_code, "NGN 側 INVITE 失敗");
-                        responder
-                            .quick(response.status_code, response.reason.as_str())
-                            .await
-                    }
-                    Err(e) => {
-                        warn!(error=%e, "NGN 側 INVITE トランスポート失敗 → 503");
-                        responder.quick(503, "Service Unavailable").await
+                        Ok(InviteOutcome::Failed { response }) => {
+                            warn!(code = response.status_code, "NGN 側 INVITE 失敗");
+                            // 486 を Busy、それ以外を Error として記録 (Timeout は invite() で
+                            // Err になるためここでは到達しない)。
+                            let result = if response.status_code == 486 {
+                                InviteResult::Busy
+                            } else {
+                                InviteResult::Error
+                            };
+                            self.metrics.record_invite_ngn(result);
+                            responder
+                                .quick(response.status_code, response.reason.as_str())
+                                .await
+                        }
+                        Err(e) => {
+                            warn!(error=%e, "NGN 側 INVITE トランスポート失敗 → 503");
+                            self.metrics.record_invite_ngn(InviteResult::Timeout);
+                            responder.quick(503, "Service Unavailable").await
+                        }
                     }
                 }
+                .instrument(span)
+                .await
             }
             UasEvent::Bye { request, remote } => {
                 debug!(%remote, "内線 BYE → NGN にも BYE 必要 (Phase 2.5)");
-                if let (Some(cid), Some(mgr)) =
-                    (request.headers.get("call-id"), self.call_manager.as_ref())
-                {
+                if let Some(cid) = request.headers.get("call-id") {
                     let removed = { self.active.lock().await.remove(cid) };
-                    if let Some(call_id) = removed {
+                    if removed.is_some() {
+                        // 通話終了として call_active を -1
+                        self.metrics.dec_call_active();
+                    }
+                    if let (Some(Some(call_id)), Some(mgr)) =
+                        (removed, self.call_manager.as_ref())
+                    {
                         if let Err(e) = mgr.terminate(call_id).await {
                             warn!(error=%e, "内線 BYE 受信時の通話終了に失敗");
                         }
@@ -624,11 +767,15 @@ impl UasEventHandler {
             ext_socket: ctx.ext_sock,
             ngn_peer: Some(ngn_peer),
             ext_peer: Some(ctx.ext_peer),
+            metrics: Some(self.metrics.clone()),
         })?;
         let cid = mgr.create_call().await;
         mgr.attach_bridge(cid, bridge).await?;
         if !call_id.is_empty() {
-            self.active.lock().await.insert(call_id.to_string(), cid);
+            self.active
+                .lock()
+                .await
+                .insert(call_id.to_string(), Some(cid));
         }
         Ok(rewritten_for_ext)
     }
@@ -666,7 +813,28 @@ pub fn wire_ngn_inbound(
     extensions: Arc<ExtensionRegistrar>,
     cfg: NgnInboundConfig,
 ) -> Arc<NgnInboundHandler> {
-    let handler = NgnInboundHandler::new(socket, inviter, extensions, cfg);
+    wire_ngn_inbound_with_metrics(
+        _layer,
+        socket,
+        inbound_rx,
+        inviter,
+        extensions,
+        cfg,
+        Metrics::new(),
+    )
+}
+
+/// `wire_ngn_inbound` のメトリクス付き版。
+pub fn wire_ngn_inbound_with_metrics(
+    _layer: Arc<TransactionLayer>,
+    socket: Arc<UdpSocket>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
+    inviter: ExtInviter,
+    extensions: Arc<ExtensionRegistrar>,
+    cfg: NgnInboundConfig,
+    metrics: Arc<Metrics>,
+) -> Arc<NgnInboundHandler> {
+    let handler = NgnInboundHandler::with_metrics(socket, inviter, extensions, cfg, metrics);
     handler.clone().spawn(inbound_rx);
     handler
 }

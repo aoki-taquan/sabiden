@@ -9,6 +9,12 @@ pub struct Config {
     pub sip: SipConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    /// 内線 UAS 設定 (省略可: NGN 側登録のみで内線受付しない構成も許容する)。
+    #[serde(default)]
+    pub uas: Option<UasConfig>,
+    /// 内線一覧 (UAS が REGISTER を受け付ける際の Digest 認証情報)。
+    #[serde(default)]
+    pub extensions: Vec<ExtensionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -33,6 +39,55 @@ pub struct HealthConfig {
     /// ヘルスチェック HTTP サーバの bind アドレス
     #[serde(default = "default_health_addr")]
     pub bind_addr: SocketAddr,
+}
+
+/// 内線 UAS (スマホ受付) の設定。
+///
+/// NGN 側 (`SipConfig`) とは別ポートで待ち受ける必要があるため
+/// (内線網と NGN 網は L4 で分離する)、独立した bind アドレスを持つ。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UasConfig {
+    /// 内線受付の bind アドレス。デフォルトは `0.0.0.0:5061`。
+    #[serde(default = "default_uas_bind")]
+    pub bind_addr: SocketAddr,
+    /// 401 で返す `realm` (Digest)。デフォルトは `sabiden`。
+    #[serde(default = "default_uas_realm")]
+    pub realm: String,
+    /// REGISTER 受付時の expires のクランプ上限 (秒)。
+    /// UA が極端に長い expires を要求しても、これを超えない。
+    #[serde(default = "default_uas_max_expires")]
+    pub max_expires: u32,
+}
+
+impl Default for UasConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_uas_bind(),
+            realm: default_uas_realm(),
+            max_expires: default_uas_max_expires(),
+        }
+    }
+}
+
+/// 1 つの内線アカウント。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionConfig {
+    /// 内線ユーザ名 (REGISTER の To/From で来る AOR の username 部分)。
+    pub username: String,
+    /// 内線パスワード (Digest 認証用、平文)。
+    pub password: String,
+}
+
+fn default_uas_bind() -> SocketAddr {
+    "0.0.0.0:5061".parse().expect("default uas bind")
+}
+
+fn default_uas_realm() -> String {
+    "sabiden".to_string()
+}
+
+fn default_uas_max_expires() -> u32 {
+    3600
 }
 
 impl Default for HealthConfig {
@@ -87,6 +142,8 @@ impl Config {
                     .unwrap_or_else(default_expires),
             },
             health: HealthConfig::default(),
+            uas: None,
+            extensions: Vec::new(),
         })
     }
 
@@ -120,6 +177,14 @@ impl Config {
                 self.health.bind_addr = addr;
             }
         }
+        if let Ok(v) = std::env::var("SABIDEN_UAS_BIND_ADDR") {
+            if let Ok(addr) = v.parse() {
+                self.uas.get_or_insert_with(UasConfig::default).bind_addr = addr;
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_UAS_REALM") {
+            self.uas.get_or_insert_with(UasConfig::default).realm = v;
+        }
     }
 
     pub fn example() -> String {
@@ -140,6 +205,21 @@ register_expires = 3600
 [health]
 # ヘルスチェック HTTP サーバ
 bind_addr = "0.0.0.0:8080"
+
+# 内線 UAS (スマホ受付) 設定 (省略可)
+[uas]
+bind_addr = "0.0.0.0:5061"
+realm = "sabiden"
+max_expires = 3600
+
+# 内線アカウント (任意)
+# [[extensions]]
+# username = "iphone"
+# password = "iphone_password"
+#
+# [[extensions]]
+# username = "android"
+# password = "android_password"
 "#
         .to_string()
     }

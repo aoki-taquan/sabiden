@@ -6,17 +6,24 @@
 //   バック付きで返す。
 //
 // セキュリティ:
-//   - Cloudflare Access で Worker ルートを保護する場合は zero-trust の
-//     CF-Access-JWT-Assertion を見る形で拡張する (Phase 2)。
+//   - `phone.a-taquan.com` (このWorker) は Cloudflare Access (email allow) で保護。
+//   - 上流 `signal.a-taquan.com` (Tunnel → K8s) は Cloudflare Access の
+//     Service Token policy で保護されており、本 Worker のみがアクセス可能。
+//   - 上流呼び出し時に `CF-Access-Client-Id` / `CF-Access-Client-Secret`
+//     ヘッダを付与する (Cloudflare Access service token 認証)。
 //   - HMAC トークンは `?token=` または `Authorization: Bearer` で
 //     クライアントから直接 sabiden 側に渡る (本 Worker は素通し)。
 
 export interface Env {
   ASSETS: { fetch: (req: Request) => Promise<Response> };
-  /** 例: https://home-sabiden.example.com (Cloudflare Tunnel hostname) */
+  /** 例: https://signal.a-taquan.com (Cloudflare Tunnel hostname) */
   SIGNAL_ORIGIN: string;
   /** 任意: アップストリームに渡す Host ヘッダ */
   SIGNAL_HOST_HEADER?: string;
+  /** Cloudflare Access service token Client ID (上流 signal.* への認証用) */
+  CF_ACCESS_CLIENT_ID?: string;
+  /** Cloudflare Access service token Client Secret */
+  CF_ACCESS_CLIENT_SECRET?: string;
   ENVIRONMENT?: string;
 }
 
@@ -51,6 +58,13 @@ async function proxySignal(request: Request, env: Env): Promise<Response> {
   // 上流に X-Forwarded-For として追加 (sabiden 側のロギング用)
   const cfip = request.headers.get("cf-connecting-ip");
   if (cfip) headers.set("x-forwarded-for", cfip);
+
+  // Cloudflare Access service token 認証ヘッダを付与。
+  // これがないと上流 (signal.a-taquan.com) の Access policy で拒否される。
+  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    headers.set("CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
+    headers.set("CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET);
+  }
 
   // WebSocket アップグレードでも fetch でそのまま中継できる
   return fetch(

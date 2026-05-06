@@ -61,9 +61,18 @@ cd frontend && npm install && npm run build && cd ..
 cd workers && npm install
 
 # 上流 Tunnel ホスト名を秘密値として登録 (公開しない)
-echo "https://home-sabiden.example.com" | npx wrangler secret put SIGNAL_ORIGIN
+# home-ops の terraform-cloudflare で signal.a-taquan.com の Tunnel を立てる構成
+echo "https://signal.a-taquan.com" | npx wrangler secret put SIGNAL_ORIGIN
 # 任意: 上流に渡す Host ヘッダの上書き
-# echo "home-sabiden.example.com" | npx wrangler secret put SIGNAL_HOST_HEADER
+# echo "signal.a-taquan.com" | npx wrangler secret put SIGNAL_HOST_HEADER
+
+# Cloudflare Access service token (上流 Tunnel が non_identity policy で
+# 保護されているため、本 Worker が認証ヘッダを付ける必要がある)
+# home-ops apply 後に terraform output で取得した値を投入する
+#   terraform output -raw sabiden_pwa_worker_service_token_client_id
+#   terraform output -raw sabiden_pwa_worker_service_token_client_secret
+echo "$CLIENT_ID"     | npx wrangler secret put CF_ACCESS_CLIENT_ID
+echo "$CLIENT_SECRET" | npx wrangler secret put CF_ACCESS_CLIENT_SECRET
 
 # デプロイ
 npx wrangler deploy

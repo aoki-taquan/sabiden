@@ -5,7 +5,7 @@
 /// とトランザクション タイムアウト (Timer F) は transaction 層で
 /// ハンドルされ、本モジュールは認証チャレンジ→再送信のロジックに集中する。
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,8 @@ pub struct Registrar {
     server_addr: SocketAddr,
     call_id: String,
     tag: String,
+    /// REGISTER 成功状態を外部 (health server 等) と共有するためのフラグ
+    registered: Arc<AtomicBool>,
 }
 
 impl Registrar {
@@ -41,18 +43,26 @@ impl Registrar {
             server_addr,
             call_id: new_call_id(),
             tag: new_tag(),
+            registered: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// REGISTER 成功状態を購読するための共有ハンドル
+    pub fn registered_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.registered)
     }
 
     pub async fn run(&self) -> Result<()> {
         loop {
             match self.register_with_retry().await {
                 Ok(expires) => {
+                    self.registered.store(true, Ordering::SeqCst);
                     let refresh = Duration::from_secs((expires as f64 * 0.9) as u64);
                     info!("REGISTER 成功 次回更新まで {}秒", refresh.as_secs());
                     time::sleep(refresh).await;
                 }
                 Err(e) => {
+                    self.registered.store(false, Ordering::SeqCst);
                     warn!("REGISTER 失敗: {} 30秒後に再試行", e);
                     time::sleep(Duration::from_secs(30)).await;
                 }

@@ -14,14 +14,15 @@
 //!
 //! # Phase 4 残作業 (本 PR スコープ外)
 //!
-//! - 実 ICE/DTLS-SRTP 終端 (`webrtc-rs` バックエンド)
-//! - Opus ↔ G.711 トランスコード (Issue #25 と並行)
+//! - Opus ↔ G.711 トランスコード結線 (Issue #29 で str0m 受信 RTP を Call
+//!   Manager に流し込む)
 //! - WebRTC → NGN 発信時の INVITE 結線 (Call Manager 連動)
 //! - JWT (Cloudflare Zero Trust) 認証
 
 pub mod auth;
 pub mod peer;
 pub mod signaling;
+pub mod str0m_session;
 
 // 上位層 (main.rs / health) からの利便性のために再エクスポート。
 // 全部使い切らない場合があるので unused_imports を抑止 (Phase 4 の途中段階)。
@@ -34,3 +35,5 @@ pub use signaling::{
     process_client_message, signal_ws_handler, ClientMessage, ServerMessage, SessionAction,
     SignalingState,
 };
+#[allow(unused_imports)]
+pub use str0m_session::{Str0mConfig, Str0mPeerSession};

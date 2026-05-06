@@ -280,11 +280,40 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                 if let Some(ext_registrar) = ext_registrar.clone() {
                     let verifier = Arc::new(webrtc::Verifier::new(secret_bytes));
                     let ttl = std::time::Duration::from_secs(full_config.webrtc.register_ttl_secs);
+                    let backend = full_config.webrtc.backend.as_str();
                     info!(
-                        "WebRTC ゲートウェイ有効: /signal (register_ttl={}s)",
+                        "WebRTC ゲートウェイ有効: /signal (backend={} register_ttl={}s)",
+                        backend,
                         ttl.as_secs()
                     );
-                    Some(webrtc::SignalingState::new(verifier, ext_registrar, ttl))
+                    let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl);
+                    if backend == "str0m" {
+                        match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {
+                            Ok(s_cfg) => {
+                                let s_cfg = std::sync::Arc::new(s_cfg);
+                                let factory: webrtc::signaling::PeerFactory =
+                                    std::sync::Arc::new(move || {
+                                        let cfg = s_cfg.clone();
+                                        Box::pin(async move {
+                                            let session =
+                                                webrtc::Str0mPeerSession::new((*cfg).clone())
+                                                    .await?;
+                                            let p: std::sync::Arc<dyn webrtc::PeerSession> =
+                                                session;
+                                            Ok(p)
+                                        })
+                                    });
+                                state = state.with_peer_factory(factory);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "str0m 設定エラー (stub バックエンドにフォールバック): {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Some(state)
                 } else {
                     tracing::warn!("WebRTC ゲートウェイ設定済みだが内線 UAS 未設定のため無効化");
                     None

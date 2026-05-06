@@ -43,6 +43,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -57,6 +58,26 @@ use super::auth::{AuthClaims, Verifier};
 use super::peer::{PeerSession, StubPeerSession};
 use crate::sip::registrar::ExtensionRegistrar;
 
+/// PeerSession を WS セッションごとに生成するファクトリ。
+///
+/// stub を返す既定実装と、str0m 実装を返す本番用とで差し替える。
+/// 戻り値の `Future` は `Send`。
+pub type PeerFactory = Arc<
+    dyn Fn() -> futures_util::future::BoxFuture<'static, Result<Arc<dyn PeerSession>>>
+        + Send
+        + Sync,
+>;
+
+/// stub バックエンド用の既定ファクトリ。
+pub fn stub_peer_factory() -> PeerFactory {
+    Arc::new(|| {
+        Box::pin(async {
+            let p: Arc<dyn PeerSession> = StubPeerSession::new();
+            Ok(p)
+        })
+    })
+}
+
 /// シグナリングサーバの共有状態。
 #[derive(Clone)]
 pub struct SignalingState {
@@ -64,9 +85,13 @@ pub struct SignalingState {
     pub extensions: Arc<ExtensionRegistrar>,
     /// `register` 受信時に AOR を Registrar に書き込む際の expires。
     pub register_ttl: Duration,
+    /// PeerSession を生成するファクトリ。`stub_peer_factory()` か、
+    /// 本番なら str0m バックエンドを返すクロージャ。
+    pub peer_factory: PeerFactory,
 }
 
 impl SignalingState {
+    /// stub PeerSession を使う既定設定 (テスト/段階導入向け)。
     pub fn new(
         verifier: Arc<Verifier>,
         extensions: Arc<ExtensionRegistrar>,
@@ -76,7 +101,14 @@ impl SignalingState {
             verifier,
             extensions,
             register_ttl,
+            peer_factory: stub_peer_factory(),
         }
+    }
+
+    /// 任意の [`PeerFactory`] を指定する。
+    pub fn with_peer_factory(mut self, factory: PeerFactory) -> Self {
+        self.peer_factory = factory;
+        self
     }
 }
 
@@ -167,8 +199,37 @@ pub async fn run_session(
     claims: AuthClaims,
     remote: SocketAddr,
 ) {
-    let (mut sender, mut receiver) = socket.split();
-    let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+    let (sender, mut receiver) = socket.split();
+    // PeerSession を factory で生成 (stub または str0m)。
+    let peer: Arc<dyn PeerSession> = match (state.peer_factory)().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error=%e, "PeerSession 生成失敗、WS セッション中断");
+            return;
+        }
+    };
+
+    // sender は両方 (run_session 本体 と trickle ICE 出力タスク) で使うので
+    // Mutex で保護する。
+    let sender = Arc::new(Mutex::new(sender));
+
+    // str0m バックエンドが local candidates を流すので、その receiver を
+    // 取り出して trickle 出力タスクを spawn する。stub は None を返すので
+    // タスクは起動されない。
+    if let Some(mut local_cand_rx) = peer.take_local_candidates().await {
+        let sender_clone = sender.clone();
+        tokio::spawn(async move {
+            while let Some(cand) = local_cand_rx.recv().await {
+                let msg = ServerMessage::Ice { candidate: cand };
+                let payload = serde_json::to_string(&msg).unwrap();
+                let mut s = sender_clone.lock().await;
+                if s.send(Message::Text(payload)).await.is_err() {
+                    debug!("trickle ICE: WS 送信失敗、出力タスク終了");
+                    break;
+                }
+            }
+        });
+    }
 
     let registered_aor: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -180,7 +241,8 @@ pub async fn run_session(
                 break;
             }
             Ok(Message::Ping(p)) => {
-                let _ = sender.send(Message::Pong(p)).await;
+                let mut s = sender.lock().await;
+                let _ = s.send(Message::Pong(p)).await;
                 continue;
             }
             Ok(_) => continue,
@@ -194,7 +256,8 @@ pub async fn run_session(
             Ok(m) => m,
             Err(e) => {
                 let err = ServerMessage::error("bad_json", e.to_string());
-                let _ = sender
+                let mut s = sender.lock().await;
+                let _ = s
                     .send(Message::Text(serde_json::to_string(&err).unwrap()))
                     .await;
                 continue;
@@ -209,10 +272,13 @@ pub async fn run_session(
         match resp {
             SessionAction::Reply(sm) => {
                 let payload = serde_json::to_string(&sm).unwrap();
-                if sender.send(Message::Text(payload)).await.is_err() {
+                let is_bye = matches!(sm, ServerMessage::Bye);
+                let mut s = sender.lock().await;
+                if s.send(Message::Text(payload)).await.is_err() {
                     break;
                 }
-                if matches!(sm, ServerMessage::Bye) {
+                drop(s);
+                if is_bye {
                     break;
                 }
             }

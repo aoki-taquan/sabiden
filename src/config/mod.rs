@@ -87,11 +87,15 @@ impl Default for UasConfig {
     }
 }
 
-/// WebRTC ゲートウェイ (Issue #23)。
+/// WebRTC ゲートウェイ (Issue #23 / Issue #28)。
 ///
 /// 有効化するには `secret_hex` (HMAC-SHA256 共有秘密) を設定する。
 /// 既存 health server (axum) に `/signal` ルートを相乗りさせるため、
 /// 独立した bind アドレスは持たず `[health] bind_addr` を共有する。
+///
+/// Issue #28 で実 ICE/DTLS-SRTP (str0m) を有効化する場合は `public_ip` を
+/// 設定し、UDP ポート範囲を `udp_port_range` で固定する (Cloudflare Tunnel /
+/// 静的ファイアウォール構成での予測可能性のため)。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WebRtcConfig {
     /// HMAC-SHA256 トークン検証用の共有秘密 (16 進文字列)。
@@ -102,10 +106,35 @@ pub struct WebRtcConfig {
     /// `register` メッセージで Registrar に書き込むときの expires 秒。
     #[serde(default = "default_webrtc_register_ttl")]
     pub register_ttl_secs: u64,
+    /// メディア層に使うバックエンド種別。
+    /// - `"stub"` (デフォルト): SDP オファ/アンサのみ生成 (テスト/開発用)
+    /// - `"str0m"`: 実 ICE/DTLS-SRTP/RTP 終端 (Issue #28)
+    #[serde(default = "default_webrtc_backend")]
+    pub backend: String,
+    /// ICE host candidate に載せる「外部から到達可能な IPv4」。
+    /// Cloudflare Tunnel 経由なら LAN 側でも可。未設定なら全インタフェースで
+    /// listen するが ICE candidate は配信できない (str0m バックエンドでは必須)。
+    #[serde(default)]
+    pub public_ip: Option<String>,
+    /// UDP メディアポートの範囲 ("40000-40999" 形式)。
+    /// str0m はソケット上限を 1 つ用意するため、本範囲から空きポートを 1 つ
+    /// 選ぶ (将来 multi-session で使い分ける可能性に備えて範囲指定)。
+    #[serde(default)]
+    pub udp_port_range: Option<String>,
+    /// 外部 STUN/TURN サーバ URL (例 `"turn:turn.example.com:3478"`)。
+    /// str0m ICE-Lite 構成では我々が NAT 越えする必要は無いが、ブラウザ側が
+    /// strict NAT 配下にいる場合に備えて relay candidate を SDP に載せる選択肢。
+    /// 本 PR では設定値の取り込みのみ行い、実際の TURN allocate は TODO。
+    #[serde(default)]
+    pub ice_servers: Vec<String>,
 }
 
 fn default_webrtc_register_ttl() -> u64 {
     300
+}
+
+fn default_webrtc_backend() -> String {
+    "stub".to_string()
 }
 
 /// 1 つの内線アカウント。
@@ -184,7 +213,10 @@ impl Config {
             uas: None,
             extensions: Vec::new(),
             trace: TraceConfig::default(),
-            webrtc: WebRtcConfig::default(),
+            webrtc: WebRtcConfig {
+                backend: default_webrtc_backend(),
+                ..WebRtcConfig::default()
+            },
         })
     }
 
@@ -239,6 +271,25 @@ impl Config {
                 self.webrtc.register_ttl_secs = n;
             }
         }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_BACKEND") {
+            if !v.is_empty() {
+                self.webrtc.backend = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_PUBLIC_IP") {
+            self.webrtc.public_ip = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_UDP_PORT_RANGE") {
+            self.webrtc.udp_port_range = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_ICE_SERVERS") {
+            // カンマ区切り
+            self.webrtc.ice_servers = if v.is_empty() {
+                Vec::new()
+            } else {
+                v.split(',').map(|s| s.trim().to_string()).collect()
+            };
+        }
     }
 
     pub fn example() -> String {
@@ -285,6 +336,14 @@ max_expires = 3600
 # [webrtc]
 # secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # register_ttl_secs = 300
+# # メディア層: "stub" (デフォルト) または "str0m" (実 ICE/DTLS-SRTP)
+# backend = "str0m"
+# # 外部到達可能 IPv4。Cloudflare Tunnel 経由なら LAN 側でも可
+# public_ip = "203.0.113.1"
+# # メディア用 UDP ポート範囲 (ファイアウォール/Tunnel 設定での予測可能性のため固定)
+# udp_port_range = "40000-40999"
+# # STUN/TURN URL (現状は SDP に乗せるのみ、relay allocate は将来実装)
+# ice_servers = ["turn:turn.example.com:3478"]
 "#
         .to_string()
     }

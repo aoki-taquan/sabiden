@@ -18,6 +18,7 @@ use tracing::info;
 
 use config::Config;
 use sip::register::Registrar;
+use sip::transaction::TransactionLayer;
 
 #[derive(Parser)]
 #[command(name = "sabiden")]
@@ -70,7 +71,9 @@ async fn main() -> Result<()> {
 
             set_dscp(&socket, 32)?;
 
-            let registrar = Registrar::new(config.clone(), socket, config.server_addr);
+            // RFC 3261 §17 トランザクション層を起動 (受信ループを spawn)
+            let (layer, _inbound_rx) = TransactionLayer::spawn(socket);
+            let registrar = Registrar::new(config.clone(), layer, config.server_addr);
             info!("REGISTER 開始 → {}", config.server_addr);
             registrar.run().await?;
         }

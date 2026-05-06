@@ -1,16 +1,21 @@
 /// RFC 3261 REGISTER + RFC 4028 Session Timer 対応
+///
+/// 本実装は SIP トランザクション層 (`super::transaction`) を経由して
+/// REGISTER を送信する (RFC 3261 §17.1.2)。これにより再送 (Timer E)
+/// とトランザクション タイムアウト (Timer F) は transaction 層で
+/// ハンドルされ、本モジュールは認証チャレンジ→再送信のロジックに集中する。
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::net::UdpSocket;
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::auth::{DigestChallenge, DigestCredentials};
-use super::message::{parse_message, SipMessage, SipMethod, SipRequest};
+use super::message::{SipMethod, SipRequest};
+use super::transaction::TransactionLayer;
 use super::utils::{new_branch, new_call_id, new_tag};
 use crate::config::SipConfig;
 
@@ -18,17 +23,21 @@ static CSEQ: AtomicU32 = AtomicU32::new(1);
 
 pub struct Registrar {
     config: Arc<SipConfig>,
-    socket: Arc<UdpSocket>,
+    layer: Arc<TransactionLayer>,
     server_addr: SocketAddr,
     call_id: String,
     tag: String,
 }
 
 impl Registrar {
-    pub fn new(config: Arc<SipConfig>, socket: Arc<UdpSocket>, server_addr: SocketAddr) -> Self {
+    pub fn new(
+        config: Arc<SipConfig>,
+        layer: Arc<TransactionLayer>,
+        server_addr: SocketAddr,
+    ) -> Self {
         Self {
             config,
-            socket,
+            layer,
             server_addr,
             call_id: new_call_id(),
             tag: new_tag(),
@@ -53,12 +62,10 @@ impl Registrar {
 
     /// 認証チャレンジを処理して REGISTER を完了させる
     async fn register_with_retry(&self) -> Result<u32> {
-        // Step 1: 認証なしで送信
+        // Step 1: 認証なしで送信 (transaction 経由)
         let cseq = CSEQ.fetch_add(1, Ordering::SeqCst);
         let req = self.build_register(cseq, None);
-        self.send(&req).await?;
-
-        let resp = self.recv_response().await?;
+        let resp = self.layer.send_request(req, self.server_addr).await?;
         match resp.status_code {
             200 => Ok(parse_expires(&resp.headers)),
             401 => {
@@ -75,9 +82,7 @@ impl Registrar {
 
                 let cseq2 = CSEQ.fetch_add(1, Ordering::SeqCst);
                 let req2 = self.build_register(cseq2, Some(&digest.header_value));
-                self.send(&req2).await?;
-
-                let resp2 = self.recv_response().await?;
+                let resp2 = self.layer.send_request(req2, self.server_addr).await?;
                 if resp2.status_code == 200 {
                     Ok(parse_expires(&resp2.headers))
                 } else {
@@ -122,38 +127,6 @@ impl Registrar {
         }
 
         req
-    }
-
-    async fn send(&self, req: &SipRequest) -> Result<()> {
-        let bytes = req.to_bytes();
-        debug!("送信:\n{}", String::from_utf8_lossy(&bytes));
-        self.socket.send_to(&bytes, self.server_addr).await?;
-        Ok(())
-    }
-
-    async fn recv_response(&self) -> Result<super::message::SipResponse> {
-        let mut buf = vec![0u8; 4096];
-        let deadline = time::sleep(Duration::from_secs(5));
-        tokio::pin!(deadline);
-
-        loop {
-            tokio::select! {
-                result = self.socket.recv_from(&mut buf) => {
-                    let (n, _) = result?;
-                    debug!("受信:\n{}", String::from_utf8_lossy(&buf[..n]));
-                    match parse_message(&buf[..n])? {
-                        SipMessage::Response(r) => return Ok(r),
-                        SipMessage::Request(_) => {
-                            // REGISTER 中に届いたリクエストは無視
-                            continue;
-                        }
-                    }
-                }
-                _ = &mut deadline => {
-                    anyhow::bail!("REGISTER タイムアウト");
-                }
-            }
-        }
     }
 }
 

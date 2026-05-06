@@ -1,5 +1,8 @@
 [sip]
 # DHCP Option 120 で取得した SIP サーバアドレス
+# - HGW 経由 (Digest 認証) なら NGN の IPv6 P-CSCF (例: [2001:A7FF:2101:6::F]:5060)
+# - NGN 直収モード (Issue #37) なら init container が DHCPv4 で取得した IPv4
+#   (例: 118.177.125.1:5060)
 server_addr = "[2001:A7FF:2101:6::F]:5060"
 # NGN UDP ソケットの bind アドレス (省略時 [::]:5060。K8s で IPv4 のみ使うなら 0.0.0.0:5060)
 # bind_addr = "[::]:5060"
@@ -12,10 +15,23 @@ server_addr = "[2001:A7FF:2101:6::F]:5060"
 phone_number = "0312345678"
 # NTT ドメイン
 domain = "ntt-east.ne.jp"
-# SIP 認証パスワード (HGW 設定画面から確認)
+# SIP 認証パスワード (HGW 設定画面から確認)。
+# NGN 直収モード ([ngn] direct_mode = true) では回線認証ベースのため不要。
+# その場合はコメントアウトするか、環境変数 SABIDEN_SIP_PASSWORD を空にする。
 password = "your_sip_password"
 # REGISTER 有効期限 (秒)
 register_expires = 3600
+
+# NGN 直収モード (Issue #37): HGW 不要で sabiden が NGN に直接 REGISTER
+# する構成。home-ops PR #214 で確定したレシピ:
+#   1. HGW を一度起動 → NTT OSS-DB に WAN MAC を永続登録 (初回のみ)
+#   2. K8s NIC レベルで HGW WAN MAC を spoof
+#   3. init container で DHCPv4 (vendor class "RX-600KI") → /30 IPv4 lease + option 120
+#   4. sabiden が SIP REGISTER (Authorization なし、回線認証ベース) → 200 OK
+# sabiden は (4) のみ担当。(1)-(3) は init container と K8s NIC 設定で実施。
+# [ngn]
+# direct_mode = true
+# vendor_class = "RX-600KI"   # NTT 東日本 HGW 機種コード (init container DHCP で参照)
 
 [health]
 # ヘルスチェック HTTP サーバ

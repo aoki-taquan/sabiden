@@ -1,0 +1,6 @@
+# wrangler dev 用ローカル環境変数 (`.dev.vars` にコピーして使う)
+# 実値はコミットしないこと。
+
+SIGNAL_ORIGIN=https://home-sabiden.example.com
+# 必要なら:
+# SIGNAL_HOST_HEADER=home-sabiden.example.com

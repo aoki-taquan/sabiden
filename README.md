@@ -22,7 +22,8 @@ HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下
 | 1 | SIP トランザクション層 / SDP / RTP / Health | ✅ 完了 |
 | 2 | INVITE/BYE UAC / 内線 UAS / Call Manager | ✅ 完了 |
 | 2.5 | main.rs 結線 / NGN 着信受付 / RTP ブリッジ / 観測機能 | ✅ 完了 |
-| 3 | Cloudflare WebRTC ゲートウェイ / Opus トランスコード | 計画中 |
+| 3 | Cloudflare WebRTC ゲートウェイ / Opus トランスコード | ✅ 完了 |
+| 4 | PWA フロントエンド / Cloudflare Workers デプロイ | 進行中 |
 
 実機投入可能な状態に到達。詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) と [docs/INSTALL.md](docs/INSTALL.md) を参照。
 
@@ -30,6 +31,8 @@ HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - アーキテクチャ概要
 - [docs/INSTALL.md](docs/INSTALL.md) - 実機インストールガイド (NGN 直収)
+- [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md) - Cloudflare Tunnel + Workers デプロイ
+- [frontend/README.md](frontend/README.md) - PWA フロントエンド (SolidJS) 開発手順
 - [deploy/dhcp/](deploy/dhcp/) - DHCP Option 120 取得スクリプトと設定例
 - [deploy/systemd/](deploy/systemd/) - systemd ユニット (ハードニング済)
 - [deploy/docker/](deploy/docker/) - Dockerfile / docker-compose.yml (host network)

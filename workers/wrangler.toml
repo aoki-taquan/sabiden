@@ -1,0 +1,40 @@
+# Cloudflare Workers 設定: sabiden PWA + WS シグナリングプロキシ
+#
+# 役割:
+#   1. `frontend/dist` を静的アセットとして配信 (Workers Assets)
+#   2. `/signal` を Cloudflare Tunnel 経由で自宅 sabiden に WS パススルー
+#
+# 事前準備 (詳細は docs/CLOUDFLARE.md):
+#   - Cloudflare Tunnel を作成し、自宅 sabiden の `:8080` を
+#     `https://home-sabiden.example.com` に公開
+#   - `wrangler secret put SIGNAL_ORIGIN` で
+#     `https://home-sabiden.example.com` を投入
+#   - `wrangler secret put SIGNAL_HOST_HEADER` (任意) でアップストリームに
+#     送る Host ヘッダを上書き
+
+name = "sabiden-pwa"
+main = "signaling-proxy.ts"
+compatibility_date = "2025-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# 静的アセット (frontend/dist) を Workers Assets で配信
+[assets]
+directory = "../frontend/dist"
+binding = "ASSETS"
+# `/signal` 等の API は Worker コードに渡す
+not_found_handling = "single-page-application"
+
+# 環境変数 (公開可能なもののみ。秘密値は `wrangler secret put` で投入する)
+[vars]
+# 環境ごとに上書き
+ENVIRONMENT = "production"
+
+# 例: ステージング環境
+[env.staging]
+name = "sabiden-pwa-staging"
+[env.staging.vars]
+ENVIRONMENT = "staging"
+
+# Cloudflare Pages を使う場合は本ファイルではなく `frontend/dist` を
+# Pages にアップロードし、`_worker.js` か Pages Functions で
+# /signal を Tunnel に向ける構成でも良い (docs/CLOUDFLARE.md 参照)。

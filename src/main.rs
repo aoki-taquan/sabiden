@@ -6,6 +6,8 @@ mod dhcp;
 #[allow(dead_code)]
 mod rtp;
 #[allow(dead_code)]
+mod sdp;
+#[allow(dead_code)]
 mod sip;
 
 use std::net::SocketAddr;

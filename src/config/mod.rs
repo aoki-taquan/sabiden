@@ -21,6 +21,9 @@ pub struct Config {
     /// WebRTC ゲートウェイ (Issue #23)。`secret_hex` 未設定なら無効。
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    /// NGN 直収モード設定 (Issue #37)。`direct_mode = true` で auth=none REGISTER。
+    #[serde(default)]
+    pub ngn: NgnConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -46,8 +49,15 @@ pub struct SipConfig {
     pub phone_number: String,
     /// SIP ドメイン (例: ntt-east.ne.jp)
     pub domain: String,
-    /// SIP パスワード
-    pub password: String,
+    /// SIP パスワード。
+    ///
+    /// HGW 経由の Digest 認証では必須だが、NGN 直収モード (Issue #37) では
+    /// 回線認証 (HGW WAN MAC + DHCPv4 vendor class "RX-600KI") に基づくため
+    /// 不要となる。`None` の場合 `register_with_retry` は Authorization
+    /// ヘッダ無しで送信し、401 が返ってきたら諦める (DHCP/MAC 経路に問題がある
+    /// と判断する)。
+    #[serde(default)]
+    pub password: Option<String>,
     /// REGISTER の Expires 値 (秒)
     #[serde(default = "default_expires")]
     pub register_expires: u32,
@@ -164,6 +174,42 @@ pub struct WebRtcConfig {
     pub ice_servers: Vec<String>,
 }
 
+/// NGN 直収モード関連の設定 (Issue #37)。
+///
+/// home-ops PR #214 の検証で確定した「HGW WAN MAC spoof + DHCPv4 vendor class
+/// `RX-600KI` で /30 IPv4 lease を貰い、回線認証ベースで SIP REGISTER する」
+/// レシピに sabiden を追従させるためのスイッチ群。
+///
+/// sabiden 自身は DHCPv4 や MAC spoof は行わない (init container と K8s NIC
+/// 設定で実施)。本構造体の `vendor_class` は init container から参照される
+/// 設定値として保持し、運用ドキュメントとの整合を取るためのもの。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NgnConfig {
+    /// NGN 直収モード。`true` の場合:
+    /// - SIP `password` は不要 (Authorization ヘッダなしで REGISTER 送信)
+    /// - 401 が返ってきたら回線認証 (MAC/DHCP) 側の問題なので bail
+    #[serde(default)]
+    pub direct_mode: bool,
+    /// DHCPv4 で送出する Vendor Class (RFC 2132 option 60)。
+    /// NGN 側は `RX-600KI` 等 NTT 純正 HGW の値を期待する。sabiden 自身は
+    /// DHCP しないため本値は init container 側から参照する想定。
+    #[serde(default = "default_vendor_class")]
+    pub vendor_class: String,
+}
+
+impl Default for NgnConfig {
+    fn default() -> Self {
+        Self {
+            direct_mode: false,
+            vendor_class: default_vendor_class(),
+        }
+    }
+}
+
+fn default_vendor_class() -> String {
+    "RX-600KI".to_string()
+}
+
 fn default_webrtc_register_ttl() -> u64 {
     300
 }
@@ -260,7 +306,11 @@ impl Config {
                     .and_then(|s| s.parse().ok()),
                 phone_number: env_required("SABIDEN_SIP_PHONE_NUMBER")?,
                 domain: env_required("SABIDEN_SIP_DOMAIN")?,
-                password: env_required("SABIDEN_SIP_PASSWORD")?,
+                // password は NGN 直収モード (Issue #37) では不要なので
+                // 環境変数のみの起動でもオプショナル扱いする。
+                password: std::env::var("SABIDEN_SIP_PASSWORD")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
                 register_expires: std::env::var("SABIDEN_SIP_REGISTER_EXPIRES")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -274,6 +324,7 @@ impl Config {
                 backend: default_webrtc_backend(),
                 ..WebRtcConfig::default()
             },
+            ngn: NgnConfig::default(),
         })
     }
 
@@ -300,7 +351,9 @@ impl Config {
             self.sip.domain = v;
         }
         if let Ok(v) = std::env::var("SABIDEN_SIP_PASSWORD") {
-            self.sip.password = v;
+            // 空文字列はパスワード未設定として扱う (NGN 直収モードで k8s から
+            // 値だけ消したい場合の対応)。
+            self.sip.password = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("SABIDEN_SIP_REGISTER_EXPIRES") {
             if let Ok(n) = v.parse() {
@@ -352,6 +405,17 @@ impl Config {
                 v.split(',').map(|s| s.trim().to_string()).collect()
             };
         }
+        // [ngn] セクション (Issue #37)
+        if let Ok(v) = std::env::var("SABIDEN_NGN_DIRECT_MODE") {
+            // "true"/"1"/"yes" を真として受ける (k8s 環境変数の自然な使い方)。
+            let lower = v.to_ascii_lowercase();
+            self.ngn.direct_mode = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_NGN_VENDOR_CLASS") {
+            if !v.is_empty() {
+                self.ngn.vendor_class = v;
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -368,10 +432,22 @@ server_addr = "[2001:A7FF:2101:6::F]:5060"
 phone_number = "0312345678"
 # NTT ドメイン
 domain = "ntt-east.ne.jp"
-# SIP 認証パスワード (HGW 設定画面から確認)
+# SIP 認証パスワード (HGW 設定画面から確認)。
+# NGN 直収モード ([ngn] direct_mode = true) では不要なのでコメントアウト可。
 password = "your_sip_password"
 # REGISTER 有効期限 (秒)
 register_expires = 3600
+
+# NGN 直収モード設定 (任意)
+# home-ops PR #214 検証で確定したレシピ:
+#   1. HGW を一度起動し OSS-DB に WAN MAC を登録
+#   2. K8s NIC で HGW WAN MAC を spoof + DHCPv4 vendor class を送出
+#   3. /30 IPv4 lease + DHCP option 120 で SIP server IP を取得
+#   4. SIP REGISTER (Authorization なし、回線認証ベース) → 200 OK
+# sabiden は (4) のみ担当。(1)-(3) は init container と K8s NIC 設定で実施。
+# [ngn]
+# direct_mode = true
+# vendor_class = "RX-600KI"
 
 [health]
 # ヘルスチェック HTTP サーバ
@@ -430,7 +506,7 @@ mod tests {
             local_addr: local.map(|s| s.parse().unwrap()),
             phone_number: "0312345678".to_string(),
             domain: "example.test".to_string(),
-            password: "p".to_string(),
+            password: Some("p".to_string()),
             register_expires: 3600,
         }
     }
@@ -445,6 +521,7 @@ mod tests {
             extensions: Vec::new(),
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
+            ngn: NgnConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -463,6 +540,7 @@ mod tests {
             extensions: Vec::new(),
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
+            ngn: NgnConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -481,6 +559,7 @@ mod tests {
             extensions: Vec::new(),
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
+            ngn: NgnConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -508,5 +587,58 @@ password = "p"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.sip.local_addr.is_none());
         assert!(cfg.sip.bind_addr.is_none());
+    }
+
+    /// Issue #37: NGN 直収モードでは password を完全に省略しても
+    /// TOML パースが通り、`SipConfig.password` が `None` であること。
+    #[test]
+    fn toml_parses_without_password_for_ngn_direct() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[ngn]
+direct_mode = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.sip.password.is_none());
+        assert!(cfg.ngn.direct_mode);
+        assert_eq!(cfg.ngn.vendor_class, "RX-600KI");
+    }
+
+    /// Issue #37: `[ngn]` セクション全省略でも `direct_mode = false` で
+    /// vendor_class はデフォルト "RX-600KI" が入る (旧 HGW Digest モード互換)。
+    #[test]
+    fn toml_default_ngn_section_is_legacy_compatible() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+password = "secret"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.ngn.direct_mode);
+        assert_eq!(cfg.ngn.vendor_class, "RX-600KI");
+        assert_eq!(cfg.sip.password.as_deref(), Some("secret"));
+    }
+
+    /// Issue #37: vendor_class は将来の機種変更に備えて上書き可能。
+    #[test]
+    fn toml_ngn_vendor_class_can_be_overridden() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[ngn]
+direct_mode = true
+vendor_class = "PR-500KI"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.ngn.vendor_class, "PR-500KI");
     }
 }

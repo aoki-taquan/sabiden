@@ -359,16 +359,33 @@ fn ext_registrar_local_ip_or_loopback() -> std::net::IpAddr {
     "127.0.0.1".parse().unwrap()
 }
 
+/// NGN SIP 送信ソケットに DSCP 32 (TOS 0x80) を設定する。
+///
+/// NGN 直収モード (Issue #37) では IPv4 path で REGISTER するため、
+/// `IPV6_TCLASS` だけでなく `IP_TOS` も併せて設定する。dual-stack v6 socket と
+/// v4 socket の両方で正しく DSCP マーキングが効くよう保険的に両方呼ぶ
+/// (`rtp::set_rtp_dscp` と同じ方針)。失敗は無視する。
 #[cfg(target_os = "linux")]
 fn set_dscp(socket: &UdpSocket, dscp: u32) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let tos = (dscp << 2) as libc::c_int;
     let fd = socket.as_raw_fd();
     unsafe {
+        // IPv6 socket では IPV6_TCLASS。HGW 経由の従来運用 (NGN IPv6 path)。
         libc::setsockopt(
             fd,
             libc::IPPROTO_IPV6,
             libc::IPV6_TCLASS,
+            &tos as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // IPv4 path 用 IP_TOS (Issue #37 / NGN 直収モード)。
+        // dual-stack v6 socket でも v4-mapped 送信時にこちらが効くカーネルがあるため
+        // 保険でセットする。失敗は無視 (一部 socket タイプでは EOPNOTSUPP になる)。
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
             &tos as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );

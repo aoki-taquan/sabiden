@@ -444,6 +444,21 @@ impl TransactionLayer {
         table.clients.remove(id);
     }
 
+    /// 応答を待たないリクエスト送信。
+    ///
+    /// RFC 3261 §13.2.2.4: 2xx に対する ACK は新規トランザクションを作らず、
+    /// TU が単発で送信する (再送制御は TU の責任)。本メソッドは UAC が
+    /// 2xx ACK や、トランザクションを介さない補助送信を行う際に使う。
+    pub async fn send_request_no_wait(
+        self: &Arc<Self>,
+        request: SipRequest,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        let bytes = request.to_bytes();
+        self.socket.send_to(&bytes, destination).await?;
+        Ok(())
+    }
+
     /// クライアント トランザクションを送って最終応答を待つ高水準 API。
     ///
     /// これは REGISTER 等の「リクエスト1本 → 応答待ち」用途向け。

@@ -1,5 +1,9 @@
 # sabiden
 
+[![CI](https://github.com/aoki-taquan/sabiden/actions/workflows/ci.yml/badge.svg)](https://github.com/aoki-taquan/sabiden/actions/workflows/ci.yml)
+[![Release](https://github.com/aoki-taquan/sabiden/actions/workflows/release.yml/badge.svg)](https://github.com/aoki-taquan/sabiden/actions/workflows/release.yml)
+[![Container](https://ghcr-badge.egpl.dev/aoki-taquan/sabiden/latest_tag?label=ghcr.io)](https://github.com/aoki-taquan/sabiden/pkgs/container/sabiden)
+
 NTT ひかり電話 (NGN) を直接喋れる Rust 実装の SIP クライアント。
 HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下から
 ひかり電話を発着信できるようにすることを目指す。
@@ -58,8 +62,17 @@ cp config.example.toml config.toml
 
 ### Docker
 ```bash
+# ghcr.io から取得 (main ブランチ最新)
+docker pull ghcr.io/aoki-taquan/sabiden:main
+# 安定版が出れば SemVer タグも利用可能
+# docker pull ghcr.io/aoki-taquan/sabiden:v0.1.0
+
+docker run --network host \
+  -v $(pwd)/config.toml:/etc/sabiden/config.toml \
+  ghcr.io/aoki-taquan/sabiden:main
+
+# ローカルビルドが必要な場合
 docker build -t sabiden -f deploy/docker/Dockerfile .
-docker run --network host -v $(pwd)/config.toml:/etc/sabiden/config.toml sabiden
 ```
 
 ### Kubernetes

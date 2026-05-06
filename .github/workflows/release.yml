@@ -1,0 +1,96 @@
+name: Release
+
+# main への push と v* タグ push でのみコンテナイメージを ghcr.io へ publish する。
+# PR では ci.yml が docker build (push なし) を行うため、ここでは publish のみを担当する。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: aoki-taquan/sabiden
+
+jobs:
+  publish:
+    name: build & push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # GitHub Release 作成用 (タグ push 時のみ)
+      packages: write       # ghcr.io への push 用
+      id-token: write       # provenance attestation 用
+      attestations: write   # build provenance attestation 用
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # OCI 標準ラベル + 規約に沿った tag を一括生成。
+      # latest は明示的な release のみ。main ブランチの push は :main + sha のみ。
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=sabiden
+            org.opencontainers.image.description=NTT ひかり電話 (NGN) 直収 SIP クライアント
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=aoki-taquan
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # SLSA build provenance を attestation として ghcr.io に添付
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # v* タグ push 時のみ GitHub Release を作成
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Container Image
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+
+            イメージダイジェスト: `${{ steps.build.outputs.digest }}`

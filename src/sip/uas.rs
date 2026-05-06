@@ -80,6 +80,13 @@ impl ResponderHandle {
         }
     }
 
+    /// テスト用に `ServerTransaction` から直接構築するヘルパ。
+    /// 通常経路では `ExtensionUas` 内部でしか作られない。
+    #[doc(hidden)]
+    pub fn __test_new(tx: ServerTransaction) -> Self {
+        Self::new(tx)
+    }
+
     /// 任意の応答を送信する。
     pub async fn respond(&self, response: SipResponse) -> Result<()> {
         let mut tx = self.inner.lock().await;
@@ -92,6 +99,30 @@ impl ResponderHandle {
             let tx = self.inner.lock().await;
             build_response_skeleton(tx.request(), status, reason)
         };
+        self.respond(resp).await
+    }
+
+    /// ボディ付き応答を送る。
+    ///
+    /// 200 OK + `application/sdp` で SDP answer を内線に返したい等、
+    /// `quick` ではボディを乗せられない用途のためのヘルパ。
+    /// To タグが未付与なら付与する (RFC 3261 §8.2.6.2)。
+    pub async fn respond_with_body(
+        &self,
+        status: u16,
+        reason: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let mut resp = {
+            let tx = self.inner.lock().await;
+            build_response_skeleton(tx.request(), status, reason)
+        };
+        if !body.is_empty() {
+            resp.headers.set("Content-Type", content_type);
+            resp.body = body;
+        }
+        ensure_to_tag(&mut resp);
         self.respond(resp).await
     }
 }

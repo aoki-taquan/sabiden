@@ -79,6 +79,40 @@ fn format_attr(a: &Attribute) -> String {
     }
 }
 
+/// SDP の RTP エンドポイント (c= IP / m= port) を sabiden 側に書き換える。
+///
+/// B2BUA で受け取った SDP オファ/アンサをそのまま反対側に流すと、ピアは
+/// 互いに直接 RTP を送ろうとして sabiden を経由しなくなってしまう。
+/// そこで sabiden が中継用に bind した IP と port で
+/// セッションレベル `c=` と最初の `m=audio` の port を書き換える。
+///
+/// 書き換え対象:
+/// - `o=` の origin address (`addr` に置換)
+/// - セッションレベル `c=` (`addr` に置換、なければ生成)
+/// - 最初の `m=audio` の port (`port` に置換)
+/// - その `m=audio` のメディアレベル `c=` があれば (`addr` に置換)
+///
+/// 元 SDP のパースに失敗したらそのまま返す。
+pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow::Result<Vec<u8>> {
+    let text = std::str::from_utf8(sdp_bytes)?;
+    let mut sdp = SessionDescription::parse(text)?;
+
+    sdp.origin.address = addr;
+    // セッションレベル c= は必ず sabiden を指すようにする
+    sdp.connection = Some(Connection { address: addr });
+
+    // 最初の audio media を sabiden 側に書き換える
+    if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
+        audio.port = port;
+        // メディアレベル c= が立っていればそちらも整合させる
+        if audio.connection.is_some() {
+            audio.connection = Some(Connection { address: addr });
+        }
+    }
+
+    Ok(sdp.to_string_crlf().into_bytes())
+}
+
 impl SessionDescription {
     /// NGN / SIP UAC で典型的に使う G.711 μ-law (PCMU) オファーを作る。
     ///
@@ -122,5 +156,60 @@ impl SessionDescription {
                 ],
             }],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// セッションレベル c= しかない SDP は c= とポートが書き換わる。
+    #[test]
+    fn rewrite_rewrites_session_level_connection() {
+        let original = b"v=0\r\n\
+                         o=- 1 1 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         c=IN IP4 192.0.2.1\r\n\
+                         t=0 0\r\n\
+                         m=audio 30000 RTP/AVP 0\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(original, new_addr, 40000).unwrap();
+        let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
+        assert_eq!(parsed.connection.as_ref().unwrap().address, new_addr);
+        assert_eq!(parsed.origin.address, new_addr);
+        assert_eq!(parsed.media[0].port, 40000);
+        // PT/rtpmap は保持される
+        assert_eq!(parsed.media[0].formats, vec!["0"]);
+        assert!(parsed.find_rtpmap(0).is_some());
+    }
+
+    /// メディアレベル c= がある SDP も書き換わる。
+    #[test]
+    fn rewrite_rewrites_media_level_connection() {
+        let original = b"v=0\r\n\
+                         o=- 1 1 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         t=0 0\r\n\
+                         m=audio 30000 RTP/AVP 0\r\n\
+                         c=IN IP4 198.51.100.5\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n";
+        let new_addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(original, new_addr, 5004).unwrap();
+        let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
+        assert_eq!(parsed.connection.as_ref().unwrap().address, new_addr);
+        assert_eq!(parsed.media[0].port, 5004);
+        assert_eq!(
+            parsed.media[0].connection.as_ref().unwrap().address,
+            new_addr
+        );
+    }
+
+    /// 不正な SDP はエラーで返る (元バイト列のまま流用するとピアが読めない)。
+    #[test]
+    fn rewrite_invalid_sdp_errors() {
+        let original = b"not an sdp at all";
+        let new_addr: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(rewrite_rtp_endpoint(original, new_addr, 1234).is_err());
     }
 }

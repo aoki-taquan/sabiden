@@ -194,6 +194,8 @@ async fn run_register(config_path: &str) -> Result<()> {
         let cfg = NgnInboundConfig {
             fork_timeout: std::time::Duration::from_secs(20),
             realm: "sabiden".to_string(),
+            bridge_ngn_bind_ip: None,
+            bridge_ext_bind_ip: None,
         };
         let _handler = wire_ngn_inbound(
             ngn_layer.clone(),

@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/aoki-taquan/sabiden/actions/workflows/ci.yml/badge.svg)](https://github.com/aoki-taquan/sabiden/actions/workflows/ci.yml)
 [![Release](https://github.com/aoki-taquan/sabiden/actions/workflows/release.yml/badge.svg)](https://github.com/aoki-taquan/sabiden/actions/workflows/release.yml)
+[![PWA Deploy](https://github.com/aoki-taquan/sabiden/actions/workflows/pwa-deploy.yml/badge.svg)](https://github.com/aoki-taquan/sabiden/actions/workflows/pwa-deploy.yml)
 [![Container](https://ghcr-badge.egpl.dev/aoki-taquan/sabiden/latest_tag?label=ghcr.io)](https://github.com/aoki-taquan/sabiden/pkgs/container/sabiden)
 
 NTT ひかり電話 (NGN) を直接喋れる Rust 実装の SIP クライアント。

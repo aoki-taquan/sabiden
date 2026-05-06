@@ -1,0 +1,65 @@
+name: PWA Deploy
+
+# main への merge 時に frontend/ または workers/ に変更があれば
+# Cloudflare Workers (PWA Assets binding + /signal proxy) を自動デプロイする。
+#
+# Worker の secret (SIGNAL_ORIGIN, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET,
+# HMAC_SECRET) は意図的に本ワークフローでは投入しない。
+# 理由: secret 漏洩経路 (workflow ログ / fork PR / actions cache) を最小化するため。
+# 初回および値変更時のみ docs/CLOUDFLARE.md の手順に従って手動で `wrangler secret put` する。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'workers/**'
+      - '.github/workflows/pwa-deploy.yml'
+  workflow_dispatch:
+
+# 同時に複数の deploy が走らないようにする (古い run はキャンセル)。
+concurrency:
+  group: pwa-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: build & deploy (wrangler)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            frontend/package-lock.json
+            workers/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend (vite + PWA)
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install workers deps
+        working-directory: workers
+        run: npm ci
+
+      # cloudflare/wrangler-action は workingDirectory 配下の wrangler.toml を
+      # 読み、`wrangler deploy` を実行する。frontend/dist は workers/wrangler.toml の
+      # [assets] directive 経由で同梱される (既存設定どおり)。
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers
+          command: deploy

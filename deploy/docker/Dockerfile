@@ -1,12 +1,17 @@
 FROM rust:1.95-bookworm AS builder
 WORKDIR /build
+# libopus-dev は Opus ↔ G.711 トランスコード (Issue #25) に必要
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopus-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+RUN cargo build --release --locked --bin sabiden
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -u 10001 -s /sbin/nologin sabiden

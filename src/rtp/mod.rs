@@ -1,111 +1,20 @@
-/// RTP (RFC 3550) + G.711 μ-law (ulaw) の基本実装
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::Arc;
+//! RTP/RTCP (RFC 3550) + G.711 μ-law (RFC 3551) 実装
+//!
+//! NGN 向けに RTP パケット送受信、ジッタバッファ、RTCP SR/RR を提供する。
+//! DSCP 32 (TOS 0x80) を RTP/RTCP 送信ソケットにも適用する。
 
-use anyhow::Result;
-use tokio::net::UdpSocket;
-use tracing::debug;
+pub mod jitter;
+pub mod packet;
+pub mod rtcp;
+pub mod session;
 
-static SEQ: AtomicU16 = AtomicU16::new(0);
+#[allow(unused_imports)]
+pub use packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME, SAMPLE_RATE};
+#[allow(unused_imports)]
+pub use session::{RtpSession, RtpSessionStats};
 
-pub const PAYLOAD_TYPE_ULAW: u8 = 0; // G.711 μ-law
-pub const SAMPLE_RATE: u32 = 8000;
+/// G.711 1 フレームのミリ秒長 (RFC 3551)
 pub const FRAME_MS: u32 = 20;
-pub const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE * FRAME_MS / 1000) as usize; // 160
-
-#[derive(Debug, Clone)]
-pub struct RtpPacket {
-    pub payload_type: u8,
-    pub sequence: u16,
-    pub timestamp: u32,
-    pub ssrc: u32,
-    pub payload: Vec<u8>,
-}
-
-impl RtpPacket {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12 + self.payload.len());
-        // V=2, P=0, X=0, CC=0, M=0
-        buf.push(0b10000000);
-        buf.push(self.payload_type & 0x7f);
-        buf.push((self.sequence >> 8) as u8);
-        buf.push(self.sequence as u8);
-        buf.push((self.timestamp >> 24) as u8);
-        buf.push((self.timestamp >> 16) as u8);
-        buf.push((self.timestamp >> 8) as u8);
-        buf.push(self.timestamp as u8);
-        buf.push((self.ssrc >> 24) as u8);
-        buf.push((self.ssrc >> 16) as u8);
-        buf.push((self.ssrc >> 8) as u8);
-        buf.push(self.ssrc as u8);
-        buf.extend_from_slice(&self.payload);
-        buf
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 12 {
-            anyhow::bail!("RTP パケットが短すぎる: {} bytes", data.len());
-        }
-        let payload_type = data[1] & 0x7f;
-        let sequence = u16::from_be_bytes([data[2], data[3]]);
-        let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        let payload = data[12..].to_vec();
-        Ok(RtpPacket {
-            payload_type,
-            sequence,
-            timestamp,
-            ssrc,
-            payload,
-        })
-    }
-}
-
-pub struct RtpSession {
-    socket: Arc<UdpSocket>,
-    remote: SocketAddr,
-    ssrc: u32,
-    timestamp: Arc<AtomicU32>,
-}
-
-impl RtpSession {
-    pub fn new(socket: Arc<UdpSocket>, remote: SocketAddr) -> Self {
-        let ssrc: u32 = rand::random();
-        Self {
-            socket,
-            remote,
-            ssrc,
-            timestamp: Arc::new(AtomicU32::new(rand::random())),
-        }
-    }
-
-    pub async fn send_ulaw(&self, pcm_ulaw: &[u8]) -> Result<()> {
-        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let ts = self
-            .timestamp
-            .fetch_add(SAMPLES_PER_FRAME as u32, Ordering::SeqCst);
-
-        let pkt = RtpPacket {
-            payload_type: PAYLOAD_TYPE_ULAW,
-            sequence: seq,
-            timestamp: ts,
-            ssrc: self.ssrc,
-            payload: pcm_ulaw.to_vec(),
-        };
-
-        let bytes = pkt.to_bytes();
-        debug!("RTP 送信: seq={} ts={} len={}", seq, ts, bytes.len());
-        self.socket.send_to(&bytes, self.remote).await?;
-        Ok(())
-    }
-
-    pub async fn recv(&self) -> Result<RtpPacket> {
-        let mut buf = vec![0u8; 1500];
-        let (n, _) = self.socket.recv_from(&mut buf).await?;
-        RtpPacket::from_bytes(&buf[..n])
-    }
-}
 
 /// G.711 μ-law エンコード (linear16 PCM → ulaw)
 pub fn encode_ulaw(sample: i16) -> u8 {
@@ -162,6 +71,41 @@ pub fn decode_ulaw(byte: u8) -> i16 {
     }
 }
 
+/// RTP/RTCP 送信ソケットに DSCP 32 (TOS 0x80) を設定する。
+///
+/// NTT ひかり電話 (NGN) は RTP/RTCP に DSCP 32 を要求する。
+/// IPv6 (NGN は IPv6 直結) では `IPV6_TCLASS`、IPv4 では `IP_TOS` を使う。
+#[cfg(target_os = "linux")]
+pub fn set_rtp_dscp(socket: &tokio::net::UdpSocket, dscp: u32) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let tos = (dscp << 2) as libc::c_int;
+    let fd = socket.as_raw_fd();
+    unsafe {
+        // IPv6 socket では IPV6_TCLASS が必要 (NGN 想定)
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TCLASS,
+            &tos as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // IPv4 用 IP_TOS も保険でセット (失敗しても無視)
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            &tos as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_rtp_dscp(_socket: &tokio::net::UdpSocket, _dscp: u32) -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,22 +137,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_rtp_packet_roundtrip() {
-        let pkt = RtpPacket {
-            payload_type: 0,
-            sequence: 12345,
-            timestamp: 0xDEADBEEF,
-            ssrc: 0xCAFEBABE,
-            payload: vec![0x01, 0x02, 0x03],
-        };
-        let bytes = pkt.to_bytes();
-        let parsed = RtpPacket::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.sequence, 12345);
-        assert_eq!(parsed.timestamp, 0xDEADBEEF);
-        assert_eq!(parsed.ssrc, 0xCAFEBABE);
-        assert_eq!(parsed.payload, vec![0x01, 0x02, 0x03]);
     }
 }

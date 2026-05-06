@@ -18,6 +18,9 @@ pub struct Config {
     /// SIP メッセージファイルダンプ (Issue #20)。`dir` 未設定なら無効。
     #[serde(default)]
     pub trace: TraceConfig,
+    /// WebRTC ゲートウェイ (Issue #23)。`secret_hex` 未設定なら無効。
+    #[serde(default)]
+    pub webrtc: WebRtcConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +85,27 @@ impl Default for UasConfig {
             max_expires: default_uas_max_expires(),
         }
     }
+}
+
+/// WebRTC ゲートウェイ (Issue #23)。
+///
+/// 有効化するには `secret_hex` (HMAC-SHA256 共有秘密) を設定する。
+/// 既存 health server (axum) に `/signal` ルートを相乗りさせるため、
+/// 独立した bind アドレスは持たず `[health] bind_addr` を共有する。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WebRtcConfig {
+    /// HMAC-SHA256 トークン検証用の共有秘密 (16 進文字列)。
+    /// 未設定の場合 WebRTC ゲートウェイは無効。
+    /// 機密情報なので環境変数 `SABIDEN_WEBRTC_SECRET_HEX` で渡すのが推奨。
+    #[serde(default)]
+    pub secret_hex: Option<String>,
+    /// `register` メッセージで Registrar に書き込むときの expires 秒。
+    #[serde(default = "default_webrtc_register_ttl")]
+    pub register_ttl_secs: u64,
+}
+
+fn default_webrtc_register_ttl() -> u64 {
+    300
 }
 
 /// 1 つの内線アカウント。
@@ -160,6 +184,7 @@ impl Config {
             uas: None,
             extensions: Vec::new(),
             trace: TraceConfig::default(),
+            webrtc: WebRtcConfig::default(),
         })
     }
 
@@ -205,6 +230,15 @@ impl Config {
             // 空文字列はトレース無効化として扱う (k8s で値だけ消したいケース対応)。
             self.trace.dir = if v.is_empty() { None } else { Some(v) };
         }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_SECRET_HEX") {
+            // 空文字列は WebRTC ゲートウェイ無効化として扱う。
+            self.webrtc.secret_hex = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_REGISTER_TTL_SECS") {
+            if let Ok(n) = v.parse() {
+                self.webrtc.register_ttl_secs = n;
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -244,6 +278,13 @@ max_expires = 3600
 # SIP メッセージファイルダンプ (任意)
 # [trace]
 # dir = "/var/log/sabiden/sip"
+
+# WebRTC ゲートウェイ (任意)
+# secret_hex は HMAC-SHA256 トークン検証用 (32 バイト = 64 hex 推奨)
+# 機密情報のため環境変数 SABIDEN_WEBRTC_SECRET_HEX 経由を推奨
+# [webrtc]
+# secret_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# register_ttl_secs = 300
 "#
         .to_string()
     }

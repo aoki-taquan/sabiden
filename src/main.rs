@@ -14,6 +14,8 @@ mod rtp;
 mod sdp;
 #[allow(dead_code)]
 mod sip;
+#[allow(dead_code)]
+mod webrtc;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -270,10 +272,40 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         });
     }
 
-    // (9) health server (メトリクス共有)
+    // (9) health server (メトリクス共有) と WebRTC シグナリング (Issue #23)
     let health_state = health::HealthState::new(registrar.registered_handle(), metrics.clone());
+    let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
+        match hex::decode(&secret_hex) {
+            Ok(secret_bytes) => {
+                if let Some(ext_registrar) = ext_registrar.clone() {
+                    let verifier = Arc::new(webrtc::Verifier::new(secret_bytes));
+                    let ttl = std::time::Duration::from_secs(full_config.webrtc.register_ttl_secs);
+                    info!(
+                        "WebRTC ゲートウェイ有効: /signal (register_ttl={}s)",
+                        ttl.as_secs()
+                    );
+                    Some(webrtc::SignalingState::new(verifier, ext_registrar, ttl))
+                } else {
+                    tracing::warn!("WebRTC ゲートウェイ設定済みだが内線 UAS 未設定のため無効化");
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::error!("webrtc.secret_hex デコード失敗: {}; ゲートウェイ無効", e);
+                None
+            }
+        }
+    } else {
+        info!("WebRTC ゲートウェイは未設定 (webrtc.secret_hex 未指定)");
+        None
+    };
     tokio::spawn(async move {
-        if let Err(e) = health::run(health_addr, health_state).await {
+        let result = if let Some(sig) = webrtc_signaling {
+            health::run_with_signaling(health_addr, health_state, sig).await
+        } else {
+            health::run(health_addr, health_state).await
+        };
+        if let Err(e) = result {
             tracing::error!("health server 終了: {}", e);
         }
     });

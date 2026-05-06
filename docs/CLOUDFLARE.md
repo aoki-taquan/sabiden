@@ -81,6 +81,20 @@ npx wrangler deploy
 これで `https://sabiden-pwa.<account>.workers.dev` (もしくは Worker
 ルート ` https://pwa.example.com/* `) で配信される。
 
+> **自動デプロイ**: 上記の `wrangler deploy` は初回と secret 変更時のみ手動で実行する。
+> `main` ブランチへ `frontend/**` または `workers/**` の変更がマージされると、
+> `.github/workflows/pwa-deploy.yml` が GitHub Actions 上で同等のビルドと
+> `wrangler deploy` を自動実行する。
+> GitHub リポジトリの Secrets に以下を事前登録しておくこと:
+>
+> - `CLOUDFLARE_API_TOKEN` ... `Edit Cloudflare Workers` 権限を持つ API token
+> - `CLOUDFLARE_ACCOUNT_ID` ... 対象アカウントの ID
+>
+> Worker 側の secret (`SIGNAL_ORIGIN`, `CF_ACCESS_CLIENT_ID`,
+> `CF_ACCESS_CLIENT_SECRET`, `HMAC_SECRET` 等) は CI からは投入しない。
+> 漏洩経路を最小化するため、上記 `wrangler secret put` を **初回と値変更時のみ**
+> 手元で実行する運用とする。
+
 ### ルーティング
 
 `workers/signaling-proxy.ts` の動作:

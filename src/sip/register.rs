@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::time;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use super::auth::{DigestChallenge, DigestCredentials};
 use super::message::{SipMethod, SipRequest};
 use super::transaction::TransactionLayer;
 use super::utils::{new_branch, new_call_id, new_tag};
 use crate::config::SipConfig;
+use crate::observability::Metrics;
 
 static CSEQ: AtomicU32 = AtomicU32::new(1);
 
@@ -29,6 +30,8 @@ pub struct Registrar {
     tag: String,
     /// REGISTER 成功状態を外部 (health server 等) と共有するためのフラグ
     registered: Arc<AtomicBool>,
+    /// 観測カウンタ (Issue #20)。`Default` 化で metrics 無し動作も許容する。
+    metrics: Arc<Metrics>,
 }
 
 impl Registrar {
@@ -37,6 +40,16 @@ impl Registrar {
         layer: Arc<TransactionLayer>,
         server_addr: SocketAddr,
     ) -> Self {
+        Self::with_metrics(config, layer, server_addr, Metrics::new())
+    }
+
+    /// メトリクス付き版コンストラクタ。`main.rs` から共有 [`Metrics`] を渡す。
+    pub fn with_metrics(
+        config: Arc<SipConfig>,
+        layer: Arc<TransactionLayer>,
+        server_addr: SocketAddr,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             config,
             layer,
@@ -44,6 +57,7 @@ impl Registrar {
             call_id: new_call_id(),
             tag: new_tag(),
             registered: Arc::new(AtomicBool::new(false)),
+            metrics,
         }
     }
 
@@ -53,21 +67,36 @@ impl Registrar {
     }
 
     pub async fn run(&self) -> Result<()> {
-        loop {
-            match self.register_with_retry().await {
-                Ok(expires) => {
-                    self.registered.store(true, Ordering::SeqCst);
-                    let refresh = Duration::from_secs((expires as f64 * 0.9) as u64);
-                    info!("REGISTER 成功 次回更新まで {}秒", refresh.as_secs());
-                    time::sleep(refresh).await;
-                }
-                Err(e) => {
-                    self.registered.store(false, Ordering::SeqCst);
-                    warn!("REGISTER 失敗: {} 30秒後に再試行", e);
-                    time::sleep(Duration::from_secs(30)).await;
+        // Call-ID と AOR を span に持たせて、再送・チャレンジまで一貫追跡できるようにする。
+        let span = info_span!(
+            "register",
+            aor = %format!("{}@{}", self.config.phone_number, self.config.domain),
+            call_id = %self.call_id,
+        );
+        async move {
+            loop {
+                match self.register_with_retry().await {
+                    Ok(expires) => {
+                        self.registered.store(true, Ordering::SeqCst);
+                        self.metrics.record_register(true);
+                        let refresh = Duration::from_secs((expires as f64 * 0.9) as u64);
+                        info!("REGISTER 成功 次回更新まで {}秒", refresh.as_secs());
+                        time::sleep(refresh).await;
+                    }
+                    Err(e) => {
+                        self.registered.store(false, Ordering::SeqCst);
+                        self.metrics.record_register(false);
+                        warn!("REGISTER 失敗: {} 30秒後に再試行", e);
+                        time::sleep(Duration::from_secs(30)).await;
+                    }
                 }
             }
+            // unreachable; ループ内で必ず continue する。型推論のため明示。
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
         }
+        .instrument(span)
+        .await
     }
 
     /// 認証チャレンジを処理して REGISTER を完了させる

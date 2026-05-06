@@ -23,7 +23,7 @@ use anyhow::Result;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::auth::{build_www_authenticate, DigestAuthorization};
 use super::message::{SipMethod, SipRequest, SipResponse};
@@ -33,6 +33,7 @@ use super::transaction::{
 };
 use super::utils::{new_call_id, new_tag};
 use crate::config::{ExtensionConfig, UasConfig};
+use crate::observability::Metrics;
 
 /// 上位層 (Call Manager) に流すイベント。
 ///
@@ -143,11 +144,22 @@ pub struct ExtensionUas {
     registrar: Arc<ExtensionRegistrar>,
     inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
     event_tx: Option<mpsc::UnboundedSender<UasEvent>>,
+    /// 観測カウンタ。internal `extension_registered` gauge を更新する。
+    metrics: Arc<Metrics>,
 }
 
 impl ExtensionUas {
     /// UDP ソケットを bind して UAS を初期化する。
     pub async fn bind(config: UasConfig, extensions: &[ExtensionConfig]) -> Result<Self> {
+        Self::bind_with_metrics(config, extensions, Metrics::new()).await
+    }
+
+    /// メトリクス付き bind。
+    pub async fn bind_with_metrics(
+        config: UasConfig,
+        extensions: &[ExtensionConfig],
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
         let socket = Arc::new(UdpSocket::bind(config.bind_addr).await?);
         info!("内線 UAS bind: {}", config.bind_addr);
         let (layer, inbound_rx) = TransactionLayer::spawn(socket.clone());
@@ -163,6 +175,7 @@ impl ExtensionUas {
             registrar: ExtensionRegistrar::new(),
             inbound_rx,
             event_tx: None,
+            metrics,
         })
     }
 
@@ -186,8 +199,10 @@ impl ExtensionUas {
 
     /// 受信ループ。`Ctrl-C` などで中断されるまで終了しない。
     pub async fn run(mut self) -> Result<()> {
-        // 期限切れエントリを掃除するタスクを並走させる
+        // 期限切れエントリを掃除するタスクを並走させる。同時に
+        // `extension_registered` gauge をスナップショット長で更新する。
         let registrar = self.registrar.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_secs(30));
             loop {
@@ -196,6 +211,8 @@ impl ExtensionUas {
                 if removed > 0 {
                     debug!("内線登録 {} 件を期限切れ削除", removed);
                 }
+                let n = registrar.snapshot().await.len() as u64;
+                metrics.set_extension_registered(n);
             }
         });
 
@@ -208,51 +225,67 @@ impl ExtensionUas {
     async fn handle_request(&self, inbound: InboundRequest) {
         let InboundRequest { request, remote } = inbound;
         let method = request.method.clone();
-        debug!(?method, %remote, "内線リクエスト受信");
+        let call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_else(|| "<no-call-id>".to_string());
+        let span = info_span!(
+            "uas_request",
+            call_id = %call_id,
+            method = %method,
+            direction = "extension",
+        );
+        async move {
+            debug!(?method, %remote, "内線リクエスト受信");
 
-        // ServerTransaction を作成 (Via/branch から ID 生成失敗 = 不正パケット)
-        let server_tx = match ServerTransaction::new(request.clone(), remote, self.socket.clone()) {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!(error=%e, "ServerTransaction 生成失敗");
-                return;
-            }
-        };
-        let responder = ResponderHandle::new(server_tx);
+            // ServerTransaction を作成 (Via/branch から ID 生成失敗 = 不正パケット)
+            let server_tx =
+                match ServerTransaction::new(request.clone(), remote, self.socket.clone()) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        warn!(error=%e, "ServerTransaction 生成失敗");
+                        return;
+                    }
+                };
+            let responder = ResponderHandle::new(server_tx);
 
-        match method {
-            SipMethod::Register => {
-                if let Err(e) = self.handle_register(&request, remote, &responder).await {
-                    warn!(error=%e, "REGISTER 処理エラー");
+            match method {
+                SipMethod::Register => {
+                    if let Err(e) = self.handle_register(&request, remote, &responder).await {
+                        warn!(error=%e, "REGISTER 処理エラー");
+                    }
                 }
-            }
-            SipMethod::Invite => {
-                if let Err(e) = self.handle_invite(&request, remote, responder).await {
-                    warn!(error=%e, "INVITE 処理エラー");
+                SipMethod::Invite => {
+                    if let Err(e) = self.handle_invite(&request, remote, responder).await {
+                        warn!(error=%e, "INVITE 処理エラー");
+                    }
                 }
-            }
-            SipMethod::Bye => {
-                self.handle_bye(&request, remote, &responder).await;
-            }
-            SipMethod::Cancel => {
-                // CANCEL は元 INVITE と同じ branch を共有する。
-                // 実装簡略化のため 200 OK で受け取り、INVITE は別途
-                // 487 Request Terminated を上位層が返す前提とする。
-                let _ = responder.quick(200, "OK").await;
-            }
-            SipMethod::Ack => {
-                // ACK にはレスポンスを返さない (RFC 3261 §17.2.7)
-                debug!("ACK 受信 (上位層に処理を委譲)");
-            }
-            SipMethod::Options => {
-                // 単純な keep-alive 応答 (Linphone 等が定期送信する)
-                let _ = responder.quick(200, "OK").await;
-            }
-            other => {
-                warn!(?other, "未対応メソッド → 405");
-                let _ = responder.quick(405, "Method Not Allowed").await;
+                SipMethod::Bye => {
+                    self.handle_bye(&request, remote, &responder).await;
+                }
+                SipMethod::Cancel => {
+                    // CANCEL は元 INVITE と同じ branch を共有する。
+                    // 実装簡略化のため 200 OK で受け取り、INVITE は別途
+                    // 487 Request Terminated を上位層が返す前提とする。
+                    let _ = responder.quick(200, "OK").await;
+                }
+                SipMethod::Ack => {
+                    // ACK にはレスポンスを返さない (RFC 3261 §17.2.7)
+                    debug!("ACK 受信 (上位層に処理を委譲)");
+                }
+                SipMethod::Options => {
+                    // 単純な keep-alive 応答 (Linphone 等が定期送信する)
+                    let _ = responder.quick(200, "OK").await;
+                }
+                other => {
+                    warn!(?other, "未対応メソッド → 405");
+                    let _ = responder.quick(405, "Method Not Allowed").await;
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// REGISTER の Digest 認証と登録。
@@ -309,6 +342,9 @@ impl ExtensionUas {
                 Duration::from_secs(expires.into()),
             )
             .await;
+        // 観測: 登録直後に gauge を更新する (purge ループの 30 秒待たずに反映する)。
+        let n = self.registrar.snapshot().await.len() as u64;
+        self.metrics.set_extension_registered(n);
         info!(
             "内線 REGISTER 成功: {} → {} (expires={}s)",
             aor, contact_uri, expires

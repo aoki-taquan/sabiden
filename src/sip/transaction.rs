@@ -21,6 +21,7 @@ use tokio::time;
 use tracing::{debug, trace, warn};
 
 use super::message::{parse_message, SipHeaders, SipMessage, SipMethod, SipRequest, SipResponse};
+use crate::observability::{extract_method_and_call_id, SipTraceWriter, TraceDir};
 
 /// RFC 3261 §17.1.1.1 Timer T1 (RTT 推定値)。デフォルトは 500ms。
 pub const T1: Duration = Duration::from_millis(500);
@@ -166,6 +167,7 @@ pub struct ClientTransaction {
     socket: Arc<UdpSocket>,
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     state: ClientState,
+    tracer: SipTraceWriter,
 }
 
 impl ClientTransaction {
@@ -176,6 +178,7 @@ impl ClientTransaction {
         destination: SocketAddr,
         socket: Arc<UdpSocket>,
         rx: mpsc::UnboundedReceiver<ClientEvent>,
+        tracer: SipTraceWriter,
     ) -> Self {
         let state = match request.method {
             SipMethod::Invite => ClientState::Calling,
@@ -188,6 +191,7 @@ impl ClientTransaction {
             socket,
             rx,
             state,
+            tracer,
         }
     }
 
@@ -199,6 +203,7 @@ impl ClientTransaction {
     pub async fn run(mut self) -> Result<SipResponse> {
         let bytes = self.request.to_bytes();
         self.socket.send_to(&bytes, self.destination).await?;
+        write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         debug!(?self.id, "client tx 送信");
 
         let mut interval = T1;
@@ -231,6 +236,7 @@ impl ClientTransaction {
                 _ = &mut next_retx, if matches!(self.state, ClientState::Calling | ClientState::Trying) => {
                     // 再送 (Timer A: INVITE は倍々, Timer E: non-INVITE は T2 上限)
                     self.socket.send_to(&bytes, self.destination).await?;
+                    write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
                     debug!(?self.id, ?interval, "client tx 再送");
                     interval = match self.request.method {
                         SipMethod::Invite => interval.saturating_mul(2),
@@ -268,10 +274,21 @@ pub struct ServerTransaction {
     socket: Arc<UdpSocket>,
     state: ServerState,
     last_response: Option<SipResponse>,
+    tracer: SipTraceWriter,
 }
 
 impl ServerTransaction {
     pub fn new(request: SipRequest, remote: SocketAddr, socket: Arc<UdpSocket>) -> Result<Self> {
+        Self::with_tracer(request, remote, socket, SipTraceWriter::disabled())
+    }
+
+    /// トレース有効版。`TransactionLayer` 経由で生成される。
+    pub fn with_tracer(
+        request: SipRequest,
+        remote: SocketAddr,
+        socket: Arc<UdpSocket>,
+        tracer: SipTraceWriter,
+    ) -> Result<Self> {
         let id = TransactionId::from_request(&request)?;
         let state = match request.method {
             SipMethod::Invite => ServerState::Proceeding,
@@ -284,6 +301,7 @@ impl ServerTransaction {
             socket,
             state,
             last_response: None,
+            tracer,
         })
     }
 
@@ -292,6 +310,7 @@ impl ServerTransaction {
         let code = resp.status_code;
         let bytes = resp.to_bytes();
         self.socket.send_to(&bytes, self.remote).await?;
+        write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         self.last_response = Some(resp);
         match (self.state, code) {
             (ServerState::Trying, 100..=199) => self.state = ServerState::Proceeding,
@@ -308,7 +327,9 @@ impl ServerTransaction {
     /// リクエスト再送に対して直近の応答を再送する (RFC 3261 §17.2.1 / §17.2.2)。
     pub async fn handle_retransmit(&self) -> Result<()> {
         if let Some(resp) = &self.last_response {
-            self.socket.send_to(&resp.to_bytes(), self.remote).await?;
+            let bytes = resp.to_bytes();
+            self.socket.send_to(&bytes, self.remote).await?;
+            write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
             trace!(?self.id, "server tx 応答再送");
         }
         Ok(())
@@ -330,10 +351,15 @@ impl ServerTransaction {
 /// トランザクション層。受信ループを駆動し、レスポンスをクライアント
 /// トランザクションへ振り分け、未マッチのリクエストは TU (上位) へ
 /// 渡す。
+///
+/// SIP トレース機能 (Issue #20) はこの層で hook する。`with_tracer` で
+/// [`SipTraceWriter`] を渡すと、recv_loop / 各トランザクションの送信時に
+/// メッセージがダンプされる。
 pub struct TransactionLayer {
     socket: Arc<UdpSocket>,
     inner: Arc<Mutex<TransactionTable>>,
     inbound_tx: mpsc::UnboundedSender<InboundRequest>,
+    tracer: SipTraceWriter,
 }
 
 #[derive(Default)]
@@ -352,15 +378,30 @@ pub struct InboundRequest {
 impl TransactionLayer {
     /// レイヤを起動し、内部で受信ループ用タスクを spawn する。
     pub fn spawn(socket: Arc<UdpSocket>) -> (Arc<Self>, mpsc::UnboundedReceiver<InboundRequest>) {
+        Self::spawn_with_tracer(socket, SipTraceWriter::disabled())
+    }
+
+    /// トレース有効版。`SipTraceWriter::open` で生成した writer を渡すと、
+    /// 受信ループ・送信パスから自動的にダンプが走る。
+    pub fn spawn_with_tracer(
+        socket: Arc<UdpSocket>,
+        tracer: SipTraceWriter,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<InboundRequest>) {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let layer = Arc::new(Self {
             socket: socket.clone(),
             inner: Arc::new(Mutex::new(TransactionTable::default())),
             inbound_tx,
+            tracer,
         });
         let driver = layer.clone();
         tokio::spawn(async move { driver.recv_loop().await });
         (layer, inbound_rx)
+    }
+
+    /// 配下で使う [`SipTraceWriter`] のハンドル (UAS 等が server tx 構築時に使う)。
+    pub fn tracer(&self) -> SipTraceWriter {
+        self.tracer.clone()
     }
 
     async fn recv_loop(self: Arc<Self>) {
@@ -369,6 +410,8 @@ impl TransactionLayer {
             match self.socket.recv_from(&mut buf).await {
                 Ok((n, remote)) => {
                     let data = &buf[..n];
+                    // パース前にトレース dump (壊れた SIP も観測したいため)
+                    write_trace(&self.tracer, TraceDir::Recv, data).await;
                     match parse_message(data) {
                         Ok(SipMessage::Response(resp)) => {
                             self.dispatch_response(resp).await;
@@ -434,6 +477,7 @@ impl TransactionLayer {
             destination,
             self.socket.clone(),
             rx,
+            self.tracer.clone(),
         ))
     }
 
@@ -456,6 +500,7 @@ impl TransactionLayer {
     ) -> Result<()> {
         let bytes = request.to_bytes();
         self.socket.send_to(&bytes, destination).await?;
+        write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         Ok(())
     }
 
@@ -481,6 +526,14 @@ impl TransactionLayer {
             .await
             .map_err(|_| anyhow!("client transaction が中断された"))?
     }
+}
+
+/// SIP メッセージ raw bytes をトレース writer に渡すヘルパ。
+/// パース失敗 / 部分受信でも observable にしたいので、UTF-8 でなくても
+/// best-effort で method / call-id を抽出して保存する。
+async fn write_trace(tracer: &SipTraceWriter, dir: TraceDir, raw: &[u8]) {
+    let (method, call_id) = extract_method_and_call_id(raw);
+    tracer.record(dir, &method, call_id.as_deref(), raw).await;
 }
 
 /// レスポンス送信用ヘルパ。
@@ -613,7 +666,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         // 起動時は登録だけし、応答は来ない
         drop(tx);
-        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx);
+        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
         let result = ct.run().await;
         assert!(result.is_err(), "timeout で Err になるはず");
     }
@@ -628,7 +681,7 @@ mod tests {
         let req = make_request("z9hG4bKprov");
         let id = TransactionId::from_request(&req).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx);
+        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
 
         // 100 Trying → 200 OK を流し込む
         tx.send(ClientEvent::Response(make_response(

@@ -7,6 +7,8 @@ mod config;
 mod dhcp;
 mod health;
 #[allow(dead_code)]
+mod observability;
+#[allow(dead_code)]
 mod rtp;
 #[allow(dead_code)]
 mod sdp;
@@ -24,8 +26,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use call::manager::UacForker;
-use call::orchestrator::{wire_ngn_inbound, NgnInboundConfig, UasEventHandler};
+use call::orchestrator::{wire_ngn_inbound_with_metrics, NgnInboundConfig, UasEventHandler};
 use config::Config;
+use observability::{Metrics, SipTraceWriter};
 use sip::register::Registrar;
 use sip::transaction::TransactionLayer;
 use sip::uac::{Uac, UacConfig};
@@ -45,6 +48,9 @@ enum Commands {
     Register {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
+        /// SIP メッセージダンプ出力先 (Issue #20)。指定すると config の `[trace] dir` を上書き。
+        #[arg(long)]
+        trace_dir: Option<String>,
     },
     /// 設定ファイルのサンプルを出力する
     Init,
@@ -57,10 +63,17 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 構造化ログ: span を NEW/CLOSE で出し、call_id 等の field を全イベントに伝播。
+    // RUST_LOG が未設定なら `sabiden=debug` がデフォルト (Issue #20)。
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("sabiden=debug".parse()?),
+        )
+        .with_target(true)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
         )
         .init();
 
@@ -69,7 +82,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Register {
             config: config_path,
-        } => run_register(&config_path).await?,
+            trace_dir,
+        } => run_register(&config_path, trace_dir.as_deref()).await?,
 
         Commands::Init => {
             println!("{}", Config::example());
@@ -110,16 +124,35 @@ async fn main() -> Result<()> {
 /// 8. UAS の受信ループを spawn
 /// 9. health server を spawn
 /// 10. `Registrar::run` を foreground で常駐させる
-async fn run_register(config_path: &str) -> Result<()> {
+async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Result<()> {
     let full_config = Config::load(config_path)?;
     let health_addr = full_config.health.bind_addr;
     let uas_config_opt = full_config.uas.clone();
     let extensions_cfg = full_config.extensions.clone();
+    let trace_dir = trace_dir_override
+        .map(|s| s.to_string())
+        .or_else(|| full_config.trace.dir.clone());
     let sip_cfg = Arc::new(full_config.sip);
     info!(
         "設定読み込み完了: {}@{}",
         sip_cfg.phone_number, sip_cfg.domain
     );
+
+    // (1) 観測: SIP トレース writer + メトリクス
+    let metrics = Metrics::new();
+    let tracer = match trace_dir.as_deref() {
+        Some(dir) => match SipTraceWriter::open(dir) {
+            Ok(w) => {
+                info!("SIP トレース有効: dir={}", dir);
+                w
+            }
+            Err(e) => {
+                tracing::error!("SIP トレース初期化失敗 ({}); 無効化して継続", e);
+                SipTraceWriter::disabled()
+            }
+        },
+        None => SipTraceWriter::disabled(),
+    };
 
     // (2) NGN 側 UDP socket
     let bind_addr: SocketAddr = sip_cfg.local_addr;
@@ -127,8 +160,9 @@ async fn run_register(config_path: &str) -> Result<()> {
     info!("NGN UDP ソケット bind: {}", bind_addr);
     set_dscp(&ngn_socket, 32)?;
 
-    // (3) NGN 側 TransactionLayer
-    let (ngn_layer, ngn_inbound_rx) = TransactionLayer::spawn(ngn_socket.clone());
+    // (3) NGN 側 TransactionLayer (トレース対応)
+    let (ngn_layer, ngn_inbound_rx) =
+        TransactionLayer::spawn_with_tracer(ngn_socket.clone(), tracer.clone());
 
     // (4) NGN 側 UAC (内線→NGN プロキシ専用) + Registrar
     let ngn_uac_cfg = UacConfig {
@@ -142,7 +176,12 @@ async fn run_register(config_path: &str) -> Result<()> {
         ngn_layer.clone(),
         sip_cfg.server_addr,
     ));
-    let registrar = Registrar::new(sip_cfg.clone(), ngn_layer.clone(), sip_cfg.server_addr);
+    let registrar = Registrar::with_metrics(
+        sip_cfg.clone(),
+        ngn_layer.clone(),
+        sip_cfg.server_addr,
+        metrics.clone(),
+    );
 
     // (5) 内線 UAS bind + UasEvent チャネル
     let (uas_event_tx, uas_event_rx) = mpsc::unbounded_channel();
@@ -152,7 +191,8 @@ async fn run_register(config_path: &str) -> Result<()> {
             extensions_cfg.len(),
             uas_cfg.bind_addr
         );
-        let uas = ExtensionUas::bind(uas_cfg, &extensions_cfg).await?;
+        let uas =
+            ExtensionUas::bind_with_metrics(uas_cfg, &extensions_cfg, metrics.clone()).await?;
         let ext_registrar = uas.registrar();
         // (6) 内線レッグ用 UAC を独立ソケットで構築
         // 内線網と NGN 網は別のトランザクション層で動かす必要があるため
@@ -172,7 +212,9 @@ async fn run_register(config_path: &str) -> Result<()> {
     if let (Some(ext_registrar), Some(ext_send_sock)) =
         (ext_registrar.clone(), ext_socket_for_forker)
     {
-        let (ext_layer, _ext_inbound_rx) = TransactionLayer::spawn(ext_send_sock.clone());
+        // 内線レッグ送信ソケットもトレース対応
+        let (ext_layer, _ext_inbound_rx) =
+            TransactionLayer::spawn_with_tracer(ext_send_sock.clone(), tracer.clone());
         let ext_uac_cfg = UacConfig {
             local_uri: "sip:sabiden@internal".to_string(),
             domain: "internal".to_string(),
@@ -197,13 +239,14 @@ async fn run_register(config_path: &str) -> Result<()> {
             bridge_ngn_bind_ip: None,
             bridge_ext_bind_ip: None,
         };
-        let _handler = wire_ngn_inbound(
+        let _handler = wire_ngn_inbound_with_metrics(
             ngn_layer.clone(),
             ngn_socket.clone(),
             ngn_inbound_rx,
             forker,
             ext_registrar,
             cfg,
+            metrics.clone(),
         );
         info!("NGN 着信ハンドラ起動完了");
     } else {
@@ -215,7 +258,7 @@ async fn run_register(config_path: &str) -> Result<()> {
     }
 
     // (7) UAS event ハンドラ
-    let uas_handler = UasEventHandler::new(ngn_uac.clone());
+    let uas_handler = UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone());
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ
@@ -227,8 +270,8 @@ async fn run_register(config_path: &str) -> Result<()> {
         });
     }
 
-    // (9) health server
-    let health_state = health::HealthState::new(registrar.registered_handle());
+    // (9) health server (メトリクス共有)
+    let health_state = health::HealthState::new(registrar.registered_handle(), metrics.clone());
     tokio::spawn(async move {
         if let Err(e) = health::run(health_addr, health_state).await {
             tracing::error!("health server 終了: {}", e);

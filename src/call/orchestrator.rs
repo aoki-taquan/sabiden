@@ -636,18 +636,12 @@ impl UasEventHandler {
                                 responder.quick(200, "OK").await?;
                             } else {
                                 responder
-                                    .respond_with_body(
-                                        200,
-                                        "OK",
-                                        "application/sdp",
-                                        body_for_ext,
-                                    )
+                                    .respond_with_body(200, "OK", "application/sdp", body_for_ext)
                                     .await?;
                             }
                             // 観測: NGN レッグも内線レッグも応答済みとして記録
                             self.metrics.record_invite_ngn(InviteResult::Answered);
-                            self.metrics
-                                .record_invite_extension(InviteResult::Answered);
+                            self.metrics.record_invite_extension(InviteResult::Answered);
                             // 通話確立として call_active を +1。透過モード (active に
                             // エントリ無し) でも BYE で必ず減算できるよう `None` を入れる。
                             if !call_id.is_empty() && call_id != "<no-call-id>" {
@@ -690,8 +684,7 @@ impl UasEventHandler {
                         // 通話終了として call_active を -1
                         self.metrics.dec_call_active();
                     }
-                    if let (Some(Some(call_id)), Some(mgr)) =
-                        (removed, self.call_manager.as_ref())
+                    if let (Some(Some(call_id)), Some(mgr)) = (removed, self.call_manager.as_ref())
                     {
                         if let Err(e) = mgr.terminate(call_id).await {
                             warn!(error=%e, "内線 BYE 受信時の通話終了に失敗");

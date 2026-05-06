@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::observability::Metrics;
+use crate::webrtc::signaling::{signal_ws_handler, SignalingState};
 
 /// ヘルスサーバが参照する共有状態
 #[derive(Clone)]
@@ -57,6 +58,19 @@ pub fn router(state: HealthState) -> Router {
         .with_state(state)
 }
 
+/// `/healthz` `/readyz` `/metrics` に加え、WebRTC シグナリング `/signal` を
+/// 追加した Router を構築する (Issue #23)。
+///
+/// `signal` は `SignalingState` を別 State として持つ axum の MethodRouter
+/// に紐づく。両 State を 1 つの Router に同居させるため、`/signal` 用の
+/// サブルータを `with_state` 適用後に `merge` する。
+pub fn router_with_signaling(state: HealthState, signaling: SignalingState) -> Router {
+    let signal_router = Router::new()
+        .route("/signal", get(signal_ws_handler))
+        .with_state(signaling);
+    router(state).merge(signal_router)
+}
+
 /// 指定したアドレスで HTTP サーバを起動する。`run` は終了するまで返らない。
 pub async fn run(bind_addr: SocketAddr, state: HealthState) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
@@ -68,6 +82,31 @@ pub async fn run(bind_addr: SocketAddr, state: HealthState) -> Result<()> {
     axum::serve(listener, router(state))
         .await
         .context("health server crashed")?;
+    Ok(())
+}
+
+/// シグナリング付き HTTP サーバを起動する (Issue #23)。
+///
+/// WS の `ConnectInfo<SocketAddr>` を抽出するため、
+/// `into_make_service_with_connect_info` で listener を消費する。
+pub async fn run_with_signaling(
+    bind_addr: SocketAddr,
+    state: HealthState,
+    signaling: SignalingState,
+) -> Result<()> {
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind health server: {}", bind_addr))?;
+    let actual = listener.local_addr().unwrap_or(bind_addr);
+    info!("health server (with /signal) listening: {}", actual);
+
+    let app = router_with_signaling(state, signaling);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("health server crashed")?;
     Ok(())
 }
 

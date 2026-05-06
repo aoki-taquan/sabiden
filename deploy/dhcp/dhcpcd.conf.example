@@ -1,0 +1,17 @@
+# sabiden dhcpcd 設定例 (Alpine / OpenWrt / Arch などで dhcpcd を使う場合)
+# /etc/dhcpcd.conf に追記する。
+
+# Option 120 (SIP servers) と Option 210 (NTT vendor) を要求する
+option ip_sip_servers
+option ntt_vendor
+
+# OpenWrt の odhcp6c を使う構成では別途 -r 120 -r 210 を指定する
+# ことになるためこのファイルは参考のみ。
+
+interface INTERFACE_PLACEHOLDER
+    ipv6rs
+    iaid 1
+    ia_pd 1/::/56
+    # dhcpcd hook script (deploy/dhcp/dhcpcd.exit-hook を /lib/dhcpcd/dhcpcd-hooks/
+    # にコピーする運用)
+    # 環境変数: $new_ip_sip_servers, $new_ntt_vendor が exit hook に渡る

@@ -1,0 +1,65 @@
+[Unit]
+Description=sabiden - NTT NGN SIP client
+Documentation=https://github.com/aoki-taquan/sabiden
+# DHCP hook が /run/sabiden/sip-servers を作成するまで待つ運用も可
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sabiden
+Group=sabiden
+
+# 設定ファイル: 設定本体は /etc/sabiden/config.toml
+# Secret (sip パスワード等) は /etc/sabiden/sabiden.env から環境変数で注入
+EnvironmentFile=-/etc/sabiden/sabiden.env
+
+ExecStart=/usr/local/bin/sabiden register --config /etc/sabiden/config.toml
+
+# 起動失敗時は再試行
+Restart=on-failure
+RestartSec=5s
+
+# stdout/stderr は journald
+StandardOutput=journal
+StandardError=journal
+
+# 5060 などの低位ポートを bind するために必要 (sabiden ユーザは非 root)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# ハードニング
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug
+
+# 書き込み許可するパス (DHCP hook が共有する /run/sabiden は読み取りのみ)
+ReadWritePaths=
+ReadOnlyPaths=/run/sabiden /etc/sabiden
+
+# IPv4/IPv6 のみ (sabiden は IPv6 が必須)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+
+# リソース制限
+LimitNOFILE=65536
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

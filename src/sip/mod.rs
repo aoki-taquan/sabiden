@@ -2,6 +2,8 @@ pub mod auth;
 pub mod dialog;
 pub mod message;
 pub mod register;
+pub mod registrar;
 pub mod transaction;
 pub mod uac;
+pub mod uas;
 pub mod utils;

@@ -15,3 +15,19 @@ register_expires = 3600
 [health]
 # ヘルスチェック HTTP サーバ
 bind_addr = "0.0.0.0:8080"
+
+# 内線 UAS (スマホ受付サーバ) 設定 (省略可)
+# Linphone / Zoiper 等の SIP UA からの REGISTER を受け付ける
+[uas]
+bind_addr = "0.0.0.0:5061"
+realm = "sabiden"
+max_expires = 3600
+
+# 内線アカウント (任意、複数可)
+# [[extensions]]
+# username = "iphone"
+# password = "iphone_password"
+#
+# [[extensions]]
+# username = "android"
+# password = "android_password"

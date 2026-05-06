@@ -22,6 +22,7 @@ use tracing::info;
 use config::Config;
 use sip::register::Registrar;
 use sip::transaction::TransactionLayer;
+use sip::uas::ExtensionUas;
 
 #[derive(Parser)]
 #[command(name = "sabiden")]
@@ -64,6 +65,8 @@ async fn main() -> Result<()> {
         } => {
             let full_config = Config::load(&config_path)?;
             let health_addr = full_config.health.bind_addr;
+            let uas_config = full_config.uas.clone();
+            let extensions = full_config.extensions.clone();
             let config = Arc::new(full_config.sip);
             info!(
                 "設定読み込み完了: {}@{}",
@@ -87,6 +90,24 @@ async fn main() -> Result<()> {
                     tracing::error!("health server 終了: {}", e);
                 }
             });
+
+            // 内線 UAS (任意): NGN 側ソケットとは別 UdpSocket / TransactionLayer
+            // で動かし、内線網と NGN 網を分離する (ARCHITECTURE.md 参照)。
+            if let Some(uas_cfg) = uas_config {
+                info!(
+                    "内線 UAS 起動 ({} 内線): {}",
+                    extensions.len(),
+                    uas_cfg.bind_addr
+                );
+                let uas = ExtensionUas::bind(uas_cfg, &extensions).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = uas.run().await {
+                        tracing::error!("内線 UAS 終了: {}", e);
+                    }
+                });
+            } else {
+                info!("内線 UAS は未設定のためスキップ");
+            }
 
             info!("REGISTER 開始 → {}", config.server_addr);
             registrar.run().await?;

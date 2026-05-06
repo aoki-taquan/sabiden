@@ -14,6 +14,7 @@
 
 pub mod bridge;
 pub mod manager;
+pub mod orchestrator;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

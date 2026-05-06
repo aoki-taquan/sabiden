@@ -60,10 +60,7 @@ impl Registrar {
 
         let resp = self.recv_response().await?;
         match resp.status_code {
-            200 => {
-                let expires = parse_expires(&resp.headers);
-                return Ok(expires);
-            }
+            200 => Ok(parse_expires(&resp.headers)),
             401 => {
                 let www_auth = resp
                     .headers
@@ -71,7 +68,8 @@ impl Registrar {
                     .ok_or_else(|| anyhow::anyhow!("401 without WWW-Authenticate"))?
                     .to_string();
                 let challenge = DigestChallenge::parse(&www_auth)?;
-                let creds = DigestCredentials::new(&self.config.phone_number, &self.config.password);
+                let creds =
+                    DigestCredentials::new(&self.config.phone_number, &self.config.password);
                 let uri = format!("sip:{}", self.config.domain);
                 let digest = creds.compute(&challenge, "REGISTER", &uri, 1);
 
@@ -95,34 +93,28 @@ impl Registrar {
         let number = &self.config.phone_number;
         let local_addr = self.config.local_addr;
 
-        let mut req = SipRequest::new(
-            SipMethod::Register,
-            format!("sip:{}", domain),
-        );
+        let mut req = SipRequest::new(SipMethod::Register, format!("sip:{}", domain));
 
         // Via ヘッダ: rport を付けない (NTT NGN 必須)
         req.headers.set(
             "Via",
-            format!(
-                "SIP/2.0/UDP {};branch={}",
-                local_addr,
-                new_branch()
-            ),
+            format!("SIP/2.0/UDP {};branch={}", local_addr, new_branch()),
         );
         req.headers.set("Max-Forwards", "70");
         req.headers.set(
             "From",
             format!("<sip:{}@{}>;tag={}", number, domain, self.tag),
         );
-        req.headers.set("To", format!("<sip:{}@{}>", number, domain));
+        req.headers
+            .set("To", format!("<sip:{}@{}>", number, domain));
         req.headers.set("Call-ID", &self.call_id);
         req.headers.set("CSeq", format!("{} REGISTER", cseq));
-        req.headers.set(
-            "Contact",
-            format!("<sip:{}@{}>", number, local_addr),
-        );
-        req.headers.set("Expires", self.config.register_expires.to_string());
-        req.headers.set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, NOTIFY");
+        req.headers
+            .set("Contact", format!("<sip:{}@{}>", number, local_addr));
+        req.headers
+            .set("Expires", self.config.register_expires.to_string());
+        req.headers
+            .set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, NOTIFY");
         req.headers.set("User-Agent", "hikari-sip/0.1");
 
         if let Some(auth) = authorization {

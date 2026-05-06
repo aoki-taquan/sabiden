@@ -1,9 +1,9 @@
+use anyhow::Result;
 /// DHCP Option 120 (RFC 3361) から SIP サーバアドレスを取得するヘルパー
 ///
 /// 実際の取得は dhclient / dhcpcd の hook スクリプト経由で環境変数に入れて
 /// このモジュールで読み取るのが現実的。
 use std::net::IpAddr;
-use anyhow::Result;
 
 /// dhclient が Option 120 を取得した際の環境変数から SIP サーバを読む
 /// dhclient.conf に以下を追加することで $new_ip_sip_servers が設定される:

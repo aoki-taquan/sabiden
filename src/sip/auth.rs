@@ -23,7 +23,9 @@ impl DigestChallenge {
         let mut opaque = None;
 
         for part in split_auth_params(s) {
-            let (k, v) = part.split_once('=').ok_or_else(|| anyhow::anyhow!("bad auth param: {}", part))?;
+            let (k, v) = part
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("bad auth param: {}", part))?;
             let k = k.trim();
             let v = v.trim().trim_matches('"');
             match k {
@@ -36,7 +38,13 @@ impl DigestChallenge {
             }
         }
 
-        Ok(DigestChallenge { realm, nonce, algorithm, qop, opaque })
+        Ok(DigestChallenge {
+            realm,
+            nonce,
+            algorithm,
+            qop,
+            opaque,
+        })
     }
 }
 
@@ -86,12 +94,18 @@ impl DigestCredentials {
     ) -> DigestResponse {
         let cnonce = format!("{:016x}", rand::random::<u64>());
 
-        let ha1 = md5_hex(&format!("{}:{}:{}", self.username, challenge.realm, self.password));
+        let ha1 = md5_hex(&format!(
+            "{}:{}:{}",
+            self.username, challenge.realm, self.password
+        ));
         let ha2 = md5_hex(&format!("{}:{}", method, uri));
 
         let response = if challenge.qop.as_deref() == Some("auth") {
             let nc_str = format!("{:08x}", nc);
-            md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, challenge.nonce, nc_str, cnonce, ha2))
+            md5_hex(&format!(
+                "{}:{}:{}:{}:auth:{}",
+                ha1, challenge.nonce, nc_str, cnonce, ha2
+            ))
         } else {
             md5_hex(&format!("{}:{}:{}", ha1, challenge.nonce, ha2))
         };
@@ -114,7 +128,11 @@ impl DigestCredentials {
 
         header.push_str(&format!(r#", algorithm={}"#, challenge.algorithm));
 
-        DigestResponse { header_value: header, cnonce, nc }
+        DigestResponse {
+            header_value: header,
+            cnonce,
+            nc,
+        }
     }
 }
 

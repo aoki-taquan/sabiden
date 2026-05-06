@@ -52,7 +52,13 @@ impl RtpPacket {
         let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         let payload = data[12..].to_vec();
-        Ok(RtpPacket { payload_type, sequence, timestamp, ssrc, payload })
+        Ok(RtpPacket {
+            payload_type,
+            sequence,
+            timestamp,
+            ssrc,
+            payload,
+        })
     }
 }
 
@@ -76,7 +82,9 @@ impl RtpSession {
 
     pub async fn send_ulaw(&self, pcm_ulaw: &[u8]) -> Result<()> {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let ts = self.timestamp.fetch_add(SAMPLES_PER_FRAME as u32, Ordering::SeqCst);
+        let ts = self
+            .timestamp
+            .fetch_add(SAMPLES_PER_FRAME as u32, Ordering::SeqCst);
 
         let pkt = RtpPacket {
             payload_type: PAYLOAD_TYPE_ULAW,
@@ -105,19 +113,35 @@ pub fn encode_ulaw(sample: i16) -> u8 {
     const CLIP: i32 = 32635;
 
     let mut s = sample as i32;
-    let sign = if s < 0 { s = -s; 0x80u8 } else { 0u8 };
-    if s > CLIP { s = CLIP; }
+    let sign = if s < 0 {
+        s = -s;
+        0x80u8
+    } else {
+        0u8
+    };
+    if s > CLIP {
+        s = CLIP;
+    }
     s += BIAS;
 
     // セグメント境界テーブルで exp (0-7) を決定
-    let exp: u8 = if s < 256 { 0 }
-                  else if s < 512 { 1 }
-                  else if s < 1024 { 2 }
-                  else if s < 2048 { 3 }
-                  else if s < 4096 { 4 }
-                  else if s < 8192 { 5 }
-                  else if s < 16384 { 6 }
-                  else { 7 };
+    let exp: u8 = if s < 256 {
+        0
+    } else if s < 512 {
+        1
+    } else if s < 1024 {
+        2
+    } else if s < 2048 {
+        3
+    } else if s < 4096 {
+        4
+    } else if s < 8192 {
+        5
+    } else if s < 16384 {
+        6
+    } else {
+        7
+    };
 
     let mantissa = ((s >> (exp as i32 + 3)) & 0x0f) as u8;
     !(sign | (exp << 4) | mantissa)
@@ -131,7 +155,11 @@ pub fn decode_ulaw(byte: u8) -> i16 {
     let mantissa = (byte & 0x0f) as i32;
     let magnitude = ((mantissa << 3) + 0x84) << exp.max(0);
     let val = magnitude - 0x84;
-    if sign { -(val as i16) } else { val as i16 }
+    if sign {
+        -(val as i16)
+    } else {
+        val as i16
+    }
 }
 
 #[cfg(test)]
@@ -143,11 +171,11 @@ mod tests {
         // μ-law は非線形量子化なので完全一致しない
         // 低振幅ほど精度が高く、最大振幅付近では量子化ステップが大きい (最大~512)
         let cases: &[(i16, i32)] = &[
-            (0, 4),        // 無音: 誤差は BIAS 分のみ
+            (0, 4), // 無音: 誤差は BIAS 分のみ
             (100, 20),
             (1000, 50),
             (8000, 300),
-            (32767, 700),  // 最大振幅: セグメント7の量子化ステップ~512
+            (32767, 700), // 最大振幅: セグメント7の量子化ステップ~512
         ];
         for &(sample, max_diff) in cases {
             for &s in &[sample, -sample] {
@@ -157,7 +185,11 @@ mod tests {
                 assert!(
                     diff <= max_diff,
                     "sample={} encoded={} decoded={} diff={} (max allowed={})",
-                    s, encoded, decoded, diff, max_diff
+                    s,
+                    encoded,
+                    decoded,
+                    diff,
+                    max_diff
                 );
             }
         }

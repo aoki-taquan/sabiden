@@ -97,12 +97,19 @@ impl SipHeaders {
 
     pub fn get(&self, name: &str) -> Option<&str> {
         let key = name.to_lowercase();
-        self.fields.iter().find(|(k, _)| k == &key).map(|(_, v)| v.as_str())
+        self.fields
+            .iter()
+            .find(|(k, _)| k == &key)
+            .map(|(_, v)| v.as_str())
     }
 
     pub fn get_all(&self, name: &str) -> Vec<&str> {
         let key = name.to_lowercase();
-        self.fields.iter().filter(|(k, _)| k == &key).map(|(_, v)| v.as_str()).collect()
+        self.fields
+            .iter()
+            .filter(|(k, _)| k == &key)
+            .map(|(_, v)| v.as_str())
+            .collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -190,7 +197,9 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
         .ok_or_else(|| anyhow::anyhow!("malformed SIP message: no CRLFCRLF"))?;
 
     let mut lines = header_part.split("\r\n");
-    let first_line = lines.next().ok_or_else(|| anyhow::anyhow!("empty SIP message"))?;
+    let first_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty SIP message"))?;
 
     let mut headers = SipHeaders::new();
     for line in lines {
@@ -203,11 +212,8 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
 
     let body = body_part.as_bytes().to_vec();
 
-    if first_line.starts_with("SIP/2.0 ") {
-        let rest = &first_line["SIP/2.0 ".len()..];
-        let (code_str, reason) = rest
-            .split_once(' ')
-            .unwrap_or((rest, ""));
+    if let Some(rest) = first_line.strip_prefix("SIP/2.0 ") {
+        let (code_str, reason) = rest.split_once(' ').unwrap_or((rest, ""));
         let status_code: u16 = code_str.parse()?;
         Ok(SipMessage::Response(SipResponse {
             status_code,
@@ -251,7 +257,8 @@ mod tests {
     #[test]
     fn test_request_serialization() {
         let mut req = SipRequest::new(SipMethod::Register, "sip:ntt-east.ne.jp");
-        req.headers.set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=abc");
+        req.headers
+            .set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=abc");
         req.headers.set("To", "<sip:0312345678@ntt-east.ne.jp>");
         req.headers.set("Call-ID", "callid@host");
         req.headers.set("CSeq", "1 REGISTER");

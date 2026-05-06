@@ -1,6 +1,11 @@
+// 公開 API は将来の Phase で利用。CI の -D warnings に引っかからないよう module 単位で抑止
+#[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
 mod dhcp;
+#[allow(dead_code)]
 mod rtp;
+#[allow(dead_code)]
 mod sip;
 
 use std::net::SocketAddr;
@@ -50,9 +55,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Register { config: config_path } => {
-            let config = Arc::new(Config::from_file(&config_path)?.sip);
-            info!("設定読み込み完了: {}@{}", config.phone_number, config.domain);
+        Commands::Register {
+            config: config_path,
+        } => {
+            let config = Arc::new(Config::load(&config_path)?.sip);
+            info!(
+                "設定読み込み完了: {}@{}",
+                config.phone_number, config.domain
+            );
 
             let bind_addr: SocketAddr = config.local_addr;
             let socket = Arc::new(UdpSocket::bind(bind_addr).await?);

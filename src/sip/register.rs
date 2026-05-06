@@ -135,7 +135,7 @@ impl Registrar {
     fn build_register(&self, cseq: u32, authorization: Option<&str>) -> SipRequest {
         let domain = &self.config.domain;
         let number = &self.config.phone_number;
-        let local_addr = self.config.local_addr;
+        let local_addr = self.config.expect_local_addr();
 
         let mut req = SipRequest::new(SipMethod::Register, format!("sip:{}", domain));
 

@@ -157,9 +157,15 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     };
 
     // (2) NGN 側 UDP socket
-    let bind_addr: SocketAddr = sip_cfg.local_addr;
+    // bind_addr (省略時 [::]:5060) で listen し、Via/Contact には local_addr を載せる。
+    // local_addr は Config::load 内で auto-detect 済み (Issue #35)。
+    let bind_addr: SocketAddr = sip_cfg.resolved_bind_addr();
+    let local_addr_for_hdr: SocketAddr = sip_cfg.expect_local_addr();
     let ngn_socket = Arc::new(UdpSocket::bind(bind_addr).await?);
-    info!("NGN UDP ソケット bind: {}", bind_addr);
+    info!(
+        "NGN UDP ソケット bind: {} (Via/Contact sent-by: {})",
+        bind_addr, local_addr_for_hdr
+    );
     set_dscp(&ngn_socket, 32)?;
 
     // (3) NGN 側 TransactionLayer (トレース対応)
@@ -170,7 +176,7 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     let ngn_uac_cfg = UacConfig {
         local_uri: format!("sip:{}@{}", sip_cfg.phone_number, sip_cfg.domain),
         domain: sip_cfg.domain.clone(),
-        local_addr: sip_cfg.local_addr,
+        local_addr: local_addr_for_hdr,
         user_agent: "sabiden/0.1".to_string(),
     };
     let ngn_uac = Arc::new(Uac::new(

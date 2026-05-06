@@ -1,12 +1,12 @@
 [package]
-name = "hikari-sip"
+name = "sabiden"
 version = "0.1.0"
 edition = "2021"
 description = "NTT ひかり電話 SIP client - DIY implementation in Rust"
 license = "MIT"
 
 [[bin]]
-name = "hikari-sip"
+name = "sabiden"
 path = "src/main.rs"
 
 [dependencies]

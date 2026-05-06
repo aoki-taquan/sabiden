@@ -15,7 +15,7 @@ use config::Config;
 use sip::register::Registrar;
 
 #[derive(Parser)]
-#[command(name = "hikari-sip")]
+#[command(name = "sabiden")]
 #[command(about = "NTT ひかり電話 SIP クライアント (DIY 実装)")]
 struct Cli {
     #[command(subcommand)]
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("hikari_sip=debug".parse()?),
+                .add_directive("sabiden=debug".parse()?),
         )
         .init();
 

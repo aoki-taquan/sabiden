@@ -20,6 +20,15 @@ HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下
 Phase 1 (基盤実装) 進行中。
 詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照。
 
+## ドキュメント / デプロイ資材
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - アーキテクチャ概要
+- [docs/INSTALL.md](docs/INSTALL.md) - 実機インストールガイド (NGN 直収)
+- [deploy/dhcp/](deploy/dhcp/) - DHCP Option 120 取得スクリプトと設定例
+- [deploy/systemd/](deploy/systemd/) - systemd ユニット (ハードニング済)
+- [deploy/docker/](deploy/docker/) - Dockerfile / docker-compose.yml (host network)
+- [deploy/k8s/](deploy/k8s/) - Kubernetes マニフェスト (hostNetwork)
+
 ## クイックスタート
 
 ### ビルド

@@ -1,0 +1,25 @@
+# sabiden dhclient 設定例
+# /etc/dhcp/dhclient.conf に追記、または /etc/dhcp/dhclient.d/sabiden.conf として配置。
+#
+# DHCP Option 120 (RFC 3361, SIP servers) と Option 210 (NTT 独自 vendor info)
+# を要求し、dhclient-exit-hooks.d/sabiden で /run/sabiden/ に書き出す。
+
+# Option 120: SIP サーバ (boolean は encoding type、IP リストが続く)
+option ip-sip-servers code 120 = { boolean, array of ip-address };
+
+# Option 210: NTT 独自 vendor info (ntt.number / ntt.domain などが入る場合がある)
+# サーバ実装によりフォーマットが揺れるため、ここではテキストとして受ける
+option vendor-class-ntt code 210 = text;
+
+# NGN 接続インタフェース (環境に合わせて変更)
+interface "INTERFACE_PLACEHOLDER" {
+    request subnet-mask, broadcast-address, time-offset, routers,
+            domain-name, domain-name-servers, domain-search, host-name,
+            ip-sip-servers,
+            vendor-class-ntt;
+    require ip-sip-servers;
+}
+
+# IPv6 専用構成の場合は dhclient -6 を使う:
+#   /usr/sbin/dhclient -6 -P INTERFACE_PLACEHOLDER
+# その際は /etc/dhcp/dhclient6.conf に同等の宣言を入れる。

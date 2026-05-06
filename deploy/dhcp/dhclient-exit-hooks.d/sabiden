@@ -1,0 +1,118 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# sabiden dhclient exit hook
+# DHCP Option 120 (RFC 3361 - SIP servers) と Option 210 (NTT 拡張 vendor info)
+# を /run/sabiden/ 配下に書き出して sabiden 本体から読み取れるようにする。
+#
+# 配置場所: /etc/dhcp/dhclient-exit-hooks.d/sabiden
+# 必要な dhclient.conf 設定: deploy/dhcp/dhclient.conf.example を参照。
+#
+# dhclient が呼び出す reason 一覧 (抜粋):
+#   BOUND, RENEW, REBIND, REBOOT  -> リース取得/更新
+#   EXPIRE, FAIL, RELEASE, STOP   -> リース解放
+#
+# 環境変数 (dhclient が export):
+#   $new_ip_sip_servers          : Option 120 で取得した SIP サーバ IP の空白区切り
+#   $new_vendor_class_ntt        : Option 210 (NTT 独自) のテキスト表現 (取得可能なら)
+#   $interface                   : 取得したインタフェース名
+
+set -eu
+
+RUNDIR="/run/sabiden"
+SIP_FILE="${RUNDIR}/sip-servers"
+NTT_FILE="${RUNDIR}/ntt-vendor.json"
+LOG_TAG="sabiden-dhclient-hook"
+
+log() {
+    # logger があれば syslog へ、無ければ stderr
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "${LOG_TAG}" -- "$1"
+    else
+        printf '%s: %s\n' "${LOG_TAG}" "$1" >&2
+    fi
+}
+
+ensure_rundir() {
+    if [ ! -d "${RUNDIR}" ]; then
+        mkdir -p "${RUNDIR}"
+        chmod 0755 "${RUNDIR}"
+    fi
+}
+
+write_sip_servers() {
+    ensure_rundir
+    # 1 行 1 サーバ形式で出力する。空白区切りを改行に置換。
+    : >"${SIP_FILE}.tmp"
+    if [ -n "${new_ip_sip_servers:-}" ]; then
+        for s in ${new_ip_sip_servers}; do
+            printf '%s\n' "${s}" >>"${SIP_FILE}.tmp"
+        done
+    fi
+    mv "${SIP_FILE}.tmp" "${SIP_FILE}"
+    chmod 0644 "${SIP_FILE}"
+    log "wrote SIP servers to ${SIP_FILE} (iface=${interface:-?})"
+}
+
+# NTT の vendor 文字列から ntt.number / ntt.domain を抜き出して JSON にする。
+# 入力は実装依存だが、よくある形式は "ntt.number=0312345678;ntt.domain=ntt-east.ne.jp"
+# のような ';' 区切り key=value の連結。
+parse_ntt_vendor() {
+    raw="${new_vendor_class_ntt:-}"
+    if [ -z "${raw}" ]; then
+        return 1
+    fi
+
+    number=""
+    domain=""
+    # ';' を改行に置換して key=value をループ
+    # shellcheck disable=SC2086
+    OLDIFS=$IFS
+    IFS=';'
+    for pair in ${raw}; do
+        case "${pair}" in
+            ntt.number=*)
+                number="${pair#ntt.number=}"
+                ;;
+            ntt.domain=*)
+                domain="${pair#ntt.domain=}"
+                ;;
+        esac
+    done
+    IFS=$OLDIFS
+
+    ensure_rundir
+    # 最低限の JSON エスケープのみ (ダブルクォート/バックスラッシュ)
+    esc() {
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    }
+    {
+        printf '{'
+        printf '"number":"%s",' "$(esc "${number}")"
+        printf '"domain":"%s"' "$(esc "${domain}")"
+        printf '}\n'
+    } >"${NTT_FILE}.tmp"
+    mv "${NTT_FILE}.tmp" "${NTT_FILE}"
+    chmod 0644 "${NTT_FILE}"
+    log "wrote NTT vendor info to ${NTT_FILE}"
+}
+
+clear_files() {
+    rm -f "${SIP_FILE}" "${NTT_FILE}" 2>/dev/null || true
+    log "cleared sabiden run files (reason=${reason:-?})"
+}
+
+case "${reason:-}" in
+    BOUND|RENEW|REBIND|REBOOT|BOUND6|RENEW6|REBIND6)
+        write_sip_servers
+        parse_ntt_vendor || true
+        ;;
+    EXPIRE|FAIL|RELEASE|STOP|EXPIRE6|RELEASE6|STOP6)
+        clear_files
+        ;;
+    *)
+        : # 何もしない
+        ;;
+esac
+
+exit 0

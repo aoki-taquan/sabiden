@@ -4,3 +4,16 @@
 .DS_Store
 .vscode/
 .idea/
+
+# PWA フロントエンド (frontend/) のビルド成果物
+# Rust の cargo build からは frontend/ と workers/ は無関係 (Cargo.toml に
+# 含まれない) が、誤って commit しないように除外する。
+frontend/node_modules/
+frontend/dist/
+frontend/dev-dist/
+frontend/.env
+frontend/.env.local
+workers/node_modules/
+workers/.wrangler/
+workers/.dev.vars
+

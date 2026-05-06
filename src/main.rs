@@ -1,5 +1,7 @@
 // 公開 API は将来の Phase で利用。CI の -D warnings に引っかからないよう module 単位で抑止
 #[allow(dead_code)]
+mod call;
+#[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
 mod dhcp;

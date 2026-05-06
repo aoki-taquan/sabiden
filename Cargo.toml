@@ -30,6 +30,10 @@ sha2 = "0.10"
 base64 = "0.22"
 subtle = "2"
 hex = "0.4"
+# Opus コーデック (libopus FFI)。ビルドには libopus-dev (Linux) が必要
+opus = "0.3"
+# 高品質リサンプラ (8kHz <-> 48kHz)
+rubato = "0.16"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -3,6 +3,7 @@
 //! NGN 向けに RTP パケット送受信、ジッタバッファ、RTCP SR/RR を提供する。
 //! DSCP 32 (TOS 0x80) を RTP/RTCP 送信ソケットにも適用する。
 
+pub mod codec;
 pub mod jitter;
 pub mod packet;
 pub mod rtcp;

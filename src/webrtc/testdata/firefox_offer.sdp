@@ -1,0 +1,22 @@
+v=0
+o=mozilla...THIS_IS_SDPARTA-99.0 1234567890123456789 0 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=fingerprint:sha-256 5C:F8:64:42:A5:C5:31:1C:09:08:E0:91:8E:38:13:A0:1F:0E:E1:46:71:35:6C:5C:0E:8B:8D:97:8E:36:1C:36
+a=group:BUNDLE 0
+a=ice-options:trickle
+a=msid-semantic:WMS *
+m=audio 9 UDP/TLS/RTP/SAVPF 109 101
+c=IN IP4 0.0.0.0
+a=sendrecv
+a=fmtp:109 maxplaybackrate=48000;stereo=1;useinbandfec=1
+a=fmtp:101 0-15
+a=ice-pwd:dummy_ice_password_12345678901234567
+a=ice-ufrag:abcd
+a=mid:0
+a=msid:- {00000000-0000-0000-0000-000000000000}
+a=rtcp-mux
+a=rtpmap:109 opus/48000/2
+a=rtpmap:101 telephone-event/8000
+a=setup:actpass
+a=ssrc:1234567890 cname:{abcdef00-1234-5678-9abc-deadbeef0000}

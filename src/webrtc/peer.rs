@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
 use crate::sdp::SessionDescription;
@@ -49,6 +49,18 @@ pub trait PeerSession: Send + Sync {
 
     /// ICE candidate を 1 つ追加する。
     async fn add_ice_candidate(&self, candidate: &str) -> Result<()>;
+
+    /// ローカル ICE candidate (a=candidate ラインのテキスト) のストリームを
+    /// 取り出す。trickle ICE で WS シグナリングに流すために使う。
+    ///
+    /// stub バックエンドは候補を生成しない (None を返す)。
+    /// str0m バックエンドはバインドした UDP ソケットの host candidate を
+    /// 1 つ送出する。`public_ip` 設定があればそれを反映した形式になる。
+    ///
+    /// 戻り値が `None` の場合、シグナリング層は trickle 配信をスキップする。
+    async fn take_local_candidates(&self) -> Option<mpsc::Receiver<String>> {
+        None
+    }
 
     /// セッションをクローズする。
     async fn close(&self) -> Result<()>;

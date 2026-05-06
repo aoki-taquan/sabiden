@@ -34,6 +34,11 @@ hex = "0.4"
 opus = "0.3"
 # 高品質リサンプラ (8kHz <-> 48kHz)
 rubato = "0.16"
+# 実 WebRTC (ICE / DTLS-SRTP / RTP) 終端 (Issue #28)。
+# Sans-IO 設計のため tokio との統合は run loop 側で行う。
+# 既定の `aws-lc-rs` バックエンドは crypto 依存が大きいので OpenSSL に切り替える
+# (Linux ではほぼ確実に利用可能で、CI イメージにも入っている)。
+str0m = { version = "0.19", default-features = false, features = ["openssl"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

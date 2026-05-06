@@ -17,8 +17,14 @@ HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下
 
 ## ステータス
 
-Phase 1 (基盤実装) 進行中。
-詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照。
+| Phase | 内容 | 状態 |
+|-------|------|------|
+| 1 | SIP トランザクション層 / SDP / RTP / Health | ✅ 完了 |
+| 2 | INVITE/BYE UAC / 内線 UAS / Call Manager | ✅ 完了 |
+| 2.5 | main.rs 結線 / NGN 着信受付 / RTP ブリッジ / 観測機能 | ✅ 完了 |
+| 3 | Cloudflare WebRTC ゲートウェイ / Opus トランスコード | 計画中 |
+
+実機投入可能な状態に到達。詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) と [docs/INSTALL.md](docs/INSTALL.md) を参照。
 
 ## ドキュメント / デプロイ資材
 

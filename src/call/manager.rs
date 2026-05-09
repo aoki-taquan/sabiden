@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use super::bridge::RtpBridge;
+use super::bridge::{MediaBridge, RtpBridge};
 use super::{CallId, CallState};
 use crate::sdp::SessionDescription;
 use crate::sip::message::SipResponse;
@@ -219,8 +219,9 @@ pub async fn fork_to_extensions(
 pub struct CallEntry {
     pub id: CallId,
     pub state: CallState,
-    /// RTP ブリッジ (確立後のみ Some)。
-    pub bridge: Option<RtpBridge>,
+    /// メディアブリッジ (確立後のみ Some)。`MediaBridge` enum で
+    /// 純リレー (PCMU↔PCMU) とトランスコード (Opus↔PCMU) を切替える。
+    pub bridge: Option<MediaBridge>,
 }
 
 /// 通話マネージャの簡易テーブル。
@@ -274,8 +275,17 @@ impl CallManager {
         Ok(())
     }
 
-    /// RTP ブリッジを取り付ける (Connected 遷移時に呼ぶ)。
+    /// 純リレー RTP ブリッジを取り付ける (Connected 遷移時に呼ぶ)。
+    ///
+    /// 内部で [`MediaBridge::Relay`] にラップする。両側 PCMU 通話用。
     pub async fn attach_bridge(&self, id: CallId, bridge: RtpBridge) -> Result<()> {
+        self.attach_media_bridge(id, MediaBridge::Relay(bridge))
+            .await
+    }
+
+    /// 任意の [`MediaBridge`] (リレー or トランスコード) を取り付ける。
+    /// Issue #29: WebRTC↔NGN 通話用の Opus⇔PCMU トランスコード経路で使う。
+    pub async fn attach_media_bridge(&self, id: CallId, bridge: MediaBridge) -> Result<()> {
         let mut inner = self.inner.lock().await;
         let entry = inner
             .calls

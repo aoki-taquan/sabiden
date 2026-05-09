@@ -265,10 +265,32 @@ impl NgnInboundHandler {
                 self.metrics.record_invite_ngn(InviteResult::Error);
                 return Ok::<(), anyhow::Error>(());
             }
+            // 登録 contact のうち、SIP UDP では到達できない WebRTC peer
+            // (`sip:<ext>@webrtc.local`) は fork から除外する。`webrtc.local` は
+            // 名前解決できず `os error 22 EINVAL` で fork leg が即失敗し、結果
+            // SIP UA も巻き添えで `486 Busy` になる事故を防ぐ。WebRTC peer への
+            // 着信通知は WS push (Phase 4 終盤 TODO) で別経路にする。
             let targets: Vec<String> = bindings
                 .iter()
-                .map(|(_, b)| b.contact_uri.clone())
+                .filter_map(|(_, b)| {
+                    if b.contact_uri.contains("webrtc.local") {
+                        warn!(
+                            target = %b.contact_uri,
+                            "WebRTC peer は WS push 未実装のため fork 対象から除外"
+                        );
+                        None
+                    } else {
+                        Some(b.contact_uri.clone())
+                    }
+                })
                 .collect();
+            if targets.is_empty() {
+                warn!("有効な fork target なし (WebRTC のみ登録) → 480");
+                self.respond(&stx, 480, "Temporarily Unavailable").await?;
+                self.pending.lock().await.remove(&call_id);
+                self.metrics.record_invite_ngn(InviteResult::Error);
+                return Ok::<(), anyhow::Error>(());
+            }
 
             // フォーク (内線レッグ)
             let sdp = request.body.clone();
@@ -609,6 +631,14 @@ impl UasEventHandler {
                             }
                         };
 
+                    // NGN は PCMU(0) しか受け入れない。Linphone/Zoiper 等が送ってくる
+                    // multi-codec オファ (Opus 等) を素通しすると 488 で蹴られるので、
+                    // NGN へ送る直前で PCMU のみに絞る。RTP ブリッジ用に書き換え済の
+                    // SDP に対してさらにコーデック絞りを適用しても既に endpoint は
+                    // sabiden 側を指しており整合性は崩れない。
+                    let sdp_for_ngn = sdp_for_ngn.map(|s| {
+                        crate::sdp::builder::restrict_audio_to_pcmu(&s)
+                    });
                     let plan = self
                         .ngn_uac
                         .build_invite(&target, sdp_for_ngn.as_deref(), None);

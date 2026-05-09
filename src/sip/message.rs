@@ -11,6 +11,11 @@ pub enum SipMethod {
     Info,
     Notify,
     Subscribe,
+    /// RFC 3262 (PRACK), RFC 3265 (NOTIFY/SUBSCRIBE), RFC 3311 (UPDATE),
+    /// RFC 3428 (MESSAGE), RFC 3515 (REFER), RFC 3903 (PUBLISH) など、
+    /// 個別ハンドラを持たないメソッドを横断で受ける。Linphone は presence で
+    /// PUBLISH を流すので、本バリアントが無いとメッセージ全体が drop される。
+    Other(String),
 }
 
 impl fmt::Display for SipMethod {
@@ -25,6 +30,7 @@ impl fmt::Display for SipMethod {
             SipMethod::Info => write!(f, "INFO"),
             SipMethod::Notify => write!(f, "NOTIFY"),
             SipMethod::Subscribe => write!(f, "SUBSCRIBE"),
+            SipMethod::Other(name) => write!(f, "{}", name),
         }
     }
 }
@@ -42,6 +48,11 @@ impl std::str::FromStr for SipMethod {
             "INFO" => Ok(SipMethod::Info),
             "NOTIFY" => Ok(SipMethod::Notify),
             "SUBSCRIBE" => Ok(SipMethod::Subscribe),
+            // 既知 SIP メソッド名 (大文字 ASCII) ならば Other に格納し、
+            // UAS 側で 405 Method Not Allowed として応答する。
+            other if !other.is_empty() && other.bytes().all(|b| b.is_ascii_uppercase()) => {
+                Ok(SipMethod::Other(other.to_string()))
+            }
             _ => anyhow::bail!("unknown SIP method: {}", s),
         }
     }
@@ -82,7 +93,7 @@ impl SipHeaders {
     }
 
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
-        let key = name.to_lowercase();
+        let key = normalize_header_key(name);
         // 既存エントリを上書き (最初の1件のみ)
         if let Some(pos) = self.fields.iter().position(|(k, _)| k == &key) {
             self.fields[pos].1 = value.into();
@@ -92,11 +103,11 @@ impl SipHeaders {
     }
 
     pub fn add(&mut self, name: &str, value: impl Into<String>) {
-        self.fields.push((name.to_lowercase(), value.into()));
+        self.fields.push((normalize_header_key(name), value.into()));
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        let key = name.to_lowercase();
+        let key = normalize_header_key(name);
         self.fields
             .iter()
             .find(|(k, _)| k == &key)
@@ -104,7 +115,7 @@ impl SipHeaders {
     }
 
     pub fn get_all(&self, name: &str) -> Vec<&str> {
-        let key = name.to_lowercase();
+        let key = normalize_header_key(name);
         self.fields
             .iter()
             .filter(|(k, _)| k == &key)
@@ -162,6 +173,41 @@ impl SipResponse {
         bytes.extend_from_slice(&self.body);
         bytes
     }
+}
+
+/// SIP ヘッダ名の格納キーを生成する。
+/// 大文字小文字差を吸収しつつ、RFC 3261 §7.3.3 のコンパクト形式 (`v`, `f`, `t`, `i`,
+/// `m`, `l`, `s`, `c`, `k`, `e` 等) を完全形に展開する。NTT NGN の P-CSCF は
+/// 200 OK 等のレスポンスでコンパクト形式を多用するため、入口で正規化しないと
+/// `headers.get("via")` 等で取り損なう。
+fn normalize_header_key(name: &str) -> String {
+    let lower = name.trim().to_ascii_lowercase();
+    let full = match lower.as_str() {
+        // RFC 3261 §7.3.3
+        "v" => "via",
+        "f" => "from",
+        "t" => "to",
+        "i" => "call-id",
+        "m" => "contact",
+        "l" => "content-length",
+        "s" => "subject",
+        "c" => "content-type",
+        "k" => "supported",
+        "e" => "content-encoding",
+        // 拡張 (RFC 3265 / 3515 / 4028 / 4474 / 4538 等)
+        "o" => "event",
+        "u" => "allow-events",
+        "r" => "refer-to",
+        "b" => "referred-by",
+        "x" => "session-expires",
+        "y" => "identity",
+        "n" => "identity-info",
+        "a" => "accept-contact",
+        "j" => "reject-contact",
+        "d" => "request-disposition",
+        other => return other.to_string(),
+    };
+    full.to_string()
 }
 
 fn canonical_header_name(lower: &str) -> &str {
@@ -249,6 +295,35 @@ mod tests {
             SipMessage::Response(r) => {
                 assert_eq!(r.status_code, 401);
                 assert!(r.headers.get("www-authenticate").is_some());
+            }
+            _ => panic!("expected response"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_compact_headers_ngn_200ok() {
+        // NTT NGN P-CSCF が REGISTER 200 OK で実際に使うコンパクトヘッダ形式
+        // (v=Via, f=From, t=To, i=Call-ID, m=Contact, l=Content-Length)。
+        // 実機 pcap (118.177.125.1 → 118.177.72.242) から取得した形そのまま。
+        let msg = b"SIP/2.0 200 OK\r\n\
+v: SIP/2.0/UDP 118.177.72.242:5060;branch=z9hG4bK1a56953e6a112f02\r\n\
+f: <sip:0191349809@ntt-east.ne.jp>;tag=956a3a90\r\n\
+t: <sip:0191349809@ntt-east.ne.jp>;tag=3987286122\r\n\
+i: afa66bea0b3de7c1@hikari-sip\r\n\
+CSeq: 1 REGISTER\r\n\
+m: <sip:0191349809@118.177.72.242:5060>;q=0;expires=3600\r\n\
+l: 0\r\n\
+\r\n";
+        let parsed = parse_message(msg).unwrap();
+        match parsed {
+            SipMessage::Response(r) => {
+                assert_eq!(r.status_code, 200);
+                assert!(r.headers.get("via").is_some(), "via が compact 'v' から拾えない");
+                assert!(r.headers.get("from").is_some());
+                assert!(r.headers.get("to").is_some());
+                assert!(r.headers.get("call-id").is_some());
+                assert!(r.headers.get("contact").is_some());
+                assert_eq!(r.headers.get("content-length"), Some("0"));
             }
             _ => panic!("expected response"),
         }

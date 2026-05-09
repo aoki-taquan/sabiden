@@ -428,7 +428,14 @@ impl TransactionLayer {
                             }
                         }
                         Err(e) => {
-                            warn!(error=%e, "SIP メッセージ パース失敗");
+                            // 空 UDP / SIP keepalive (CRLF だけ) はパース失敗するが
+                            // 障害ではない。warn を散らすと実害のある故障が
+                            // 埋もれるので debug に格下げする。
+                            if data.iter().all(|&b| b.is_ascii_whitespace()) {
+                                debug!(len = data.len(), "空 UDP/keepalive を無視");
+                            } else {
+                                warn!(error=%e, "SIP メッセージ パース失敗");
+                            }
                         }
                     }
                 }

@@ -706,13 +706,8 @@ mod tests {
         let local = client.local_addr().unwrap();
 
         // チャレンジを取得するため認証なし INVITE を送る
-        let mut req = builders::invite_from_phone(
-            &local,
-            "iphone",
-            "sip:dest@sabiden",
-            "z9hG4bKinv1",
-            None,
-        );
+        let mut req =
+            builders::invite_from_phone(&local, "iphone", "sip:dest@sabiden", "z9hG4bKinv1", None);
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
         let mut buf = vec![0u8; 4096];
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))

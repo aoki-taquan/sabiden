@@ -1200,7 +1200,10 @@ mod tests {
         drop(tx);
         let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
         let result = ct.run().await;
-        assert!(result.is_err(), "Timer B (64*T1=32s) でタイムアウトするはず");
+        assert!(
+            result.is_err(),
+            "Timer B (64*T1=32s) でタイムアウトするはず"
+        );
     }
 
     /// Timer F (64*T1 = 32s) 相当のタイムアウト確認 (non-INVITE)。
@@ -1216,7 +1219,10 @@ mod tests {
         drop(tx);
         let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
         let result = ct.run().await;
-        assert!(result.is_err(), "Timer F (64*T1=32s) でタイムアウトするはず");
+        assert!(
+            result.is_err(),
+            "Timer F (64*T1=32s) でタイムアウトするはず"
+        );
     }
 
     /// 1xx 受信で Proceeding に遷移し、2xx で完了することを確認。
@@ -1618,10 +1624,9 @@ mod tests {
     #[test]
     fn test_build_non2xx_ack_copies_headers_per_rfc3261_17_1_1_3() {
         let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@ntt-east.ne.jp");
-        invite.headers.set(
-            "Via",
-            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest",
-        );
+        invite
+            .headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest");
         invite
             .headers
             .set("From", "<sip:alice@ntt-east.ne.jp>;tag=alice");
@@ -1629,14 +1634,15 @@ mod tests {
         invite.headers.set("Call-ID", "ackc-call@host");
         invite.headers.set("CSeq", "42 INVITE");
         invite.headers.set("Max-Forwards", "70");
-        invite.headers.add("Route", "<sip:proxy1@ntt-east.ne.jp;lr>");
-        invite.headers.add("Route", "<sip:proxy2@ntt-east.ne.jp;lr>");
+        invite
+            .headers
+            .add("Route", "<sip:proxy1@ntt-east.ne.jp;lr>");
+        invite
+            .headers
+            .add("Route", "<sip:proxy2@ntt-east.ne.jp;lr>");
 
         let mut resp_headers = SipHeaders::new();
-        resp_headers.set(
-            "Via",
-            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest",
-        );
+        resp_headers.set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest");
         resp_headers.set("From", "<sip:alice@ntt-east.ne.jp>;tag=alice");
         // 応答では To に tag が付く (UAS 側で生成された)
         resp_headers.set("To", "<sip:bob@ntt-east.ne.jp>;tag=ngn-server-tag");
@@ -1719,8 +1725,7 @@ mod tests {
 
             // 2) 403 Forbidden を構築・送信 (To に tag を付けて返す)
             let mut resp = build_response_skeleton(&invite_req, 403, "Forbidden");
-            resp.headers
-                .set("To", "<sip:bob@example>;tag=ngn-uas-tag");
+            resp.headers.set("To", "<sip:bob@example>;tag=ngn-uas-tag");
             resp.reason = "Forbidden".into();
             let resp_bytes = resp.to_bytes();
             uas_clone.send_to(&resp_bytes, peer).await.unwrap();
@@ -1750,12 +1755,19 @@ mod tests {
             );
             // 必須: To に応答の tag が乗っている
             assert!(
-                recv_ack.headers.get("to").unwrap().contains("tag=ngn-uas-tag"),
+                recv_ack
+                    .headers
+                    .get("to")
+                    .unwrap()
+                    .contains("tag=ngn-uas-tag"),
                 "ACK の To に応答 tag が無い"
             );
             // 必須: CSeq method=ACK, 番号は元 INVITE と同じ
             assert_eq!(recv_ack.headers.get("cseq").unwrap(), "1 ACK");
-            assert_eq!(recv_ack.headers.get("call-id").unwrap(), "invite-ack-test@host");
+            assert_eq!(
+                recv_ack.headers.get("call-id").unwrap(),
+                "invite-ack-test@host"
+            );
 
             // 4) 403 を再送 (NGN がよくやる)
             uas_clone.send_to(&resp_bytes, peer).await.unwrap();

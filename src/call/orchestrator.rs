@@ -49,9 +49,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::bridge::{BridgeConfig, RtpBridge};
-use super::manager::{
-    extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker,
-};
+use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::rewrite_rtp_endpoint;
@@ -795,7 +793,10 @@ impl UasEventHandler {
                 request,
                 remote,
                 responder,
-            } => self.handle_invite(from_aor, request, remote, responder).await,
+            } => {
+                self.handle_invite(from_aor, request, remote, responder)
+                    .await
+            }
             UasEvent::Bye {
                 request,
                 remote,
@@ -1376,10 +1377,7 @@ pub async fn fork_to_bindings(
                             }
                         }
                         Ok(super::manager::LegOutcome::Failed { status, .. }) => {
-                            LegResult::Failed {
-                                aor: aor_c,
-                                status,
-                            }
+                            LegResult::Failed { aor: aor_c, status }
                         }
                         Ok(super::manager::LegOutcome::Errored { .. }) | Err(_) => {
                             LegResult::Errored { aor: aor_c }
@@ -1662,20 +1660,19 @@ fn force_rewrite_sdp_for_ngn(ext_offer: &[u8], ngn_local_ip: IpAddr) -> Option<V
     }
     // 元 SDP の m=audio port を温存しつつ c=/o= IP のみ NGN 側へ書き換える。
     // rewrite_rtp_endpoint は port も書き換えてしまうため、まず port を取り出す。
-    let port = match crate::sdp::SessionDescription::parse(
-        std::str::from_utf8(ext_offer).unwrap_or(""),
-    ) {
-        Ok(sdp) => sdp
-            .media
-            .iter()
-            .find(|m| m.media == "audio")
-            .map(|m| m.port)
-            .unwrap_or(0),
-        Err(e) => {
-            warn!(error=%e, "SDP パース失敗 → 元 body のまま (LAN IP 漏洩リスク)");
-            return Some(ext_offer.to_vec());
-        }
-    };
+    let port =
+        match crate::sdp::SessionDescription::parse(std::str::from_utf8(ext_offer).unwrap_or("")) {
+            Ok(sdp) => sdp
+                .media
+                .iter()
+                .find(|m| m.media == "audio")
+                .map(|m| m.port)
+                .unwrap_or(0),
+            Err(e) => {
+                warn!(error=%e, "SDP パース失敗 → 元 body のまま (LAN IP 漏洩リスク)");
+                return Some(ext_offer.to_vec());
+            }
+        };
     match rewrite_rtp_endpoint(ext_offer, ngn_local_ip, port) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
@@ -1687,7 +1684,7 @@ fn force_rewrite_sdp_for_ngn(ext_offer: &[u8], ngn_local_ip: IpAddr) -> Option<V
 
 /// `wire_ngn_inbound` の `CallManager` 接続版。RTP ブリッジを起動する経路。
 pub fn wire_ngn_inbound_with_manager(
-    _layer: Arc<TransactionLayer>,
+    layer: Arc<TransactionLayer>,
     socket: Arc<UdpSocket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
     inviter: ExtInviter,
@@ -1695,8 +1692,44 @@ pub fn wire_ngn_inbound_with_manager(
     cfg: NgnInboundConfig,
     call_manager: Arc<CallManager>,
 ) -> Arc<NgnInboundHandler> {
-    let handler =
-        NgnInboundHandler::with_call_manager(socket, inviter, extensions, cfg, call_manager);
+    wire_ngn_inbound_with_manager_and_metrics(
+        layer,
+        socket,
+        inbound_rx,
+        inviter,
+        extensions,
+        cfg,
+        call_manager,
+        Metrics::new(),
+    )
+}
+
+/// `wire_ngn_inbound_with_manager` の メトリクス付きバージョン。
+///
+/// Issue #40 の本流配線で `main.rs` から呼ぶエントリポイント。NGN 着信 INVITE に
+/// 対して内線フォーク + RTP ブリッジ起動を一括で結線する。
+///
+/// 引数が多いのは結線ヘルパとして必須パラメータをそのまま受け渡すためで、
+/// 構造体化は本流配線の関心事ではない (`main.rs` から 1 か所で呼ぶだけ)。
+#[allow(clippy::too_many_arguments)]
+pub fn wire_ngn_inbound_with_manager_and_metrics(
+    _layer: Arc<TransactionLayer>,
+    socket: Arc<UdpSocket>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
+    inviter: ExtInviter,
+    extensions: Arc<ExtensionRegistrar>,
+    cfg: NgnInboundConfig,
+    call_manager: Arc<CallManager>,
+    metrics: Arc<Metrics>,
+) -> Arc<NgnInboundHandler> {
+    let handler = NgnInboundHandler::with_call_manager_and_metrics(
+        socket,
+        inviter,
+        extensions,
+        cfg,
+        call_manager,
+        metrics,
+    );
     handler.clone().spawn(inbound_rx);
     handler
 }
@@ -1841,7 +1874,11 @@ mod tests {
             }
         }
         assert!(got_480, "480 Temporarily Unavailable が返るべき");
-        assert_eq!(inviter.call_count(), 0, "内線が無ければ inviter は呼ばれない");
+        assert_eq!(
+            inviter.call_count(),
+            0,
+            "内線が無ければ inviter は呼ばれない"
+        );
     }
 
     /// `make_forker` は与えられた Uac を内包する forker を生成する。
@@ -1908,10 +1945,9 @@ mod tests {
                           a=rtpmap:0 PCMU/8000\r\n";
         let eth1_ip: IpAddr = "118.177.72.242".parse().unwrap();
         let rewritten = force_rewrite_sdp_for_ngn(ext_offer, eth1_ip).expect("Some");
-        let parsed = crate::sdp::SessionDescription::parse(
-            std::str::from_utf8(&rewritten).unwrap(),
-        )
-        .expect("rewritten SDP must parse");
+        let parsed =
+            crate::sdp::SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap())
+                .expect("rewritten SDP must parse");
 
         // c= / o= は eth1 IP に書換 (LAN private は漏らさない)
         assert_eq!(parsed.connection.as_ref().unwrap().address, eth1_ip);
@@ -1945,8 +1981,7 @@ mod tests {
             let parsed = parse_message(&buf[..n]).unwrap();
             if let SipMessage::Request(req) = parsed {
                 *captured_uri_c.lock().unwrap() = Some(req.uri.clone());
-                *captured_via_c.lock().unwrap() =
-                    req.headers.get("via").map(str::to_string);
+                *captured_via_c.lock().unwrap() = req.headers.get("via").map(str::to_string);
                 let mut resp = build_response_skeleton(&req, 200, "OK");
                 resp.headers.set(
                     "To",
@@ -2015,13 +2050,11 @@ mod tests {
             .await
             .unwrap();
         let mut buf = vec![0u8; 4096];
-        let (n, remote) = tokio::time::timeout(
-            Duration::from_secs(2),
-            sabiden_uas_sock.recv_from(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (n, remote) =
+            tokio::time::timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
         let parsed = parse_message(&buf[..n]).unwrap();
         let req = match parsed {
             SipMessage::Request(r) => r,
@@ -2769,13 +2802,15 @@ mod tests {
             format!("SIP/2.0/UDP {};branch=z9hG4bKextbye2", phone_addr),
         );
         bye.headers.set("From", "<sip:iphone@sabiden>;tag=phonet");
-        bye.headers
-            .set("To", "<sip:0312345678@sabiden>;tag=local"); // sabiden 側 tag 未把握なので仮値
+        bye.headers.set("To", "<sip:0312345678@sabiden>;tag=local"); // sabiden 側 tag 未把握なので仮値
         bye.headers.set("Call-ID", "ext-bye-cid");
         bye.headers.set("CSeq", "2 BYE");
 
         // sabiden 側で BYE を受信して UasEvent::Bye を直接 fire (UAS::run なしで動かしてるため)
-        phone.send_to(&bye.to_bytes(), sabiden_ext_addr).await.unwrap();
+        phone
+            .send_to(&bye.to_bytes(), sabiden_ext_addr)
+            .await
+            .unwrap();
         let (n, remote) = timeout(Duration::from_secs(2), sabiden_ext_sock.recv_from(&mut buf))
             .await
             .unwrap()
@@ -2866,11 +2901,7 @@ mod tests {
             bye.headers.set("CSeq", "1 BYE");
             fake_ngn_clone.send_to(&bye.to_bytes(), peer).await.unwrap();
             // BYE への 200 OK を受け取る (ペイロードは捨てる)
-            let _ = timeout(
-                Duration::from_secs(3),
-                fake_ngn_clone.recv_from(&mut buf),
-            )
-            .await;
+            let _ = timeout(Duration::from_secs(3), fake_ngn_clone.recv_from(&mut buf)).await;
         });
 
         // sabiden NGN UAC + 着信ハンドラ
@@ -2900,12 +2931,10 @@ mod tests {
 
         // NGN 着信ハンドラを起動 (NGN 側 inbound_rx で BYE をキャッチさせる)。
         // inviter は使わない (内線着信は来ない) ので minimal な dummy を渡す。
-        let dummy_inviter: ExtInviter = Arc::new(ScriptedInviter {
-            status: 486,
-            body: Vec::new(),
-            called: AtomicUsize::new(0),
-            seen_targets: StdMutex::new(Vec::new()),
-        });
+        // (ハーネス Issue #42 で `ScriptedInviter` は builder ベースに統合された。)
+        let dummy_inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
         let extensions_empty = ExtensionRegistrar::new();
         let ngn_handler = NgnInboundHandler::new(
             ngn_client_sock.clone(),
@@ -3042,11 +3071,8 @@ mod tests {
                         .await
                         .unwrap();
                     // ACK 受信 (drop)
-                    let _ = timeout(
-                        Duration::from_secs(2),
-                        fake_ngn_clone.recv_from(&mut buf),
-                    )
-                    .await;
+                    let _ =
+                        timeout(Duration::from_secs(2), fake_ngn_clone.recv_from(&mut buf)).await;
                 }
             }
         });
@@ -3160,7 +3186,10 @@ mod tests {
 
         // NGN へ CANCEL が届く
         let _ = timeout(Duration::from_secs(3), ngn_task).await;
-        assert!(*cancel_seen.lock().unwrap(), "NGN へ CANCEL が伝搬されるべき");
+        assert!(
+            *cancel_seen.lock().unwrap(),
+            "NGN へ CANCEL が伝搬されるべき"
+        );
     }
 
     /// `OutboundCallRegistry` の単体動作: pending → confirmed の遷移と
@@ -3280,13 +3309,11 @@ mod tests {
             }
         });
 
-        // SIP fork 用 inviter (本テストでは呼ばれないはずだが ExtInviter が必要)
-        let inviter = Arc::new(ScriptedInviter {
-            status: 200,
-            body: Vec::new(),
-            called: AtomicUsize::new(0),
-            seen_targets: StdMutex::new(Vec::new()),
-        });
+        // SIP fork 用 inviter (本テストでは呼ばれないはずだが ExtInviter が必要)。
+        // (ハーネス Issue #42 で `ScriptedInviter` は builder ベースに統合された。)
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
 
         let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
         let _handler = wire_ngn_inbound(
@@ -3359,7 +3386,7 @@ mod tests {
             "200 OK の SDP body は browser の answer がそのまま入るべき"
         );
         assert_eq!(
-            inviter.called.load(AOrd::SeqCst),
+            inviter.call_count(),
             0,
             "WebRTC 専用 binding なので SIP fork inviter は呼ばれないはず"
         );

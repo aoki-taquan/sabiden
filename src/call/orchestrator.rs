@@ -56,7 +56,7 @@ use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::rewrite_rtp_endpoint;
 use crate::sip::dialog::{Dialog, DialogConfig};
-use crate::sip::message::{parse_sip_uri, SipHeaders, SipMethod, SipRequest, SipResponse};
+use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
 use crate::sip::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
@@ -526,47 +526,6 @@ impl NgnInboundHandler {
     }
 }
 
-/// 内線→NGN プロキシ時の Request-URI 正規化。
-///
-/// 内線 (Linphone 等) は `INVITE sip:<dial>@<sabiden-LAN-IP>` を吐くため、
-/// このまま NGN にプロキシすると P-CSCF が LAN IP 宛 URI を 403 で蹴る。
-/// host 部が NGN ドメインでも NGN P-CSCF アドレスでもない場合は、
-/// host を `ngn_domain` に置換し、ユーザ部 (= dial 番号) を保持して返す。
-/// `;params` `?headers` は捨てる (NGN 直収では transport=udp 等は不要)。
-///
-/// 既に NGN ドメインや P-CSCF アドレスを指している場合は変更しない。
-/// パースに失敗した場合 (相対 URI 等) はフェイルセーフとして元 URI を返す。
-fn normalize_request_uri_for_ngn(req_uri: &str, ngn_domain: &str, ngn_server_host: &str) -> String {
-    let Some(parts) = parse_sip_uri(req_uri) else {
-        return req_uri.to_string();
-    };
-    let host_lower = parts.host.to_ascii_lowercase();
-    let domain_lower = ngn_domain.to_ascii_lowercase();
-    let server_lower = ngn_server_host.to_ascii_lowercase();
-    if host_lower == domain_lower || host_lower == server_lower {
-        return rebuild_sip_uri(parts.scheme, parts.user, parts.host, parts.port);
-    }
-    rebuild_sip_uri(parts.scheme, parts.user, ngn_domain, None)
-}
-
-/// `parse_sip_uri` の結果から `;params` を剥がした URI を再構築する。
-/// IPv6 リテラルの場合は `[..]` を付け直す。
-fn rebuild_sip_uri(scheme: &str, user: Option<&str>, host: &str, port: Option<&str>) -> String {
-    let host_part = if host.contains(':') {
-        format!("[{}]", host)
-    } else {
-        host.to_string()
-    };
-    let host_with_port = match port {
-        Some(p) => format!("{}:{}", host_part, p),
-        None => host_part,
-    };
-    match user {
-        Some(u) => format!("{}:{}@{}", scheme, u, host_with_port),
-        None => format!("{}:{}", scheme, host_with_port),
-    }
-}
-
 /// レスポンスの To に tag が無ければ付与する (RFC 3261 §8.2.6.2)。
 fn ensure_to_tag(resp: &mut SipResponse) {
     if let Some(to) = resp.headers.get("to") {
@@ -872,45 +831,44 @@ impl UasEventHandler {
         );
         async move {
             info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
-            // 内線が出した Request-URI は host が sabiden 側 LAN IP (内線 UAS の
-            // bind IP) のため、そのまま NGN にプロキシすると P-CSCF が
-            // `403 Forbidden` で蹴る (NGN は LAN IP 宛 URI を受け付けない)。
-            // NGN ドメイン (`UacConfig::domain`) に正規化する。To ヘッダは
-            // `Uac::build_invite` 内で target から組み立てるため自動で揃う。
-            let cfg = self.ngn_uac.config();
-            let server_host = self.ngn_uac.server_addr().ip().to_string();
-            let target = normalize_request_uri_for_ngn(&request.uri, &cfg.domain, &server_host);
+            // Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.1):
+            // 内線が出した Request-URI (LAN private IP / NGN ドメイン) を
+            // P-CSCF IP+port に正規化する。NGN は Request-URI host に P-CSCF
+            // IP を要求する (ドメインや LAN IP のままだと 403 で蹴られる)。
+            let ngn_server = self.ngn_uac.server_addr();
+            let target = normalize_request_uri_for_ngn(
+                &request.uri,
+                &ngn_server.ip().to_string(),
+                ngn_server.port(),
+            );
             if target != request.uri {
                 debug!(
                     original = %request.uri,
                     rewritten = %target,
-                    "Request-URI を NGN ドメインに正規化"
+                    "Request-URI を P-CSCF IP+port に正規化"
                 );
             }
             let ext_offer = request.body.clone();
 
             // CallManager があれば RTP ブリッジ用ソケットを先に確保し、
             // NGN へ送る INVITE の SDP を sabiden 側に書き換える。
+            // CallManager 未注入 (透過モード) でも、Asterisk 実機準拠で SDP の
+            // `c=` / `o=` IP は **必ず** NGN 側 (eth1 IP = sent-by IP) へ強制
+            // 書換する (`docs/asterisk-real-invite.md` §5.2)。LAN private IP
+            // (192.168.x.x) を NGN 側に漏らすと 403 / 接続不能。
+            let ngn_local_ip = self.ngn_uac.config().local_addr.ip();
             let (bridge_ctx, sdp_for_ngn) =
                 match self.prepare_outbound_bridge(&ext_offer).await {
                     Ok(Some((ctx, rewritten))) => (Some(ctx), Some(rewritten)),
                     Ok(None) => (
                         None,
-                        if ext_offer.is_empty() {
-                            None
-                        } else {
-                            Some(ext_offer.clone())
-                        },
+                        force_rewrite_sdp_for_ngn(&ext_offer, ngn_local_ip),
                     ),
                     Err(e) => {
-                        warn!(error=%e, "NGN 側 RTP ブリッジ準備失敗 → SDP 透過");
+                        warn!(error=%e, "NGN 側 RTP ブリッジ準備失敗 → SDP 強制書換で続行");
                         (
                             None,
-                            if ext_offer.is_empty() {
-                                None
-                            } else {
-                                Some(ext_offer.clone())
-                            },
+                            force_rewrite_sdp_for_ngn(&ext_offer, ngn_local_ip),
                         )
                     }
                 };
@@ -1629,6 +1587,104 @@ pub fn wire_ngn_inbound_with_metrics(
     handler
 }
 
+/// 内線が出した INVITE の Request-URI を NGN 直収用に正規化する。
+///
+/// NTT NGN (P-CSCF) は Request-URI の host が IP アドレス (P-CSCF IP) で
+/// あることを要求する。LAN private IP (例: `192.168.20.239`) や NGN ドメイン
+/// (例: `ntt-east.ne.jp`) のままだと **403 Forbidden** で蹴られる
+/// (`docs/asterisk-real-invite.md` §3 / §5.1 — Asterisk 20 が同一線で
+/// `sip:117@118.177.125.1:5060` で 200 OK を取得した実機キャプチャ準拠)。
+///
+/// 引数:
+/// - `req_uri`: 内線が出した SIP URI (例: `sip:117@192.168.20.239`)
+/// - `ngn_server_host`: P-CSCF IP (例: `118.177.125.1`)
+/// - `ngn_server_port`: P-CSCF port (通常 `5060`)
+///
+/// 戻り値: `sip:<user>@<ngn_server_host>:<ngn_server_port>` 形式の URI。
+/// 既に host:port が一致していればそのまま返す (idempotent)。
+/// パース不能な URI は変更せず元のまま返す (フェイルセーフ)。
+pub fn normalize_request_uri_for_ngn(
+    req_uri: &str,
+    ngn_server_host: &str,
+    ngn_server_port: u16,
+) -> String {
+    // SIP URI の最低限のパース: `<scheme>:<user>@<host>[:port]` または
+    // `<scheme>:<host>[:port]` (user 部省略は今回考慮しない)。
+    // パラメータ (`;param`) があれば後段で温存する。
+    let (scheme_user_part, host_with_params) = match req_uri.split_once('@') {
+        Some(parts) => parts,
+        None => {
+            // user 部なしの SIP URI は NGN 直収では基本想定しない。フェイルセーフで原文返す。
+            return req_uri.to_string();
+        }
+    };
+    // host_with_params: "192.168.20.239" or "ntt-east.ne.jp;transport=udp" 等
+    let (host_port, params) = match host_with_params.split_once(';') {
+        Some((hp, rest)) => (hp, Some(rest)),
+        None => (host_with_params, None),
+    };
+    let current_host = host_port.split(':').next().unwrap_or(host_port);
+    // 既に P-CSCF host:port を指していれば idempotent。port が違えば書換。
+    let already_pcsf_host = current_host.eq_ignore_ascii_case(ngn_server_host);
+    let port_part = host_port.split_once(':').map(|x| x.1).unwrap_or("");
+    let already_pcsf_port = port_part == ngn_server_port.to_string();
+    if already_pcsf_host && already_pcsf_port {
+        return req_uri.to_string();
+    }
+    // 再構築。`scheme:user@<pcsf_host>:<pcsf_port>[;params]`
+    let new_host_port = format!("{}:{}", ngn_server_host, ngn_server_port);
+    match params {
+        Some(p) => format!("{}@{};{}", scheme_user_part, new_host_port, p),
+        None => format!("{}@{}", scheme_user_part, new_host_port),
+    }
+}
+
+/// 内線→NGN 発信時の SDP 強制書換 (CallManager 未注入時のフォールバック)。
+///
+/// Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.2): NGN へ出す INVITE の
+/// SDP に LAN private IP (192.168.x.x 等) を載せると応答先が成立しない。
+/// `c=` / `o=` IP は **必ず** sabiden eth1 (NGN 側 sent-by) IP に書換える。
+///
+/// RTP port は本パスでは sabiden が中継しないため、内線広告の port を
+/// そのまま広告する (= NGN→内線 RTP は経路上 NAT 越えできないため音声は
+/// 流れないが、SIP signaling は通り 200 OK を取れる)。本来は CallManager を
+/// `main.rs` で注入し `prepare_outbound_bridge` 経由で IP/port 両方を sabiden
+/// 側に書換るのが正解。
+///
+/// 戻り値:
+/// - 入力が空なら `None`
+/// - 書換成功なら `Some(rewritten_bytes)`
+/// - 書換失敗 (SDP パースエラー等) でも、元 body を `Some` で返す
+///   (LAN IP を漏らすが、INVITE 自体は出る)。warn ログで観測可能。
+fn force_rewrite_sdp_for_ngn(ext_offer: &[u8], ngn_local_ip: IpAddr) -> Option<Vec<u8>> {
+    if ext_offer.is_empty() {
+        return None;
+    }
+    // 元 SDP の m=audio port を温存しつつ c=/o= IP のみ NGN 側へ書き換える。
+    // rewrite_rtp_endpoint は port も書き換えてしまうため、まず port を取り出す。
+    let port = match crate::sdp::SessionDescription::parse(
+        std::str::from_utf8(ext_offer).unwrap_or(""),
+    ) {
+        Ok(sdp) => sdp
+            .media
+            .iter()
+            .find(|m| m.media == "audio")
+            .map(|m| m.port)
+            .unwrap_or(0),
+        Err(e) => {
+            warn!(error=%e, "SDP パース失敗 → 元 body のまま (LAN IP 漏洩リスク)");
+            return Some(ext_offer.to_vec());
+        }
+    };
+    match rewrite_rtp_endpoint(ext_offer, ngn_local_ip, port) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            warn!(error=%e, "SDP 強制書換失敗 → 元 body のまま (LAN IP 漏洩リスク)");
+            Some(ext_offer.to_vec())
+        }
+    }
+}
+
 /// `wire_ngn_inbound` の `CallManager` 接続版。RTP ブリッジを起動する経路。
 pub fn wire_ngn_inbound_with_manager(
     _layer: Arc<TransactionLayer>,
@@ -1883,6 +1939,207 @@ mod tests {
         let forker = make_forker(uac);
         // 型確認のみ (本体は manager::tests でカバー)
         let _ = forker;
+    }
+
+    /// Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.1):
+    /// 内線が出した Request-URI が LAN private IP / NGN ドメインのどちらでも
+    /// P-CSCF IP+port (`118.177.125.1:5060`) に正規化される。
+    #[test]
+    fn normalize_request_uri_rewrites_to_pcsf_ip() {
+        // ケース 1: LAN private IP → P-CSCF IP+port
+        let lan = "sip:117@192.168.20.239";
+        let out = normalize_request_uri_for_ngn(lan, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース 2: NGN ドメイン (`ntt-east.ne.jp`) → P-CSCF IP+port
+        // (NGN は host が IP でないと 403 を返す実機証拠あり)
+        let domain = "sip:117@ntt-east.ne.jp";
+        let out = normalize_request_uri_for_ngn(domain, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース 3: LAN IP に port 付き
+        let lan_port = "sip:117@192.168.20.239:5060";
+        let out = normalize_request_uri_for_ngn(lan_port, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース 4: 既に P-CSCF host:port なら idempotent (= 変更しない)
+        let already = "sip:117@118.177.125.1:5060";
+        let out = normalize_request_uri_for_ngn(already, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース 5: パラメータ (`;transport=udp` 等) は温存される
+        let with_params = "sip:117@ntt-east.ne.jp;transport=udp";
+        let out = normalize_request_uri_for_ngn(with_params, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060;transport=udp");
+    }
+
+    /// Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.2):
+    /// 内線 SDP に乗っている LAN private IP (`192.168.30.162` 等) は
+    /// NGN 行きの INVITE では eth1 IP に強制書換される。
+    #[test]
+    fn outbound_invite_sdp_rewrites_private_ip_to_eth1() {
+        let ext_offer = b"v=0\r\n\
+                          o=iphone 2246 1745 IN IP4 192.168.30.162\r\n\
+                          s=Talk\r\n\
+                          c=IN IP4 192.168.30.162\r\n\
+                          t=0 0\r\n\
+                          m=audio 55120 RTP/AVP 0\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n";
+        let eth1_ip: IpAddr = "118.177.72.242".parse().unwrap();
+        let rewritten = force_rewrite_sdp_for_ngn(ext_offer, eth1_ip).expect("Some");
+        let parsed = crate::sdp::SessionDescription::parse(
+            std::str::from_utf8(&rewritten).unwrap(),
+        )
+        .expect("rewritten SDP must parse");
+
+        // c= / o= は eth1 IP に書換 (LAN private は漏らさない)
+        assert_eq!(parsed.connection.as_ref().unwrap().address, eth1_ip);
+        assert_eq!(parsed.origin.address, eth1_ip);
+        // RTP port は内線広告の port をそのまま温存 (中継不能でも SIP は通る)
+        assert_eq!(parsed.media[0].port, 55120);
+
+        // 空 body は None
+        assert!(force_rewrite_sdp_for_ngn(b"", eth1_ip).is_none());
+    }
+
+    /// Asterisk 実機準拠 e2e: 内線 INVITE に対し UasEventHandler が NGN へ
+    /// プロキシする際、出力 INVITE の Request-URI が P-CSCF IP:port になる。
+    /// `docs/asterisk-real-invite.md` §3 / §5.1 の事故再現テスト。
+    #[tokio::test]
+    async fn invite_request_uri_uses_pcsf_ip_when_proxied_from_extension() {
+        use crate::sip::uac::UacConfig;
+
+        // (1) フェイク NGN (= P-CSCF) サーバ: INVITE を受けたら Request-URI を
+        //     検査して 200 OK を返す。
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let captured_uri: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_via: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_uri_c = captured_uri.clone();
+        let captured_via_c = captured_via.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_message(&buf[..n]).unwrap();
+            if let SipMessage::Request(req) = parsed {
+                *captured_uri_c.lock().unwrap() = Some(req.uri.clone());
+                *captured_via_c.lock().unwrap() =
+                    req.headers.get("via").map(str::to_string);
+                let mut resp = build_response_skeleton(&req, 200, "OK");
+                resp.headers.set(
+                    "To",
+                    format!("{};tag=ngn-tag", req.headers.get("to").unwrap()),
+                );
+                resp.headers
+                    .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+                fake_ngn_clone
+                    .send_to(&resp.to_bytes(), peer)
+                    .await
+                    .unwrap();
+                let _ = fake_ngn_clone.recv_from(&mut buf).await;
+            }
+        });
+
+        // (2) sabiden NGN 側 UAC: server_addr = fake_ngn (P-CSCF 役)。
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // (3) UasEventHandler を起動 (CallManager 無し = SDP 強制書換パス)
+        let handler = UasEventHandler::new(ngn_uac.clone());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        handler.spawn(event_rx);
+
+        // (4) 模擬内線 UAS: ServerTransaction を sabiden 内に作って
+        //     UasEvent を直接 push する。
+        let phone_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_addr = phone_sock.local_addr().unwrap();
+        let sabiden_uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+
+        // 内線が出すであろう INVITE: Request-URI は LAN IP (= 内線 UA から見た sabiden)。
+        // ここでは "sip:117@192.168.20.239" を模擬。
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:117@192.168.20.239");
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKptest", phone_addr),
+        );
+        invite
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=phonereq");
+        invite.headers.set("To", "<sip:117@192.168.20.239>");
+        invite.headers.set("Call-ID", "uri-rewrite-cid");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Content-Type", "application/sdp");
+        invite.body = b"v=0\r\n\
+                        o=iphone 2246 1745 IN IP4 192.168.30.162\r\n\
+                        s=Talk\r\n\
+                        c=IN IP4 192.168.30.162\r\n\
+                        t=0 0\r\n\
+                        m=audio 55120 RTP/AVP 0\r\n\
+                        a=rtpmap:0 PCMU/8000\r\n"
+            .to_vec();
+        phone_sock
+            .send_to(&invite.to_bytes(), sabiden_uas_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) = tokio::time::timeout(
+            Duration::from_secs(2),
+            sabiden_uas_sock.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let parsed = parse_message(&buf[..n]).unwrap();
+        let req = match parsed {
+            SipMessage::Request(r) => r,
+            _ => panic!("INVITE 期待"),
+        };
+        let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
+        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        event_tx
+            .send(UasEvent::Invite {
+                from_aor: "iphone".to_string(),
+                request: req,
+                remote,
+                responder,
+            })
+            .unwrap();
+
+        // (5) NGN タスクが Request-URI を回収するまで待つ
+        let _ = ngn_task.await;
+
+        // (6) 検証: 出力 INVITE の Request-URI は P-CSCF IP:port (= fake_ngn_addr) に
+        //         書換わっているはず。
+        let uri = captured_uri
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NGN へ INVITE が届くべき");
+        let pcsf_str = fake_ngn_addr.to_string();
+        let user_at_pcsf = format!("sip:117@{}", pcsf_str);
+        assert_eq!(
+            uri, user_at_pcsf,
+            "Request-URI は P-CSCF IP+port に書換わるべき (Asterisk pcap §5.1)"
+        );
+        // 副次確認: Via に rport が付いていること (§5.5)
+        let via = captured_via.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            via.contains(";rport"),
+            "Via に `;rport` が必要 (Asterisk pcap §5.5): got {}",
+            via
+        );
     }
 
     /// 内線 UA → 内線 UAS → UasEventHandler → NGN UAC → フェイク NGN の

@@ -6,9 +6,10 @@
 //! 直接使わない (CONTRIBUTING / ARCHITECTURE.md の責務分担に従う)。
 //!
 //! NTT NGN 制約:
-//! - Via に `rport` を付けない
+//! - Via に `rport` を付ける (Asterisk 実機キャプチャ準拠、`docs/asterisk-real-invite.md` §3 / §5.5)
 //! - Session Timer の既定値は 300 秒、Min-SE は 90 秒
 //! - DSCP は呼び出し側 socket 構築時に設定済みであることを前提
+//! - `P-Preferred-Identity` / `Privacy` は付けない (Asterisk が無しで 200 OK を取得した実機証拠あり、§5.3)
 //!
 //! ## 高水準 API
 //! - [`Uac::invite`][] : INVITE を送り 2xx を得たらダイアログを確立
@@ -99,9 +100,15 @@ impl Uac {
         let session_expires = session_expires_secs.unwrap_or(DEFAULT_SESSION_EXPIRES);
 
         let mut req = SipRequest::new(SipMethod::Invite, target_uri.to_string());
+        // RFC 3581 / Asterisk 実機準拠: Via に `;rport` を付ける。
+        // NGN P-CSCF が NAT 越えで応答先 port を学習できる形式 (Asterisk pcap §3 参照)。
         req.headers.set(
             "Via",
-            format!("SIP/2.0/UDP {};branch={}", self.config.sent_by(), branch),
+            format!(
+                "SIP/2.0/UDP {};rport;branch={}",
+                self.config.sent_by(),
+                branch
+            ),
         );
         req.headers.set("Max-Forwards", "70");
         req.headers.set(
@@ -122,17 +129,10 @@ impl Uac {
         );
         req.headers.set("Min-SE", MIN_SE.to_string());
         req.headers.set("User-Agent", &self.config.user_agent);
-        // RFC 3325: NTT NGN P-CSCF は INVITE で発信者番号 (caller-ID) を
-        // `P-Preferred-Identity: <sip:<phone>@ntt-east.ne.jp>` で提示するよう
-        // 求めてくる。これが無いと 403 Forbidden で蹴られる (実機 trace で確認、
-        // home-ops #205 の REGISTER 認証なし仮説は INVITE には適用されない)。
-        // `Privacy: none` も併送する (RFC 3323 / NTT 仕様で識別保留しないことの
-        // 明示。NGN は Privacy ヘッダの存在自体を要求するケースあり)。
-        req.headers.set(
-            "P-Preferred-Identity",
-            format!("<{}>", self.config.local_addr_of_record()),
-        );
-        req.headers.set("Privacy", "none");
+        // P-Preferred-Identity / Privacy は付けない (Asterisk 実機キャプチャ準拠、
+        // `docs/asterisk-real-invite.md` §5.3): Asterisk 20 が同一 NGN 線で両方
+        // 無しのまま 117 へ INVITE を送り 200 OK を取得した。逆に sabiden が
+        // PPI/Privacy 付きで送っても 403 のままだった事実とも整合する。
 
         if let Some(body) = sdp_offer {
             req.headers.set("Content-Type", "application/sdp");
@@ -212,6 +212,8 @@ impl Uac {
     }
 
     /// 上流 SIP サーバ (NGN 経路では P-CSCF) のアドレス。
+    /// orchestrator が Request-URI を P-CSCF IP+port に書き換えるとき使う。
+    /// Asterisk 実機準拠の host 補正に必要 (`docs/asterisk-real-invite.md` §5.1)。
     pub fn server_addr(&self) -> SocketAddr {
         self.server_addr
     }
@@ -411,32 +413,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invite_includes_p_preferred_identity_and_privacy_for_ngn() {
-        // NTT NGN P-CSCF は INVITE で発信者番号を P-Preferred-Identity で
-        // 提示するよう要求し、無いと 403 Forbidden を返す。Privacy ヘッダの
-        // 存在自体も要求するため `Privacy: none` を併送する必要がある。
-        // 実機 (118.177.125.1) で 117 / 携帯番号宛に対し 403 を観測した
-        // のを契機に追加。
+    async fn invite_omits_p_preferred_identity_and_privacy_per_asterisk_pcap() {
+        // Asterisk 実機キャプチャ準拠 (`docs/asterisk-real-invite.md` §5.3):
+        // Asterisk 20 は同一 NGN 線で `P-Preferred-Identity` も `Privacy` も
+        // 付けずに 117 へ INVITE を送り 200 OK を取得した。逆に sabiden が
+        // 両ヘッダ付きで送っても 403 のままだった事実とも整合する。
+        // 過去の場当たり (両ヘッダ追加) を撤去した根拠を残す再発防止テスト。
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (layer, _rx) = TransactionLayer::spawn(socket);
         let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let uac = Uac::new(cfg(), layer, server);
-        let plan = uac.build_invite("sip:117@ntt-east.ne.jp", None, None);
+        let plan = uac.build_invite("sip:117@118.177.125.1:5060", None, None);
         let req = &plan.request;
-        assert_eq!(
-            req.headers.get("p-preferred-identity"),
-            Some("<sip:0312345678@ntt-east.ne.jp>"),
-            "PPI ヘッダが無いと NGN は 403 Forbidden を返す"
+        assert!(
+            req.headers.get("p-preferred-identity").is_none(),
+            "PPI は付けない (Asterisk 実機証拠)"
         );
-        assert_eq!(
-            req.headers.get("privacy"),
-            Some("none"),
-            "Privacy ヘッダ自体の存在を NGN は要求する"
+        assert!(
+            req.headers.get("privacy").is_none(),
+            "Privacy は付けない (Asterisk 実機証拠)"
         );
+        // Via に `;rport` が含まれること (RFC 3581 / Asterisk 実機準拠)
+        let via = req.headers.get("via").unwrap();
+        assert!(via.contains(";rport"), "Via に rport が必要: {}", via);
     }
 
     #[test]
-    fn invite_plan_includes_session_timer_and_no_rport() {
+    fn invite_plan_includes_session_timer_and_rport() {
         let socket_layer_addr: SocketAddr = "[::1]:1".parse().unwrap();
         // Layer は実際には使わないが、型を満たすため bind なしで Arc 経由で渡す
         // → 実際にレイヤを起動するテストは下の async test に任せる。
@@ -520,8 +523,14 @@ mod tests {
         let uac = Uac::new(uac_cfg, layer, server_addr);
 
         let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, Some(300));
-        // Via に rport 不付与
-        assert!(!plan.request.headers.get("via").unwrap().contains("rport"));
+        // Asterisk 実機準拠: Via に `;rport` が付与される (`docs/asterisk-real-invite.md` §3, §5.5)。
+        assert!(
+            plan.request.headers.get("via").unwrap().contains(";rport"),
+            "Via に `;rport` パラメータが含まれるべき (Asterisk pcap 準拠)"
+        );
+        // P-Preferred-Identity / Privacy は付けない (Asterisk は無しで 200 OK 取得、§5.3)。
+        assert!(plan.request.headers.get("p-preferred-identity").is_none());
+        assert!(plan.request.headers.get("privacy").is_none());
         // Session Timer ヘッダ
         assert_eq!(
             plan.request.headers.get("session-expires").unwrap(),

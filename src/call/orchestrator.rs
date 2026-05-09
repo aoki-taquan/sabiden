@@ -872,7 +872,21 @@ impl UasEventHandler {
         );
         async move {
             info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
-            let target = request.uri.clone();
+            // 内線が出した Request-URI は host が sabiden 側 LAN IP (内線 UAS の
+            // bind IP) のため、そのまま NGN にプロキシすると P-CSCF が
+            // `403 Forbidden` で蹴る (NGN は LAN IP 宛 URI を受け付けない)。
+            // NGN ドメイン (`UacConfig::domain`) に正規化する。To ヘッダは
+            // `Uac::build_invite` 内で target から組み立てるため自動で揃う。
+            let cfg = self.ngn_uac.config();
+            let server_host = self.ngn_uac.server_addr().ip().to_string();
+            let target = normalize_request_uri_for_ngn(&request.uri, &cfg.domain, &server_host);
+            if target != request.uri {
+                debug!(
+                    original = %request.uri,
+                    rewritten = %target,
+                    "Request-URI を NGN ドメインに正規化"
+                );
+            }
             let ext_offer = request.body.clone();
 
             // CallManager があれば RTP ブリッジ用ソケットを先に確保し、

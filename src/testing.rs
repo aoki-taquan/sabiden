@@ -31,7 +31,11 @@
 //! - RFC 3261 §9.1:    CANCEL は 487 Request Terminated を伴う
 
 #![cfg(test)]
-#![allow(dead_code)] // 段階的に各テストへ移行するためダム未使用は許容する
+// `dead_code` を許容したい (段階的にハーネスへ移行する都合) が、`main.rs` 側の
+// `mod testing;` 宣言にも `#[allow(dead_code)]` が付いており clippy
+// `duplicated_attributes` に引っかかるため、本ファイル側ではモジュール属性を
+// 重ねず、必要な箇所で個別 `#[allow(dead_code)]` を付与する方針とする。
+// (`lib.rs` 側からの取込時はそちらの宣言が dead_code を抑止する。)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -234,7 +238,8 @@ pub mod builders {
         req.headers.set("To", format!("<sip:{}@sabiden>", user));
         req.headers.set("Call-ID", new_call_id());
         req.headers.set("CSeq", "1 REGISTER");
-        req.headers.set("Contact", format!("<sip:{}@{}>", user, local));
+        req.headers
+            .set("Contact", format!("<sip:{}@{}>", user, local));
         req.headers.set("Expires", "300");
         if let Some(a) = authorization {
             req.headers.set("Authorization", a);
@@ -259,7 +264,8 @@ pub mod builders {
         req.headers.set("To", format!("<{}>", request_uri));
         req.headers.set("Call-ID", new_call_id());
         req.headers.set("CSeq", "1 INVITE");
-        req.headers.set("Contact", format!("<sip:{}@{}>", user, local));
+        req.headers
+            .set("Contact", format!("<sip:{}@{}>", user, local));
         if let Some(a) = authorization {
             req.headers.set("Authorization", a);
         }
@@ -276,10 +282,8 @@ pub mod builders {
         body: Vec<u8>,
     ) -> SipRequest {
         let mut req = SipRequest::new(SipMethod::Invite, request_uri);
-        req.headers.set(
-            "Via",
-            format!("SIP/2.0/UDP {};branch={}", ngn_addr, branch),
-        );
+        req.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", ngn_addr, branch));
         req.headers.set("Max-Forwards", "70");
         req.headers
             .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn-test");
@@ -684,8 +688,7 @@ pub mod pcsf {
                                 let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
                             }
                             _ => {
-                                let resp =
-                                    build_response_skeleton(&req, 405, "Method Not Allowed");
+                                let resp = build_response_skeleton(&req, 405, "Method Not Allowed");
                                 let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
                             }
                         }
@@ -857,8 +860,13 @@ pub mod ext_ua {
             body: Vec<u8>,
         ) -> Result<SipResponse> {
             // 1) authless INVITE → 401
-            let mut req1 =
-                builders::invite_from_phone(&self.local_addr, &self.user, request_uri, "z9hG4bKi1", None);
+            let mut req1 = builders::invite_from_phone(
+                &self.local_addr,
+                &self.user,
+                request_uri,
+                "z9hG4bKi1",
+                None,
+            );
             if !body.is_empty() {
                 req1.headers.set("Content-Type", "application/sdp");
                 req1.body = body.clone();
@@ -901,11 +909,7 @@ pub mod ext_ua {
         }
 
         /// 任意のリクエストをそのまま送る (CANCEL / BYE 等)。
-        pub async fn send_request(
-            &self,
-            server: SocketAddr,
-            req: &SipRequest,
-        ) -> Result<()> {
+        pub async fn send_request(&self, server: SocketAddr, req: &SipRequest) -> Result<()> {
             self.socket.send_to(&req.to_bytes(), server).await?;
             Ok(())
         }
@@ -1005,8 +1009,10 @@ pub mod webrtc_browser {
 
         /// `PendingAnswers::deliver` 風: offer を送り、answer 文字列を待つ。
         pub async fn offer_and_wait_answer(&mut self, sdp_offer: &str) -> Result<String> {
-            let payload =
-                format!(r#"{{"type":"offer","sdp":{}}}"#, serde_json::to_string(sdp_offer)?);
+            let payload = format!(
+                r#"{{"type":"offer","sdp":{}}}"#,
+                serde_json::to_string(sdp_offer)?
+            );
             self.send_text(&payload).await?;
             let resp = self.recv_text().await?;
             // answer 形式: {"type":"answer","sdp":"..."}
@@ -1110,17 +1116,10 @@ mod self_tests {
         let phone = ext_ua::MockExtensionUa::bind("iphone", "secret")
             .await
             .unwrap();
-        let req = builders::register_from_phone(
-            &phone.local_addr,
-            "iphone",
-            "z9hG4bKsmoke-pcsf",
-            None,
-        );
+        let req =
+            builders::register_from_phone(&phone.local_addr, "iphone", "z9hG4bKsmoke-pcsf", None);
         phone.send_request(pcsf.addr, &req).await.unwrap();
-        let resp = phone
-            .recv_response(Duration::from_secs(2))
-            .await
-            .unwrap();
+        let resp = phone.recv_response(Duration::from_secs(2)).await.unwrap();
         assert_eq!(resp.status_code, 200);
     }
 }

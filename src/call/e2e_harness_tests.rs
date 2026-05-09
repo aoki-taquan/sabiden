@@ -378,10 +378,7 @@ async fn harness_pieces_compose_smoke() {
         Some("Digest dummy"),
     );
     phone.send_request(pcsf.addr, &req).await.unwrap();
-    let resp = phone
-        .recv_response(Duration::from_secs(2))
-        .await
-        .unwrap();
+    let resp = phone.recv_response(Duration::from_secs(2)).await.unwrap();
     asserts::assert_status_code(&resp, 200, "MockNgnPcsf::AlwaysAccept");
 
     // observed に 1 件記録されている

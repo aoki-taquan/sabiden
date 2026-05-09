@@ -766,9 +766,7 @@ mod tests {
         invite.headers.set("To", "<sip:dest@sabiden>");
         invite.headers.set("Call-ID", "uas-call-id@sabiden");
         invite.headers.set("CSeq", "1 INVITE");
-        invite
-            .headers
-            .set("Contact", "<sip:iphone@192.0.2.1:5060>");
+        invite.headers.set("Contact", "<sip:iphone@192.0.2.1:5060>");
 
         // sabiden が応答した 200 OK (To に sabiden 側の tag が乗る)
         let mut headers = SipHeaders::new();

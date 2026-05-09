@@ -22,6 +22,12 @@ pub mod transcoder;
 #[cfg(test)]
 mod e2e_harness_tests;
 
+// Issue #45: NGN→内線 着信フロー専用 E2E テスト。
+// `NgnInboundHandler` の round-trip / 失敗パターン (480 / 408 / NGN CANCEL race) を
+// docs/architecture.md §4.2 / §5.7 のシーケンスに沿って網羅する。
+#[cfg(test)]
+mod inbound_e2e_tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 通話の状態 (RFC 3261 §13 + 内部状態)。

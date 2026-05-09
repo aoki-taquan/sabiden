@@ -168,6 +168,89 @@ impl Dialog {
         })
     }
 
+    /// 受信した INVITE と自身が返した 2xx 応答から **UAS 側ダイアログ** を構築する。
+    ///
+    /// B2BUA で sabiden が内線 (UA) からの INVITE を受け、上位レッグ (NGN) と
+    /// やり取りした結果を内線へ 2xx で返した直後に呼ぶ。以降このダイアログを
+    /// 介して内線へ in-dialog リクエスト (BYE / Re-INVITE) を sabiden が UAC として
+    /// 送出する。RFC 3261 §12.1.1 の UAS 側 dialog 確立規則に従う:
+    ///
+    /// - `local_tag` = 我々が応答に付けた To-tag (= response To-tag)
+    /// - `remote_tag` = INVITE From-tag
+    /// - `local_uri` / `remote_uri` は cfg で指定 (我々視点の From / To URI)
+    /// - `remote_target` = INVITE の Contact ヘッダ (= 内線が次に受け取る宛先)
+    /// - `route_set` = INVITE の Record-Route を **そのままの順序** で保持
+    ///   (UAS 側は受信順, RFC 3261 §12.1.1)
+    /// - `local_cseq` は INVITE と無関係に独自採番 (内線は in-dialog で別 CSeq)
+    pub fn from_uas_invite(
+        invite: &SipRequest,
+        response: &SipResponse,
+        cfg: DialogConfig,
+    ) -> Result<Self> {
+        let call_id = invite
+            .headers
+            .get("call-id")
+            .ok_or_else(|| anyhow!("INVITE に Call-ID がない"))?
+            .to_string();
+        let from = invite
+            .headers
+            .get("from")
+            .ok_or_else(|| anyhow!("INVITE に From がない"))?;
+        let to = response
+            .headers
+            .get("to")
+            .ok_or_else(|| anyhow!("応答に To がない"))?;
+        let remote_tag = parse_tag(from)
+            .ok_or_else(|| anyhow!("INVITE From に tag がない: {}", from))?
+            .to_string();
+        let local_tag = parse_tag(to)
+            .ok_or_else(|| anyhow!("応答 To に tag がない: {}", to))?
+            .to_string();
+        let remote_target = invite
+            .headers
+            .get("contact")
+            .map(extract_uri)
+            .ok_or_else(|| anyhow!("INVITE に Contact がない"))?;
+        // UAS 側は Record-Route の **順序通り** (RFC 3261 §12.1.1)
+        let route_set: Vec<String> = invite
+            .headers
+            .get_all("record-route")
+            .into_iter()
+            .flat_map(split_route_header)
+            .collect();
+
+        let state = if response.status_code >= 200 && response.status_code < 300 {
+            DialogState::Confirmed
+        } else if response.status_code >= 100 && response.status_code < 200 {
+            DialogState::Early
+        } else {
+            return Err(anyhow!(
+                "ダイアログを作れない応答コード: {}",
+                response.status_code
+            ));
+        };
+
+        // UAS は INVITE と独立した CSeq 空間を持つ (RFC 3261 §12.2.1.1)。
+        // 1 から開始する。
+        let local_cseq = Arc::new(AtomicU32::new(1));
+
+        Ok(Self {
+            id: DialogId {
+                call_id,
+                local_tag,
+                remote_tag,
+            },
+            state,
+            local_uri: cfg.local_uri,
+            remote_uri: cfg.remote_uri,
+            remote_target,
+            route_set,
+            local_cseq,
+            local_contact: cfg.local_contact,
+            sent_by: cfg.sent_by,
+        })
+    }
+
     /// Early ダイアログを Confirmed に昇格させる (2xx 受信時)。
     /// route_set / remote_target は 2xx の値で更新する (RFC 3261 §13.2.2.4)。
     pub fn confirm(&mut self, response: &SipResponse) -> Result<()> {
@@ -668,5 +751,66 @@ mod tests {
     fn split_route_header_handles_multi_value_line() {
         let split = split_route_header("<sip:a;lr>, <sip:b;lr>");
         assert_eq!(split, vec!["<sip:a;lr>", "<sip:b;lr>"]);
+    }
+
+    #[test]
+    fn from_uas_invite_swaps_local_remote_tag_and_uses_invite_contact() {
+        // 内線が送ってきた INVITE: From-tag=ext-side, To に tag なし
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        invite
+            .headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKuasinv");
+        invite
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=ext-side");
+        invite.headers.set("To", "<sip:dest@sabiden>");
+        invite.headers.set("Call-ID", "uas-call-id@sabiden");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite
+            .headers
+            .set("Contact", "<sip:iphone@192.0.2.1:5060>");
+
+        // sabiden が応答した 200 OK (To に sabiden 側の tag が乗る)
+        let mut headers = SipHeaders::new();
+        headers.set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKuasinv");
+        headers.set("From", "<sip:iphone@sabiden>;tag=ext-side");
+        headers.set("To", "<sip:dest@sabiden>;tag=sabiden-side");
+        headers.set("Call-ID", "uas-call-id@sabiden");
+        headers.set("CSeq", "1 INVITE");
+        headers.set("Contact", "<sip:sabiden@10.0.0.1:5060>");
+        let response = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: Vec::new(),
+        };
+
+        let cfg = DialogConfig {
+            // sabiden 視点の local = 我々の URI (To から)
+            local_uri: "sip:dest@sabiden".to_string(),
+            // remote = 内線の URI (From)
+            remote_uri: "sip:iphone@sabiden".to_string(),
+            local_contact: "sip:sabiden@10.0.0.1:5060".to_string(),
+            sent_by: "10.0.0.1:5060".to_string(),
+        };
+        let dlg = Dialog::from_uas_invite(&invite, &response, cfg).unwrap();
+        assert_eq!(dlg.state(), DialogState::Confirmed);
+        assert_eq!(dlg.id().call_id, "uas-call-id@sabiden");
+        // sabiden 視点では local=200OK の To-tag, remote=INVITE の From-tag
+        assert_eq!(dlg.id().local_tag, "sabiden-side");
+        assert_eq!(dlg.id().remote_tag, "ext-side");
+        // Remote target は内線が INVITE で示した Contact
+        assert_eq!(dlg.remote_target(), "sip:iphone@192.0.2.1:5060");
+
+        // UAS 側 BYE は CSeq 1 から始まる (INVITE と独立)。
+        let bye = dlg.build_bye();
+        assert_eq!(bye.method, SipMethod::Bye);
+        assert_eq!(bye.headers.get("cseq").unwrap(), "1 BYE");
+        assert_eq!(bye.uri, "sip:iphone@192.0.2.1:5060");
+        // From は sabiden 側 (local), To は内線側 (remote)
+        let from = bye.headers.get("from").unwrap();
+        assert!(from.contains("tag=sabiden-side"), "from: {}", from);
+        let to = bye.headers.get("to").unwrap();
+        assert!(to.contains("tag=ext-side"), "to: {}", to);
     }
 }

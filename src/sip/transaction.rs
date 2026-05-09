@@ -404,6 +404,12 @@ impl TransactionLayer {
         self.tracer.clone()
     }
 
+    /// 受信ループで使っているソケットのローカルアドレス。
+    /// Via sent-by / Contact ヘッダ生成に使う。
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     async fn recv_loop(self: Arc<Self>) {
         let mut buf = vec![0u8; 8192];
         loop {

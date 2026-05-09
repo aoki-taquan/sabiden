@@ -559,7 +559,12 @@ sequenceDiagram
 
 WebRTC peer がブラウザから WS で `register` 済みの状態で、NGN から着信が
 来た場合のフロー。**現状一部未結線**: `Event::MediaData` を str0m から
-`TranscodingBridge` に流す経路が未実装 (Phase R6 / Issue #29)。
+`TranscodingBridge` に流す経路と、 RtpBridge と WebRTC peer の RTP 結線が
+未実装 (Phase R6 / Issue #29 + Issue #73 follow-up)。
+
+Issue #73 で sabiden 自身が **offerer** に切り替わった (NGN 由来生 SDP は
+ブラウザが DTLS-SRTP / ICE 認証情報不在で拒絶するため、`peer.create_offer()`
+で SAVPF/PCMU オファを生成して push する。RFC 8827 §6.5, RFC 8839 §4.1)。
 
 ```mermaid
 sequenceDiagram
@@ -582,15 +587,15 @@ sequenceDiagram
   Sig->>Browser: { type: registered, ext_id }
   Note over Browser,Sig: WebRTC peer 着信待ち
 
-  Pcscf->>NgnInb: INVITE
+  Pcscf->>NgnInb: INVITE (NGN SDP: RTP/AVP PCMU)
   NgnInb->>ExtReg: snapshot() → [..., (ext_id, webrtc.peer)]
-  NgnInb->>Sig: fork_to_bindings: dispatch WebRTC leg<br/>(LegOutcome 経由 / 現状: 偽 Via で SipResponse 組成)
-  Sig->>Peer: PeerSession::new + handle_offer(ngn_sdp)
-  Note right of Sig: あるべき: Negotiator::for_webrtc()<br/>で NGN PCMU offer を Opus offer に変換
-  Sig-->>Browser: { type: offer, sdp: ngn_sdp }
+  NgnInb->>Sig: fork_to_bindings: dispatch WebRTC leg
+  Sig->>Peer: peer.create_offer()<br/>(sabiden が offerer; SAVPF/PCMU + DTLS fingerprint + ICE)
+  Peer-->>Sig: SAVPF/PCMU SDP オファ
+  Sig-->>Browser: { type: offer, sdp: savpf_offer }
   Browser->>Browser: setRemoteDescription + createAnswer
-  Browser-->>Sig: { type: answer, sdp: web_sdp }
-  Sig->>Peer: handle_offer 内部で answer 完成
+  Browser-->>Sig: { type: answer, sdp: savpf_answer }
+  Sig->>Peer: peer.accept_answer(savpf_answer)
   par ICE candidate 交換 (trickle)
     Peer-->>Sig: local cand
     Sig-->>Browser: { type: ice, candidate }
@@ -598,11 +603,12 @@ sequenceDiagram
     Sig->>Peer: add_ice_candidate
   end
   Note over Browser,Peer: ICE / DTLS-SRTP 確立
-  Peer-->>NgnInb: LegOutcome::Established(answer)
+  Sig-->>NgnInb: LegResult::Established (body = convert_savpf_to_avp(savpf_answer))
+  NgnInb->>NgnInb: start_bridge_for_inbound:<br/>rewrite c=/m= port → sabiden NGN socket
   NgnInb->>Pcscf: 200 OK (sabiden の RTP socket を指す SDP)
   Pcscf->>NgnInb: ACK
 
-  Note over Pcscf,Browser: メディア結線 (現状 TODO #29)
+  Note over Pcscf,Browser: メディア結線 (現状 TODO #29 + 別 Issue)
   Pcscf-->>NgnInb: RTP PCMU
   NgnInb-->>Trans: (TODO) RTP transcoder 経由
   Trans-->>Peer: RTP Opus → str0m write_rtp
@@ -613,12 +619,20 @@ sequenceDiagram
   NgnInb-->>Pcscf: RTP PCMU
 ```
 
+> なお `start_bridge_for_inbound` が起動できなかった場合、 WebRTC leg の
+> 200 OK SDP body は `c=IN IP4 0.0.0.0` / `m=audio 9` のままなので、
+> `NgnInboundHandler::handle_invite` は **502 Bad Gateway** を返して呼を
+> 放棄する (Issue #73 review)。 transparent モード (`call_manager == None`,
+> Issue #15 互換) でも、 `is_unrewritten_webrtc_sdp` が `0.0.0.0:9` を
+> 検知したら 502 に切り替える。 SIP leg のみの transparent 動作は従来どおり。
+
 #### 現状実装と「あるべき」のギャップ
 
 | 項目 | 現状 (`webrtc/str0m_session.rs:386` 周辺) | あるべき (Phase R6) |
 |---|---|---|
 | `Event::MediaData` の扱い | drop (TODO #29) | `media_in_tx: mpsc::Sender<MediaPacket>` 経由で `TranscodingBridge` に流す |
-| NGN SDP → browser SDP 変換 | NGN PCMU offer をそのまま push (str0m が `RTP/AVP` を解釈失敗する個体あり) | `Negotiator::for_webrtc()` で `UDP/TLS/RTP/SAVPF` + Opus + DTLS fingerprint 付きの offer に再合成 |
+| NGN SDP → browser SDP 変換 | Issue #73 で `peer.create_offer()` 経由に切替済 (SAVPF/PCMU オファを sabiden 側生成、DTLS fingerprint / ICE 認証情報込み)。Negotiator API (RFC 3264 統合) は別 Issue (Phase R3) | `Negotiator::for_webrtc()` で NGN ⇔ browser のコーデック折衝を Opus 含めて一元化 |
+| WebRTC peer ↔ RtpBridge 結線 | `extract_rtp_endpoint(savpf_answer) = 0.0.0.0:9` で意味のある RTP 宛先にならない (str0m が独自 UDP socket を持つため、 `RtpBridge` 経由の relay には別経路が必要) | str0m の RTP I/O を `MediaPacket` チャンネルに繋ぎ、 `TranscodingBridge` で NGN 側 PCMU と双方向中継 (Issue #73 follow-up) |
 | ICE failure 通知 | `local_cand_rx` が drop されたら run_loop 終了するだけ | `B2buaCall` に通知 → NGN レッグで CANCEL 発射 |
 | `ExtTransport::WebRtc` の bind 構造 | `registrar.rs` が `webrtc::peer::PeerSession` を直接 import (層越境) | `ExtCallTarget` trait 経由 |
 

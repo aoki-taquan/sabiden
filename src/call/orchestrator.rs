@@ -52,7 +52,7 @@ use super::bridge::{BridgeConfig, RtpBridge};
 use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
-use crate::sdp::builder::rewrite_rtp_endpoint;
+use crate::sdp::builder::{restrict_audio_to_pcmu, rewrite_rtp_endpoint};
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
@@ -132,6 +132,11 @@ pub struct NgnInboundHandler {
     /// 確立済み通話の Call-ID → `Option<CallId>` 対応。BYE 時にブリッジ停止に使う。
     /// `None` の値は「確立済みだが RTP ブリッジ未起動 (透過モード)」を意味する。
     active: Arc<Mutex<HashMap<String, Option<CallId>>>>,
+    /// 進行中 (= 内線フォーク中) の INVITE。NGN から CANCEL が来たときに
+    /// `Notify::notify_one` を撃って fork を打ち切るために保持する
+    /// (RFC 3261 §9.1: NGN が CANCEL を出した時点で sabiden は内線フォークを
+    /// 中止し、INVITE には 487 Request Terminated を返す)。
+    in_flight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// RTP ブリッジを管理する Call Manager。`None` なら SDP 透過モードで動く
     /// (Issue #15 互換)。
     call_manager: Option<Arc<CallManager>>,
@@ -168,6 +173,7 @@ impl NgnInboundHandler {
             cfg,
             pending: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             call_manager: None,
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -208,6 +214,7 @@ impl NgnInboundHandler {
             cfg,
             pending: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -250,10 +257,19 @@ impl NgnInboundHandler {
                 Ok(())
             }
             SipMethod::Cancel => {
-                let stx = ServerTransaction::new(request, remote, self.socket.clone())?;
-                let mut tx = stx;
+                // RFC 3261 §9.2: CANCEL は新しい transaction で 200 OK を返し、
+                // INVITE 側は 487 Request Terminated で完了させる。
+                // 進行中の内線フォークがあれば `in_flight` に登録した Notify を
+                // 撃って `handle_invite` 側 (tokio::select!) に「中止」を伝える。
+                let cid = request.headers.get("call-id").map(str::to_string);
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
                 tx.respond(build_response_skeleton(tx.request(), 200, "OK"))
                     .await?;
+                if let Some(cid) = cid {
+                    if let Some(notify) = self.in_flight.lock().await.get(&cid).cloned() {
+                        notify.notify_one();
+                    }
+                }
                 Ok(())
             }
             SipMethod::Options => {
@@ -317,15 +333,40 @@ impl NgnInboundHandler {
                 return Ok::<(), anyhow::Error>(());
             }
             // フォーク (内線レッグ): SIP / WebRTC を transport で分岐して並列に呼び出す。
+            // NGN から CANCEL が来たら fork を打ち切るため Notify を仕込んで
+            // `tokio::select!` で待ち合わせる (RFC 3261 §9.2 / §9.1)。
+            let cancel_notify = Arc::new(tokio::sync::Notify::new());
+            self.in_flight
+                .lock()
+                .await
+                .insert(call_id.clone(), cancel_notify.clone());
+
             let sdp = request.body.clone();
-            let result = fork_to_bindings(
+            let fork_fut = fork_to_bindings(
                 self.inviter.clone(),
                 bindings,
                 sdp,
                 call_id.clone(),
                 self.cfg.fork_timeout,
-            )
-            .await;
+            );
+
+            let result = tokio::select! {
+                biased;
+                _ = cancel_notify.notified() => {
+                    // NGN が CANCEL を出した。INVITE 側は 487 で打ち切る。
+                    info!("NGN CANCEL を受信 → 487 Request Terminated で打ち切り");
+                    self.respond(&stx, 487, "Request Terminated").await?;
+                    self.pending.lock().await.remove(&call_id);
+                    self.in_flight.lock().await.remove(&call_id);
+                    self.metrics.record_invite_extension(InviteResult::Error);
+                    self.metrics.record_invite_ngn(InviteResult::Error);
+                    return Ok(());
+                }
+                r = fork_fut => r,
+            };
+
+            // fork が完了したので in_flight からは外す (CANCEL の競合は無視する)。
+            self.in_flight.lock().await.remove(&call_id);
 
             match result {
                 ForkResult::Answered {
@@ -474,8 +515,12 @@ impl NgnInboundHandler {
         );
 
         // NGN へ返す 200 OK SDP は sabiden の NGN 側ソケットを指すように書き換える。
+        // `restrict_audio_to_pcmu` で内線 UA が乗せた WebRTC 由来属性 (rtcp-fb /
+        // rtcp-mux / fingerprint 等) を除去し、コーデックを PCMU (PT 0) に絞り込む
+        // (`docs/asterisk-real-invite.md` §2 / `CLAUDE.md` §5: NGN は PCMU only)。
+        let pcmu_only = restrict_audio_to_pcmu(ext_answer);
         let rewritten =
-            rewrite_rtp_endpoint(ext_answer, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
+            rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
 
         let bridge = RtpBridge::start(BridgeConfig {
             ngn_socket: ngn_bridge_sock,

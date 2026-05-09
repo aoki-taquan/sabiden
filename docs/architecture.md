@@ -910,6 +910,40 @@ stateDiagram-v2
   Terminating --> [*]: bridge.stop + active.remove
 ```
 
+### 5.8 PWA SignalingClient 接続状態 (Issue #119)
+
+ブラウザ PWA (`frontend/src/lib/signaling.ts::SignalingClient`) の WS 接続状態
+機械。 W3C WebSocket API §10.7 では「open 後の close からの再接続は application
+責務」と明記されており、 sabiden PWA は「自宅電話受話器の代替」 として常時待機が
+前提なので、 WiFi 電源管理 / モバイルデータ切替 / Cloudflare Tunnel idle timeout
+で WS が落ちても自動で復旧する必要がある。
+
+```mermaid
+stateDiagram-v2
+  [*] --> idle
+  idle --> connecting: connect()
+  connecting --> open: ws.onopen
+  connecting --> reconnecting: ws.onclose<br/>(open 前の失敗) → backoff schedule
+  open --> reconnecting: ws.onclose<br/>(瞬断) → backoff schedule
+  reconnecting --> reconnecting: backoff timer 満了 → 新 WS 試行<br/>(1s, 2s, 4s, 8s, ..., cap 30s + jitter)
+  reconnecting --> open: ws.onopen<br/>(再接続成功 / attempts=0 リセット)
+  reconnecting --> closed: client.close()
+  open --> closed: client.close()
+  connecting --> closed: client.close()
+  closed --> [*]
+```
+
+ポイント:
+- backoff は **`min(maxDelayMs, initialDelayMs * 2^attempt) + jitter(0..maxJitterMs)`**。
+  既定で `initialDelayMs=1000`, `maxDelayMs=30000`, `maxJitterMs=250` (Issue #119 DoD)。
+- `ws.onopen` で `reconnectAttempts` を 0 にリセットするため、 一度復旧すれば
+  次回切断は再び 1s 後に試行する (連続切断による発散を防止)。
+- `onOpen` ハンドラは初回 / 再接続いずれの open でも発火する。 `App.tsx` は
+  ここで毎回 `register` を送り、 sabiden 側 WS セッション = 内線登録 の lifetime
+  に再追従する。 トークンは `localStorage` に保管されているため、 ブラウザを
+  reload しても保持される (`frontend/src/lib/storage.ts`)。
+- `client.close()` を呼ぶと以後の自動再接続は停止する (ログアウト時)。
+
 ---
 
 ## 6. 抽象モデル (Class Diagram)

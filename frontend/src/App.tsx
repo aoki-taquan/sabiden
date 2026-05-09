@@ -119,16 +119,44 @@ export const App: Component = () => {
     signaling = new SignalingClient(url, tok, {
       onMessage: handleSignalMessage,
       onOpen: () => {
+        // 接続確立 (初回 / 再接続いずれも) 直後に必ず Re-Register。
+        // sabiden 側は WS セッション = 内線登録の lifetime なので、
+        // 切断 → 再接続後は新セッションとして登録し直す必要がある (Issue #119)。
         setStatus("認証済み");
         signaling?.send({ type: "register", ext_id: ext });
       },
       onClose: () => {
-        setStatus("切断");
+        // SignalingClient が自動再接続を schedule する。 状態文言は
+        // onStateChange で `reconnecting` に切替わるので、 ここでは
+        // statusOk の二重打ちのみ。
         setStatusOk(false);
       },
       onError: () => {
-        setStatus("接続エラー");
         setStatusOk(false);
+      },
+      onStateChange: (s) => {
+        switch (s) {
+          case "idle":
+            setStatus("未接続");
+            setStatusOk(false);
+            break;
+          case "connecting":
+            setStatus("接続中...");
+            setStatusOk(false);
+            break;
+          case "open":
+            // `registered` 受信時にさらに上書きするので一時的な文言。
+            setStatus("認証済み");
+            break;
+          case "reconnecting":
+            setStatus("再接続中...");
+            setStatusOk(false);
+            break;
+          case "closed":
+            setStatus("切断");
+            setStatusOk(false);
+            break;
+        }
       },
     });
     try {
@@ -136,8 +164,12 @@ export const App: Component = () => {
       setView({ kind: "dialer" });
     } catch (e) {
       console.error(e);
-      setStatus("接続失敗 (トークン/URL を確認)");
+      // 初回 connect の resolve は失敗したが、 SignalingClient は内部で
+      // backoff 再接続を継続している。 ユーザーには再接続中であることを
+      // 示し、 dialer view には移行する (発信ボタンは statusOk で disable)。
+      setStatus("再接続中...");
       setStatusOk(false);
+      setView({ kind: "dialer" });
     }
   };
 

@@ -122,6 +122,17 @@ impl Uac {
         );
         req.headers.set("Min-SE", MIN_SE.to_string());
         req.headers.set("User-Agent", &self.config.user_agent);
+        // RFC 3325: NTT NGN P-CSCF は INVITE で発信者番号 (caller-ID) を
+        // `P-Preferred-Identity: <sip:<phone>@ntt-east.ne.jp>` で提示するよう
+        // 求めてくる。これが無いと 403 Forbidden で蹴られる (実機 trace で確認、
+        // home-ops #205 の REGISTER 認証なし仮説は INVITE には適用されない)。
+        // `Privacy: none` も併送する (RFC 3323 / NTT 仕様で識別保留しないことの
+        // 明示。NGN は Privacy ヘッダの存在自体を要求するケースあり)。
+        req.headers.set(
+            "P-Preferred-Identity",
+            format!("<{}>", self.config.local_addr_of_record()),
+        );
+        req.headers.set("Privacy", "none");
 
         if let Some(body) = sdp_offer {
             req.headers.set("Content-Type", "application/sdp");
@@ -397,6 +408,31 @@ mod tests {
         );
         assert_eq!(cancel.headers.get("cseq").unwrap(), "5 CANCEL");
         assert_eq!(cancel.headers.get("call-id").unwrap(), "cidA");
+    }
+
+    #[tokio::test]
+    async fn invite_includes_p_preferred_identity_and_privacy_for_ngn() {
+        // NTT NGN P-CSCF は INVITE で発信者番号を P-Preferred-Identity で
+        // 提示するよう要求し、無いと 403 Forbidden を返す。Privacy ヘッダの
+        // 存在自体も要求するため `Privacy: none` を併送する必要がある。
+        // 実機 (118.177.125.1) で 117 / 携帯番号宛に対し 403 を観測した
+        // のを契機に追加。
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(socket);
+        let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let uac = Uac::new(cfg(), layer, server);
+        let plan = uac.build_invite("sip:117@ntt-east.ne.jp", None, None);
+        let req = &plan.request;
+        assert_eq!(
+            req.headers.get("p-preferred-identity"),
+            Some("<sip:0312345678@ntt-east.ne.jp>"),
+            "PPI ヘッダが無いと NGN は 403 Forbidden を返す"
+        );
+        assert_eq!(
+            req.headers.get("privacy"),
+            Some("none"),
+            "Privacy ヘッダ自体の存在を NGN は要求する"
+        );
     }
 
     #[test]

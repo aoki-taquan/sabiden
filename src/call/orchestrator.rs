@@ -1638,47 +1638,59 @@ pub fn wire_ngn_inbound_with_metrics(
 /// (`docs/asterisk-real-invite.md` §3 / §5.1 — Asterisk 20 が同一線で
 /// `sip:117@118.177.125.1:5060` で 200 OK を取得した実機キャプチャ準拠)。
 ///
+/// 加えて、内線 (baresip 等) が `sip:117@<host>;transport=udp` のように
+/// **uri-parameters** (RFC 3261 §19.1.1) を付けてくると、NGN P-CSCF は
+/// `;transport=udp` を含む Request-URI を **`500 Server Internal Error`**
+/// で蹴る (Issue #58 の実機 trace)。同 §19.1.1 の通り `uri-parameters` は
+/// `;param` の繰返し、`headers` は `?h=v&h=v` の形を取るが、Asterisk 実機
+/// INVITE は **どちらも付けず** に 200 OK を取得している
+/// (`docs/asterisk-real-invite.md` §5.1)。NGN 直収では `transport`/`lr`/
+/// `maddr` 等の URI パラメータは **不要かつ有害** なので、host/port 書換と
+/// 同時に `;params` と `?headers` を完全に剥がす。
+///
 /// 引数:
-/// - `req_uri`: 内線が出した SIP URI (例: `sip:117@192.168.20.239`)
+/// - `req_uri`: 内線が出した SIP URI (例: `sip:117@192.168.20.239;transport=udp`)
 /// - `ngn_server_host`: P-CSCF IP (例: `118.177.125.1`)
 /// - `ngn_server_port`: P-CSCF port (通常 `5060`)
 ///
 /// 戻り値: `sip:<user>@<ngn_server_host>:<ngn_server_port>` 形式の URI。
-/// 既に host:port が一致していればそのまま返す (idempotent)。
-/// パース不能な URI は変更せず元のまま返す (フェイルセーフ)。
+/// `;uri-parameters` と `?headers` は常に削除する (NGN 仕様)。
+/// 既に正規化済 (host:port 一致 + params/headers 無し) ならそのまま返す
+/// (idempotent)。パース不能な URI は変更せず元のまま返す (フェイルセーフ)。
 pub fn normalize_request_uri_for_ngn(
     req_uri: &str,
     ngn_server_host: &str,
     ngn_server_port: u16,
 ) -> String {
-    // SIP URI の最低限のパース: `<scheme>:<user>@<host>[:port]` または
-    // `<scheme>:<host>[:port]` (user 部省略は今回考慮しない)。
-    // パラメータ (`;param`) があれば後段で温存する。
-    let (scheme_user_part, host_with_params) = match req_uri.split_once('@') {
-        Some(parts) => parts,
-        None => {
-            // user 部なしの SIP URI は NGN 直収では基本想定しない。フェイルセーフで原文返す。
-            return req_uri.to_string();
-        }
+    // RFC 3261 §19.1.1 準拠の構造解析を `parse_sip_uri` に委譲し、
+    // ここでは host/port の書換と uri-parameters/headers の破棄だけ行う。
+    let parsed = match crate::sip::message::parse_sip_uri(req_uri) {
+        Ok(p) => p,
+        Err(_) => return req_uri.to_string(),
     };
-    // host_with_params: "192.168.20.239" or "ntt-east.ne.jp;transport=udp" 等
-    let (host_port, params) = match host_with_params.split_once(';') {
-        Some((hp, rest)) => (hp, Some(rest)),
-        None => (host_with_params, None),
-    };
-    let current_host = host_port.split(':').next().unwrap_or(host_port);
-    // 既に P-CSCF host:port を指していれば idempotent。port が違えば書換。
-    let already_pcsf_host = current_host.eq_ignore_ascii_case(ngn_server_host);
-    let port_part = host_port.split_once(':').map(|x| x.1).unwrap_or("");
-    let already_pcsf_port = port_part == ngn_server_port.to_string();
-    if already_pcsf_host && already_pcsf_port {
+    // 既に P-CSCF host:port + params/headers 無しなら何もしない (idempotent)。
+    let already_pcsf_host = parsed.host.eq_ignore_ascii_case(ngn_server_host);
+    let already_pcsf_port = parsed.port == Some(ngn_server_port);
+    if already_pcsf_host
+        && already_pcsf_port
+        && parsed.params.is_empty()
+        && parsed.headers.is_empty()
+    {
         return req_uri.to_string();
     }
-    // 再構築。`scheme:user@<pcsf_host>:<pcsf_port>[;params]`
-    let new_host_port = format!("{}:{}", ngn_server_host, ngn_server_port);
-    match params {
-        Some(p) => format!("{}@{};{}", scheme_user_part, new_host_port, p),
-        None => format!("{}@{}", scheme_user_part, new_host_port),
+    // 再構築。`<scheme>:<user>@<pcsf_host>:<pcsf_port>` のみ。
+    // `;params` と `?headers` は NGN 仕様 (§docstring 参照) で常に剥がす。
+    let scheme = if parsed.scheme.is_empty() {
+        "sip".to_string()
+    } else {
+        parsed.scheme.clone()
+    };
+    match parsed.user {
+        Some(user) => format!(
+            "{}:{}@{}:{}",
+            scheme, user, ngn_server_host, ngn_server_port
+        ),
+        None => format!("{}:{}:{}", scheme, ngn_server_host, ngn_server_port),
     }
 }
 
@@ -1969,11 +1981,44 @@ mod tests {
         let already = "sip:117@118.177.125.1:5060";
         let out = normalize_request_uri_for_ngn(already, "118.177.125.1", 5060);
         assert_eq!(out, "sip:117@118.177.125.1:5060");
+    }
 
-        // ケース 5: パラメータ (`;transport=udp` 等) は温存される
-        let with_params = "sip:117@ntt-east.ne.jp;transport=udp";
-        let out = normalize_request_uri_for_ngn(with_params, "118.177.125.1", 5060);
-        assert_eq!(out, "sip:117@118.177.125.1:5060;transport=udp");
+    /// RFC 3261 §19.1.1 — uri-parameters (`;transport`, `;lr`, `;maddr`, ...)
+    /// と `?headers` は SIP-URI 構文上許されるが、NTT NGN P-CSCF は
+    /// `;transport=udp` を含む Request-URI を **500 Server Internal Error**
+    /// で蹴る (Issue #58 実機 trace)。Asterisk 実機 INVITE はどちらも付けず
+    /// 200 OK を取得しているため (`docs/asterisk-real-invite.md` §5.1)、
+    /// `normalize_request_uri_for_ngn` は host/port 書換と同時に `;params`
+    /// と `?headers` を完全に削除する。
+    #[test]
+    fn rfc3261_19_1_1_normalize_strips_uri_params_and_headers() {
+        // ケース A: ;transport=udp は剥がす (Issue #58 の主症状)
+        let with_transport = "sip:117@127.0.0.1;transport=udp";
+        let out = normalize_request_uri_for_ngn(with_transport, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース B: 複数 uri-parameters (;lr;maddr=...) はまとめて剥がす
+        let with_multi = "sip:117@127.0.0.1;lr;maddr=192.0.2.1";
+        let out = normalize_request_uri_for_ngn(with_multi, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース C: ?headers (RFC 3261 §19.1.1) も剥がす
+        let with_headers = "sip:117@127.0.0.1?header=value";
+        let out = normalize_request_uri_for_ngn(with_headers, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース D: 既に P-CSCF host:port だが ;params が残っているケース。
+        // host/port 書換は不要だが ;params 削除のみ走らせて idempotent に
+        // 落ち着かせる (Issue #58 の二重正規化対策)。
+        let pcsf_with_params = "sip:117@118.177.125.1:5060;transport=udp";
+        let out = normalize_request_uri_for_ngn(pcsf_with_params, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
+
+        // ケース E: 完全正規化済 (host:port 一致 + params/headers 無し) は
+        // そのまま返す (true idempotent)。
+        let canonical = "sip:117@118.177.125.1:5060";
+        let out = normalize_request_uri_for_ngn(canonical, "118.177.125.1", 5060);
+        assert_eq!(out, "sip:117@118.177.125.1:5060");
     }
 
     /// Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.2):

@@ -408,25 +408,45 @@ impl ExtensionUas {
         responder.respond(resp).await
     }
 
+    /// 内線からの INVITE を受け付ける。
+    ///
+    /// # 認証ポリシー (RFC 3261 §22 / Issue #62)
+    ///
+    /// REGISTER で確立した内線 binding を信用し、INVITE では Digest 認証を
+    /// **要求しない**。RFC 3261 §22.1 は UAS が任意のリクエストに 401/407 を
+    /// 返せるとしか規定しておらず、INVITE auth は実装依存。Asterisk / Kamailio /
+    /// OpenSIPS など主要 OSS UAS の標準設定は「REGISTER で auth、 in-dialog や
+    /// INVITE では binding を信用」であり、Linphone などのクライアントは
+    /// INVITE 401 challenge に対し再 INVITE を送らない (REGISTER 済の AOR を
+    /// 同じ Digest 認証で再認証する経路を持たない実装が多い)。
+    ///
+    /// 実機 trace (2026-05-09) で sabiden が INVITE に 401 を返したところ、
+    /// Linphone は再 INVITE を送らず通話確立に失敗した。本実装は internal/VPN
+    /// 信頼境界の前提 (内線網は L4 で分離、§ARCHITECTURE.md) のもと、INVITE
+    /// では Authorization ヘッダの有無に関わらず検証せず、From URI のユーザ部
+    /// が `ExtensionRegistrar` に登録済かどうかだけを binding 認可として用いる。
+    ///
+    /// - binding 有り: `UasEvent::Invite` を上位 (Call Manager) に流す
+    /// - binding 無し: **403 Forbidden** で蹴る (401 challenge は意図的に出さない)
+    /// - Authorization ヘッダ付きの INVITE: 検証せず無視する
     async fn handle_invite(
         &self,
         request: &SipRequest,
         remote: SocketAddr,
         responder: ResponderHandle,
     ) -> Result<()> {
-        // 認証
-        let auth = match request.headers.get("authorization") {
-            Some(h) => match DigestAuthorization::parse(h) {
-                Ok(a) => a,
-                Err(_) => return self.send_challenge(&responder, "Bad Authorization").await,
-            },
-            None => return self.send_challenge(&responder, "Unauthorized").await,
+        // From URI のユーザ部 = AOR を取り出す。取れない (壊れた From) なら
+        // 4xx で蹴るしかない。RFC 3261 §8.1.1.3 で From は必須ヘッダ。
+        let Some(from_aor) = request.headers.get("from").and_then(extract_user_from_addr) else {
+            warn!("INVITE に From ユーザ部が無い → 400");
+            return responder.quick(400, "Bad Request").await;
         };
-        let Some(password) = self.auth_db.get(&auth.username) else {
+
+        // REGISTER で確立した binding を信用する。未登録の AOR からの
+        // INVITE は 403 で蹴る (challenge しない意図を 401 ではなく 403 で示す)。
+        if self.registrar.lookup(&from_aor).await.is_none() {
+            warn!(aor=%from_aor, "未登録 AOR からの INVITE → 403");
             return responder.quick(403, "Forbidden").await;
-        };
-        if !auth.verify("INVITE", password) {
-            return self.send_challenge(&responder, "Unauthorized").await;
         }
 
         // 100 Trying を即返す (RFC 3261 §17.2.1)
@@ -435,7 +455,7 @@ impl ExtensionUas {
         // 上位 (Call Manager) があれば渡す。なければ 503。
         if let Some(tx) = &self.event_tx {
             let event = UasEvent::Invite {
-                from_aor: auth.username,
+                from_aor,
                 request: request.clone(),
                 remote,
                 responder,
@@ -497,6 +517,32 @@ fn parse_register_expires(request: &SipRequest) -> u32 {
         .get("expires")
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(3600)
+}
+
+/// `From` / `To` 等の name-addr ヘッダ値から `sip:user@host` の `user` を取り出す。
+///
+/// RFC 3261 §20.20 / §20.39 によりヘッダ値は `name-addr` 形式
+/// (`"Display" <sip:user@host>;tag=...`) または `addr-spec` 形式
+/// (`sip:user@host;tag=...`) を取りうる。本ヘルパは双方を扱う。
+///
+/// `user` 部が無い (`sip:host` 形式) URI では `None` を返す。
+fn extract_user_from_addr(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    // name-addr 形式なら `<...>` の中身、それ以外は先頭の `;` までを URI とする。
+    let uri_part = if let Some(start) = trimmed.find('<') {
+        let rest = &trimmed[start + 1..];
+        rest.split_once('>').map(|x| x.0).unwrap_or(rest)
+    } else if let Some((uri, _)) = trimmed.split_once(';') {
+        uri
+    } else {
+        trimmed
+    };
+    // `sip:user@host` の `:` 後 → `@` 前を user とみなす。
+    let after_scheme = uri_part.split_once(':').map(|x| x.1).unwrap_or(uri_part);
+    after_scheme
+        .split_once('@')
+        .map(|(user, _)| user.to_string())
+        .filter(|u| !u.is_empty())
 }
 
 /// `Contact: <sip:user@host:port>;expires=...` から URI 部分を抽出。
@@ -690,77 +736,18 @@ mod tests {
         assert_eq!(resp.status_code, 403);
     }
 
-    /// Call Manager 未接続なら認証済み INVITE は 503 で返る。
+    /// Issue #62 / RFC 3261 §22: 既登録 binding を持つ内線からの INVITE は
+    /// Authorization ヘッダ無しでも 401 challenge せず、上位 (Call Manager) に
+    /// 流す。本テストでは Call Manager 未接続のため、challenge 経由ではなく
+    /// `100 Trying` に続いて `503 Service Unavailable` が返ることで確認する。
     #[tokio::test]
-    async fn invite_without_handler_returns_503() {
+    async fn invite_with_existing_registration_passes_through_without_auth_challenge() {
         let extensions = vec![fixtures::extension_iphone()];
         let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
             .await
             .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
-        tokio::spawn(async move {
-            uas.run().await.unwrap();
-        });
-
-        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
-        let local = client.local_addr().unwrap();
-
-        // チャレンジを取得するため認証なし INVITE を送る
-        let mut req =
-            builders::invite_from_phone(&local, "iphone", "sip:dest@sabiden", "z9hG4bKinv1", None);
-        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let resp = match parse_message(&buf[..n]).unwrap() {
-            SipMessage::Response(r) => r,
-            _ => panic!(),
-        };
-        assert_eq!(resp.status_code, 401);
-        let challenge =
-            DigestChallenge::parse(resp.headers.get("www-authenticate").unwrap()).unwrap();
-
-        // Authorization 付きで再送
-        let creds = DigestCredentials::new("iphone", "secret");
-        let auth = creds.compute(&challenge, "INVITE", "sip:dest@sabiden", 1);
-        req = builders::invite_from_phone(
-            &local,
-            "iphone",
-            "sip:dest@sabiden",
-            "z9hG4bKinv2",
-            Some(&auth.header_value),
-        );
-        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
-
-        // 100 Trying と 503 が来るはず (順不同に近いがどちらも届くまで読む)
-        let mut got_100 = false;
-        let mut got_503 = false;
-        for _ in 0..2 {
-            let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
-                match r.status_code {
-                    100 => got_100 = true,
-                    503 => got_503 = true,
-                    _ => {}
-                }
-            }
-        }
-        assert!(got_100 && got_503, "100 と 503 が届くべき");
-    }
-
-    /// `with_handler` で接続したチャネルに INVITE が転送される。
-    #[tokio::test]
-    async fn invite_with_handler_forwards_event() {
-        let extensions = vec![fixtures::extension_iphone()];
-        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
-            .await
-            .unwrap();
-        let server_addr = uas.socket.local_addr().unwrap();
+        let registrar = uas.registrar();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let uas = uas.with_handler(event_tx);
         tokio::spawn(async move {
@@ -770,38 +757,22 @@ mod tests {
         let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
-        // チャレンジ往復 (省略のため直接 challenge 値を作る代わりに UAS から取得)
-        let mut req = builders::invite_from_phone(
-            &local,
-            "iphone",
-            "sip:dest@sabiden",
-            "z9hG4bKinvfwd1",
-            None,
-        );
-        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let resp = match parse_message(&buf[..n]).unwrap() {
-            SipMessage::Response(r) => r,
-            _ => panic!(),
-        };
-        let challenge =
-            DigestChallenge::parse(resp.headers.get("www-authenticate").unwrap()).unwrap();
-        let creds = DigestCredentials::new("iphone", "secret");
-        let auth = creds.compute(&challenge, "INVITE", "sip:dest@sabiden", 1);
-        req = builders::invite_from_phone(
-            &local,
-            "iphone",
-            "sip:dest@sabiden",
-            "z9hG4bKinvfwd2",
-            Some(&auth.header_value),
-        );
+        // 事前に binding を直接挿入して REGISTER 往復を省略する。
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", local),
+                local,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // Authorization ヘッダ無し INVITE を 1 発送る (Linphone と同等の挙動)
+        let req =
+            builders::invite_from_phone(&local, "iphone", "sip:dest@sabiden", "z9hG4bKinv1", None);
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
 
-        // 上位層がイベントを受け取る
+        // 上位層が UasEvent::Invite を受け取る (= 401 で蹴られていない)
         let event = time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
             .expect("event timeout")
@@ -813,28 +784,191 @@ mod tests {
                 ..
             } => {
                 assert_eq!(from_aor, "iphone");
-                // 上位層相当: 200 OK を返してみる
+                // 上位層相当: 200 OK を返す
                 responder.quick(200, "OK").await.unwrap();
             }
             other => panic!("unexpected event: {:?}", other),
         }
 
-        // 100 Trying / 200 OK 等、何らかの 2xx が届く
+        // 100 Trying と 200 OK が来る (401 は来ない)
+        let mut buf = vec![0u8; 4096];
+        let mut saw_100 = false;
         let mut saw_2xx = false;
         for _ in 0..3 {
-            match time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+            match time::timeout(Duration::from_secs(1), client.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
                     if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
-                        if (200..300).contains(&r.status_code) {
-                            saw_2xx = true;
-                            break;
+                        assert_ne!(
+                            r.status_code, 401,
+                            "RFC 3261 §22 / Issue #62: 既登録 binding に対する INVITE で 401 を返してはならない"
+                        );
+                        match r.status_code {
+                            100 => saw_100 = true,
+                            s if (200..300).contains(&s) => saw_2xx = true,
+                            _ => {}
                         }
                     }
                 }
                 _ => break,
             }
         }
+        assert!(saw_100, "100 Trying が届くべき (RFC 3261 §17.2.1)");
         assert!(saw_2xx, "200 OK が届くべき");
+    }
+
+    /// Issue #62: 未登録 AOR からの INVITE は 401 ではなく **403 Forbidden**。
+    /// challenge しない意図を 401 と区別するため明示的に 403 を返す。
+    #[tokio::test]
+    async fn invite_without_registration_returns_403_not_401() {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        // REGISTER を挟まず (= binding 無し) でいきなり INVITE
+        let req =
+            builders::invite_from_phone(&local, "ghost", "sip:dest@sabiden", "z9hG4bKnoreg", None);
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let resp = match parse_message(&buf[..n]).unwrap() {
+            SipMessage::Response(r) => r,
+            _ => panic!("response expected"),
+        };
+        assert_eq!(
+            resp.status_code, 403,
+            "未登録 AOR は 401 challenge ではなく 403 Forbidden"
+        );
+        assert!(
+            resp.headers.get("www-authenticate").is_none(),
+            "403 では WWW-Authenticate を付与しない (RFC 3261 §22 challenge せず)"
+        );
+    }
+
+    /// Authorization ヘッダ付きの INVITE が来ても検証しない (透過)。binding 有り
+    /// なら上位に流す。Issue #62 の「ヘッダは無視」要件の回帰確認。
+    #[tokio::test]
+    async fn invite_with_authorization_header_is_ignored_and_passes_through() {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        let registrar = uas.registrar();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let uas = uas.with_handler(event_tx);
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", local),
+                local,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 検証されない (= 不正な値でも通る) ことを確認するためダミーの
+        // Authorization ヘッダを乗せる。
+        let bogus_auth = "Digest username=\"iphone\", realm=\"sabiden-test\", nonce=\"x\", \
+                          uri=\"sip:dest@sabiden\", response=\"deadbeefdeadbeefdeadbeefdeadbeef\"";
+        let req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKauth",
+            Some(bogus_auth),
+        );
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let event = time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("event present");
+        assert!(matches!(event, UasEvent::Invite { .. }));
+    }
+
+    /// 既存挙動の回帰確認: BYE は元から auth 不要 (RFC 3261 §15.1.1 dialog 内
+    /// request)。INVITE auth 撤廃で BYE 経路に副作用が出ないことを担保する。
+    #[tokio::test]
+    async fn bye_in_dialog_no_auth_challenge() {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        // BYE は event_tx 未接続なら handle_bye 内で 200 OK を直接返す。
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        let req = builders::bye(
+            &local,
+            "sip:caller@sabiden",
+            "call-bye-1",
+            "z9hG4bKbye",
+            "from-tag",
+            "to-tag",
+        );
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let resp = match parse_message(&buf[..n]).unwrap() {
+            SipMessage::Response(r) => r,
+            _ => panic!("response expected"),
+        };
+        assert_eq!(resp.status_code, 200, "BYE は 200 OK で閉じる");
+        assert!(
+            resp.headers.get("www-authenticate").is_none(),
+            "BYE に対し challenge してはならない"
+        );
+    }
+
+    #[test]
+    fn extract_user_from_name_addr_with_tag() {
+        // RFC 3261 §20.20 / §20.39 name-addr 形式
+        assert_eq!(
+            extract_user_from_addr("\"iPhone\" <sip:iphone@host>;tag=abc"),
+            Some("iphone".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_user_from_addr_spec() {
+        // RFC 3261 §20.20 addr-spec 形式 (山括弧無し)
+        assert_eq!(
+            extract_user_from_addr("sip:iphone@host;tag=abc"),
+            Some("iphone".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_user_from_addr_without_user() {
+        // ユーザ部無し → None
+        assert_eq!(extract_user_from_addr("<sip:host>"), None);
     }
 
     #[test]

@@ -135,6 +135,27 @@ pub const TIMER_I: Duration = T4;
 /// RFC 3261 §17.2.2 Timer J = 64 * T1 (server non-INVITE Completed 滞在時間, UDP)。
 pub const TIMER_J: Duration = Duration::from_millis(64 * 500);
 
+/// UDP datagram の最大サイズ (= IPv4/IPv6 datagram length field 上限の 65535 オクテット)。
+///
+/// RFC 3261 §18.1.1 (Sending Requests over UDP):
+///   "If the request is too large for UDP, TCP MUST be used instead."
+/// RFC 3261 §18.3 (Framing):
+///   UDP では 1 SIP メッセージ = 1 datagram。SIP メッセージ自体に
+///   公式な上限は無く、`Content-Length` は 32-bit 整数まで許容されるが、
+///   UDP datagram は IP 層の都合で 65535 オクテットを超えられない。
+/// RFC 3261 §18.4 (Error Handling):
+///   トランスポート層でメッセージを破棄したら、上位層には届かない。
+///   sabiden は NGN 直収で UDP のみ使うので、TCP fallback はせず、
+///   UDP datagram の理論上限まで受理できるバッファを使う。
+///
+/// `recv_from` は datagram が buf より大きい場合 silently truncate するため、
+/// バッファは datagram 上限以上を確保する。実機 NGN の 200 OK は通常 1〜2 KB
+/// だが、Path / Service-Route / Authentication-Info / 多段 Record-Route を
+/// 重ねると 8 KB を簡単に超える事例があり、`vec![0u8; 8192]` だと
+/// SDP body が削られて parse は通っても下流が壊れる
+/// (issue #88 / `docs/asterisk-real-invite.md`)。
+pub const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
+
 /// Client/Server を区別しないトランザクション ID。
 ///
 /// RFC 3261 §17.1.3 / §17.2.3 に従い、branch (RFC 3261 magic cookie 付き) と
@@ -998,11 +1019,35 @@ impl TransactionLayer {
         self.socket.local_addr()
     }
 
+    /// UDP 受信ループ本体。
+    ///
+    /// RFC 3261 §18.1.1 / §18.3 により、UDP では 1 SIP メッセージ = 1 datagram。
+    /// `tokio::net::UdpSocket::recv_from` は buf より大きい datagram を
+    /// 受信した場合 silently truncate し、戻り値 `n` には buf 長しか入らない。
+    /// truncate された SIP メッセージは header 不整合や SDP body 切れで
+    /// 下流が誤動作するため、バッファは UDP datagram 上限 (65535 オクテット)
+    /// を確保する (`MAX_UDP_DATAGRAM_SIZE`)。
+    ///
+    /// それでも `n == buf.len()` なら datagram が 65535 オクテット丁度か、
+    /// それを超えて IP 層 fragment failure 等に遭った可能性があるので
+    /// warn ログで band-aid 検知のヒントを残す (RFC 3261 §18.4
+    /// "Error Handling" 観点)。
     async fn recv_loop(self: Arc<Self>) {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((n, remote)) => {
+                    if n == buf.len() {
+                        // RFC 3261 §18.1.1: UDP datagram が buffer 上限ぴったり
+                        // で返るのは現実的には truncate の兆候 (= datagram が
+                        // 65535 オクテット以上)。NGN では発生し得ない想定だが、
+                        // 観測経路を確保しておく。
+                        warn!(
+                            len = n,
+                            %remote,
+                            "UDP recv buffer 上限到達: SIP メッセージが truncate された可能性 (RFC 3261 §18.1.1)"
+                        );
+                    }
                     let data = &buf[..n];
                     // パース前にトレース dump (壊れた SIP も観測したいため)
                     write_trace(&self.tracer, TraceDir::Recv, data).await;
@@ -2152,5 +2197,105 @@ mod tests {
             resp_text
         );
         drop(stx);
+    }
+
+    /// RFC 3261 §18.1.1 / §18.3: UDP では 1 SIP メッセージ = 1 datagram。
+    /// `recv_from` のバッファが datagram より小さいと silently truncate され、
+    /// 末端が削れた SIP メッセージは下流で誤動作する。
+    ///
+    /// issue #88: 旧実装は `vec![0u8; 8192]` 固定で、Path / Service-Route /
+    /// Authentication-Info を多段で重ねた応答 (8 KB 超) を取りこぼしていた。
+    /// バッファを `MAX_UDP_DATAGRAM_SIZE` (= 65535) に拡大したことで、
+    /// 16 KB の SIP 応答が完全に parse されることを検証する。
+    #[tokio::test]
+    async fn rfc3261_18_1_1_recv_loop_handles_16kb_response() {
+        // server = テスト用 UAS、client_sock 上に TransactionLayer を spawn
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock.clone());
+
+        let local = client_sock.local_addr().unwrap();
+        let branch = "z9hG4bKlarge16k";
+        let mut req = SipRequest::new(SipMethod::Register, "sip:ntt-east.ne.jp");
+        req.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        req.headers
+            .set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=alice");
+        req.headers.set("To", "<sip:0312345678@ntt-east.ne.jp>");
+        req.headers.set("Call-ID", "callid-large@host");
+        req.headers.set("CSeq", "1 REGISTER");
+
+        // サーバ役: REGISTER を受け、巨大 (>16 KB) の 200 OK を組み立てて返送する。
+        // Path / Service-Route / Record-Route が多段で乗ったケースを模す。
+        let server_clone = server.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_message(&buf[..n]).unwrap();
+            let parsed_req = match parsed {
+                SipMessage::Request(r) => r,
+                _ => panic!("expected request"),
+            };
+            let mut resp = build_response_skeleton(&parsed_req, 200, "OK");
+            // 1 個 ~256 バイトの Path ヘッダを 80 個積んで合計 ~20 KB に膨らませる
+            // (8 KB を確実に超え、かつ UDP datagram 上限 65535 には収まる)。
+            let mut path_blob = String::new();
+            for i in 0..80 {
+                path_blob.push_str(&format!(
+                    "<sip:term@scscf{i:03}.ims.example.net;lr;\
+                     transport=udp;orig;\
+                     route-padding-{}>",
+                    "x".repeat(200)
+                ));
+                if i + 1 < 80 {
+                    path_blob.push(',');
+                }
+            }
+            resp.headers.set("Path", path_blob);
+            // SDP body も少し付ける (8 KB 超でも下流で読めることを確かめる目的)。
+            // Content-Length は to_bytes() 側で付与される。
+            let body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n".to_vec();
+            resp.headers.set("Content-Type", "application/sdp");
+            resp.body = body;
+
+            let bytes = resp.to_bytes();
+            assert!(
+                bytes.len() > 16 * 1024,
+                "test fixture が 16 KB を超えていない: {} bytes",
+                bytes.len()
+            );
+            assert!(
+                bytes.len() < MAX_UDP_DATAGRAM_SIZE,
+                "test fixture が UDP 上限を超えている: {} bytes",
+                bytes.len()
+            );
+            server_clone.send_to(&bytes, peer).await.unwrap();
+        });
+
+        // 旧 8 KB バッファだと SDP body が削れて parse は通っても下流で失敗する。
+        // 65535 バッファなら 200 OK が完全に届き、TransactionLayer が
+        // 正しい応答を Future に dispatch できる。
+        let resp =
+            tokio::time::timeout(Duration::from_secs(3), layer.send_request(req, server_addr))
+                .await
+                .expect("send_request timeout (= recv_loop が大 datagram を取り落とした疑い)")
+                .expect("send_request error");
+        assert_eq!(resp.status_code, 200);
+        // 大量に積んだ Path ヘッダが parse 後も生きている = truncate されていない。
+        let path = resp.headers.get("path").expect("Path header missing");
+        assert!(
+            path.len() > 16 * 1024,
+            "Path header が短すぎる (truncate?): {} bytes",
+            path.len()
+        );
+        // SDP body も末端まで届いているか確認 (truncate 検出)。
+        let body_text = std::str::from_utf8(&resp.body).unwrap();
+        assert!(
+            body_text.contains("m=audio 30000 RTP/AVP 0"),
+            "SDP body が末端で truncate: {:?}",
+            body_text
+        );
     }
 }

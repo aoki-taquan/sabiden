@@ -64,9 +64,15 @@ src/
 ## レイヤ責務
 
 ### SIP Transport Layer
-- UDP ソケット送受信
+- UDP ソケット送受信 (TCP/TLS は将来)
 - DSCP マーキング (32 / TOS 0x80)
 - 受信メッセージのトランザクション層へのルーティング
+- UDP recv バッファは **UDP datagram 上限 65535 オクテット** (`MAX_UDP_DATAGRAM_SIZE` in `src/sip/transaction.rs`)。
+  RFC 3261 §18.1.1 / §18.3 により UDP では 1 SIP メッセージ = 1 datagram だが、
+  `recv_from` は buf を超える datagram を silently truncate する。NGN の 200 OK は通常 1〜2 KB だが、
+  Path / Service-Route / Authentication-Info 多段で 8 KB を超える事例があるため、上限まで確保する
+  (issue #88)。`n == buf.len()` で受信した場合は truncate の兆候として warn ログを残す
+  (RFC 3261 §18.4 Error Handling)。
 
 ### SIP Transaction Layer (RFC 3261 §17)
 - トランザクション ID (branch + via-sent-by + cseq-method)

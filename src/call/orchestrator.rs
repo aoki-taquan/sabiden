@@ -1926,7 +1926,7 @@ pub async fn fork_to_bindings(
 /// - `peer.accept_answer` 失敗時は既に `deliver` が `pending` を消費済みなので
 ///   何もしない (`Errored` を返す)。
 ///
-/// # 注意 (Issue #N follow-up)
+/// # 注意 (Issue #121 follow-up)
 ///
 /// 戻り値 200 OK SDP の `c=` / `m= port` は `0.0.0.0:9` のままで、
 /// 呼出側の `start_bridge_for_inbound` が `rewrite_rtp_endpoint` で sabiden の

@@ -74,9 +74,10 @@ src/
   (issue #88)。`n == buf.len()` で受信した場合は truncate の兆候として warn ログを残す
   (RFC 3261 §18.4 Error Handling)。
 - `parse_message` は **生バイト** ベース。 Content-Length (RFC 3261 §20.14)
-  を見て本文を切り出し、 truncate 検知時は `Err` で drop。 body は opaque
-  octet 列 (RFC 3261 §7.4) として扱い、UTF-8 妥当性は要求しない (詳細 →
-  [`architecture.md`](./architecture.md) §11.6)。
+  を見て本文を切り出し、 truncate 検知時 / 重複 Content-Length 時は `Err` で
+  drop。 body は opaque octet 列 (RFC 3261 §7.4) として扱い、UTF-8 妥当性は
+  要求しない。 ヘッダ部も `from_utf8_lossy` で U+FFFD 置換し、 不正バイト
+  混入による DoS 経路を遮断する (詳細 → [`architecture.md`](./architecture.md) §11.6)。
 
 ### SIP Transaction Layer (RFC 3261 §17)
 - トランザクション ID (branch + via-sent-by + cseq-method)

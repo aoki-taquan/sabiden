@@ -1537,10 +1537,20 @@ graph LR
   8192 byte buf を超えた INVITE / 200 OK が SDP 半分受信のまま下流に流れる
   事故を防ぐ。 値が残より小さい場合は先頭 N バイトのみ採用し、残余は
   別 datagram (もしくは garbage) として drop する。
-- **Body の opaque 性** (RFC 3261 §7.4): message-body は任意 octet 列で、
-  メッセージ全体に UTF-8 妥当性を要求しない。これにより、攻撃者が body に
-  非 UTF-8 バイトを 1 個混ぜただけで全 SIP メッセージが drop される DoS
-  経路を遮断 (旧実装は `from_utf8` をメッセージ全体に適用していた)。
+- **Content-Length 重複検出** (RFC 3261 §7.3.1 / §20.14, Issue #82 follow-up):
+  単一値ヘッダである `Content-Length` が同 datagram 内に **2 件以上** 現れた
+  場合は `Err` を返す。 attacker が `Content-Length: 0\r\nContent-Length: 999`
+  のように食い違う重複を仕込んでも 1 件目だけ採用して silent に通る
+  (request smuggling 風) 経路を遮断する。 検出は `headers.get_all("content-length")`
+  で `len() >= 2` を判定する。
+- **Body の opaque 性 + ヘッダ lossy 化** (RFC 3261 §7.3.1 / §7.4 / §25.1, Issue #82):
+  message-body は任意 octet 列で、メッセージ全体に UTF-8 妥当性を要求しない
+  (§7.4)。 ヘッダ部は `TEXT-UTF8-TRIM` BNF (§25.1) により多バイト UTF-8 が
+  許容されるが、 不正バイトが 1 個混入しても全 datagram drop に至らないよう
+  `String::from_utf8_lossy` で U+FFFD 置換してパースを継続する。 これにより、
+  攻撃者が任意の場所 (body もヘッダも) に非 UTF-8 バイトを 1 個混ぜるだけで
+  SIP メッセージ全体が drop される DoS 経路を遮断する (旧実装は body 経路を
+  ふさいでも、ヘッダ経路の strict `from_utf8` で同じ DoS が成立していた)。
 
 ---
 

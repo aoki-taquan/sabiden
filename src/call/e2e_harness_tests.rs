@@ -140,6 +140,104 @@ async fn extension_initiated_call_to_ngn_full_round_trip() {
     );
 }
 
+/// Issue #64 / RFC 3261 §13.3.1.4 (UAS Behavior, 2xx Responses):
+/// 内線→sabiden→NGN 発信通話で、sabiden が内線レッグに返す 200 OK は
+/// Contact ヘッダを必ず持つ。Contact が無いと内線 UA (Linphone 等) は
+/// dialog の remote target を確定できず、ACK / BYE の宛先が不定となり
+/// dialog 確立に失敗する。
+#[tokio::test]
+async fn rfc3261_13_3_1_4_extension_invite_2xx_response_has_contact_header() {
+    // (1) mock NGN: 200 OK を返すだけの最小実装 (Contact は内線レッグの
+    // 検証対象なので NGN 側 SDP は中身不問)
+    let fake_ngn = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+    let fake_ngn_clone = fake_ngn.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        if let Ok((n, peer)) = fake_ngn_clone.recv_from(&mut buf).await {
+            if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n]) {
+                let mut resp = build_response_skeleton(&req, 200, "OK");
+                resp.headers.set(
+                    "To",
+                    format!("{};tag=ngn-tag-64", req.headers.get("to").unwrap()),
+                );
+                resp.headers
+                    .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+                let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
+                // ACK は読んで捨てる
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    fake_ngn_clone.recv_from(&mut buf),
+                )
+                .await;
+            }
+        }
+    });
+
+    // (2) sabiden NGN UAC
+    let ngn_client_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+    let ngn_uac = Arc::new(Uac::new(
+        UacConfig {
+            local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            local_addr: ngn_client_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+        },
+        ngn_layer,
+        fake_ngn_addr,
+    ));
+
+    // (3) sabiden 内線 UAS
+    let uas_cfg = UasConfig {
+        bind_addr: fixtures::loopback_any(),
+        realm: "sabiden-test".to_string(),
+        max_expires: 3600,
+    };
+    let extensions = vec![ExtensionConfig {
+        username: "iphone".to_string(),
+        password: "secret".to_string(),
+    }];
+    let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
+    let uas_addr = uas.socket().local_addr().unwrap();
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let uas = uas.with_handler(event_tx);
+    tokio::spawn(async move {
+        uas.run().await.unwrap();
+    });
+
+    let handler = UasEventHandler::new(ngn_uac);
+    handler.spawn(event_rx);
+
+    // (4) 内線 UA で REGISTER → INVITE
+    let mut phone = MockExtensionUa::bind("iphone", "secret").await.unwrap();
+    phone.register_with_digest(uas_addr).await.unwrap();
+    let resp = phone
+        .invite_with_digest(uas_addr, "sip:dest@sabiden", Vec::new())
+        .await
+        .unwrap();
+
+    // (5) RFC 3261 §13.3.1.4: 内線レッグ 200 OK には Contact ヘッダ必須
+    assert!(
+        (200..300).contains(&resp.status_code),
+        "200 OK を期待: got {}",
+        resp.status_code
+    );
+    let contact = resp.headers.get("contact");
+    assert!(
+        contact.is_some(),
+        "RFC 3261 §13.3.1.4: 内線レッグ 200 OK に Contact ヘッダが必須 (Issue #64). headers={:?}",
+        resp.headers,
+    );
+    let contact = contact.unwrap();
+    assert!(
+        contact.contains("sabiden"),
+        "Contact URI は sabiden を指すべき: got {}",
+        contact
+    );
+}
+
 /// NGN→sabiden→内線の着信フルラウンドトリップ。
 ///
 /// 1. mock NGN ピアから sabiden NGN ソケットに INVITE

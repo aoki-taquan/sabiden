@@ -986,7 +986,14 @@ impl UasEventHandler {
                     };
 
                     // 200 OK を組み立てて内線へ返す (UAS 側 dialog 構築用に保持)。
-                    let response_to_ext = build_2xx_to_ext(&request, &body_for_ext);
+                    // Contact URI は内線 UAS の bind addr が最優先 (= 内線レッグで
+                    // sabiden が in-dialog 受信する socket)。`ext_local_addr` 未設定
+                    // (= attach_ext_layer されていないテスト経路) の場合は NGN UAC
+                    // の local_addr で代替する (RFC 3261 §13.3.1.4 を満たすには
+                    // sub-optimal だが Contact 自体は必ず入れる)。
+                    let contact_uri = self.ext_contact_uri();
+                    let response_to_ext =
+                        build_2xx_to_ext(&request, &body_for_ext, &contact_uri);
                     responder.respond(response_to_ext.clone()).await?;
 
                     // 観測: NGN レッグも内線レッグも応答済みとして記録
@@ -1217,6 +1224,39 @@ impl UasEventHandler {
         Ok(())
     }
 
+    /// 内線レッグの 200 OK / in-dialog レスポンスに載せる Contact URI を返す。
+    ///
+    /// RFC 3261 §13.3.1.4 (UAS Behavior, 2xx Responses) に従い、Contact は
+    /// 内線レッグで in-dialog request を受け付ける socket を指す必要がある。
+    ///
+    /// 解決順:
+    /// 1. `ext_local_addr` (attach_ext_layer で渡される内線 UAS bind addr)
+    /// 2. `ext_layer.local_addr()` (TransactionLayer 結線済 socket)
+    /// 3. NGN UAC の `local_addr` (sub-optimal: 内線とトランスポートが
+    ///    分かれているケースでは届かない可能性があるが、RFC §13.3.1.4 違反
+    ///    回避のため必ず何か入れる)
+    ///
+    /// 3 にフォールバックした場合は warn を出す。
+    fn ext_contact_uri(&self) -> String {
+        let host = self
+            .ext_local_addr
+            .map(|a| a.to_string())
+            .or_else(|| {
+                self.ext_layer
+                    .as_ref()
+                    .and_then(|l| l.local_addr().ok().map(|a| a.to_string()))
+            })
+            .unwrap_or_else(|| {
+                let ngn_addr = self.ngn_uac.config().local_addr;
+                warn!(
+                    fallback=%ngn_addr,
+                    "内線レッグ Contact: ext_local_addr/ext_layer 未設定 → NGN UAC local_addr で代替"
+                );
+                ngn_addr.to_string()
+            });
+        format!("sip:sabiden@{}", host)
+    }
+
     /// 内線レッグの sabiden=UAS dialog 構築用 cfg を作る。
     fn build_ext_dialog_cfg(&self, invite: &SipRequest) -> DialogConfig {
         // local_uri = 内線 INVITE の To URI (= sabiden 側)
@@ -1322,13 +1362,27 @@ impl UasEventHandler {
 }
 
 /// 内線レッグの 200 OK を組み立てる。`build_response_skeleton` がベース。
-/// To に tag を付け、SDP body があれば設定する。
-fn build_2xx_to_ext(invite: &SipRequest, body: &[u8]) -> SipResponse {
+/// To に tag を付け、SDP body があれば設定し、Contact ヘッダを必ず付与する。
+///
+/// RFC 3261 §13.3.1.4 (UAS Behavior, 2xx Responses):
+/// > The 2xx response to an INVITE MUST contain a Contact header field with
+/// > a SIP or SIPS URI that the UAS will accept subsequent in-dialog
+/// > requests at.
+///
+/// RFC 3261 §12.1.1 (UAS Dialog State) も同様に Contact 必須を規定する。
+/// Contact が無いと UAC 側で remote target が決まらず ACK / BYE の宛先が
+/// 不定となり、Linphone 等は dialog 確立を諦めて切断する。
+///
+/// `contact_uri` は sabiden が内線レッグで listen している SIP URI
+/// (例 `sip:sabiden@192.168.20.239:5061`)。`<...>` 形式に整形される前提の
+/// 生 URI で渡し、本関数内で `<` `>` を付けて name-addr 形式にする。
+fn build_2xx_to_ext(invite: &SipRequest, body: &[u8], contact_uri: &str) -> SipResponse {
     let mut resp = build_response_skeleton(invite, 200, "OK");
     if !body.is_empty() {
         resp.headers.set("Content-Type", "application/sdp");
         resp.body = body.to_vec();
     }
+    resp.headers.set("Contact", format!("<{}>", contact_uri));
     ensure_to_tag(&mut resp);
     resp
 }
@@ -2019,6 +2073,45 @@ mod tests {
         let canonical = "sip:117@118.177.125.1:5060";
         let out = normalize_request_uri_for_ngn(canonical, "118.177.125.1", 5060);
         assert_eq!(out, "sip:117@118.177.125.1:5060");
+    }
+
+    /// RFC 3261 §13.3.1.4 (UAS Behavior, 2xx Responses):
+    /// 内線レッグの 200 OK には Contact ヘッダが必須。Contact が無いと
+    /// UAC 側で remote target が決まらず ACK / BYE の宛先が不定となり、
+    /// Linphone 等は dialog 確立を諦めて切断する (Issue #64)。
+    #[test]
+    fn rfc3261_13_3_1_4_build_2xx_to_ext_includes_contact_header() {
+        // 模擬 INVITE (To = sabiden 内線、From = 内線 UA)
+        let ngn_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let invite = builders::invite_from_phone(
+            &ngn_addr,
+            "iphone",
+            "sip:0312345678@sabiden",
+            "z9hG4bK-2xx-contact",
+            None,
+        );
+        let body = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n";
+
+        let resp = build_2xx_to_ext(&invite, body, "sip:sabiden@192.168.20.239:5061");
+
+        // Contact ヘッダが name-addr 形式で必ず入る
+        assert_eq!(
+            resp.headers.get("contact"),
+            Some("<sip:sabiden@192.168.20.239:5061>"),
+            "RFC 3261 §13.3.1.4: 2xx には Contact ヘッダが必須",
+        );
+        // SDP body と Content-Type も維持
+        assert_eq!(resp.headers.get("content-type"), Some("application/sdp"));
+        assert_eq!(resp.body, body);
+        // To tag は ensure_to_tag で付く
+        assert!(
+            resp.headers
+                .get("to")
+                .map(|v| v.contains("tag="))
+                .unwrap_or(false),
+            "RFC 3261 §8.2.6.2: 2xx の To には tag が必須"
+        );
+        assert_eq!(resp.status_code, 200);
     }
 
     /// Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.2):

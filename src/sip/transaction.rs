@@ -2,13 +2,100 @@
 //!
 //! トランザクション ID は (branch, sent-by, cseq-method) で一意に決まる
 //! (RFC 3261 §17.1.3, §17.2.3)。本モジュールでは UAC/UAS の双方の
-//! トランザクション状態機械と、UDP 上での再送 (Timer A/E) ・
-//! トランザクション タイムアウト (Timer B/F) ・最終応答後の
-//! バッファリング (Timer D/K) を実装する。
+//! トランザクション状態機械を、UDP 上の前提で実装する。
 //!
-//! NTT NGN 制約: 既存 `register.rs` 同様、Via ヘッダに `rport` を付けない
-//! (拒否される) 制約は呼び出し側 (リクエスト ビルダ) の責務であり、本層は
-//! Via をそのまま透過する。
+//! ## 状態機械
+//!
+//! ### Client INVITE (RFC 3261 §17.1.1, Figure 5)
+//! ```text
+//!         |INVITE from TU
+//!         |INVITE sent
+//!         |Timer A fires (T1, 2*T1, ..., resend INVITE)
+//!         V
+//!     +---------+
+//!     | Calling | -- 1xx --+
+//!     +---------+         |
+//!         |               V
+//!      2xx-6xx       +-----------+
+//!         |          |Proceeding |--- 1xx ---+
+//!         V          +-----------+           |
+//!     +-----------+      |  2xx-6xx          |
+//!     | Completed |<-----+                   |
+//!     +-----------+                          |
+//!         |                                  |
+//!      Timer D                               |
+//!         V                                  |
+//!     +------------+                         |
+//!     | Terminated |<------- Timer B --------+
+//!     +------------+
+//! ```
+//! - Timer A: T1, 2*T1, 4*T1, ... (UDP のみ; INVITE 再送)
+//! - Timer B: 64*T1 (=32s) でタイムアウト
+//! - Timer D: UDP では 32s 以上 (本実装は 32s)
+//!
+//! ### Client non-INVITE (RFC 3261 §17.1.2, Figure 6)
+//! ```text
+//!         |Request from TU
+//!         V
+//!     +-------+
+//!     |Trying | -- Timer E (T1, then min(2*prev, T2)) -> resend
+//!     +-------+
+//!         |  1xx                          200-699
+//!         V                                   |
+//!     +-----------+                           |
+//!     |Proceeding | -- Timer E -> resend      |
+//!     +-----------+                           |
+//!         |  200-699                          |
+//!         V                                   V
+//!     +-----------+
+//!     | Completed | -- Timer K (4s, UDP) -> Terminated
+//!     +-----------+
+//!         ^
+//!         | Timer F (64*T1) -> Terminated (timeout)
+//! ```
+//!
+//! ### Server INVITE (RFC 3261 §17.2.1, Figure 7)
+//! ```text
+//!         |INVITE
+//!         V                       100-199 from TU
+//!     +-----------+ <----------+
+//!     |Proceeding |            |
+//!     +-----------+ ---- 200 OK from TU ----> +-------+
+//!         |       --- 300-699 from TU ---->   |       |
+//!         |                                   |       |
+//!         V                                   V       |
+//!     +-----------+ ACK                  +-----------+|
+//!     | Completed |---------> Confirmed  |   '2xx    ||
+//!     +-----------+                      | retxn'    || (RFC 6026)
+//!        | Timer G (T1, 2*T1, ..., T2 cap)|            |
+//!        | resend final non-2xx          +-----------+
+//!        | Timer H (64*T1) -> Terminated
+//!        V (ACK)
+//!     +-----------+   Timer I (T4) -> Terminated
+//!     | Confirmed |
+//!     +-----------+
+//! ```
+//! 200 OK の再送は本実装では `ServerTransaction` で `Timer G/H` 相当を
+//! 同じパスで駆動する (RFC 6026 で 200 OK も transaction が保持する形に
+//! 整理されたが、本実装は最後に送った final response を一律保持する)。
+//!
+//! ### Server non-INVITE (RFC 3261 §17.2.2, Figure 8)
+//! ```text
+//!         |Request from network
+//!         V
+//!     +--------+
+//!     | Trying | --- 1xx -> Proceeding --- 200-699 -> Completed
+//!     +--------+                                    | Timer J (64*T1, UDP)
+//!                                                   V
+//!                                              Terminated
+//! ```
+//! Completed 中の同一リクエスト再送に対しては、最後に送った final
+//! response をそのまま再送する (RFC 3261 §17.2.2)。
+//!
+//! ## NTT NGN 制約
+//! 既存 `register.rs` 同様、Via ヘッダに `rport` を付けない (拒否される)
+//! 制約は呼び出し側 (リクエスト ビルダ) の責務であり、本層は Via を
+//! そのまま透過する。
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,18 +112,32 @@ use crate::observability::{extract_method_and_call_id, SipTraceWriter, TraceDir}
 
 /// RFC 3261 §17.1.1.1 Timer T1 (RTT 推定値)。デフォルトは 500ms。
 pub const T1: Duration = Duration::from_millis(500);
-/// RFC 3261 §17.1.2.2 Timer T2 (non-INVITE 再送間隔の上限)。デフォルトは 4s。
+/// RFC 3261 §17.1.2.2 Timer T2 (non-INVITE 再送間隔の上限 / INVITE 200 OK 再送上限)。
 pub const T2: Duration = Duration::from_secs(4);
-/// RFC 3261 §17.1.1.2 Timer T4 (メッセージのネット上残留時間)。デフォルトは 5s。
+/// RFC 3261 §17.1.1.2 Timer T4 (メッセージのネット上残留時間)。
 pub const T4: Duration = Duration::from_secs(5);
-/// RFC 3261 §17.1.1.2 Timer B/F = 64 * T1 (トランザクション タイムアウト)。
+
+/// RFC 3261 §17.1.1.2 Timer B = 64 * T1 (client INVITE タイムアウト = 32s)。
 pub const TIMER_B: Duration = Duration::from_millis(64 * 500);
+/// RFC 3261 §17.1.2.2 Timer F = 64 * T1 (client non-INVITE タイムアウト = 32s)。
+pub const TIMER_F: Duration = Duration::from_millis(64 * 500);
+/// RFC 3261 §17.1.1.2 Timer D (client INVITE Completed 滞在時間, UDP は >= 32s)。
+pub const TIMER_D: Duration = Duration::from_secs(32);
+/// RFC 3261 §17.1.2.2 Timer K (client non-INVITE Completed 滞在時間, UDP = T4)。
+pub const TIMER_K: Duration = T4;
+/// RFC 3261 §17.2.1 Timer H = 64 * T1 (server INVITE ACK 待ちの最終タイムアウト)。
+pub const TIMER_H: Duration = Duration::from_millis(64 * 500);
+/// RFC 3261 §17.2.1 Timer I (server INVITE Confirmed 滞在時間, UDP = T4)。
+pub const TIMER_I: Duration = T4;
+/// RFC 3261 §17.2.2 Timer J = 64 * T1 (server non-INVITE Completed 滞在時間, UDP)。
+pub const TIMER_J: Duration = Duration::from_millis(64 * 500);
 
 /// Client/Server を区別しないトランザクション ID。
 ///
 /// RFC 3261 §17.1.3 / §17.2.3 に従い、branch (RFC 3261 magic cookie 付き) と
 /// 送信元 sent-by、CSeq method の三要素で同定する。CANCEL は元の INVITE と
-/// 同一 branch を共有するが method で区別される。
+/// 同一 branch を共有するが method で区別される。ACK もまた CSeq method
+/// が "INVITE" のままなので、サーバ側マッチングで特別扱いが必要。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransactionId {
     pub branch: String,
@@ -124,13 +225,14 @@ fn parse_via(via: &str) -> Result<(String, String)> {
 /// クライアント トランザクションの状態 (RFC 3261 §17.1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
-    /// INVITE 送信直後。再送タイマ A 起動 (RFC 3261 §17.1.1.2)。
+    /// INVITE 送信直後。Timer A (再送) / B (タイムアウト) 起動。
     Calling,
-    /// non-INVITE 送信直後。再送タイマ E 起動 (RFC 3261 §17.1.2.2)。
+    /// non-INVITE 送信直後。Timer E (再送) / F (タイムアウト) 起動。
     Trying,
-    /// 1xx 受信後。INVITE/non-INVITE で Timer A/E が止まる。
+    /// 1xx 受信後。INVITE は Timer A 停止、non-INVITE は Timer E を T2 に
+    /// クリップしつつ継続。
     Proceeding,
-    /// 最終応答 (>=200) 受信後。Timer D (UDP) / K でバッファ。
+    /// 最終応答 (>=200) 受信後。INVITE は Timer D, non-INVITE は Timer K で滞在。
     Completed,
     /// 終了。
     Terminated,
@@ -141,11 +243,13 @@ pub enum ClientState {
 pub enum ServerState {
     /// non-INVITE: リクエスト受信直後 (provisional 未送信)。
     Trying,
-    /// provisional 送信後。
+    /// provisional 送信後 / INVITE は受信直後から Proceeding。
     Proceeding,
-    /// 最終応答送信後。再送に備えて Timer J/H 待機。
+    /// 最終応答送信後。
+    /// - non-INVITE: Timer J (64*T1) で滞在し、再送に応える。
+    /// - INVITE non-2xx: Timer G (T1→T2 cap) で再送、Timer H (64*T1) で異常終了。
     Completed,
-    /// INVITE のみ。最終応答 (>=300 又は 2xx 以外の終端) 後 ACK 受信。
+    /// INVITE Completed で ACK を受信した後の状態。Timer I (T4) で滞在。
     Confirmed,
     /// 終了。
     Terminated,
@@ -156,6 +260,15 @@ pub enum ServerState {
 enum ClientEvent {
     /// 受信した SIP レスポンス。
     Response(SipResponse),
+}
+
+/// サーバ トランザクションへ TransactionLayer から流すイベント。
+#[derive(Debug)]
+enum ServerEvent {
+    /// 同じ branch+method のリクエスト再送。
+    Retransmit,
+    /// INVITE Completed 中に到着した ACK (CSeq method=INVITE)。
+    Ack,
 }
 
 /// クライアント トランザクションのハンドル。`run` を await すると
@@ -197,20 +310,55 @@ impl ClientTransaction {
 
     /// Transaction を駆動して最終応答を返す。
     ///
-    /// - Calling/Trying → Proceeding: 1xx 受信
-    /// - * → Completed: >=200 受信
-    /// - Timer B/F: タイムアウト (64*T1)
+    /// RFC 3261 §17.1 (Figure 5/6) の擬似コード:
+    ///
+    /// ```text
+    /// // INVITE
+    /// state = Calling
+    /// send(request)
+    /// schedule(Timer A = T1, fire repeatedly: send(request); A *= 2)
+    /// schedule(Timer B = 64*T1, fire once: state = Terminated; report timeout)
+    /// loop {
+    ///   recv response or timer:
+    ///     1xx: state = Proceeding; cancel(Timer A)
+    ///     2xx-6xx: state = Completed; cancel(Timer A,B); schedule(Timer D)
+    ///     Timer D: state = Terminated
+    /// }
+    ///
+    /// // non-INVITE
+    /// state = Trying
+    /// send(request)
+    /// schedule(Timer E = T1, fire repeatedly: send(request); E = min(2*E, T2))
+    /// schedule(Timer F = 64*T1, fire once: state = Terminated; report timeout)
+    /// loop {
+    ///   recv response or timer:
+    ///     1xx: state = Proceeding (Timer E は継続だが上限が T2)
+    ///     200-699: state = Completed; cancel(E,F); schedule(Timer K = T4)
+    ///     Timer K: state = Terminated
+    /// }
+    /// ```
+    ///
+    /// 本実装は `Completed` に入った時点で final response を呼び出し側に
+    /// 返し、Timer D / K に相当するエントリ滞在は [`TransactionLayer`] 側
+    /// で行う ([`TransactionLayer::drop_client_after`] 参照)。これは
+    /// レスポンス再送への ACK 整合 (RFC 3261 §17.1.1.3) は ACK 送信側
+    /// (UAC TU) の責務に切り出されているため。
     pub async fn run(mut self) -> Result<SipResponse> {
         let bytes = self.request.to_bytes();
         self.socket.send_to(&bytes, self.destination).await?;
         write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         debug!(?self.id, "client tx 送信");
 
+        // INVITE: Timer A 初期値 T1, 倍々
+        // non-INVITE: Timer E 初期値 T1, min(2*prev, T2)
+        let is_invite = matches!(self.request.method, SipMethod::Invite);
         let mut interval = T1;
+        let timeout = if is_invite { TIMER_B } else { TIMER_F };
+
         let next_retx = time::sleep(interval);
         tokio::pin!(next_retx);
-        let timeout_b = time::sleep(TIMER_B);
-        tokio::pin!(timeout_b);
+        let timeout_bf = time::sleep(timeout);
+        tokio::pin!(timeout_bf);
 
         loop {
             tokio::select! {
@@ -221,32 +369,51 @@ impl ClientTransaction {
                     let code = resp.status_code;
                     trace!(?self.id, code, "client tx 応答");
                     if (100..200).contains(&code) {
-                        // 1xx で再送停止 (RFC 3261 §17.1.1.2 / §17.1.2.2)
+                        // 1xx で状態遷移。
+                        // - INVITE: Timer A を停止 (再送停止)
+                        // - non-INVITE: Timer E は継続するが上限を T2 にクリップ。
+                        //   既に T2 を超えていれば即 T2 にする。
                         self.state = ClientState::Proceeding;
-                        // 再送停止: タイマを十分先へ延ばす
-                        next_retx
-                            .as_mut()
-                            .reset(time::Instant::now() + TIMER_B);
+                        if is_invite {
+                            // Timer A 停止: 十分先へ
+                            next_retx
+                                .as_mut()
+                                .reset(time::Instant::now() + timeout);
+                        } else {
+                            // RFC 3261 §17.1.2.2: Proceeding では Timer E を T2 にクリップ
+                            interval = T2;
+                            next_retx
+                                .as_mut()
+                                .reset(time::Instant::now() + interval);
+                        }
                         continue;
                     }
-                    // 最終応答
+                    // 最終応答 (>=200)
                     self.state = ClientState::Completed;
                     return Ok(resp);
                 }
-                _ = &mut next_retx, if matches!(self.state, ClientState::Calling | ClientState::Trying) => {
-                    // 再送 (Timer A: INVITE は倍々, Timer E: non-INVITE は T2 上限)
+                _ = &mut next_retx, if matches!(self.state, ClientState::Calling | ClientState::Trying | ClientState::Proceeding) => {
+                    // RFC 3261 §17.1.1.2 Timer A: INVITE は倍々 (T1, 2*T1, 4*T1, ...)
+                    // RFC 3261 §17.1.2.2 Timer E: non-INVITE は min(2*prev, T2)
+                    // ただし INVITE は Proceeding 入り後は再送しない。
+                    if is_invite && self.state != ClientState::Calling {
+                        // 念のためガード (上の 1xx ブランチで停止済みのはず)
+                        next_retx.as_mut().reset(time::Instant::now() + timeout);
+                        continue;
+                    }
                     self.socket.send_to(&bytes, self.destination).await?;
                     write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
                     debug!(?self.id, ?interval, "client tx 再送");
-                    interval = match self.request.method {
-                        SipMethod::Invite => interval.saturating_mul(2),
-                        _ => std::cmp::min(interval.saturating_mul(2), T2),
+                    interval = if is_invite {
+                        interval.saturating_mul(2)
+                    } else {
+                        std::cmp::min(interval.saturating_mul(2), T2)
                     };
                     next_retx.as_mut().reset(time::Instant::now() + interval);
                 }
-                _ = &mut timeout_b => {
+                _ = &mut timeout_bf => {
                     self.state = ClientState::Terminated;
-                    warn!(?self.id, "client tx Timer B/F タイムアウト");
+                    warn!(?self.id, ?timeout, "client tx Timer B/F タイムアウト");
                     return Err(anyhow!("transaction timeout"));
                 }
             }
@@ -264,9 +431,13 @@ impl ClientTransaction {
 
 /// サーバ トランザクション (RFC 3261 §17.2)。
 ///
-/// non-INVITE では provisional / final response 送信を司り、
-/// 同一リクエストの再送に対しては最後に送った応答を返す。
-/// INVITE では ACK 待機 (Timer H) の責務を負う。
+/// Figure 7/8 の状態機械を内部で駆動する。Final response を `respond` で
+/// 送ると、再送タイマ (INVITE: Timer G + H, non-INVITE: Timer J 滞在)
+/// を内部で起動し、ACK 受信や Timer 満了で Terminated に遷移する。
+///
+/// 同一リクエストの再送に対しては、最後に送った final response を
+/// 自動的に再送する ([`handle_retransmit`])。これは [`TransactionLayer`]
+/// が ID マッチで呼び出すか、外部から直接呼び出す。
 pub struct ServerTransaction {
     id: TransactionId,
     request: SipRequest,
@@ -275,6 +446,19 @@ pub struct ServerTransaction {
     state: ServerState,
     last_response: Option<SipResponse>,
     tracer: SipTraceWriter,
+    /// `respond` で final を送った時点で起動する内部タイマタスクのハンドル。
+    /// Drop 時に abort して、未完のタイマを掃除する。
+    timer_task: Option<tokio::task::JoinHandle<()>>,
+    /// 内部タイマタスクへ ACK / 再送イベントを伝えるチャネル。
+    timer_event_tx: Option<mpsc::UnboundedSender<ServerEvent>>,
+}
+
+impl Drop for ServerTransaction {
+    fn drop(&mut self) {
+        if let Some(h) = self.timer_task.take() {
+            h.abort();
+        }
+    }
 }
 
 impl ServerTransaction {
@@ -302,20 +486,31 @@ impl ServerTransaction {
             state,
             last_response: None,
             tracer,
+            timer_task: None,
+            timer_event_tx: None,
         })
     }
 
     /// 応答を送信し、状態を遷移させる。
+    ///
+    /// final response (>=200) を送った時点で:
+    /// - INVITE non-2xx: Completed に遷移し、Timer G (T1→T2 cap) で再送、
+    ///   Timer H (64*T1) で異常タイムアウト。ACK 受信で Confirmed → Timer I。
+    /// - INVITE 2xx: 同様に Timer G/H でメッセージを保持する (RFC 6026 で
+    ///   transaction が 2xx も保持する形に整理された)。ACK 受信で Confirmed。
+    /// - non-INVITE: Completed に遷移し、Timer J (64*T1) で滞在。
     pub async fn respond(&mut self, resp: SipResponse) -> Result<()> {
         let code = resp.status_code;
         let bytes = resp.to_bytes();
         self.socket.send_to(&bytes, self.remote).await?;
         write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         self.last_response = Some(resp);
+
         match (self.state, code) {
             (ServerState::Trying, 100..=199) => self.state = ServerState::Proceeding,
             (ServerState::Trying | ServerState::Proceeding, 200..=699) => {
                 self.state = ServerState::Completed;
+                self.start_completed_timers();
             }
             (ServerState::Proceeding, 100..=199) => {} // 追加 provisional は状態維持
             _ => {}
@@ -324,15 +519,145 @@ impl ServerTransaction {
         Ok(())
     }
 
+    /// `state == Completed` に入った時点で再送 / タイムアウトのバックグラウンド
+    /// タスクを起動する。Drop で abort される。
+    fn start_completed_timers(&mut self) {
+        // 既に走っているなら停止 (二重 final 等)。
+        if let Some(h) = self.timer_task.take() {
+            h.abort();
+        }
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        self.timer_event_tx = Some(event_tx);
+
+        let is_invite = matches!(self.request.method, SipMethod::Invite);
+        let socket = self.socket.clone();
+        let remote = self.remote;
+        let tracer = self.tracer.clone();
+        let id = self.id.clone();
+        let last_bytes = self
+            .last_response
+            .as_ref()
+            .map(|r| r.to_bytes())
+            .unwrap_or_default();
+
+        let task = tokio::spawn(async move {
+            if last_bytes.is_empty() {
+                return;
+            }
+            if is_invite {
+                // Timer G: T1 から始め T2 にクリップ、Timer H = 64*T1
+                let mut g_interval = T1;
+                let g_sleep = time::sleep(g_interval);
+                tokio::pin!(g_sleep);
+                let h_sleep = time::sleep(TIMER_H);
+                tokio::pin!(h_sleep);
+
+                let got_ack;
+                loop {
+                    tokio::select! {
+                        ev = event_rx.recv() => {
+                            match ev {
+                                Some(ServerEvent::Retransmit) => {
+                                    // RFC 3261 §17.2.1: Completed 中に再送リクエスト
+                                    // が来たら最後の final を返し、Timer G を初期化。
+                                    let _ = socket.send_to(&last_bytes, remote).await;
+                                    write_trace(&tracer, TraceDir::Sent, &last_bytes).await;
+                                    g_interval = T1;
+                                    g_sleep.as_mut().reset(time::Instant::now() + g_interval);
+                                }
+                                Some(ServerEvent::Ack) => {
+                                    got_ack = true;
+                                    break;
+                                }
+                                None => return,
+                            }
+                        }
+                        _ = &mut g_sleep => {
+                            // Timer G 満了: 自発再送
+                            let _ = socket.send_to(&last_bytes, remote).await;
+                            write_trace(&tracer, TraceDir::Sent, &last_bytes).await;
+                            g_interval = std::cmp::min(g_interval.saturating_mul(2), T2);
+                            g_sleep.as_mut().reset(time::Instant::now() + g_interval);
+                            trace!(?id, ?g_interval, "server tx Timer G 自発再送");
+                        }
+                        _ = &mut h_sleep => {
+                            warn!(?id, "server tx Timer H タイムアウト (ACK 不到来)");
+                            got_ack = false;
+                            break;
+                        }
+                    }
+                }
+
+                if got_ack {
+                    // RFC 3261 §17.2.1: Confirmed で Timer I = T4 だけ滞在し、
+                    // 遅延 ACK の再送を吸収して Terminated。
+                    time::sleep(TIMER_I).await;
+                    trace!(?id, "server tx Timer I 終了 → Terminated");
+                } else {
+                    trace!(?id, "server tx Timer H で異常終了");
+                }
+            } else {
+                // non-INVITE: Timer J = 64*T1 滞在。Completed 中の再送には
+                // 既送 final を再送 (RFC 3261 §17.2.2)。
+                let j_sleep = time::sleep(TIMER_J);
+                tokio::pin!(j_sleep);
+
+                loop {
+                    tokio::select! {
+                        ev = event_rx.recv() => {
+                            match ev {
+                                Some(ServerEvent::Retransmit) => {
+                                    let _ = socket.send_to(&last_bytes, remote).await;
+                                    write_trace(&tracer, TraceDir::Sent, &last_bytes).await;
+                                }
+                                Some(ServerEvent::Ack) => {
+                                    // non-INVITE には ACK が来ないが、念のため無視
+                                }
+                                None => return,
+                            }
+                        }
+                        _ = &mut j_sleep => {
+                            trace!(?id, "server tx Timer J 終了 → Terminated");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        self.timer_task = Some(task);
+    }
+
     /// リクエスト再送に対して直近の応答を再送する (RFC 3261 §17.2.1 / §17.2.2)。
+    ///
+    /// 内部タイマタスクが起動済みならそちらに通知して再送 + Timer リセットを
+    /// させる。未起動 (Completed 前) なら同期的に最後の応答を送る。
     pub async fn handle_retransmit(&self) -> Result<()> {
+        if let Some(tx) = &self.timer_event_tx {
+            let _ = tx.send(ServerEvent::Retransmit);
+            return Ok(());
+        }
         if let Some(resp) = &self.last_response {
             let bytes = resp.to_bytes();
             self.socket.send_to(&bytes, self.remote).await?;
             write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
-            trace!(?self.id, "server tx 応答再送");
+            trace!(?self.id, "server tx 応答再送 (タイマ未起動)");
         }
         Ok(())
+    }
+
+    /// INVITE Completed 中に ACK を受信したことを伝える。
+    /// Confirmed に遷移し、Timer I (T4) 滞在後に Terminated。
+    pub fn handle_ack(&mut self) {
+        if matches!(self.request.method, SipMethod::Invite)
+            && matches!(self.state, ServerState::Completed)
+        {
+            self.state = ServerState::Confirmed;
+            if let Some(tx) = &self.timer_event_tx {
+                let _ = tx.send(ServerEvent::Ack);
+            }
+        }
     }
 
     pub fn id(&self) -> &TransactionId {
@@ -583,6 +908,20 @@ mod tests {
         req
     }
 
+    fn make_invite_request(branch: &str) -> SipRequest {
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:bob@ntt-east.ne.jp");
+        req.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP 192.0.2.1:5060;branch={}", branch),
+        );
+        req.headers
+            .set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=alice");
+        req.headers.set("To", "<sip:bob@ntt-east.ne.jp>");
+        req.headers.set("Call-ID", "callid@host");
+        req.headers.set("CSeq", "1 INVITE");
+        req
+    }
+
     fn make_response(branch: &str, code: u16, method: &str) -> SipResponse {
         let mut headers = SipHeaders::new();
         headers.set(
@@ -647,28 +986,37 @@ mod tests {
         assert_eq!(resp.headers.get("cseq").unwrap(), "1 REGISTER");
     }
 
-    /// Timer B (64*T1 = 32s) 相当のタイムアウト確認。
+    /// Timer B (64*T1 = 32s) 相当のタイムアウト確認 (INVITE)。
     /// `tokio::time::pause` で仮想時間を進めて短時間で検証する。
     #[tokio::test(start_paused = true)]
-    async fn test_client_transaction_timeout_b() {
-        // 受信側として bind だけする (相手は応答しない)
+    async fn test_client_invite_timer_b_timeout() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let dest: SocketAddr = socket.local_addr().unwrap();
-
-        // ループバックに送るが受信側は何もしない (= 応答が来ないシナリオ)
-        // 別ソケットを宛先にすることで自分宛の再送を吸収させる。
         let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest_sink: SocketAddr = sink.local_addr().unwrap();
-        let _ = dest;
 
-        let req = make_request("z9hG4bKtimeoutB");
+        let req = make_invite_request("z9hG4bKtimerB");
         let id = TransactionId::from_request(&req).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        // 起動時は登録だけし、応答は来ない
         drop(tx);
         let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
         let result = ct.run().await;
-        assert!(result.is_err(), "timeout で Err になるはず");
+        assert!(result.is_err(), "Timer B (64*T1=32s) でタイムアウトするはず");
+    }
+
+    /// Timer F (64*T1 = 32s) 相当のタイムアウト確認 (non-INVITE)。
+    #[tokio::test(start_paused = true)]
+    async fn test_client_non_invite_timer_f_timeout() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_sink: SocketAddr = sink.local_addr().unwrap();
+
+        let req = make_request("z9hG4bKtimerF");
+        let id = TransactionId::from_request(&req).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(tx);
+        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
+        let result = ct.run().await;
+        assert!(result.is_err(), "Timer F (64*T1=32s) でタイムアウトするはず");
     }
 
     /// 1xx 受信で Proceeding に遷移し、2xx で完了することを確認。
@@ -699,6 +1047,115 @@ mod tests {
 
         let resp = ct.run().await.unwrap();
         assert_eq!(resp.status_code, 200);
+    }
+
+    /// 再送ステップを観測するためのヘルパ。
+    ///
+    /// `tokio::time::pause` モードでは、UDP recv は実 OS の syscall であり
+    /// 仮想時間と独立に走るため、`time::advance` 後は recv タスクに poll
+    /// 機会を与える必要がある。`yield_now` を数回挟んで、tokio runtime に
+    /// 再スケジュール機会を与える。
+    async fn step_and_yield(amount: Duration) {
+        time::advance(amount).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// RFC 3261 §17.1.1.2 Timer A: INVITE は T1, 2*T1, 4*T1, ... で再送される。
+    /// 仮想時間を進めて再送回数が指数バックオフであることを確認。
+    #[tokio::test(start_paused = true)]
+    async fn test_client_invite_timer_a_exponential_backoff() {
+        // 受信側ソケットに送って recv で再送をカウントする。
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sink = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = sink.local_addr().unwrap();
+
+        // recv は別タスクで貯める
+        let sink_clone = sink.clone();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if sink_clone.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_invite_request("z9hG4bKtimerA");
+        let id = TransactionId::from_request(&req).unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let ct = ClientTransaction::new(id, req, dest, socket, rx, SipTraceWriter::disabled());
+        let h = tokio::spawn(async move { ct.run().await });
+        // 初回送信を待つ
+        step_and_yield(Duration::from_millis(0)).await;
+
+        // 仮想時間: T1 (500ms) で 1 回目再送, +1000ms で 2回目, +2000ms で 3回目, ...
+        // 段階的に進めて UDP recv に処理機会を与える。
+        for _ in 0..6 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+
+        let n = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            n >= 5,
+            "Timer A による再送が指数バックオフで複数回起きるはず (got {})",
+            n
+        );
+
+        // 最終的に Timer B でエラーになる
+        step_and_yield(Duration::from_secs(5)).await;
+        let res = h.await.unwrap();
+        assert!(res.is_err(), "Timer B でタイムアウトするはず");
+    }
+
+    /// RFC 3261 §17.1.2.2 Timer E: non-INVITE は T1, 2*T1, ..., T2 cap で再送。
+    /// 1 秒以上経過しても再送間隔は T2 (=4s) を超えないことを確認。
+    #[tokio::test(start_paused = true)]
+    async fn test_client_non_invite_timer_e_t2_cap() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sink = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = sink.local_addr().unwrap();
+
+        let sink_clone = sink.clone();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if sink_clone.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_request("z9hG4bKtimerE");
+        let id = TransactionId::from_request(&req).unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let ct = ClientTransaction::new(id, req, dest, socket, rx, SipTraceWriter::disabled());
+        let h = tokio::spawn(async move { ct.run().await });
+        step_and_yield(Duration::from_millis(0)).await;
+
+        // 32s 弱の間で T1, 2T1, 4T1=2s, 8T1=4s, T2=4s, T2=4s, ... で
+        // 累計 ~10 回程度の送信が起きる (1 + 5..10 程度の再送)。
+        for _ in 0..6 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+
+        let n = counter.load(std::sync::atomic::Ordering::SeqCst);
+        // 純粋な指数バックオフだと 32s で 6 回 (1+2+4+8+16=31s 累積) にしかならないが、
+        // T2 cap で抑えられて 7 回以上になるはず。
+        assert!(
+            n >= 7,
+            "Timer E は T2 cap で抑えられて再送回数が増えるはず (got {})",
+            n
+        );
+
+        step_and_yield(Duration::from_secs(5)).await;
+        let res = h.await.unwrap();
+        assert!(res.is_err(), "Timer F でタイムアウトするはず");
     }
 
     /// レスポンス ディスパッチが ID 一致でクライアントに届くことを確認。
@@ -736,5 +1193,220 @@ mod tests {
 
         let resp = layer.send_request(req, server_addr).await.unwrap();
         assert_eq!(resp.status_code, 200);
+    }
+
+    /// RFC 3261 §17.2.1 Timer G: server INVITE Completed で final response が
+    /// 自発再送される。Timer G は T1, 2*T1, ..., T2 cap。
+    #[tokio::test(start_paused = true)]
+    async fn test_server_invite_timer_g_retransmits_final() {
+        // server tx 用ソケット (送信元)。client 役は別ソケットで recv する。
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr: SocketAddr = client_sock.local_addr().unwrap();
+
+        // 受信カウンタ
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        let cs = client_sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if cs.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_invite_request("z9hG4bKsrvG");
+        let mut stx = ServerTransaction::new(req, client_addr, server_sock).unwrap();
+        // 486 Busy Here を返す = Completed に遷移し Timer G/H 起動
+        let resp = make_response("z9hG4bKsrvG", 486, "INVITE");
+        stx.respond(resp).await.unwrap();
+        assert_eq!(stx.state(), ServerState::Completed);
+        step_and_yield(Duration::from_millis(0)).await;
+
+        // 最初の送信 1 回 + Timer G 自発再送が 32s 内で複数回起きる。
+        for _ in 0..6 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+
+        let n = counter.load(std::sync::atomic::Ordering::SeqCst);
+        // 1 (初送) + Timer G 5 回以上 (T1+2T1+4T1+T2+T2+... )
+        assert!(
+            n >= 6,
+            "Timer G による final response 再送が複数回起きるはず (got {})",
+            n
+        );
+
+        // ここで stx を drop して内部タスクを停止
+        drop(stx);
+    }
+
+    /// RFC 3261 §17.2.1 Timer H: server INVITE Completed で ACK が来ないと
+    /// 64*T1 (=32s) 後に Timer H で異常終了 (再送停止)。
+    #[tokio::test(start_paused = true)]
+    async fn test_server_invite_timer_h_stops_retransmits() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr: SocketAddr = client_sock.local_addr().unwrap();
+
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        let cs = client_sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if cs.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_invite_request("z9hG4bKsrvH");
+        let mut stx = ServerTransaction::new(req, client_addr, server_sock).unwrap();
+        let resp = make_response("z9hG4bKsrvH", 486, "INVITE");
+        stx.respond(resp).await.unwrap();
+        step_and_yield(Duration::from_millis(0)).await;
+
+        // Timer H (32s) を超えて経過しても再送はそれ以上増えないことを確認。
+        for _ in 0..7 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+        let count_after_h = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        for _ in 0..3 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+        let count_later = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            count_after_h, count_later,
+            "Timer H 後は再送停止 (count: {} -> {})",
+            count_after_h, count_later
+        );
+        drop(stx);
+    }
+
+    /// RFC 3261 §17.2.1: ACK 受信で Confirmed → Timer I (T4=5s) 後 Terminated。
+    /// `handle_ack` で再送が止まることを確認。
+    #[tokio::test(start_paused = true)]
+    async fn test_server_invite_ack_stops_timer_g() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr: SocketAddr = client_sock.local_addr().unwrap();
+
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        let cs = client_sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if cs.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_invite_request("z9hG4bKsrvACK");
+        let mut stx = ServerTransaction::new(req, client_addr, server_sock).unwrap();
+        let resp = make_response("z9hG4bKsrvACK", 486, "INVITE");
+        stx.respond(resp).await.unwrap();
+        step_and_yield(Duration::from_millis(0)).await;
+
+        // T1+α の間に ACK を渡して Timer G を停止
+        step_and_yield(Duration::from_millis(800)).await;
+        let count_before_ack = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count_before_ack >= 2,
+            "ACK 前に少なくとも 1 回は Timer G 再送 (got {})",
+            count_before_ack
+        );
+
+        stx.handle_ack();
+        assert_eq!(stx.state(), ServerState::Confirmed);
+
+        // ACK 後、Timer I (T4=5s) 期間は何もしない。
+        for _ in 0..4 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+        let count_after_ack = counter.load(std::sync::atomic::Ordering::SeqCst);
+        // ACK 後は再送がほとんど増えない (タイミング差 1 回ぐらいまで許容)
+        assert!(
+            count_after_ack - count_before_ack <= 1,
+            "ACK 受信後は Timer G 停止 (before {} -> after {})",
+            count_before_ack,
+            count_after_ack
+        );
+        drop(stx);
+    }
+
+    /// RFC 3261 §17.2.2 Timer J: server non-INVITE Completed 滞在中に
+    /// 同一リクエスト再送に対し既送 final を再送する。
+    #[tokio::test(start_paused = true)]
+    async fn test_server_non_invite_timer_j_retransmits_on_request_dup() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr: SocketAddr = client_sock.local_addr().unwrap();
+
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = counter.clone();
+        let cs = client_sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                if cs.recv_from(&mut buf).await.is_ok() {
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let req = make_request("z9hG4bKsrvJ"); // REGISTER (non-INVITE)
+        let stx = ServerTransaction::new(req, client_addr, server_sock).unwrap();
+        // mut で final を送る
+        let mut stx = stx;
+        stx.respond(make_response("z9hG4bKsrvJ", 200, "REGISTER"))
+            .await
+            .unwrap();
+
+        // 最初の 1 回が届くまで進める
+        step_and_yield(Duration::from_millis(0)).await;
+        let count_initial = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count_initial, 1, "final 1 回送信 (got {})", count_initial);
+
+        // 同一リクエスト再送 → handle_retransmit (Timer J 期間内は既送 final を再送)
+        for _ in 0..3 {
+            stx.handle_retransmit().await.unwrap();
+            step_and_yield(Duration::from_millis(0)).await;
+        }
+        let count_after_dup = counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count_after_dup >= 4,
+            "再送リクエストごとに既送 final が再送される (got {})",
+            count_after_dup
+        );
+
+        // Timer J (32s) 後はタイマタスクが終了する。
+        for _ in 0..7 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
+        // 以降の handle_retransmit は通知だけで何も送らない (タスクが居ないため)
+        // ただし通知チャネルは生きているので unwrap は成功する。
+        stx.handle_retransmit().await.unwrap();
+        drop(stx);
+    }
+
+    #[test]
+    fn test_timer_constants_match_rfc() {
+        // RFC 3261 §17 で各 Timer の値がデフォルトと一致することを定数で確認。
+        assert_eq!(T1, Duration::from_millis(500));
+        assert_eq!(T2, Duration::from_secs(4));
+        assert_eq!(T4, Duration::from_secs(5));
+        assert_eq!(TIMER_B, T1 * 64);
+        assert_eq!(TIMER_F, T1 * 64);
+        assert_eq!(TIMER_H, T1 * 64);
+        assert_eq!(TIMER_J, T1 * 64);
+        assert_eq!(TIMER_K, T4);
+        assert_eq!(TIMER_I, T4);
+        assert_eq!(TIMER_D, Duration::from_secs(32));
     }
 }

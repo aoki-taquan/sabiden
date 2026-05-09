@@ -844,9 +844,14 @@ pub mod ext_ua {
             Ok(())
         }
 
-        /// Digest 認証付き INVITE を 1 往復で送る。
+        /// 内線 → sabiden UAS への INVITE を送り、最終応答 (>=200) を返す。
         ///
-        /// 戻り値は 100/200 を含む受信した最初の `>=200` レスポンス。
+        /// Issue #62 / RFC 3261 §22 以降、sabiden UAS は内線 INVITE に対して
+        /// Digest challenge を出さない (REGISTER で確立した binding を信用)。
+        /// 本ヘルパもそれに合わせ、Authorization ヘッダ無しで 1 発送って 100
+        /// を読み飛ばし最終応答を返すだけの実装にする。
+        ///
+        /// 戻り値は受信した最初の `>=200` レスポンス。
         /// `request_uri` は INVITE の宛先 (例 "sip:0312345678@sabiden")。
         /// `body` は SDP オファ。
         pub async fn invite_with_digest(
@@ -855,8 +860,7 @@ pub mod ext_ua {
             request_uri: &str,
             body: Vec<u8>,
         ) -> Result<SipResponse> {
-            // 1) authless INVITE → 401
-            let mut req1 = builders::invite_from_phone(
+            let mut req = builders::invite_from_phone(
                 &self.local_addr,
                 &self.user,
                 request_uri,
@@ -864,35 +868,10 @@ pub mod ext_ua {
                 None,
             );
             if !body.is_empty() {
-                req1.headers.set("Content-Type", "application/sdp");
-                req1.body = body.clone();
+                req.headers.set("Content-Type", "application/sdp");
+                req.body = body;
             }
-            self.socket.send_to(&req1.to_bytes(), server).await?;
-            let resp = self.recv_response(Duration::from_secs(2)).await?;
-            if resp.status_code != 401 {
-                anyhow::bail!("INVITE: 401 を期待 (got {})", resp.status_code);
-            }
-            let challenge = DigestChallenge::parse(
-                resp.headers
-                    .get("www-authenticate")
-                    .ok_or_else(|| anyhow::anyhow!("WWW-Authenticate 無し"))?,
-            )?;
-
-            // 2) Authorization 付き
-            let creds = DigestCredentials::new(&self.user, &self.password);
-            let auth = creds.compute(&challenge, "INVITE", request_uri, 1);
-            let mut req2 = builders::invite_from_phone(
-                &self.local_addr,
-                &self.user,
-                request_uri,
-                "z9hG4bKi2",
-                Some(&auth.header_value),
-            );
-            if !body.is_empty() {
-                req2.headers.set("Content-Type", "application/sdp");
-                req2.body = body;
-            }
-            self.socket.send_to(&req2.to_bytes(), server).await?;
+            self.socket.send_to(&req.to_bytes(), server).await?;
 
             // 100 Trying は読み飛ばし、最初の最終応答を返す。
             for _ in 0..5 {

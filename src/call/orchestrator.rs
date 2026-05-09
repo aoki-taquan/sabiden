@@ -2192,7 +2192,6 @@ mod tests {
     #[tokio::test]
     async fn uas_event_proxies_invite_to_ngn() {
         use crate::config::{ExtensionConfig, UasConfig};
-        use crate::sip::auth::{DigestChallenge, DigestCredentials};
         use crate::sip::uas::ExtensionUas;
         use crate::sip::utils::{new_call_id, new_tag};
 
@@ -2252,6 +2251,7 @@ mod tests {
         }];
         let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
         let uas_addr = uas.socket().local_addr().unwrap();
+        let registrar = uas.registrar();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let uas = uas.with_handler(event_tx);
@@ -2263,11 +2263,23 @@ mod tests {
         let handler = UasEventHandler::new(ngn_uac);
         handler.spawn(event_rx);
 
-        // (5) フェイク内線 UA から INVITE を送る (Digest 認証付き)
+        // (5) フェイク内線 UA から INVITE を送る。
+        //
+        // Issue #62 / RFC 3261 §22 以降、内線 INVITE では Digest challenge を
+        // 出さない (REGISTER で確立した binding を信用)。ここでは REGISTER の
+        // 往復を省略するため、registrar に AOR を直接 register して binding を
+        // 作っておく (本テストの主眼は INVITE→NGN プロキシのため)。
         let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let phone_local = phone.local_addr().unwrap();
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", phone_local),
+                phone_local,
+                Duration::from_secs(60),
+            )
+            .await;
 
-        // 5-a) 認証なし INVITE → 401
         let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
         req.headers.set(
             "Via",
@@ -2283,44 +2295,17 @@ mod tests {
             .set("Contact", format!("<sip:iphone@{}>", phone_local));
         phone.send_to(&req.to_bytes(), uas_addr).await.unwrap();
 
+        // 100 Trying → 200 OK が届くまで複数応答を読む。401 は来ない。
         let mut buf = vec![0u8; 8192];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), phone.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let resp = match parse_message(&buf[..n]).unwrap() {
-            SipMessage::Response(r) => r,
-            _ => panic!("expected response"),
-        };
-        assert_eq!(resp.status_code, 401);
-        let challenge =
-            DigestChallenge::parse(resp.headers.get("www-authenticate").unwrap()).unwrap();
-
-        // 5-b) Authorization 付きで再送
-        let creds = DigestCredentials::new("iphone", "secret");
-        let auth = creds.compute(&challenge, "INVITE", "sip:dest@sabiden", 1);
-        let mut req2 = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
-        req2.headers.set(
-            "Via",
-            format!("SIP/2.0/UDP {};branch=z9hG4bKuasint2", phone_local),
-        );
-        req2.headers.set("Max-Forwards", "70");
-        req2.headers
-            .set("From", format!("<sip:iphone@sabiden>;tag={}", new_tag()));
-        req2.headers.set("To", "<sip:dest@sabiden>");
-        req2.headers.set("Call-ID", new_call_id());
-        req2.headers.set("CSeq", "1 INVITE");
-        req2.headers
-            .set("Contact", format!("<sip:iphone@{}>", phone_local));
-        req2.headers.set("Authorization", &auth.header_value);
-        phone.send_to(&req2.to_bytes(), uas_addr).await.unwrap();
-
-        // 100 Trying → 200 OK が届くまで複数応答を読む
         let mut got_2xx = false;
         for _ in 0..5 {
             match tokio::time::timeout(Duration::from_secs(3), phone.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
                     if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        assert_ne!(
+                            r.status_code, 401,
+                            "Issue #62: 既登録 binding に対し challenge してはならない"
+                        );
                         if (200..300).contains(&r.status_code) {
                             got_2xx = true;
                             break;

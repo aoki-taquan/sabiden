@@ -31,11 +31,7 @@
 //! - RFC 3261 §9.1:    CANCEL は 487 Request Terminated を伴う
 
 #![cfg(test)]
-// `dead_code` を許容したい (段階的にハーネスへ移行する都合) が、`main.rs` 側の
-// `mod testing;` 宣言にも `#[allow(dead_code)]` が付いており clippy
-// `duplicated_attributes` に引っかかるため、本ファイル側ではモジュール属性を
-// 重ねず、必要な箇所で個別 `#[allow(dead_code)]` を付与する方針とする。
-// (`lib.rs` 側からの取込時はそちらの宣言が dead_code を抑止する。)
+#![allow(dead_code)] // 段階的に各テストへ移行するためダム未使用は許容する
 
 use std::net::SocketAddr;
 use std::sync::Arc;

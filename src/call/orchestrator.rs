@@ -1729,7 +1729,7 @@ fn force_rewrite_sdp_for_ngn(ext_offer: &[u8], ngn_local_ip: IpAddr) -> Option<V
 
 /// `wire_ngn_inbound` の `CallManager` 接続版。RTP ブリッジを起動する経路。
 pub fn wire_ngn_inbound_with_manager(
-    _layer: Arc<TransactionLayer>,
+    layer: Arc<TransactionLayer>,
     socket: Arc<UdpSocket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
     inviter: ExtInviter,
@@ -1737,8 +1737,44 @@ pub fn wire_ngn_inbound_with_manager(
     cfg: NgnInboundConfig,
     call_manager: Arc<CallManager>,
 ) -> Arc<NgnInboundHandler> {
-    let handler =
-        NgnInboundHandler::with_call_manager(socket, inviter, extensions, cfg, call_manager);
+    wire_ngn_inbound_with_manager_and_metrics(
+        layer,
+        socket,
+        inbound_rx,
+        inviter,
+        extensions,
+        cfg,
+        call_manager,
+        Metrics::new(),
+    )
+}
+
+/// `wire_ngn_inbound_with_manager` の メトリクス付きバージョン。
+///
+/// Issue #40 の本流配線で `main.rs` から呼ぶエントリポイント。NGN 着信 INVITE に
+/// 対して内線フォーク + RTP ブリッジ起動を一括で結線する。
+///
+/// 引数が多いのは結線ヘルパとして必須パラメータをそのまま受け渡すためで、
+/// 構造体化は本流配線の関心事ではない (`main.rs` から 1 か所で呼ぶだけ)。
+#[allow(clippy::too_many_arguments)]
+pub fn wire_ngn_inbound_with_manager_and_metrics(
+    _layer: Arc<TransactionLayer>,
+    socket: Arc<UdpSocket>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
+    inviter: ExtInviter,
+    extensions: Arc<ExtensionRegistrar>,
+    cfg: NgnInboundConfig,
+    call_manager: Arc<CallManager>,
+    metrics: Arc<Metrics>,
+) -> Arc<NgnInboundHandler> {
+    let handler = NgnInboundHandler::with_call_manager_and_metrics(
+        socket,
+        inviter,
+        extensions,
+        cfg,
+        call_manager,
+        metrics,
+    );
     handler.clone().spawn(inbound_rx);
     handler
 }
@@ -2940,7 +2976,10 @@ mod tests {
 
         // NGN 着信ハンドラを起動 (NGN 側 inbound_rx で BYE をキャッチさせる)。
         // inviter は使わない (内線着信は来ない) ので minimal な dummy を渡す。
-        let dummy_inviter: ExtInviter = ScriptedInviter::builder().build();
+        // (ハーネス Issue #42 で `ScriptedInviter` は builder ベースに統合された。)
+        let dummy_inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
         let extensions_empty = ExtensionRegistrar::new();
         let ngn_handler = NgnInboundHandler::new(
             ngn_client_sock.clone(),
@@ -3315,7 +3354,8 @@ mod tests {
             }
         });
 
-        // SIP fork 用 inviter (本テストでは呼ばれないはずだが ExtInviter が必要)
+        // SIP fork 用 inviter (本テストでは呼ばれないはずだが ExtInviter が必要)。
+        // (ハーネス Issue #42 で `ScriptedInviter` は builder ベースに統合された。)
         let inviter = ScriptedInviter::builder()
             .default_action(ScriptedAction::ok())
             .build();

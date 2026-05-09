@@ -192,10 +192,12 @@ impl Str0mPeerSession {
     ///
     /// NGN → ブラウザ着信フローで使う。NGN から受け取った RTP/AVP の SDP
     /// オファをそのままブラウザに渡すと、ブラウザの WebRTC スタックは
-    /// DTLS-SRTP 必須なので拒絶する。代わりに sabiden は次のいずれかを行う:
-    /// (1) NGN 側オファを `convert_avp_to_savpf` でブラウザ用に整形する。
-    /// (2) 自身が新規 WebRTC オファを作ってブラウザに push する。
-    /// 本メソッドは (2) のために str0m に SDP オファを生成させる経路。
+    /// DTLS-SRTP 必須なので拒絶する。代わりに sabiden は
+    /// 1) NGN 側オファを `convert_avp_to_savpf` でブラウザ用に整形する
+    /// 2) (or) 自身が新規 WebRTC オファを作ってブラウザに push する
+    ///
+    /// のいずれかを行う。本メソッドは (2) のために str0m に SDP オファを
+    /// 生成させる経路。
     pub async fn create_offer(&self) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx

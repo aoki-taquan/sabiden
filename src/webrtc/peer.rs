@@ -44,10 +44,30 @@ use crate::sdp::SessionDescription;
 /// シグナリング層から差し替え可能。
 #[async_trait]
 pub trait PeerSession: Send + Sync {
-    /// ブラウザからの SDP offer を処理して answer を返す。
+    /// ブラウザからの SDP offer を処理して answer を返す
+    /// (RFC 3264 §5: answerer flow)。
+    ///
+    /// PWA→sabiden→NGN の発信フロー (内線オファ→SAVPF answer) で使う。
     async fn handle_offer(&self, sdp: &str) -> Result<String>;
 
-    /// ICE candidate を 1 つ追加する。
+    /// sabiden が offerer となって SDP オファを生成する
+    /// (RFC 3264 §5: offerer flow)。
+    ///
+    /// NGN→PWA の **着信** フローで sabiden 自身が DTLS-SRTP/SAVPF オファを
+    /// 作り、ブラウザに WS で push する用途。NGN の生 SDP (RTP/AVP) を
+    /// そのままブラウザに渡しても、ブラウザは DTLS fingerprint / ICE 認証情報
+    /// 不在で setRemoteDescription を拒絶するため、sabiden 側で SAVPF オファを
+    /// 組み直す必要がある (Issue #73 / `docs/asterisk-real-invite.md` §5.2)。
+    async fn create_offer(&self) -> Result<String>;
+
+    /// `create_offer` で出したオファに対するブラウザの SDP answer を受理する
+    /// (RFC 3264 §6: answerer の応答を offerer 側で適用)。
+    ///
+    /// str0m バックエンドでは `accept_answer` が DTLS-SRTP / ICE の確立を
+    /// 進める。stub バックエンドは形式チェックだけ行う。
+    async fn accept_answer(&self, sdp: &str) -> Result<()>;
+
+    /// ICE candidate を 1 つ追加する (RFC 8445 §5.1.1: trickle ICE)。
     async fn add_ice_candidate(&self, candidate: &str) -> Result<()>;
 
     /// ローカル ICE candidate (a=candidate ラインのテキスト) のストリームを
@@ -117,6 +137,33 @@ impl PeerSession for StubPeerSession {
             "stub PeerSession: SDP answer 生成"
         );
         Ok(answer)
+    }
+
+    async fn create_offer(&self) -> Result<String> {
+        // Stub では実 DTLS / ICE を持たないので、形式上 SAVPF / PCMU PT 0 を
+        // 含む最小 SDP を返す。テストはこの戻り値が NGN の生 SDP と区別できれば
+        // 十分。実バックエンド (str0m) では `Str0mPeerSession::create_offer` が
+        // 実フィンガプリント / ICE 認証情報入りで返す。
+        let offer = "v=0\r\n\
+                     o=- 0 0 IN IP4 0.0.0.0\r\n\
+                     s=-\r\n\
+                     c=IN IP4 0.0.0.0\r\n\
+                     t=0 0\r\n\
+                     m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=sendrecv\r\n"
+            .to_string();
+        Ok(offer)
+    }
+
+    async fn accept_answer(&self, sdp: &str) -> Result<()> {
+        // Stub は SDP の形式だけ確認し、実 ICE/DTLS の遷移はしない。
+        // パース不能なら Err、`m=audio` 不在は Err。
+        let parsed = SessionDescription::parse(sdp)?;
+        if !parsed.media.iter().any(|m| m.media == "audio") {
+            return Err(anyhow!("answer に m=audio がない"));
+        }
+        Ok(())
     }
 
     async fn add_ice_candidate(&self, candidate: &str) -> Result<()> {
@@ -218,5 +265,32 @@ mod tests {
     fn build_answer_rejects_offer_without_audio() {
         let bad = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=-\r\nc=IN IP4 1.2.3.4\r\nt=0 0\r\n";
         assert!(build_minimal_answer(bad).is_err());
+    }
+
+    /// Issue #73: `create_offer` は SAVPF / PCMU を含む SDP を返す
+    /// (RFC 3264 §5: offerer flow)。NGN の生 RTP/AVP SDP と区別可能であること。
+    #[tokio::test]
+    async fn stub_create_offer_returns_savpf_pcmu() {
+        let p = StubPeerSession::new();
+        let offer = p.create_offer().await.unwrap();
+        assert!(
+            offer.contains("UDP/TLS/RTP/SAVPF"),
+            "offer に SAVPF proto がない: {}",
+            offer
+        );
+        assert!(offer.contains("a=rtpmap:0 PCMU/8000"));
+        // NGN AVP SDP にはない proto なので、生 NGN SDP と取り違えない
+        assert!(!offer.contains("RTP/AVP "), "AVP proto が混入: {}", offer);
+    }
+
+    /// Issue #73: `accept_answer` は形式上 m=audio を含む SDP のみ受理。
+    #[tokio::test]
+    async fn stub_accept_answer_requires_audio_m_line() {
+        let p = StubPeerSession::new();
+        let ok_sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n\
+                      m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        p.accept_answer(ok_sdp).await.expect("受理");
+        let bad = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n";
+        assert!(p.accept_answer(bad).await.is_err());
     }
 }

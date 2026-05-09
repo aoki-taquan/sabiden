@@ -188,40 +188,6 @@ impl Str0mPeerSession {
         }))
     }
 
-    /// sabiden 側を offerer として PCMU 音声の WebRTC オファを生成する。
-    ///
-    /// NGN → ブラウザ着信フローで使う。NGN から受け取った RTP/AVP の SDP
-    /// オファをそのままブラウザに渡すと、ブラウザの WebRTC スタックは
-    /// DTLS-SRTP 必須なので拒絶する。代わりに sabiden は
-    /// 1) NGN 側オファを `convert_avp_to_savpf` でブラウザ用に整形する
-    /// 2) (or) 自身が新規 WebRTC オファを作ってブラウザに push する
-    ///
-    /// のいずれかを行う。本メソッドは (2) のために str0m に SDP オファを
-    /// 生成させる経路。
-    pub async fn create_offer(&self) -> Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::CreateOffer { reply: tx })
-            .await
-            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
-        rx.await
-            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
-    }
-
-    /// `create_offer` で出した SDP に対するブラウザ answer を受理する。
-    pub async fn accept_answer(&self, sdp: &str) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::AcceptAnswer {
-                sdp: sdp.to_string(),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
-        rx.await
-            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
-    }
-
     /// 現在の str0m インスタンスから ICE-ufrag / ICE-pwd / DTLS fingerprint
     /// を取り出す。`setup` には SDP の `a=setup:<role>` に書く役割を入れる
     /// (sabiden が server として answer する場合は `"passive"`、offer する場合は
@@ -249,6 +215,38 @@ impl PeerSession for Str0mPeerSession {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::AcceptOffer {
+                sdp: sdp.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
+        rx.await
+            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
+    }
+
+    /// sabiden 側を offerer として PCMU 音声の WebRTC オファを生成する
+    /// (RFC 3264 §5)。
+    ///
+    /// NGN→ブラウザ着信フローで使う。NGN から受け取った RTP/AVP の SDP
+    /// オファをそのままブラウザに渡すと、ブラウザの WebRTC スタックは
+    /// DTLS-SRTP 必須 (RFC 8827 §6.5) / ICE 認証情報必須 (RFC 8839 §4.1)
+    /// で拒絶する。代わりに sabiden 側で新規 WebRTC オファを作って push する。
+    async fn create_offer(&self) -> Result<String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::CreateOffer { reply: tx })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
+        rx.await
+            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
+    }
+
+    /// `create_offer` で出した SDP に対するブラウザ answer を受理する
+    /// (RFC 3264 §6)。
+    async fn accept_answer(&self, sdp: &str) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::AcceptAnswer {
                 sdp: sdp.to_string(),
                 reply: tx,
             })

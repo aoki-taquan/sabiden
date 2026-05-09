@@ -42,7 +42,8 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rand::Rng;
-use str0m::change::SdpOffer;
+use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::media::{Direction, MediaKind};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
@@ -51,6 +52,7 @@ use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::{debug, info, trace, warn};
 
 use super::peer::PeerSession;
+use crate::sdp::builder::DtlsIceParams;
 
 /// `[webrtc]` config からこのバックエンド向けに切り出した最小限のパラメータ。
 #[derive(Debug, Clone)]
@@ -107,6 +109,23 @@ enum Command {
         candidate: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// sabiden 側を offerer として PCMU 音声の SDP オファを生成する。
+    /// NGN → ブラウザ着信フローで、NGN から受け取った AVP オファに対し
+    /// sabiden が DTLS-SRTP/SAVPF オファをブラウザ向けに作る用途。
+    CreateOffer {
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// `CreateOffer` で生成したオファに対するブラウザ answer を受理する。
+    AcceptAnswer {
+        sdp: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// 現在の Rtc から local DTLS fingerprint と ICE 認証情報を取り出す。
+    /// AVP↔SAVPF SDP 変換ヘルパに渡す目的。
+    GetLocalDtlsParams {
+        setup: String,
+        reply: oneshot::Sender<Result<DtlsIceParams>>,
+    },
     Close,
 }
 
@@ -141,7 +160,14 @@ impl Str0mPeerSession {
 
         // ICE-Lite で Rtc を構築。ICE-Lite では我々が controlled、ブラウザが
         // controlling。STUN binding は受けるだけ。
-        let rtc = RtcConfig::new().set_ice_lite(true).build(Instant::now());
+        // PCMU/8000 を有効化し、それ以外の音声/ビデオコーデックは無効化する
+        // (NGN ↔ ブラウザの間を G.711 μ-law でパススルーする想定。Opus は
+        //  本パスでは使わない)。
+        let rtc = RtcConfig::new()
+            .set_ice_lite(true)
+            .clear_codecs()
+            .enable_pcmu(true)
+            .build(Instant::now());
 
         let socket = Arc::new(socket);
         let local_bind = local_addr;
@@ -153,12 +179,66 @@ impl Str0mPeerSession {
             host_candidate: host,
             cmd_rx,
             local_cand_tx,
+            pending_offer: None,
         }));
 
         Ok(Arc::new(Self {
             cmd_tx,
             local_cand_rx: Mutex::new(Some(local_cand_rx)),
         }))
+    }
+
+    /// sabiden 側を offerer として PCMU 音声の WebRTC オファを生成する。
+    ///
+    /// NGN → ブラウザ着信フローで使う。NGN から受け取った RTP/AVP の SDP
+    /// オファをそのままブラウザに渡すと、ブラウザの WebRTC スタックは
+    /// DTLS-SRTP 必須なので拒絶する。代わりに sabiden は
+    /// 1) NGN 側オファを `convert_avp_to_savpf` でブラウザ用に整形する
+    /// 2) (or) 自身が新規 WebRTC オファを作ってブラウザに push する
+    /// のいずれかを行う。本メソッドは (2) のために str0m に SDP オファを
+    /// 生成させる経路。
+    pub async fn create_offer(&self) -> Result<String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::CreateOffer { reply: tx })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
+        rx.await
+            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
+    }
+
+    /// `create_offer` で出した SDP に対するブラウザ answer を受理する。
+    pub async fn accept_answer(&self, sdp: &str) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::AcceptAnswer {
+                sdp: sdp.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
+        rx.await
+            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
+    }
+
+    /// 現在の str0m インスタンスから ICE-ufrag / ICE-pwd / DTLS fingerprint
+    /// を取り出す。`setup` には SDP の `a=setup:<role>` に書く役割を入れる
+    /// (sabiden が server として answer する場合は `"passive"`、offer する場合は
+    /// `"actpass"`)。
+    ///
+    /// 取得した [`DtlsIceParams`] は [`crate::sdp::builder::convert_avp_to_savpf`]
+    /// に渡して NGN→ブラウザ向け SDP を生成するのに使う。
+    pub async fn local_dtls_params(&self, setup: &str) -> Result<DtlsIceParams> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::GetLocalDtlsParams {
+                setup: setup.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))?;
+        rx.await
+            .map_err(|_| anyhow!("str0m run_loop が応答せず終了"))?
     }
 }
 
@@ -208,6 +288,8 @@ struct RunCtx {
     host_candidate: Candidate,
     cmd_rx: mpsc::Receiver<Command>,
     local_cand_tx: mpsc::Sender<String>,
+    /// `create_offer` で出した SDP の保留オファ。`accept_answer` で消費する。
+    pending_offer: Option<str0m::change::SdpPendingOffer>,
 }
 
 /// str0m を駆動する run loop。
@@ -269,6 +351,18 @@ async fn run_loop(mut ctx: RunCtx) {
                         let r = add_remote_candidate(&mut ctx.rtc, &candidate);
                         let _ = reply.send(r);
                     }
+                    Some(Command::CreateOffer { reply }) => {
+                        let r = create_offer(&mut ctx.rtc, &mut ctx.pending_offer);
+                        let _ = reply.send(r);
+                    }
+                    Some(Command::AcceptAnswer { sdp, reply }) => {
+                        let r = accept_answer(&mut ctx.rtc, &mut ctx.pending_offer, &sdp);
+                        let _ = reply.send(r);
+                    }
+                    Some(Command::GetLocalDtlsParams { setup, reply }) => {
+                        let r = get_local_dtls_params(&mut ctx.rtc, &setup);
+                        let _ = reply.send(r);
+                    }
                     Some(Command::Close) | None => {
                         debug!("str0m: close コマンド受信");
                         closed = true;
@@ -327,6 +421,59 @@ fn accept_offer(rtc: &mut Rtc, sdp: &str) -> Result<String> {
         .accept_offer(offer)
         .map_err(|e| anyhow!("str0m accept_offer: {}", e))?;
     Ok(answer.to_sdp_string())
+}
+
+/// sabiden を offerer として PCMU 音声 1 本のオファを生成する。
+///
+/// `pending` には消費前の保留オファを保存する。既存の保留オファがある場合は
+/// 上書きせずエラーを返す (ブラウザに二重 offer が出ると state machine が
+/// 壊れる)。
+fn create_offer(
+    rtc: &mut Rtc,
+    pending: &mut Option<str0m::change::SdpPendingOffer>,
+) -> Result<String> {
+    if pending.is_some() {
+        return Err(anyhow!(
+            "create_offer: 既に保留オファあり (accept_answer 待ち)"
+        ));
+    }
+    let mut api = rtc.sdp_api();
+    api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let (offer, p) = api
+        .apply()
+        .ok_or_else(|| anyhow!("create_offer: 変更が空 (codec 設定漏れ?)"))?;
+    *pending = Some(p);
+    Ok(offer.to_sdp_string())
+}
+
+/// 保留中の offer に対するブラウザ answer を str0m に渡す。
+fn accept_answer(
+    rtc: &mut Rtc,
+    pending: &mut Option<str0m::change::SdpPendingOffer>,
+    sdp: &str,
+) -> Result<()> {
+    let p = pending
+        .take()
+        .ok_or_else(|| anyhow!("accept_answer: 対応する保留 offer なし"))?;
+    let answer =
+        SdpAnswer::from_sdp_string(sdp).map_err(|e| anyhow!("SDP answer パース: {}", e))?;
+    rtc.sdp_api()
+        .accept_answer(p, answer)
+        .map_err(|e| anyhow!("str0m accept_answer: {}", e))?;
+    Ok(())
+}
+
+/// 現 Rtc の local DTLS fingerprint と ICE 認証情報を取り出して
+/// SDP 変換ヘルパ用 [`DtlsIceParams`] にまとめる。
+fn get_local_dtls_params(rtc: &mut Rtc, setup: &str) -> Result<DtlsIceParams> {
+    let api = rtc.direct_api();
+    let creds = api.local_ice_credentials();
+    let fp = api.local_dtls_fingerprint();
+    // Fingerprint::Display は "<algo> <HEX:...>" のフォーマットを直接吐くので
+    // SDP 行末に乗せられる (DtlsIceParams::fingerprint の規約と一致)。
+    let mut p = DtlsIceParams::new(creds.ufrag.clone(), creds.pass.clone(), fp.to_string());
+    p.setup = setup.to_string();
+    Ok(p)
 }
 
 fn add_remote_candidate(rtc: &mut Rtc, candidate: &str) -> Result<()> {
@@ -555,5 +702,160 @@ mod tests {
             .add_ice_candidate(cand2)
             .await
             .expect("受理 (a= 付)");
+    }
+
+    /// `local_dtls_params` が ufrag / pwd / fingerprint を non-empty に返す。
+    #[tokio::test]
+    async fn str0m_session_exposes_local_dtls_params() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (49000, 49999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let p = session.local_dtls_params("passive").await.expect("取得成功");
+        assert!(!p.ice_ufrag.is_empty(), "ufrag が空");
+        assert!(!p.ice_pwd.is_empty(), "pwd が空");
+        // fingerprint は "<algo> <hex:...>" 形式 (DtlsIceParams の規約)
+        assert!(
+            p.fingerprint.starts_with("sha-256 ") || p.fingerprint.starts_with("sha-1 "),
+            "fingerprint 形式不正: {}",
+            p.fingerprint
+        );
+        assert!(p.fingerprint.contains(':'), "fingerprint hex 区切り欠落");
+        assert_eq!(p.setup, "passive");
+    }
+
+    /// sabiden 主導で SDP オファ (PCMU 1 本) を生成する。
+    /// NGN→ブラウザ着信フローで使う想定。
+    #[tokio::test]
+    async fn str0m_session_create_offer_returns_pcmu_savpf() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (50000, 50999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let sdp = session.create_offer().await.expect("offer 生成");
+        // PCMU codec + SAVPF proto がオファに乗っているか
+        assert!(sdp.contains("m=audio"), "audio m= が無い: {}", sdp);
+        assert!(
+            sdp.contains("UDP/TLS/RTP/SAVPF"),
+            "DTLS-SRTP proto 欠落: {}",
+            sdp
+        );
+        assert!(
+            sdp.to_uppercase().contains("PCMU"),
+            "PCMU rtpmap 欠落: {}",
+            sdp
+        );
+        // ICE-Lite なので a=ice-lite が含まれるはず
+        assert!(sdp.contains("ice-lite"), "ice-lite 欠落: {}", sdp);
+    }
+
+    /// `create_offer` を 2 回連続で呼ぶと 2 回目はエラー (保留 offer 1 件のみ許容)。
+    #[tokio::test]
+    async fn str0m_session_create_offer_twice_errors() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (51000, 51999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let _ = session.create_offer().await.expect("1 回目");
+        let r = session.create_offer().await;
+        assert!(r.is_err(), "2 回目は保留中のためエラーであるべき");
+    }
+
+    /// `accept_answer` は対応する保留オファが無ければエラーを返す。
+    #[tokio::test]
+    async fn str0m_session_accept_answer_without_offer_errors() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (52000, 52999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let r = session.accept_answer("v=0\r\n").await;
+        assert!(r.is_err());
+    }
+
+    /// NGN→ブラウザ着信フロー想定の統合テスト:
+    /// 1. NGN の RTP/AVP オファ (PCMU PT=0) を擬似的に用意
+    /// 2. str0m から local DTLS / ICE 認証情報を取り出す
+    /// 3. `convert_avp_to_savpf` でブラウザ向け SDP に変換
+    /// 4. 変換結果が SAVPF / DTLS-SRTP / PCMU を保ったまま再パース可能であること
+    /// 5. 模擬ブラウザ answer を生成し `convert_savpf_to_avp` で NGN 用に逆変換
+    ///    → PCMU が保持されていること
+    #[tokio::test]
+    async fn ngn_to_browser_sdp_conversion_round_trip() {
+        use crate::sdp::builder::{convert_avp_to_savpf, convert_savpf_to_avp};
+        use crate::sdp::SessionDescription;
+
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (53500, 53999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+
+        // (2) str0m から local DTLS / ICE 認証情報を取得
+        // NGN→ブラウザ向けは sabiden が answer 側になるので setup=passive。
+        let params = session
+            .local_dtls_params("passive")
+            .await
+            .expect("dtls params");
+
+        // (1) NGN 由来の RTP/AVP オファ
+        let ngn_offer = b"v=0\r\n\
+                          o=- 0 0 IN IP4 192.0.2.10\r\n\
+                          s=-\r\n\
+                          c=IN IP4 192.0.2.10\r\n\
+                          t=0 0\r\n\
+                          m=audio 30000 RTP/AVP 0\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=ptime:20\r\n\
+                          a=sendrecv\r\n";
+
+        // (3) ブラウザ向け SAVPF SDP を生成
+        let browser_offer =
+            convert_avp_to_savpf(ngn_offer, &params).expect("AVP->SAVPF 変換");
+        let s = std::str::from_utf8(&browser_offer).unwrap();
+        assert!(s.contains("UDP/TLS/RTP/SAVPF"), "SAVPF proto 不在");
+        assert!(s.contains("a=rtpmap:0 PCMU/8000"), "PCMU rtpmap 損失");
+        assert!(s.contains("a=fingerprint:"), "fingerprint 行欠落");
+        assert!(s.contains("a=ice-ufrag:"), "ice-ufrag 行欠落");
+        assert!(s.contains("a=ice-pwd:"), "ice-pwd 行欠落");
+        assert!(s.contains("a=setup:passive"), "setup=passive 不在");
+        assert!(s.contains("a=rtcp-mux"), "rtcp-mux 不在");
+        // 再パース確認
+        SessionDescription::parse(s).expect("変換結果が再パース可能");
+
+        // (5) 模擬ブラウザ answer (典型的なフォーマット)。実際の ufrag/pwd は
+        //     ブラウザ側で生成されるため、ここでは形式のみ検証する。
+        let browser_answer = b"v=0\r\n\
+                               o=mozilla 1 0 IN IP4 0.0.0.0\r\n\
+                               s=-\r\n\
+                               t=0 0\r\n\
+                               a=group:BUNDLE 0\r\n\
+                               m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                               c=IN IP4 0.0.0.0\r\n\
+                               a=rtpmap:0 PCMU/8000\r\n\
+                               a=ptime:20\r\n\
+                               a=sendrecv\r\n\
+                               a=ice-ufrag:browser\r\n\
+                               a=ice-pwd:browserpasswordbrowserpassword\r\n\
+                               a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+                               a=setup:active\r\n\
+                               a=mid:0\r\n\
+                               a=rtcp-mux\r\n";
+        let ngn_answer = convert_savpf_to_avp(browser_answer).expect("SAVPF->AVP 変換");
+        let parsed = SessionDescription::parse(std::str::from_utf8(&ngn_answer).unwrap()).unwrap();
+        assert_eq!(parsed.media[0].protocol, "RTP/AVP");
+        assert_eq!(parsed.media[0].formats, vec!["0"]);
+        assert!(
+            parsed.find_rtpmap(0).is_some(),
+            "PCMU rtpmap が NGN 用 SDP から欠落"
+        );
     }
 }

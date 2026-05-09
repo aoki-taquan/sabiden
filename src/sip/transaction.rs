@@ -31,6 +31,10 @@ pub const T2: Duration = Duration::from_secs(4);
 pub const T4: Duration = Duration::from_secs(5);
 /// RFC 3261 §17.1.1.2 Timer B/F = 64 * T1 (トランザクション タイムアウト)。
 pub const TIMER_B: Duration = Duration::from_millis(64 * 500);
+/// RFC 3261 §17.1.1.2 Timer D。non-2xx 最終応答 → ACK 後の応答再送吸収期間。
+/// UDP では 32s 以上必須 (デフォルト 32s)。TCP/SCTP では 0s で良いが
+/// 本実装は UDP 専用なので固定 32s とする。
+pub const TIMER_D: Duration = Duration::from_secs(32);
 
 /// Client/Server を区別しないトランザクション ID。
 ///
@@ -168,10 +172,17 @@ pub struct ClientTransaction {
     rx: mpsc::UnboundedReceiver<ClientEvent>,
     state: ClientState,
     tracer: SipTraceWriter,
+    /// Timer D の間 transaction エントリを保持し、満了後に自身を
+    /// 削除するためのテーブル ハンドル (RFC 3261 §17.1.1.2)。
+    /// `TransactionLayer::create_client` 経由で生成された場合のみ Some。
+    /// 単体テスト等で `ClientTransaction::new` を直接使う場合は None。
+    table_handle: Option<Arc<Mutex<TransactionTable>>>,
 }
 
 impl ClientTransaction {
     /// 新しいクライアント トランザクションを作成し、駆動可能な状態にする。
+    /// テスト専用 (Production パスは `new_with_table` 経由で table_handle を持つ)。
+    #[cfg(test)]
     fn new(
         id: TransactionId,
         request: SipRequest,
@@ -179,6 +190,19 @@ impl ClientTransaction {
         socket: Arc<UdpSocket>,
         rx: mpsc::UnboundedReceiver<ClientEvent>,
         tracer: SipTraceWriter,
+    ) -> Self {
+        Self::new_with_table(id, request, destination, socket, rx, tracer, None)
+    }
+
+    /// `TransactionLayer` 連携版。Timer D の自己消滅機能を有効にする。
+    fn new_with_table(
+        id: TransactionId,
+        request: SipRequest,
+        destination: SocketAddr,
+        socket: Arc<UdpSocket>,
+        rx: mpsc::UnboundedReceiver<ClientEvent>,
+        tracer: SipTraceWriter,
+        table_handle: Option<Arc<Mutex<TransactionTable>>>,
     ) -> Self {
         let state = match request.method {
             SipMethod::Invite => ClientState::Calling,
@@ -192,6 +216,7 @@ impl ClientTransaction {
             rx,
             state,
             tracer,
+            table_handle,
         }
     }
 
@@ -200,6 +225,11 @@ impl ClientTransaction {
     /// - Calling/Trying → Proceeding: 1xx 受信
     /// - * → Completed: >=200 受信
     /// - Timer B/F: タイムアウト (64*T1)
+    /// - INVITE で 300-699 受信時は本層内で ACK を生成・送出し
+    ///   (RFC 3261 §17.1.1.3)、Timer D (32s) の間は応答再送を吸収して
+    ///   既送出 ACK を再送する (RFC 3261 §17.1.1.2 figure 5)。
+    ///   この吸収はバックグラウンド タスクへ委譲し、本関数は直ちに
+    ///   最終応答を呼び出し元へ返す。
     pub async fn run(mut self) -> Result<SipResponse> {
         let bytes = self.request.to_bytes();
         self.socket.send_to(&bytes, self.destination).await?;
@@ -231,6 +261,30 @@ impl ClientTransaction {
                     }
                     // 最終応答
                     self.state = ClientState::Completed;
+                    // RFC 3261 §17.1.1.3: INVITE で non-2xx 最終応答が来たら
+                    // 本トランザクション内で ACK を生成・送出する。2xx ACK は
+                    // dialog 層 (RFC 3261 §13.2.2.4) の責務なので扱わない。
+                    if self.request.method == SipMethod::Invite && (300..700).contains(&code) {
+                        match build_non2xx_ack(&self.request, &resp) {
+                            Ok(ack) => {
+                                let ack_bytes = ack.to_bytes();
+                                if let Err(e) =
+                                    self.socket.send_to(&ack_bytes, self.destination).await
+                                {
+                                    warn!(error=%e, "non-2xx ACK 送信失敗");
+                                } else {
+                                    write_trace(&self.tracer, TraceDir::Sent, &ack_bytes).await;
+                                    debug!(?self.id, code, "non-2xx ACK 送出");
+                                }
+                                // Timer D の間、応答再送を吸収して ACK を
+                                // 再送するバックグラウンド タスクを起動。
+                                self.spawn_completed_absorber(ack_bytes);
+                            }
+                            Err(e) => {
+                                warn!(error=%e, "non-2xx ACK 構築失敗 (INVITE 本体不整合)");
+                            }
+                        }
+                    }
                     return Ok(resp);
                 }
                 _ = &mut next_retx, if matches!(self.state, ClientState::Calling | ClientState::Trying) => {
@@ -251,6 +305,66 @@ impl ClientTransaction {
                 }
             }
         }
+    }
+
+    /// Completed 状態 (non-2xx 最終応答受信後) で動作するバックグラウンド
+    /// タスクを spawn する (RFC 3261 §17.1.1.2 figure 5)。
+    ///
+    /// Timer D (UDP: 32s) の間、同じトランザクションへの応答再送を
+    /// 吸収し、その都度 既送出 ACK (`ack_bytes`) をそのまま再送する。
+    /// 新たな ACK は **生成しない**: 同一の ACK バイト列を流すことで
+    /// UAS 側の transaction matching を成立させる。
+    /// Timer D 満了後にトランザクション テーブルから自身を削除する。
+    fn spawn_completed_absorber(&mut self, ack_bytes: Vec<u8>) {
+        // self.rx は所有権が必要。受信機をこのタスクへ移すために
+        // ダミー チャネルへ差し替える (run 関数自体は return 直後)。
+        let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
+        let mut rx = std::mem::replace(&mut self.rx, dummy_rx);
+        let socket = self.socket.clone();
+        let dest = self.destination;
+        let tracer = self.tracer.clone();
+        let id = self.id.clone();
+        let table = self.table_handle.clone();
+
+        tokio::spawn(async move {
+            let timer_d = time::sleep(TIMER_D);
+            tokio::pin!(timer_d);
+            loop {
+                tokio::select! {
+                    ev = rx.recv() => {
+                        match ev {
+                            Some(ClientEvent::Response(resp)) => {
+                                // 同じ最終応答 (非 1xx) の再送 → ACK 再送。
+                                // 1xx 等の不整合は無視。
+                                if resp.status_code >= 200 {
+                                    if let Err(e) =
+                                        socket.send_to(&ack_bytes, dest).await
+                                    {
+                                        warn!(error=%e, "non-2xx ACK 再送失敗");
+                                    } else {
+                                        write_trace(&tracer, TraceDir::Sent, &ack_bytes).await;
+                                        trace!(?id, "non-2xx ACK 再送");
+                                    }
+                                }
+                            }
+                            None => {
+                                // 上位 dispatcher が落ちた。Timer D を待たずに終了。
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut timer_d => {
+                        debug!(?id, "Timer D 満了 → Terminated");
+                        break;
+                    }
+                }
+            }
+            // 自身をテーブルから削除 (Terminated)。
+            if let Some(table) = table {
+                let mut guard = table.lock().await;
+                guard.clients.remove(&id);
+            }
+        });
     }
 
     pub fn id(&self) -> &TransactionId {
@@ -484,13 +598,14 @@ impl TransactionLayer {
             let mut table = self.inner.lock().await;
             table.clients.insert(id.clone(), tx);
         }
-        Ok(ClientTransaction::new(
+        Ok(ClientTransaction::new_with_table(
             id,
             request,
             destination,
             self.socket.clone(),
             rx,
             self.tracer.clone(),
+            Some(self.inner.clone()),
         ))
     }
 
@@ -527,12 +642,22 @@ impl TransactionLayer {
     ) -> Result<SipResponse> {
         let tx = self.create_client(request, destination).await?;
         let id = tx.id().clone();
+        let is_invite = matches!(id.method, SipMethod::Invite);
         // run の完了 (成功/失敗) 双方でテーブルを掃除する。
+        // ただし INVITE で non-2xx 最終応答が返った場合は ClientTransaction
+        // 内部で Timer D 期間中エントリを保持し続ける必要があるため、
+        // 自前 cleanup はしない (absorber 側で削除する)。
         let layer = self.clone();
         let (done_tx, done_rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = tx.run().await;
-            layer.drop_client(&id).await;
+            let absorber_owns_cleanup = match &result {
+                Ok(resp) => is_invite && (300..700).contains(&resp.status_code),
+                Err(_) => false,
+            };
+            if !absorber_owns_cleanup {
+                layer.drop_client(&id).await;
+            }
             let _ = done_tx.send(result);
         });
         done_rx
@@ -547,6 +672,69 @@ impl TransactionLayer {
 async fn write_trace(tracer: &SipTraceWriter, dir: TraceDir, raw: &[u8]) {
     let (method, call_id) = extract_method_and_call_id(raw);
     tracer.record(dir, &method, call_id.as_deref(), raw).await;
+}
+
+/// non-2xx 最終応答に対する ACK を構築する (RFC 3261 §17.1.1.3)。
+///
+/// 同じ INVITE トランザクション内で送出されるため:
+/// - Request-URI: 元 INVITE と同じ
+/// - Call-ID / From: 元 INVITE と同じ (From tag も保持)
+/// - To: **応答** からコピー (応答に乗ってきた tag を含めるのが要件)
+/// - CSeq: 元 INVITE と同じ番号、method は ACK
+/// - Via: 元 INVITE の **top Via** だけを単一エントリで持たせる
+///   (branch も同一 → UAS 側で同じトランザクションに突き合わせ)
+/// - Route: 元 INVITE と同じ
+/// - Max-Forwards: 元 INVITE のものをそのまま (なければ 70)
+/// - Body: なし
+fn build_non2xx_ack(invite: &SipRequest, response: &SipResponse) -> Result<SipRequest> {
+    let mut ack = SipRequest::new(SipMethod::Ack, invite.uri.clone());
+
+    let via = invite
+        .headers
+        .get("via")
+        .ok_or_else(|| anyhow!("元 INVITE に Via がない"))?;
+    ack.headers.set("Via", via);
+
+    let from = invite
+        .headers
+        .get("from")
+        .ok_or_else(|| anyhow!("元 INVITE に From がない"))?;
+    ack.headers.set("From", from);
+
+    // To は応答側からコピー (tag を含める)。応答に To が無いのは異常。
+    let to = response
+        .headers
+        .get("to")
+        .ok_or_else(|| anyhow!("応答に To がない"))?;
+    ack.headers.set("To", to);
+
+    let call_id = invite
+        .headers
+        .get("call-id")
+        .ok_or_else(|| anyhow!("元 INVITE に Call-ID がない"))?;
+    ack.headers.set("Call-ID", call_id);
+
+    // CSeq: 同じ番号 + method=ACK
+    let cseq = invite
+        .headers
+        .get("cseq")
+        .ok_or_else(|| anyhow!("元 INVITE に CSeq がない"))?;
+    let seq_num = cseq
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("CSeq の数値部が読めない: {}", cseq))?;
+    ack.headers.set("CSeq", format!("{} ACK", seq_num));
+
+    // Max-Forwards (元 INVITE のものをそのまま、なければ 70)
+    let mf = invite.headers.get("max-forwards").unwrap_or("70");
+    ack.headers.set("Max-Forwards", mf);
+
+    // Route ヘッダ群 (RFC 3261 §17.1.1.3 末尾: same Route as original request)
+    for r in invite.headers.get_all("route") {
+        ack.headers.add("Route", r);
+    }
+
+    Ok(ack)
 }
 
 /// レスポンス送信用ヘルパ。
@@ -749,5 +937,189 @@ mod tests {
 
         let resp = layer.send_request(req, server_addr).await.unwrap();
         assert_eq!(resp.status_code, 200);
+    }
+
+    /// `build_non2xx_ack` の単体テスト。RFC 3261 §17.1.1.3 の必須要件:
+    /// - Request-URI / Call-ID / From / Via branch / CSeq# は元 INVITE
+    /// - To は **応答** の To (tag を含む)
+    /// - CSeq method は ACK
+    /// - Route ヘッダはコピー
+    #[test]
+    fn test_build_non2xx_ack_copies_headers_per_rfc3261_17_1_1_3() {
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@ntt-east.ne.jp");
+        invite.headers.set(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest",
+        );
+        invite
+            .headers
+            .set("From", "<sip:alice@ntt-east.ne.jp>;tag=alice");
+        invite.headers.set("To", "<sip:bob@ntt-east.ne.jp>");
+        invite.headers.set("Call-ID", "ackc-call@host");
+        invite.headers.set("CSeq", "42 INVITE");
+        invite.headers.set("Max-Forwards", "70");
+        invite.headers.add("Route", "<sip:proxy1@ntt-east.ne.jp;lr>");
+        invite.headers.add("Route", "<sip:proxy2@ntt-east.ne.jp;lr>");
+
+        let mut resp_headers = SipHeaders::new();
+        resp_headers.set(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest",
+        );
+        resp_headers.set("From", "<sip:alice@ntt-east.ne.jp>;tag=alice");
+        // 応答では To に tag が付く (UAS 側で生成された)
+        resp_headers.set("To", "<sip:bob@ntt-east.ne.jp>;tag=ngn-server-tag");
+        resp_headers.set("Call-ID", "ackc-call@host");
+        resp_headers.set("CSeq", "42 INVITE");
+        let resp = SipResponse {
+            status_code: 403,
+            reason: "Forbidden".into(),
+            headers: resp_headers,
+            body: Vec::new(),
+        };
+
+        let ack = build_non2xx_ack(&invite, &resp).unwrap();
+        assert_eq!(ack.method, SipMethod::Ack);
+        assert_eq!(ack.uri, "sip:bob@ntt-east.ne.jp");
+        assert_eq!(
+            ack.headers.get("via").unwrap(),
+            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKackctest"
+        );
+        assert_eq!(
+            ack.headers.get("from").unwrap(),
+            "<sip:alice@ntt-east.ne.jp>;tag=alice"
+        );
+        // To は応答からコピーされ tag を含む
+        assert_eq!(
+            ack.headers.get("to").unwrap(),
+            "<sip:bob@ntt-east.ne.jp>;tag=ngn-server-tag"
+        );
+        assert_eq!(ack.headers.get("call-id").unwrap(), "ackc-call@host");
+        assert_eq!(ack.headers.get("cseq").unwrap(), "42 ACK");
+        assert_eq!(ack.headers.get("max-forwards").unwrap(), "70");
+        // Route ヘッダ群が保持される
+        let routes = ack.headers.get_all("route");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0], "<sip:proxy1@ntt-east.ne.jp;lr>");
+        assert_eq!(routes[1], "<sip:proxy2@ntt-east.ne.jp;lr>");
+        assert!(ack.body.is_empty());
+    }
+
+    /// INVITE → 403 の流れで、トランザクション層が ACK を自動送出することを
+    /// 実 UDP ソケット越しに確認する (RFC 3261 §17.1.1.3 への直接テスト)。
+    /// 続けて 同じ 403 を再送した時、同じ ACK が再送されることも確認する
+    /// (RFC 3261 §17.1.1.2 figure 5)。
+    #[tokio::test]
+    async fn test_invite_non2xx_triggers_ack_and_absorbs_retransmits() {
+        // mock UAS ソケット: INVITE を受け、403 を 2 度送り、ACK を 2 つ受ける
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uas_addr = uas_sock.local_addr().unwrap();
+
+        // UAC 側: layer をスポーンし INVITE を送る
+        let uac_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uac_local = uac_sock.local_addr().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(uac_sock.clone());
+
+        let branch = "z9hG4bKinviteack";
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@127.0.0.1");
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch={}", uac_local, branch),
+        );
+        invite.headers.set("From", "<sip:alice@example>;tag=alice");
+        invite.headers.set("To", "<sip:bob@example>");
+        invite.headers.set("Call-ID", "invite-ack-test@host");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Max-Forwards", "70");
+
+        // mock UAS タスク
+        let uas_clone = uas_sock.clone();
+        let uac_invite_branch = branch.to_string();
+        let uas_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            // 1) INVITE 受信
+            let (n, peer) = uas_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_message(&buf[..n]).unwrap();
+            let invite_req = match parsed {
+                SipMessage::Request(r) => r,
+                _ => panic!("INVITE 期待"),
+            };
+            assert_eq!(invite_req.method, SipMethod::Invite);
+
+            // 2) 403 Forbidden を構築・送信 (To に tag を付けて返す)
+            let mut resp = build_response_skeleton(&invite_req, 403, "Forbidden");
+            resp.headers
+                .set("To", "<sip:bob@example>;tag=ngn-uas-tag");
+            resp.reason = "Forbidden".into();
+            let resp_bytes = resp.to_bytes();
+            uas_clone.send_to(&resp_bytes, peer).await.unwrap();
+
+            // 3) ACK を受信 (timeout を設けて hang を防ぐ)
+            let recv_ack = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut b = vec![0u8; 4096];
+                loop {
+                    let (m, _p) = uas_clone.recv_from(&mut b).await.unwrap();
+                    let parsed = parse_message(&b[..m]).unwrap();
+                    if let SipMessage::Request(r) = parsed {
+                        if r.method == SipMethod::Ack {
+                            return r;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("ACK が来ない");
+
+            // 必須: 元 INVITE と同じ Via branch を持つ
+            let via = recv_ack.headers.get("via").unwrap();
+            assert!(
+                via.contains(&uac_invite_branch),
+                "ACK Via に元 INVITE の branch がない: {}",
+                via
+            );
+            // 必須: To に応答の tag が乗っている
+            assert!(
+                recv_ack.headers.get("to").unwrap().contains("tag=ngn-uas-tag"),
+                "ACK の To に応答 tag が無い"
+            );
+            // 必須: CSeq method=ACK, 番号は元 INVITE と同じ
+            assert_eq!(recv_ack.headers.get("cseq").unwrap(), "1 ACK");
+            assert_eq!(recv_ack.headers.get("call-id").unwrap(), "invite-ack-test@host");
+
+            // 4) 403 を再送 (NGN がよくやる)
+            uas_clone.send_to(&resp_bytes, peer).await.unwrap();
+
+            // 5) 2 回目の ACK を受信 (吸収 → 再送が要件)
+            let recv_ack2 = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut b = vec![0u8; 4096];
+                loop {
+                    let (m, _p) = uas_clone.recv_from(&mut b).await.unwrap();
+                    let parsed = parse_message(&b[..m]).unwrap();
+                    if let SipMessage::Request(r) = parsed {
+                        if r.method == SipMethod::Ack {
+                            return r;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("2 回目の ACK が来ない (応答再送吸収が動いてない)");
+
+            // 同じ ACK バイト列が再送されることを Via branch で確認
+            assert_eq!(
+                recv_ack2.headers.get("via").unwrap(),
+                recv_ack.headers.get("via").unwrap()
+            );
+            assert_eq!(
+                recv_ack2.headers.get("cseq").unwrap(),
+                recv_ack.headers.get("cseq").unwrap()
+            );
+        });
+
+        // UAC 側で INVITE を送って 403 を受け取る
+        let resp = layer.send_request(invite, uas_addr).await.unwrap();
+        assert_eq!(resp.status_code, 403);
+
+        uas_handle.await.unwrap();
     }
 }

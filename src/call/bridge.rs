@@ -300,6 +300,90 @@ mod tests {
         bridge.stop().await;
     }
 
+    /// Issue #66: PCMU (RFC 3551 PT 0) パケットを双方向で 5 個ずつ流して、
+    /// 1 個も落とさず NGN ⇔ 内線で順序通りに届くことを smoke test する。
+    /// peer は SDP で既知 (`Some(...)`) のシナリオ — Issue #66 の本流経路で
+    /// `prepare_outbound_bridge` / `finalize_outbound_bridge` が SDP の
+    /// `c=`/`m=audio` から peer を抽出してブリッジに渡す前提と一致する。
+    #[tokio::test]
+    async fn rtp_bridge_forwards_pcmu_packets_in_both_directions() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let ext_addr = ext_sock.local_addr().unwrap();
+
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ext_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+        let ext_peer_addr = ext_peer_sock.local_addr().unwrap();
+
+        let bridge = RtpBridge::start(BridgeConfig {
+            ngn_socket: ngn_sock,
+            ext_socket: ext_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            ext_peer: Some(ext_peer_addr),
+            metrics: None,
+        })
+        .unwrap();
+
+        const N: u16 = 5;
+
+        // NGN → ext: 5 パケット (G.711 μ-law / PT=0、20ms フレーム = 160 sample)
+        for i in 0..N {
+            let pkt = RtpPacket {
+                payload_type: PAYLOAD_TYPE_ULAW,
+                marker: false,
+                sequence: 100 + i,
+                timestamp: 160 * u32::from(i),
+                ssrc: 0xAAAA_0000,
+                payload: vec![0xff; 160],
+            }
+            .to_bytes();
+            ngn_peer_sock.send_to(&pkt, ngn_addr).await.unwrap();
+        }
+        let mut buf = vec![0u8; 1500];
+        for i in 0..N {
+            let (n, _src) = timeout(Duration::from_secs(1), ext_peer_sock.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("NGN→ext PCMU #{i} を受信できない"))
+                .unwrap();
+            let pkt = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
+            assert_eq!(pkt.sequence, 100 + i);
+            assert_eq!(pkt.ssrc, 0xAAAA_0000);
+        }
+
+        // ext → NGN: 5 パケット
+        for i in 0..N {
+            let pkt = RtpPacket {
+                payload_type: PAYLOAD_TYPE_ULAW,
+                marker: false,
+                sequence: 200 + i,
+                timestamp: 160 * u32::from(i),
+                ssrc: 0xBBBB_0000,
+                payload: vec![0xee; 160],
+            }
+            .to_bytes();
+            ext_peer_sock.send_to(&pkt, ext_addr).await.unwrap();
+        }
+        for i in 0..N {
+            let (n, _src) = timeout(Duration::from_secs(1), ngn_peer_sock.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("ext→NGN PCMU #{i} を受信できない"))
+                .unwrap();
+            let pkt = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
+            assert_eq!(pkt.sequence, 200 + i);
+            assert_eq!(pkt.ssrc, 0xBBBB_0000);
+        }
+
+        let (to_ext, to_ngn) = bridge.stats();
+        assert_eq!(to_ext, u64::from(N), "NGN→ext のリレー総数が一致しない");
+        assert_eq!(to_ngn, u64::from(N), "ext→NGN のリレー総数が一致しない");
+
+        bridge.stop().await;
+    }
+
     /// SDP で peer が分からなくても、最初の受信で学習して以降は転送できる。
     #[tokio::test]
     async fn learns_peer_from_first_packet() {

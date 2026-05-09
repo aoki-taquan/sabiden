@@ -247,18 +247,31 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // - NGN→内線 着信 (`NgnInboundHandler`): `start_bridge_for_inbound` 経由で
     //   200 OK 返送前に RTP ブリッジを起動する。
     //
-    // RTP ブリッジ用 bind IP は SIP の sent-by IP (= NGN レッグ local_addr) を使う。
-    // `docs/asterisk-real-invite.md` §5.2 準拠: NGN へ広告する c=/m= は eth1 IP。
-    // 内線レッグ側はループバックでは無く同じ IP を使う (HGW 介さず ONU 直収では
-    // sabiden が NGN/LAN 双方を eth1 1 枚で持つ運用が現状の検証構成)。
-    let bridge_ngn_ip = local_addr_for_hdr.ip();
+    // RTP ブリッジ用 bind IP の決定 (Issue #66 / `docs/asterisk-real-invite.md` §5.2):
+    // - NGN レッグ: 既定で SIP local_addr (= eth1 NGN 側 IP)。`[bridge] ngn_bind_ip`
+    //   で上書き可能。NGN へ広告する SDP `c=`/`o=` もこの IP に揃える。
+    // - 内線レッグ: 既定では NGN レッグと同じ (1 NIC テスト構成用)。内線 UA
+    //   (Linphone 等) が LAN 側 (例 192.168.20.0/24) にいる本番構成では
+    //   `[bridge] ext_bind_ip` に eth0 LAN IP を設定する必要がある (内線 UA
+    //   から到達可能でないと SDP に広告したエンドポイントへ RTP が届かない =
+    //   音声無音になる、Issue #66 の根因)。
+    let bridge_ngn_ip = full_config
+        .bridge
+        .ngn_bind_ip
+        .unwrap_or_else(|| local_addr_for_hdr.ip());
+    let bridge_ext_ip = full_config.bridge.ext_bind_ip.unwrap_or(bridge_ngn_ip);
+    info!(
+        bridge_ngn_ip = %bridge_ngn_ip,
+        bridge_ext_ip = %bridge_ext_ip,
+        "RTP ブリッジ bind IP を決定 (Issue #66)"
+    );
     let uas_handler = if let Some(ext_registrar) = ext_registrar.clone() {
         let call_manager = CallManager::new(ext_registrar);
         let mut h = UasEventHandler::with_call_manager_and_metrics(
             ngn_uac.clone(),
             call_manager,
             Some(bridge_ngn_ip),
-            Some(bridge_ngn_ip),
+            Some(bridge_ext_ip),
             metrics.clone(),
         );
         if let (Some(uas_layer), uas_addr) = (uas_layer_for_b2bua.clone(), uas_local_addr) {
@@ -301,10 +314,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         let cfg = NgnInboundConfig {
             fork_timeout: std::time::Duration::from_secs(20),
             realm: "sabiden".to_string(),
-            // NGN→内線 着信時の RTP ブリッジ bind IP も sent-by IP に揃える
-            // (`docs/asterisk-real-invite.md` §5.2)。
+            // NGN→内線 着信時も outbound と同じ bind IP 方針を使う
+            // (`[bridge] ngn_bind_ip` / `ext_bind_ip` は両方向で意味が同じ)。
             bridge_ngn_bind_ip: Some(bridge_ngn_ip),
-            bridge_ext_bind_ip: Some(bridge_ngn_ip),
+            bridge_ext_bind_ip: Some(bridge_ext_ip),
         };
         // 着信 NGN→内線 用にも CallManager を渡す。outbound 側と同じ
         // `ext_registrar` を共有することで、登録テーブルを 1 つに保つ。
@@ -324,7 +337,8 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             .set_outbound_forwarder(uas_handler_for_forwarder)
             .await;
         info!(
-            bridge_bind_ip = %bridge_ngn_ip,
+            bridge_ngn_ip = %bridge_ngn_ip,
+            bridge_ext_ip = %bridge_ext_ip,
             "NGN 着信ハンドラ起動完了 (CallManager 注入済 / RTP ブリッジ有効)"
         );
     } else {

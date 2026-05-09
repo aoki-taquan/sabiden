@@ -98,6 +98,11 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     let mut sdp = SessionDescription::parse(text)?;
 
     sdp.origin.address = addr;
+    // Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §3 / §4):
+    // `o=` の username は `-` に正規化する (Asterisk は `-`、sabiden は内線
+    // 由来で `iphone` 等が乗る → NGN は 500 Server Internal Error を返す)。
+    // RFC 4566 §5.2 でも username が `-` (anonymous origin) は推奨形。
+    sdp.origin.username = "-".to_string();
     // セッションレベル c= は必ず sabiden を指すようにする
     sdp.connection = Some(Connection { address: addr });
 

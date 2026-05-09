@@ -18,3 +18,8 @@ pub mod rtp;
 pub mod sdp;
 pub mod sip;
 pub mod webrtc;
+
+// Issue #42: テスト共通ハーネス。`#[cfg(test)]` でゲートしているため
+// production ビルドには含まれない。
+#[cfg(test)]
+pub mod testing;

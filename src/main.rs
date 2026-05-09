@@ -17,6 +17,13 @@ mod sip;
 #[allow(dead_code)]
 mod webrtc;
 
+// Issue #42: テスト共通ハーネス。lib.rs と同じファイルを test ビルド時のみロードして
+// `crate::testing::*` で参照できるようにする (bin と lib で `mod call;` 等を二重に
+// 宣言する既存の構成上の対策。production ビルドには含まれない)。
+#[cfg(test)]
+#[allow(dead_code)]
+mod testing;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

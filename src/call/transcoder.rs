@@ -76,6 +76,12 @@ pub struct TranscodingBridge {
     ngn_to_web: Option<JoinHandle<()>>,
     web_to_ngn: Option<JoinHandle<()>>,
     state: Arc<BridgeState>,
+    /// NGN 側 socket / 学習済 peer。DTMF 注入 (Issue #69) で使う。
+    ngn_socket: Arc<UdpSocket>,
+    ngn_state: Arc<LegState>,
+    /// WebRTC 側 socket / 学習済 peer。NGN→内線 INFO 経路の placeholder。
+    web_socket: Arc<UdpSocket>,
+    web_state: Arc<LegState>,
 }
 
 #[derive(Default)]
@@ -125,10 +131,10 @@ impl TranscodingBridge {
 
         // WebRTC → NGN: Opus デコード → 48k PCM → ダウンサンプル → 8k PCM → μ-law
         let web_to_ngn = tokio::spawn(web_to_ngn_loop(
-            web_socket,
-            ngn_socket,
-            web_state,
-            ngn_state,
+            web_socket.clone(),
+            ngn_socket.clone(),
+            web_state.clone(),
+            ngn_state.clone(),
             state.clone(),
             opus_payload_type,
             metrics,
@@ -138,7 +144,34 @@ impl TranscodingBridge {
             ngn_to_web: Some(ngn_to_web),
             web_to_ngn: Some(web_to_ngn),
             state,
+            ngn_socket,
+            ngn_state,
+            web_socket,
+            web_state,
         })
+    }
+
+    /// Issue #69: NGN 側 socket から NGN ピア宛に任意 RTP datagram を 1 つ送る。
+    /// SIP INFO で受け取った DTMF を RFC 4733 telephone-event RTP packet に
+    /// 変換して NGN レッグに乗せるための注入経路。
+    ///
+    /// NGN ピアが学習されていない (= まだ RTP を受信していない) 場合は `Err`。
+    /// トランスコード経路では Opus → μ-law 変換と independent に PT=101 を
+    /// 直接送れるので、DTMF をリサンプル / 再エンコードしない (RFC 4733 §2.4)。
+    pub async fn send_to_ngn(&self, datagram: &[u8]) -> Result<()> {
+        let dest = { *self.ngn_state.peer.lock().await };
+        let dest = dest.ok_or_else(|| anyhow::anyhow!("NGN peer 未確定"))?;
+        self.ngn_socket.send_to(datagram, dest).await?;
+        Ok(())
+    }
+
+    /// Issue #69: WebRTC 側 socket から WebRTC ピア宛に任意 RTP datagram を 1 つ送る
+    /// (NGN→内線 INFO 経路の placeholder)。
+    pub async fn send_to_web(&self, datagram: &[u8]) -> Result<()> {
+        let dest = { *self.web_state.peer.lock().await };
+        let dest = dest.ok_or_else(|| anyhow::anyhow!("Web peer 未確定"))?;
+        self.web_socket.send_to(datagram, dest).await?;
+        Ok(())
     }
 
     /// 両ループを停止する。

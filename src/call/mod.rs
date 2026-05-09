@@ -14,6 +14,7 @@
 
 pub mod bridge;
 pub mod codec_pipeline;
+pub mod dtmf;
 pub mod manager;
 pub mod orchestrator;
 pub mod transcoder;

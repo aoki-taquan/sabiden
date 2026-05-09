@@ -24,8 +24,67 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
+use super::transcoder::TranscodingBridge;
 use crate::observability::Metrics;
 use crate::rtp::set_rtp_dscp;
+
+/// NGN レッグと内線レッグの SDP に応じて、純リレーまたはトランスコードの
+/// どちらかで動く統一ブリッジハンドル (Issue #29)。
+///
+/// `RtpBridge` (両側 PCMU 想定) と `TranscodingBridge` (Opus↔PCMU) を
+/// 1 つの型に閉じ込め、`CallManager::attach_bridge` 経由で 1 通話に
+/// 1 つだけ持たせるための薄いアダプタ。
+///
+/// # 既存パスの保持
+///
+/// - 両側 PCMU の場合は必ず [`MediaBridge::Relay`] を選び、`RtpBridge` の
+///   ホットパスをそのまま使う (= 既存の Linphone↔NGN / 117 時報通話の
+///   挙動と完全一致)。
+/// - WebRTC レッグ (Opus) ↔ NGN レッグ (PCMU) のときのみ
+///   [`MediaBridge::Transcode`] を選び、Opus encode/decode + 8k↔48k
+///   リサンプルを噛ませる。
+pub enum MediaBridge {
+    /// 純リレー (G.711 μ-law をそのまま転送)。
+    Relay(RtpBridge),
+    /// Opus ⇔ G.711 トランスコード (RFC 7587 ↔ RFC 3551)。
+    Transcode(TranscodingBridge),
+}
+
+impl MediaBridge {
+    /// 両ループを停止する。`RtpBridge::stop` / `TranscodingBridge::stop`
+    /// と同等。
+    pub async fn stop(self) {
+        match self {
+            MediaBridge::Relay(b) => b.stop().await,
+            MediaBridge::Transcode(b) => b.stop().await,
+        }
+    }
+
+    /// 観測用統計。`(NGN→ext, ext→NGN)` のパケット数を返す。
+    /// トランスコード時は `(NGN→Web, Web→NGN)` を同じ意味で返す
+    /// (B2BUA 観点では NGN レッグ⇔ 内線レッグ の単純な 2 方向)。
+    pub fn stats(&self) -> (u64, u64) {
+        match self {
+            MediaBridge::Relay(b) => b.stats(),
+            MediaBridge::Transcode(b) => {
+                let (n2w, w2n, _err) = b.stats();
+                (n2w, w2n)
+            }
+        }
+    }
+}
+
+impl From<RtpBridge> for MediaBridge {
+    fn from(b: RtpBridge) -> Self {
+        MediaBridge::Relay(b)
+    }
+}
+
+impl From<TranscodingBridge> for MediaBridge {
+    fn from(b: TranscodingBridge) -> Self {
+        MediaBridge::Transcode(b)
+    }
+}
 
 /// 1 つのリレー方向 (片側ソケット → 反対側) を表す共有状態。
 ///
@@ -381,6 +440,125 @@ mod tests {
         assert_eq!(to_ext, u64::from(N), "NGN→ext のリレー総数が一致しない");
         assert_eq!(to_ngn, u64::from(N), "ext→NGN のリレー総数が一致しない");
 
+        bridge.stop().await;
+    }
+
+    /// Issue #29: MediaBridge::Relay で wrap した RtpBridge が PCMU パケットを
+    /// 双方向に流す (= 既存パスをそのまま使えること)。
+    #[tokio::test]
+    async fn media_bridge_relay_variant_forwards_pcmu_unchanged() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ext_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+        let ext_peer_addr = ext_peer_sock.local_addr().unwrap();
+
+        let bridge: MediaBridge = RtpBridge::start(BridgeConfig {
+            ngn_socket: ngn_sock,
+            ext_socket: ext_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            ext_peer: Some(ext_peer_addr),
+            metrics: None,
+        })
+        .unwrap()
+        .into();
+
+        let pkt = RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: false,
+            sequence: 7,
+            timestamp: 160,
+            ssrc: 0xC0DE_FACE,
+            payload: vec![0x55; 160],
+        }
+        .to_bytes();
+        ngn_peer_sock.send_to(&pkt, ngn_addr).await.unwrap();
+        let mut buf = vec![0u8; 1500];
+        let (n, _) = timeout(Duration::from_secs(1), ext_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("Relay ブランチでもパケットが届くべき")
+            .unwrap();
+        let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(recv.payload_type, PAYLOAD_TYPE_ULAW);
+        assert_eq!(recv.ssrc, 0xC0DE_FACE);
+        let (to_ext, _to_ngn) = bridge.stats();
+        assert!(to_ext >= 1);
+        bridge.stop().await;
+    }
+
+    /// Issue #29: MediaBridge::Transcode が NGN→ext (μ-law→Opus) と
+    /// ext→NGN (Opus→μ-law) の両方向を 1 オブジェクトで stop できる。
+    /// 入出力 PT は SDP の rtpmap で指定された値を使う。
+    #[tokio::test]
+    async fn media_bridge_transcode_variant_handles_both_directions() {
+        use crate::call::transcoder::{
+            build_opus_rtp_packet, build_ulaw_rtp_packet, TranscodeConfig, TranscodingBridge,
+            DEFAULT_OPUS_PT,
+        };
+        use crate::rtp::codec::opus::{OpusEncoder, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE};
+        use crate::rtp::codec::resample::{NARROW_BAND_RATE, NB_FRAME_SAMPLES};
+        use crate::rtp::codec::AudioFrame;
+        use crate::rtp::packet::SAMPLES_PER_FRAME;
+
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let web_addr = web_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge: MediaBridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap()
+        .into();
+
+        // NGN→WebRTC: μ-law (160 サンプル無音) を投入 → Opus が出てくる。
+        let silence_nb = vec![0i16; NB_FRAME_SAMPLES];
+        let pkt_ulaw = build_ulaw_rtp_packet(1, 0, 0xAAAA_AAAA, &silence_nb);
+        ngn_peer.send_to(&pkt_ulaw, ngn_addr).await.unwrap();
+        let mut buf = vec![0u8; 1500];
+        let (n, _) = timeout(Duration::from_secs(2), web_peer.recv_from(&mut buf))
+            .await
+            .expect("Transcode 経由で Opus が届かない")
+            .unwrap();
+        let received_opus = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(received_opus.payload_type, DEFAULT_OPUS_PT);
+        assert!(!received_opus.payload.is_empty());
+
+        // WebRTC→NGN: Opus (48k 無音) を投入 → μ-law 160 サンプルが出てくる。
+        let mut enc = OpusEncoder::new().unwrap();
+        let silence_wb = AudioFrame::new(OPUS_SAMPLE_RATE, vec![0i16; OPUS_FRAME_SAMPLES]);
+        let pkt_opus =
+            build_opus_rtp_packet(DEFAULT_OPUS_PT, 1, 0, 0xBBBB_BBBB, &mut enc, &silence_wb)
+                .unwrap();
+        // RTP のホットパスの順序保証のため、念のためサンプルレート明示
+        let _ = NARROW_BAND_RATE;
+        web_peer.send_to(&pkt_opus, web_addr).await.unwrap();
+        let (n2, _) = timeout(Duration::from_secs(2), ngn_peer.recv_from(&mut buf))
+            .await
+            .expect("Transcode 経由で μ-law が届かない")
+            .unwrap();
+        let received_ulaw = RtpPacket::from_bytes(&buf[..n2]).unwrap();
+        assert_eq!(received_ulaw.payload_type, PAYLOAD_TYPE_ULAW);
+        assert_eq!(received_ulaw.payload.len(), SAMPLES_PER_FRAME);
+
+        // MediaBridge 経由でも統計が読めること。
+        let (to_ext, to_ngn) = bridge.stats();
+        assert!(to_ext >= 1, "NGN→Web 統計 = {}", to_ext);
+        assert!(to_ngn >= 1, "Web→NGN 統計 = {}", to_ngn);
+
+        // MediaBridge::stop で両ループがちゃんと畳まれる。
         bridge.stop().await;
     }
 

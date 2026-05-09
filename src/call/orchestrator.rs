@@ -48,8 +48,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, info_span, warn, Instrument};
 
-use super::bridge::{BridgeConfig, RtpBridge};
+use super::bridge::{BridgeConfig, MediaBridge, RtpBridge};
+use super::codec_pipeline::{select_media_plan, MediaPlan};
 use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker};
+use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::{restrict_audio_to_pcmu, rewrite_rtp_endpoint};
@@ -522,16 +524,35 @@ impl NgnInboundHandler {
         let rewritten =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
 
-        let bridge = RtpBridge::start(BridgeConfig {
-            ngn_socket: ngn_bridge_sock,
-            ext_socket: ext_bridge_sock,
-            ngn_peer: Some(ngn_peer),
-            ext_peer: Some(ext_peer),
-            metrics: Some(self.metrics.clone()),
-        })?;
+        // Issue #29: NGN 側 SDP は PCMU 固定だが、内線レッグが Opus を要求した
+        // 場合は Opus⇔PCMU トランスコードを噛ませる。両側 PCMU の場合は
+        // 既存パスと完全に同じ純リレー (RtpBridge) を使う。
+        let plan = select_media_plan(ngn_offer, ext_answer);
+        let bridge: MediaBridge = match plan {
+            MediaPlan::Relay => RtpBridge::start(BridgeConfig {
+                ngn_socket: ngn_bridge_sock,
+                ext_socket: ext_bridge_sock,
+                ngn_peer: Some(ngn_peer),
+                ext_peer: Some(ext_peer),
+                metrics: Some(self.metrics.clone()),
+            })?
+            .into(),
+            MediaPlan::Transcode { opus_pt } => {
+                info!(opus_pt, "内線が Opus → Opus⇔PCMU トランスコード起動");
+                TranscodingBridge::start(TranscodeConfig {
+                    ngn_socket: ngn_bridge_sock,
+                    web_socket: ext_bridge_sock,
+                    ngn_peer: Some(ngn_peer),
+                    web_peer: Some(ext_peer),
+                    opus_payload_type: opus_pt,
+                    metrics: Some(self.metrics.clone()),
+                })?
+                .into()
+            }
+        };
 
         let cid = mgr.create_call().await;
-        mgr.attach_bridge(cid, bridge).await?;
+        mgr.attach_media_bridge(cid, bridge).await?;
         self.active
             .lock()
             .await
@@ -1373,15 +1394,35 @@ impl UasEventHandler {
         let rewritten_for_ext =
             rewrite_rtp_endpoint(ext_offer, sabiden_ext_addr.ip(), sabiden_ext_addr.port())?;
 
-        let bridge = RtpBridge::start(BridgeConfig {
-            ngn_socket: ctx.ngn_sock,
-            ext_socket: ctx.ext_sock,
-            ngn_peer: Some(ngn_peer),
-            ext_peer: Some(ctx.ext_peer),
-            metrics: Some(self.metrics.clone()),
-        })?;
+        // Issue #29: 内線→NGN 発信でも内線レッグが Opus を要求した場合は
+        // Opus⇔PCMU トランスコード。NGN レッグは PCMU 固定 (上流で
+        // restrict_audio_to_pcmu 済) なので NGN answer は PCMU 想定。
+        let plan = select_media_plan(ngn_answer, ext_offer);
+        let bridge: MediaBridge = match plan {
+            MediaPlan::Relay => RtpBridge::start(BridgeConfig {
+                ngn_socket: ctx.ngn_sock,
+                ext_socket: ctx.ext_sock,
+                ngn_peer: Some(ngn_peer),
+                ext_peer: Some(ctx.ext_peer),
+                metrics: Some(self.metrics.clone()),
+            })?
+            .into(),
+            MediaPlan::Transcode { opus_pt } => {
+                info!(opus_pt, "内線が Opus → 発信時 Opus⇔PCMU トランスコード起動");
+                TranscodingBridge::start(TranscodeConfig {
+                    ngn_socket: ctx.ngn_sock,
+                    web_socket: ctx.ext_sock,
+                    ngn_peer: Some(ngn_peer),
+                    web_peer: Some(ctx.ext_peer),
+                    opus_payload_type: opus_pt,
+                    metrics: Some(self.metrics.clone()),
+                })?
+                .into()
+            }
+        };
+
         let cid = mgr.create_call().await;
-        mgr.attach_bridge(cid, bridge).await?;
+        mgr.attach_media_bridge(cid, bridge).await?;
         Ok((rewritten_for_ext, Some(cid)))
     }
 }
@@ -3775,5 +3816,130 @@ mod tests {
             ngn_addr.port(),
             body
         );
+    }
+
+    /// Issue #29: 内線レッグ SDP が Opus を要求した場合、
+    /// `finalize_outbound_bridge` は `MediaBridge::Transcode` を選んで
+    /// Opus⇔PCMU トランスコーダを起動する。
+    ///
+    /// 直接 enum バリアントを覗くために `CallManager::inner` を経由するのが
+    /// 重いため、本テストでは「トランスコーダが起動 → bridge_call_id が
+    /// `Some`」だけを assert し、実際にトランスコードが回ることは
+    /// transcoder.rs 側の `web_to_ngn_transcodes_packet` 等で別途
+    /// 担保している。
+    #[tokio::test]
+    async fn finalize_outbound_bridge_with_opus_offer_starts_transcoding_bridge() {
+        use crate::call::manager::CallManager;
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            "127.0.0.1:5060".parse().unwrap(),
+        ));
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr.clone(),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = OutboundBridgeCtx {
+            ngn_sock,
+            ext_sock,
+            ext_peer: "127.0.0.1:40001".parse().unwrap(),
+        };
+
+        // 内線オファ: WebRTC ブラウザ風に Opus 動的 PT 111 を宣言。
+        let ext_offer = b"v=0\r\n\
+            o=- 1 1 IN IP4 192.168.20.50\r\n\
+            s=-\r\n\
+            c=IN IP4 192.168.20.50\r\n\
+            t=0 0\r\n\
+            m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            a=ptime:20\r\n";
+        // NGN は restrict_audio_to_pcmu 後の PCMU only answer を返す。
+        let ngn_answer = b"v=0\r\n\
+            o=- 9 9 IN IP4 118.177.125.1\r\n\
+            s=-\r\n\
+            c=IN IP4 118.177.125.1\r\n\
+            t=0 0\r\n\
+            m=audio 28196 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+
+        let (_body, bridge_id) = handler
+            .finalize_outbound_bridge(Some(ctx), ext_offer, ngn_answer)
+            .await
+            .expect("finalize_outbound_bridge with opus offer");
+        assert!(
+            bridge_id.is_some(),
+            "Opus 内線オファでブリッジが起動していない"
+        );
+    }
+
+    /// Issue #29 安全網: 両側 PCMU の従来パスも MediaBridge::Relay で
+    /// ちゃんと起動する (= 既存 117 時報通話 / Linphone↔NGN を壊していない)。
+    #[tokio::test]
+    async fn finalize_outbound_bridge_with_pcmu_uses_relay_bridge() {
+        use crate::call::manager::CallManager;
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            "127.0.0.1:5060".parse().unwrap(),
+        ));
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr.clone(),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = OutboundBridgeCtx {
+            ngn_sock,
+            ext_sock,
+            ext_peer: "127.0.0.1:40002".parse().unwrap(),
+        };
+
+        let ext_offer = b"v=0\r\n\
+            o=- 1 1 IN IP4 192.168.20.50\r\n\
+            s=-\r\n\
+            c=IN IP4 192.168.20.50\r\n\
+            t=0 0\r\n\
+            m=audio 7078 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let ngn_answer = b"v=0\r\n\
+            o=- 9 9 IN IP4 118.177.125.1\r\n\
+            s=-\r\n\
+            c=IN IP4 118.177.125.1\r\n\
+            t=0 0\r\n\
+            m=audio 28196 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+
+        let (_body, bridge_id) = handler
+            .finalize_outbound_bridge(Some(ctx), ext_offer, ngn_answer)
+            .await
+            .expect("finalize_outbound_bridge pcmu");
+        assert!(bridge_id.is_some(), "PCMU 通話でブリッジが起動していない");
     }
 }

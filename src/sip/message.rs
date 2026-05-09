@@ -1,5 +1,24 @@
+//! SIP メッセージ層 (RFC 3261 §7)
+//!
+//! - SIP Request / Response の共通モデル
+//! - SIP Method の enum (PUBLISH/NOTIFY/PRACK/SUBSCRIBE まで個別バリアント)
+//! - SipHeaders: 同名複数行 (Via, Route 等) を保持できるヘッダ表
+//! - SIP-URI のパース (`SipUriParts` / [`parse_sip_uri`])
+//!
+//! ヘッダ名は内部的に "long form" の小文字 (例: `via`, `from`, `to`) で
+//! 保持する。受信時に compact form (RFC 3261 §7.3.3 / §20:
+//! `i=Call-ID`, `m=Contact`, `f=From`, `t=To`, `v=Via`, `c=Content-Type`,
+//! `l=Content-Length`, `e=Content-Encoding`, `s=Subject`, `k=Supported`)
+//! を long form へ展開し、書き出し時に [`canonical_header_name`] が
+//! Title-Case 化する。
+
 use std::fmt;
 
+/// SIP method (RFC 3261 §7.1 + 拡張)。
+///
+/// RFC 3261 で定義される基本メソッドに加え、よく使われる拡張メソッド
+/// (PUBLISH/NOTIFY/SUBSCRIBE/PRACK) は専用バリアントを持ち、未知の
+/// メソッドは [`SipMethod::Other`] にフォールバックする。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SipMethod {
     Register,
@@ -9,52 +28,66 @@ pub enum SipMethod {
     Cancel,
     Options,
     Info,
+    /// RFC 3265
     Notify,
+    /// RFC 3265
     Subscribe,
-    /// RFC 3262 (PRACK), RFC 3265 (NOTIFY/SUBSCRIBE), RFC 3311 (UPDATE),
-    /// RFC 3428 (MESSAGE), RFC 3515 (REFER), RFC 3903 (PUBLISH) など、
-    /// 個別ハンドラを持たないメソッドを横断で受ける。Linphone は presence で
-    /// PUBLISH を流すので、本バリアントが無いとメッセージ全体が drop される。
+    /// RFC 3262 (Reliable Provisional Responses)
+    Prack,
+    /// RFC 3903 (Event State Publication)
+    Publish,
+    /// 未知のメソッド名 (パース時に保持しておくが、ルータは 405 等で返す想定)。
     Other(String),
 }
 
-impl fmt::Display for SipMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl SipMethod {
+    /// 文字列表現 (大文字)。`Other` は中身をそのまま返す。
+    pub fn as_str(&self) -> &str {
         match self {
-            SipMethod::Register => write!(f, "REGISTER"),
-            SipMethod::Invite => write!(f, "INVITE"),
-            SipMethod::Ack => write!(f, "ACK"),
-            SipMethod::Bye => write!(f, "BYE"),
-            SipMethod::Cancel => write!(f, "CANCEL"),
-            SipMethod::Options => write!(f, "OPTIONS"),
-            SipMethod::Info => write!(f, "INFO"),
-            SipMethod::Notify => write!(f, "NOTIFY"),
-            SipMethod::Subscribe => write!(f, "SUBSCRIBE"),
-            SipMethod::Other(name) => write!(f, "{}", name),
+            SipMethod::Register => "REGISTER",
+            SipMethod::Invite => "INVITE",
+            SipMethod::Ack => "ACK",
+            SipMethod::Bye => "BYE",
+            SipMethod::Cancel => "CANCEL",
+            SipMethod::Options => "OPTIONS",
+            SipMethod::Info => "INFO",
+            SipMethod::Notify => "NOTIFY",
+            SipMethod::Subscribe => "SUBSCRIBE",
+            SipMethod::Prack => "PRACK",
+            SipMethod::Publish => "PUBLISH",
+            SipMethod::Other(s) => s.as_str(),
         }
     }
 }
 
+impl fmt::Display for SipMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for SipMethod {
+    /// 任意の token を受け付け、未知メソッドは [`SipMethod::Other`] に
+    /// 包む。空文字列だけはエラーとする。
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "REGISTER" => Ok(SipMethod::Register),
-            "INVITE" => Ok(SipMethod::Invite),
-            "ACK" => Ok(SipMethod::Ack),
-            "BYE" => Ok(SipMethod::Bye),
-            "CANCEL" => Ok(SipMethod::Cancel),
-            "OPTIONS" => Ok(SipMethod::Options),
-            "INFO" => Ok(SipMethod::Info),
-            "NOTIFY" => Ok(SipMethod::Notify),
-            "SUBSCRIBE" => Ok(SipMethod::Subscribe),
-            // 既知 SIP メソッド名 (大文字 ASCII) ならば Other に格納し、
-            // UAS 側で 405 Method Not Allowed として応答する。
-            other if !other.is_empty() && other.bytes().all(|b| b.is_ascii_uppercase()) => {
-                Ok(SipMethod::Other(other.to_string()))
-            }
-            _ => anyhow::bail!("unknown SIP method: {}", s),
+        if s.is_empty() {
+            anyhow::bail!("empty SIP method");
         }
+        Ok(match s {
+            "REGISTER" => SipMethod::Register,
+            "INVITE" => SipMethod::Invite,
+            "ACK" => SipMethod::Ack,
+            "BYE" => SipMethod::Bye,
+            "CANCEL" => SipMethod::Cancel,
+            "OPTIONS" => SipMethod::Options,
+            "INFO" => SipMethod::Info,
+            "NOTIFY" => SipMethod::Notify,
+            "SUBSCRIBE" => SipMethod::Subscribe,
+            "PRACK" => SipMethod::Prack,
+            "PUBLISH" => SipMethod::Publish,
+            other => SipMethod::Other(other.to_string()),
+        })
     }
 }
 
@@ -80,10 +113,12 @@ pub enum SipMessage {
     Response(SipResponse),
 }
 
-/// 複数値を持てる SIP ヘッダ (Via 等は複数行になる)
+/// 複数値を持てる SIP ヘッダ (Via 等は複数行になる)。
+///
+/// キーは long form の小文字で正規化される ([`normalize_header_name`])。
+/// 書き出し時には [`canonical_header_name`] により Title-Case 化される。
 #[derive(Debug, Clone, Default)]
 pub struct SipHeaders {
-    // 小文字キーで保持
     fields: Vec<(String, String)>,
 }
 
@@ -93,7 +128,7 @@ impl SipHeaders {
     }
 
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
-        let key = normalize_header_key(name);
+        let key = normalize_header_name(name);
         // 既存エントリを上書き (最初の1件のみ)
         if let Some(pos) = self.fields.iter().position(|(k, _)| k == &key) {
             self.fields[pos].1 = value.into();
@@ -103,11 +138,12 @@ impl SipHeaders {
     }
 
     pub fn add(&mut self, name: &str, value: impl Into<String>) {
-        self.fields.push((normalize_header_key(name), value.into()));
+        self.fields
+            .push((normalize_header_name(name), value.into()));
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        let key = normalize_header_key(name);
+        let key = normalize_header_name(name);
         self.fields
             .iter()
             .find(|(k, _)| k == &key)
@@ -115,7 +151,7 @@ impl SipHeaders {
     }
 
     pub fn get_all(&self, name: &str) -> Vec<&str> {
-        let key = normalize_header_key(name);
+        let key = normalize_header_name(name);
         self.fields
             .iter()
             .filter(|(k, _)| k == &key)
@@ -175,128 +211,241 @@ impl SipResponse {
     }
 }
 
-/// SIP ヘッダ名の格納キーを生成する。
-/// 大文字小文字差を吸収しつつ、RFC 3261 §7.3.3 のコンパクト形式 (`v`, `f`, `t`, `i`,
-/// `m`, `l`, `s`, `c`, `k`, `e` 等) を完全形に展開する。NTT NGN の P-CSCF は
-/// 200 OK 等のレスポンスでコンパクト形式を多用するため、入口で正規化しないと
-/// `headers.get("via")` 等で取り損なう。
-fn normalize_header_key(name: &str) -> String {
+/// ヘッダ名を内部キー (long-form, lowercase) に正規化する。
+///
+/// RFC 3261 §7.3.3 / §20 の compact form (`i`/`m`/`f`/`t`/`v`/`c`/`l`/
+/// `e`/`s`/`k`/`b`/`o`/`r`/`u`) を long form の小文字へ展開する。
+/// それ以外はそのまま小文字化する。
+///
+/// このヘルパが [`SipHeaders`] の唯一の正規化点で、書き出し時の
+/// [`canonical_header_name`] と二重に大文字化ロジックを抱えないように
+/// 「内部表現は常に long-form lowercase」を不変条件にする。
+pub fn normalize_header_name(name: &str) -> String {
     let lower = name.trim().to_ascii_lowercase();
-    let full = match lower.as_str() {
-        // RFC 3261 §7.3.3
-        "v" => "via",
-        "f" => "from",
-        "t" => "to",
-        "i" => "call-id",
-        "m" => "contact",
-        "l" => "content-length",
-        "s" => "subject",
-        "c" => "content-type",
-        "k" => "supported",
-        "e" => "content-encoding",
-        // 拡張 (RFC 3265 / 3515 / 4028 / 4474 / 4538 等)
-        "o" => "event",
-        "u" => "allow-events",
-        "r" => "refer-to",
-        "b" => "referred-by",
-        "x" => "session-expires",
-        "y" => "identity",
-        "n" => "identity-info",
-        "a" => "accept-contact",
-        "j" => "reject-contact",
-        "d" => "request-disposition",
-        other => return other.to_string(),
-    };
-    full.to_string()
-}
-
-fn canonical_header_name(lower: &str) -> &str {
-    match lower {
-        "via" => "Via",
-        "from" => "From",
-        "to" => "To",
-        "call-id" => "Call-ID",
-        "cseq" => "CSeq",
-        "contact" => "Contact",
-        "content-type" => "Content-Type",
-        "content-length" => "Content-Length",
-        "max-forwards" => "Max-Forwards",
-        "authorization" => "Authorization",
-        "www-authenticate" => "WWW-Authenticate",
-        "expires" => "Expires",
-        "allow" => "Allow",
-        "supported" => "Supported",
-        "session-expires" => "Session-Expires",
-        "min-se" => "Min-SE",
-        "p-preferred-identity" => "P-Preferred-Identity",
-        "p-asserted-identity" => "P-Asserted-Identity",
-        "user-agent" => "User-Agent",
-        other => other,
+    match lower.as_str() {
+        // RFC 3261 §20 compact form
+        "i" => "call-id".into(),
+        "m" => "contact".into(),
+        "f" => "from".into(),
+        "t" => "to".into(),
+        "v" => "via".into(),
+        "c" => "content-type".into(),
+        "l" => "content-length".into(),
+        "e" => "content-encoding".into(),
+        "s" => "subject".into(),
+        "k" => "supported".into(),
+        "b" => "referred-by".into(),
+        "o" => "event".into(),
+        "r" => "refer-to".into(),
+        "u" => "allow-events".into(),
+        _ => lower,
     }
 }
 
-/// 簡易 SIP URI 分解結果。RFC 3261 §19.1 完全準拠ではなく、
-/// `sip:user@host[:port][;params][?headers]` の主要部分のみを抜き出す。
-/// `<>` などの display-name angle-brackets は含めずに渡すこと。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SipUriParts<'a> {
-    /// "sip" / "sips" / "tel" 等のスキーム (小文字化はしない)。
-    pub scheme: &'a str,
-    /// `@` の左側 (ユーザ部)。`None` なら `host` のみ。
-    pub user: Option<&'a str>,
-    /// host (IPv4 / IPv6 リテラル `[..]` / FQDN)。port やパラメータは除外済み。
-    pub host: &'a str,
-    /// `:port` 部 (省略可)。
-    pub port: Option<&'a str>,
+/// long-form lowercase キーから書き出し用の Title-Case 名を返す。
+///
+/// 既知のヘッダは RFC 互換の慣用 case (例: `Call-ID`, `CSeq`,
+/// `WWW-Authenticate`) を使い、未知のヘッダは ハイフン区切りで
+/// 各トークンを title-case する (`X-Foo-Bar` → `X-Foo-Bar`)。
+pub fn canonical_header_name(lower: &str) -> String {
+    match lower {
+        "via" => "Via".into(),
+        "from" => "From".into(),
+        "to" => "To".into(),
+        "call-id" => "Call-ID".into(),
+        "cseq" => "CSeq".into(),
+        "contact" => "Contact".into(),
+        "content-type" => "Content-Type".into(),
+        "content-length" => "Content-Length".into(),
+        "content-encoding" => "Content-Encoding".into(),
+        "max-forwards" => "Max-Forwards".into(),
+        "authorization" => "Authorization".into(),
+        "www-authenticate" => "WWW-Authenticate".into(),
+        "proxy-authenticate" => "Proxy-Authenticate".into(),
+        "proxy-authorization" => "Proxy-Authorization".into(),
+        "expires" => "Expires".into(),
+        "allow" => "Allow".into(),
+        "allow-events" => "Allow-Events".into(),
+        "supported" => "Supported".into(),
+        "require" => "Require".into(),
+        "session-expires" => "Session-Expires".into(),
+        "min-se" => "Min-SE".into(),
+        "p-preferred-identity" => "P-Preferred-Identity".into(),
+        "p-asserted-identity" => "P-Asserted-Identity".into(),
+        "user-agent" => "User-Agent".into(),
+        "subject" => "Subject".into(),
+        "event" => "Event".into(),
+        "refer-to" => "Refer-To".into(),
+        "referred-by" => "Referred-By".into(),
+        "rseq" => "RSeq".into(),
+        "rack" => "RAck".into(),
+        "record-route" => "Record-Route".into(),
+        "route" => "Route".into(),
+        other => title_case_dashed(other),
+    }
 }
 
-/// `sip:user@host[:port][;params]` 形式の SIP URI を分解する。
-///
-/// - `<sip:..>` の山括弧は事前に剥がしてから渡すこと
-/// - `;params` `?headers` は捨てる
-/// - IPv6 リテラル `[2001:db8::1]:5060` を扱える
-///
-/// 失敗時は `None`。本格的な RFC 3261 §19.1 パーサは用意しない。
-pub fn parse_sip_uri(uri: &str) -> Option<SipUriParts<'_>> {
-    let uri = uri.trim();
-    // angle-brackets が残っている場合は剥がす
-    let uri = uri
-        .strip_prefix('<')
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or(uri);
-    let (scheme, rest) = uri.split_once(':')?;
-    // パラメータ / ヘッダ部を捨てる
-    let rest = rest.split(';').next()?;
-    let rest = rest.split('?').next()?;
+/// `x-foo-bar` → `X-Foo-Bar` のように "-" 区切り各トークンを Title Case。
+fn title_case_dashed(s: &str) -> String {
+    s.split('-')
+        .map(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
 
-    let (user, hostport) = match rest.split_once('@') {
+/// SIP-URI の最低限のパース結果 (RFC 3261 §19.1.1)。
+///
+/// 完全な URI BNF は実装せず、UAC/UAS が実用上参照する範囲に絞る:
+///
+/// ```text
+/// sip:user:password@host:port;p1=v1;p2?h1=v1&h2=v2
+/// |scheme|user_info|host|port|;params       |?headers
+/// ```
+///
+/// - `scheme`: "sip" / "sips" / その他 (lower-case で保持)
+/// - `user`: `@` の左側 (パスワード `:` は削除しユーザ名のみ)
+/// - `host`: ホスト or `[v6]`
+/// - `port`: 数値 (省略時 None)
+/// - `params`: `;k=v` ペア (順序維持、値が無い `lr` は空文字列)
+/// - `headers`: `?k=v&k=v` ペア
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SipUriParts {
+    pub scheme: String,
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+    pub params: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl SipUriParts {
+    /// 値の有無に関わらず特定パラメータを持つか?
+    pub fn has_param(&self, name: &str) -> bool {
+        let n = name.to_ascii_lowercase();
+        self.params.iter().any(|(k, _)| k.eq_ignore_ascii_case(&n))
+    }
+
+    /// パラメータの値を取得 (大文字小文字無視)。
+    pub fn param(&self, name: &str) -> Option<&str> {
+        let n = name.to_ascii_lowercase();
+        self.params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&n))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// SIP/SIPS URI をパースする。
+///
+/// 入力例:
+/// - `sip:bob@example.com`
+/// - `sip:bob:secret@example.com:5060;transport=udp;lr?Subject=Hi`
+/// - `sips:[2001:db8::1]:5061`
+///
+/// `<sip:..>` の山かっこは付いていない前提。display name 付きの
+/// name-addr は呼び出し側で剥がしてから渡す。
+pub fn parse_sip_uri(input: &str) -> anyhow::Result<SipUriParts> {
+    let s = input.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty SIP-URI");
+    }
+
+    // scheme
+    let (scheme, rest) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("missing scheme: {}", s))?;
+    let scheme_lc = scheme.to_ascii_lowercase();
+    if scheme_lc != "sip" && scheme_lc != "sips" {
+        // 未知スキームでも構造解析は続けるが、scheme は保持する。
+    }
+
+    // ?headers 部
+    let (rest, headers_part) = match rest.split_once('?') {
+        Some((a, b)) => (a, Some(b)),
+        None => (rest, None),
+    };
+
+    // ;params 部
+    let (rest, params_part) = match rest.split_once(';') {
+        Some((a, b)) => (a, Some(b)),
+        None => (rest, None),
+    };
+
+    // user@host[:port]
+    let (user_part, hostport) = match rest.rsplit_once('@') {
         Some((u, h)) => (Some(u), h),
         None => (None, rest),
     };
 
-    // IPv6 リテラル `[..]` を考慮した host:port 分離
-    let (host, port) = if let Some(rest_after_bracket) = hostport.strip_prefix('[') {
-        let (h, after) = rest_after_bracket.split_once(']')?;
-        // `[host]:port` または `[host]` のみ
-        let port = after.strip_prefix(':');
-        // host 部に `[]` を含めて返す形にもできるが、比較しやすさを優先して中身のみ。
-        (h, port)
+    let user = user_part.map(|u| {
+        // user[:password] のうちユーザ名だけ取る
+        u.split(':').next().unwrap_or(u).to_string()
+    });
+
+    // hostport: IPv6 リテラルは [..]:port
+    let (host, port) = if let Some(stripped) = hostport.strip_prefix('[') {
+        // "[host]:port" or "[host]"
+        let end = stripped
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("unclosed IPv6 literal: {}", hostport))?;
+        let host = stripped[..end].to_string();
+        let after = &stripped[end + 1..];
+        let port = if let Some(p) = after.strip_prefix(':') {
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("bad port: {}", p))?,
+            )
+        } else {
+            None
+        };
+        (format!("[{}]", host), port)
     } else if let Some((h, p)) = hostport.rsplit_once(':') {
-        // ":" を 1 つ含む通常の IPv4/FQDN
-        (h, Some(p))
+        // host:port (host に : が無い前提 = IPv4 / FQDN)
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("bad port: {}", p))?;
+        (h.to_string(), Some(port))
     } else {
-        (hostport, None)
+        (hostport.to_string(), None)
     };
 
     if host.is_empty() {
-        return None;
+        anyhow::bail!("empty host: {}", input);
     }
-    Some(SipUriParts {
-        scheme,
+
+    let params = match params_part {
+        Some(p) => parse_kv_list(p, ';'),
+        None => Vec::new(),
+    };
+    let headers = match headers_part {
+        Some(h) => parse_kv_list(h, '&'),
+        None => Vec::new(),
+    };
+
+    Ok(SipUriParts {
+        scheme: scheme_lc,
         user,
         host,
         port,
+        params,
+        headers,
     })
+}
+
+fn parse_kv_list(s: &str, sep: char) -> Vec<(String, String)> {
+    s.split(sep)
+        .filter(|p| !p.is_empty())
+        .map(|part| match part.split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim().to_string()),
+            None => (part.trim().to_ascii_lowercase(), String::new()),
+        })
+        .collect()
 }
 
 /// SIP メッセージのパーサ
@@ -313,9 +462,7 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
 
     let mut headers = SipHeaders::new();
     for line in lines {
-        if let Some((k, v)) = line.split_once(": ") {
-            headers.add(k.trim(), v.trim());
-        } else if let Some((k, v)) = line.split_once(":") {
+        if let Some((k, v)) = line.split_once(':') {
             headers.add(k.trim(), v.trim());
         }
     }
@@ -364,73 +511,6 @@ mod tests {
         }
     }
 
-    fn test_parse_response_compact_headers_ngn_200ok() {
-        // NTT NGN P-CSCF が REGISTER 200 OK で実際に使うコンパクトヘッダ形式
-        // (v=Via, f=From, t=To, i=Call-ID, m=Contact, l=Content-Length)。
-        // 実機 pcap (118.177.125.1 → 118.177.72.242) から取得した形そのまま。
-        let msg = b"SIP/2.0 200 OK\r\n\
-v: SIP/2.0/UDP 118.177.72.242:5060;branch=z9hG4bK1a56953e6a112f02\r\n\
-f: <sip:0191349809@ntt-east.ne.jp>;tag=956a3a90\r\n\
-t: <sip:0191349809@ntt-east.ne.jp>;tag=3987286122\r\n\
-i: afa66bea0b3de7c1@hikari-sip\r\n\
-CSeq: 1 REGISTER\r\n\
-m: <sip:0191349809@118.177.72.242:5060>;q=0;expires=3600\r\n\
-l: 0\r\n\
-\r\n";
-        let parsed = parse_message(msg).unwrap();
-        match parsed {
-            SipMessage::Response(r) => {
-                assert_eq!(r.status_code, 200);
-                assert!(r.headers.get("via").is_some(), "via が compact 'v' から拾えない");
-                assert!(r.headers.get("from").is_some());
-                assert!(r.headers.get("to").is_some());
-                assert!(r.headers.get("call-id").is_some());
-                assert!(r.headers.get("contact").is_some());
-                assert_eq!(r.headers.get("content-length"), Some("0"));
-            }
-            _ => panic!("expected response"),
-        }
-    }
-
-    #[test]
-    fn parse_sip_uri_user_host() {
-        let p = parse_sip_uri("sip:117@192.168.20.239").unwrap();
-        assert_eq!(p.scheme, "sip");
-        assert_eq!(p.user, Some("117"));
-        assert_eq!(p.host, "192.168.20.239");
-        assert_eq!(p.port, None);
-    }
-
-    #[test]
-    fn parse_sip_uri_strips_params_and_port() {
-        let p = parse_sip_uri("sip:117@192.168.20.239:5060;transport=udp").unwrap();
-        assert_eq!(p.user, Some("117"));
-        assert_eq!(p.host, "192.168.20.239");
-        assert_eq!(p.port, Some("5060"));
-    }
-
-    #[test]
-    fn parse_sip_uri_strips_angle_brackets() {
-        let p = parse_sip_uri("<sip:0312345678@ntt-east.ne.jp>").unwrap();
-        assert_eq!(p.user, Some("0312345678"));
-        assert_eq!(p.host, "ntt-east.ne.jp");
-    }
-
-    #[test]
-    fn parse_sip_uri_ipv6_literal() {
-        let p = parse_sip_uri("sip:bob@[2001:db8::1]:5060").unwrap();
-        assert_eq!(p.user, Some("bob"));
-        assert_eq!(p.host, "2001:db8::1");
-        assert_eq!(p.port, Some("5060"));
-    }
-
-    #[test]
-    fn parse_sip_uri_no_user() {
-        let p = parse_sip_uri("sip:ntt-east.ne.jp").unwrap();
-        assert_eq!(p.user, None);
-        assert_eq!(p.host, "ntt-east.ne.jp");
-    }
-
     #[test]
     fn test_request_serialization() {
         let mut req = SipRequest::new(SipMethod::Register, "sip:ntt-east.ne.jp");
@@ -443,5 +523,102 @@ l: 0\r\n\
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("REGISTER sip:ntt-east.ne.jp SIP/2.0\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn test_compact_header_form_normalized() {
+        // RFC 3261 §7.3.3: compact form は long form と等価。
+        // 受信側で `i=foo\r\nm=bar` を long form で取り出せること。
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\nv: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\nf: <sip:a@x>;tag=1\r\nt: <sip:b@x>\r\ni: 123@x\r\nCSeq: 1 INVITE\r\nm: <sip:a@x:5060>\r\nl: 0\r\n\r\n";
+        let parsed = parse_message(raw).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert!(req.headers.get("via").is_some(), "v -> via");
+                assert!(req.headers.get("from").is_some(), "f -> from");
+                assert!(req.headers.get("to").is_some(), "t -> to");
+                assert!(req.headers.get("call-id").is_some(), "i -> call-id");
+                assert!(req.headers.get("contact").is_some(), "m -> contact");
+                // get でも compact form を解決できる
+                assert_eq!(req.headers.get("v"), req.headers.get("via"));
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    #[test]
+    fn test_canonical_header_for_unknown() {
+        assert_eq!(canonical_header_name("x-my-header"), "X-My-Header");
+        assert_eq!(canonical_header_name("call-id"), "Call-ID");
+        assert_eq!(canonical_header_name("cseq"), "CSeq");
+    }
+
+    #[test]
+    fn test_method_other_for_unknown() {
+        // RFC 3428 (MESSAGE) など未対応メソッドは Other に入る
+        let m: SipMethod = "MESSAGE".parse().unwrap();
+        assert_eq!(m, SipMethod::Other("MESSAGE".to_string()));
+        assert_eq!(m.as_str(), "MESSAGE");
+        assert_eq!(format!("{}", m), "MESSAGE");
+    }
+
+    #[test]
+    fn test_method_publish_prack_explicit() {
+        // RFC 3262 / RFC 3903: PRACK / PUBLISH は専用バリアント。
+        let p: SipMethod = "PRACK".parse().unwrap();
+        let pub_: SipMethod = "PUBLISH".parse().unwrap();
+        assert_eq!(p, SipMethod::Prack);
+        assert_eq!(pub_, SipMethod::Publish);
+    }
+
+    #[test]
+    fn test_parse_sip_uri_basic() {
+        let u = parse_sip_uri("sip:bob@example.com").unwrap();
+        assert_eq!(u.scheme, "sip");
+        assert_eq!(u.user.as_deref(), Some("bob"));
+        assert_eq!(u.host, "example.com");
+        assert!(u.port.is_none());
+        assert!(u.params.is_empty());
+        assert!(u.headers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_sip_uri_with_port_and_params() {
+        let u = parse_sip_uri("sip:alice@host.example:5061;transport=tls;lr").unwrap();
+        assert_eq!(u.user.as_deref(), Some("alice"));
+        assert_eq!(u.host, "host.example");
+        assert_eq!(u.port, Some(5061));
+        assert!(u.has_param("lr"));
+        assert_eq!(u.param("transport"), Some("tls"));
+        assert_eq!(u.param("LR"), Some("")); // case-insensitive lookup
+    }
+
+    #[test]
+    fn test_parse_sip_uri_with_headers() {
+        let u = parse_sip_uri("sip:bob@x.example?Subject=Hi&Priority=urgent").unwrap();
+        assert_eq!(u.headers.len(), 2);
+        assert_eq!(u.headers[0].0, "subject");
+        assert_eq!(u.headers[0].1, "Hi");
+        assert_eq!(u.headers[1].0, "priority");
+    }
+
+    #[test]
+    fn test_parse_sip_uri_ipv6() {
+        let u = parse_sip_uri("sips:[2001:db8::1]:5061;transport=tls").unwrap();
+        assert_eq!(u.scheme, "sips");
+        assert_eq!(u.host, "[2001:db8::1]");
+        assert_eq!(u.port, Some(5061));
+        assert!(u.user.is_none());
+    }
+
+    #[test]
+    fn test_parse_sip_uri_with_password_strips_password() {
+        let u = parse_sip_uri("sip:alice:secret@x.example").unwrap();
+        assert_eq!(u.user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_parse_sip_uri_rejects_empty() {
+        assert!(parse_sip_uri("").is_err());
+        assert!(parse_sip_uri("bob@x.example").is_err());
     }
 }

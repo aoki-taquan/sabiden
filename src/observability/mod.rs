@@ -507,7 +507,13 @@ pub fn extract_method_and_call_id(raw: &[u8]) -> (String, Option<String>) {
             continue;
         }
         let lower_prefix = line.to_ascii_lowercase();
-        if let Some(rest) = lower_prefix.strip_prefix("call-id:") {
+        // NTT NGN P-CSCF はコンパクトヘッダ (RFC 3261 §7.3.3) で応答するので
+        // `Call-ID:` だけでなく `i:` も Call-ID として認識する。これを抜くと
+        // trace ファイル名が `nocallid` になり call_id 横断検索が壊れる。
+        let call_id_rest = lower_prefix
+            .strip_prefix("call-id:")
+            .or_else(|| lower_prefix.strip_prefix("i:"));
+        if let Some(rest) = call_id_rest {
             // 元の line から値を取り出す (大小文字保持)
             let value = line
                 .split_once(':')
@@ -607,6 +613,27 @@ mod tests {
         let (m, cid) = extract_method_and_call_id(raw);
         assert_eq!(m, "RESP-200-REGISTER");
         assert_eq!(cid.as_deref(), Some("call-1@host"));
+    }
+
+    #[test]
+    fn extract_compact_call_id_from_ngn_response() {
+        // NTT NGN P-CSCF が返す compact form (`v:`, `f:`, `t:`, `i:`, `m:`, `l:`)。
+        // 実機 (118.177.125.1) の REGISTER 200 OK pcap から取った形をそのまま渡す。
+        let raw = b"SIP/2.0 200 OK\r\n\
+v: SIP/2.0/UDP 118.177.72.242:5060;branch=z9hG4bK1\r\n\
+f: <sip:0191349809@ntt-east.ne.jp>;tag=956a3a90\r\n\
+t: <sip:0191349809@ntt-east.ne.jp>;tag=3987286122\r\n\
+i: afa66bea0b3de7c1@hikari-sip\r\n\
+CSeq: 1 REGISTER\r\n\
+m: <sip:0191349809@118.177.72.242:5060>\r\n\
+l: 0\r\n\r\n";
+        let (m, cid) = extract_method_and_call_id(raw);
+        assert_eq!(m, "RESP-200-REGISTER");
+        assert_eq!(
+            cid.as_deref(),
+            Some("afa66bea0b3de7c1@hikari-sip"),
+            "compact 'i:' から call-id を抽出できないと trace ファイル名が nocallid になる"
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"permissions":{"allow":["Bash(sudo timeout * /home/aoki/sabiden/target/*/sabiden *:*)","Bash(sudo /home/aoki/sabiden/target/*/sabiden  *:*)","Bash(/home/aoki/sabiden/target/*/sabiden *:*)","Bash(sudo dhclient*)","Bash(sudo tcpdump*)","Bash(sudo pkill *tcpdump*)","Bash(sudo ip *)","Bash(sudo apt-get install*)"]}}

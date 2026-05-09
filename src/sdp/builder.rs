@@ -98,6 +98,11 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     let mut sdp = SessionDescription::parse(text)?;
 
     sdp.origin.address = addr;
+    // Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §3 / §4):
+    // `o=` の username は `-` に正規化する (Asterisk は `-`、sabiden は内線
+    // 由来で `iphone` 等が乗る → NGN は 500 Server Internal Error を返す)。
+    // RFC 4566 §5.2 でも username が `-` (anonymous origin) は推奨形。
+    sdp.origin.username = "-".to_string();
     // セッションレベル c= は必ず sabiden を指すようにする
     sdp.connection = Some(Connection { address: addr });
 
@@ -111,6 +116,173 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     }
 
     Ok(sdp.to_string_crlf().into_bytes())
+}
+
+/// audio メディアを **G.711 μ-law (payload type 0) のみ** に絞った SDP を返す。
+///
+/// NTT ひかり電話 (NGN) は PCMU(0) しか受け入れず、Linphone/Zoiper 等が送ってくる
+/// multi-codec オファ (Opus, Speex, G.729, telephone-event 等) を素通しすると
+/// `488 Not Acceptable Here` で拒否される。本関数は内線→NGN プロキシ時の
+/// SDP を NGN 仕様に正規化する用途。
+///
+/// 動作:
+/// - audio media の `formats` を `["0"]` に置換
+/// - rtpmap / fmtp 系のうち payload_type=0 以外を削除
+/// - WebRTC/DTLS-SRTP/ICE 由来属性 (rtcp-fb / rtcp-xr / fingerprint / setup /
+///   ice-* / candidate / msid / mid / ssrc* / extmap / rtcp-mux 等) を削除
+/// - PCMU の `a=rtpmap:0 PCMU/8000` が無ければ補う
+///
+/// パース不能ならそのまま返す (ベストエフォート)。
+pub fn restrict_audio_to_pcmu(sdp_bytes: &[u8]) -> Vec<u8> {
+    let text = match std::str::from_utf8(sdp_bytes) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+    let mut sdp = match SessionDescription::parse(text) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+
+    // WebRTC / DTLS-SRTP / ICE / multiplex 系・rtcp-xr 等は NGN が解釈しない
+    // ので、セッションレベル / メディアレベル双方で削除する。
+    fn is_unsupported_by_ngn(a: &Attribute) -> bool {
+        match a {
+            Attribute::Value { key, .. } => matches!(
+                key.as_str(),
+                "rtcp-fb"
+                    | "rtcp-xr"
+                    | "fingerprint"
+                    | "setup"
+                    | "ice-ufrag"
+                    | "ice-pwd"
+                    | "ice-options"
+                    | "ice-mismatch"
+                    | "candidate"
+                    | "msid"
+                    | "mid"
+                    | "ssrc"
+                    | "ssrc-group"
+                    | "extmap"
+                    | "rtcp-mux"
+                    | "record"
+            ),
+            Attribute::Property(p) => {
+                matches!(p.as_str(), "rtcp-mux" | "ice-lite" | "rtcp-rsize")
+            }
+        }
+    }
+
+    sdp.attributes.retain(|a| !is_unsupported_by_ngn(a));
+
+    if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
+        audio.formats = vec!["0".to_string()];
+        let mut have_pcmu_rtpmap = false;
+        audio.attributes.retain(|a| {
+            if is_unsupported_by_ngn(a) {
+                return false;
+            }
+            match a {
+                Attribute::Value { key, value } => {
+                    let is_pt_zero = || {
+                        value
+                            .split_whitespace()
+                            .next()
+                            .and_then(|p| p.parse::<u8>().ok())
+                            .map(|pt| pt == 0)
+                            .unwrap_or(true)
+                    };
+                    match key.as_str() {
+                        "rtpmap" => {
+                            let keep = is_pt_zero();
+                            if keep {
+                                have_pcmu_rtpmap = true;
+                            }
+                            keep
+                        }
+                        "fmtp" => is_pt_zero(),
+                        _ => true,
+                    }
+                }
+                Attribute::Property(_) => true,
+            }
+        });
+        if !have_pcmu_rtpmap {
+            audio.attributes.insert(
+                0,
+                Attribute::Value {
+                    key: "rtpmap".to_string(),
+                    value: "0 PCMU/8000".to_string(),
+                },
+            );
+        }
+    }
+    sdp.to_string_crlf().into_bytes()
+}
+
+#[cfg(test)]
+mod restrict_pcmu_tests {
+    use super::*;
+
+    #[test]
+    fn restrict_audio_to_pcmu_drops_opus_and_keeps_pcmu() {
+        // Linphone (実機 trace) が NGN に送ってきた multi-codec オファ。
+        // 96=opus, 97=speex/16k, 98=speex/8k, 0=PCMU, 8=PCMA, 18=G.729,
+        // 101=telephone-event/48k, 99/100=telephone-event/16k/8k。
+        let linphone_sdp = b"v=0\r\n\
+o=iphone 2043 3470 IN IP4 192.168.30.162\r\n\
+s=Talk\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+a=rtcp-xr:rcvr-rtt=all:10000 stat-summary=loss,dup,jitt,TTL voip-metrics\r\n\
+a=record:off\r\n\
+m=audio 54205 RTP/AVP 96 97 98 0 8 18 101 99 100\r\n\
+a=rtpmap:96 opus/48000/2\r\n\
+a=fmtp:96 useinbandfec=1\r\n\
+a=rtpmap:97 speex/16000\r\n\
+a=fmtp:97 vbr=on\r\n\
+a=rtpmap:98 speex/8000\r\n\
+a=fmtp:98 vbr=on\r\n\
+a=fmtp:18 annexb=yes\r\n\
+a=rtpmap:101 telephone-event/48000\r\n\
+a=rtpmap:99 telephone-event/16000\r\n\
+a=rtpmap:100 telephone-event/8000\r\n\
+a=rtcp:62018\r\n\
+a=rtcp-fb:* trr-int 1000\r\n\
+a=rtcp-fb:* ccm tmmbr\r\n";
+
+        let restricted = restrict_audio_to_pcmu(linphone_sdp);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+
+        // 必ず残るべきもの
+        assert!(s.contains("m=audio 54205 RTP/AVP 0\r\n"), "m= が PCMU only に絞られてない: {s}");
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"), "PCMU rtpmap が無い: {s}");
+
+        // 必ず消えるべきもの
+        assert!(!s.to_lowercase().contains("opus"), "opus が残ってる: {s}");
+        assert!(!s.to_lowercase().contains("speex"), "speex が残ってる: {s}");
+        assert!(!s.to_lowercase().contains("telephone-event"), "telephone-event が残ってる");
+        assert!(!s.contains("rtcp-fb"), "rtcp-fb が残ってる");
+        assert!(!s.contains("rtcp-xr"), "rtcp-xr が残ってる (セッションレベルのみ削除対象外なら見直し)");
+    }
+
+    #[test]
+    fn restrict_audio_to_pcmu_passes_through_already_pcmu_only() {
+        let pcmu_only = b"v=0\r\n\
+o=- 0 0 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n\
+a=sendrecv\r\n";
+        let restricted = restrict_audio_to_pcmu(pcmu_only);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(s.contains("m=audio 30000 RTP/AVP 0\r\n"));
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=ptime:20\r\n"));
+        assert!(s.contains("a=sendrecv\r\n"));
+    }
 }
 
 impl SessionDescription {

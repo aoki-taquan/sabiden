@@ -32,8 +32,8 @@ pub use auth::{AuthClaims, AuthError, Verifier};
 pub use peer::{PeerSession, StubPeerSession};
 #[allow(unused_imports)]
 pub use signaling::{
-    process_client_message, signal_ws_handler, ClientMessage, ServerMessage, SessionAction,
-    SignalingState,
+    process_client_message, signal_ws_handler, ClientMessage, PendingAnswers, ServerMessage,
+    SessionAction, SignalingState, WsSink,
 };
 #[allow(unused_imports)]
 pub use str0m_session::{Str0mConfig, Str0mPeerSession};

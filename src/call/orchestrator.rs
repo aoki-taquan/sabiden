@@ -50,19 +50,21 @@ use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::bridge::{BridgeConfig, RtpBridge};
 use super::manager::{
-    extract_rtp_endpoint, fork_to_extensions, CallManager, ForkResult, LegInviter, UacForker,
+    extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker,
 };
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::rewrite_rtp_endpoint;
 use crate::sip::dialog::{Dialog, DialogConfig};
-use crate::sip::message::{SipMethod, SipRequest, SipResponse};
-use crate::sip::registrar::ExtensionRegistrar;
+use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
+use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
 use crate::sip::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
 };
 use crate::sip::uac::{InviteOutcome, InvitePlan, Uac, UacDialog};
 use crate::sip::uas::{ResponderHandle, UasEvent};
+use crate::webrtc::peer::PeerSession;
+use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
 
 /// NGN 着信処理の動作パラメータ。
 #[derive(Debug, Clone)]
@@ -316,15 +318,16 @@ impl NgnInboundHandler {
                 self.metrics.record_invite_ngn(InviteResult::Error);
                 return Ok::<(), anyhow::Error>(());
             }
-            let targets: Vec<String> = bindings
-                .iter()
-                .map(|(_, b)| b.contact_uri.clone())
-                .collect();
-
-            // フォーク (内線レッグ)
+            // フォーク (内線レッグ): SIP / WebRTC を transport で分岐して並列に呼び出す。
             let sdp = request.body.clone();
-            let result =
-                fork_to_extensions(self.inviter.clone(), targets, sdp, self.cfg.fork_timeout).await;
+            let result = fork_to_bindings(
+                self.inviter.clone(),
+                bindings,
+                sdp,
+                call_id.clone(),
+                self.cfg.fork_timeout,
+            )
+            .await;
 
             match result {
                 ForkResult::Answered {
@@ -1293,6 +1296,232 @@ struct OutboundBridgeCtx {
     ngn_sock: Arc<UdpSocket>,
     ext_sock: Arc<UdpSocket>,
     ext_peer: SocketAddr,
+}
+
+/// `fork_to_bindings` 内部で使う leg 結果。
+enum LegResult {
+    Established {
+        #[allow(dead_code)]
+        aor: String,
+        winner_uri: String,
+        response: SipResponse,
+    },
+    Failed {
+        #[allow(dead_code)]
+        aor: String,
+        status: u16,
+    },
+    Errored {
+        #[allow(dead_code)]
+        aor: String,
+    },
+}
+
+/// winner 決定後に Cancel を送るための WebRTC leg 識別子。
+#[derive(Clone)]
+struct WebRtcLegHandle {
+    ws: WsSink,
+    pending: PendingAnswers,
+    call_id: String,
+}
+
+/// 内線フォーク (transport-aware)。SIP/WebRTC を transport で分岐し並列に呼び出す。
+/// 先着の 200 OK を winner として採用、それ以外の WebRTC leg には Cancel を流す。
+pub async fn fork_to_bindings(
+    inviter: ExtInviter,
+    bindings: Vec<(String, Binding)>,
+    sdp_offer: Vec<u8>,
+    call_id: String,
+    overall_timeout: Duration,
+) -> ForkResult {
+    if bindings.is_empty() {
+        return ForkResult::AllFailed { last_status: None };
+    }
+
+    // 各 leg の終了を待ち合わせるチャネル。先着 200 を採用したら drop で終了させる。
+    let (tx, mut rx) = mpsc::unbounded_channel::<LegResult>();
+    let total = bindings.len();
+    let webrtc_legs: Arc<Mutex<Vec<WebRtcLegHandle>>> = Arc::new(Mutex::new(Vec::new()));
+
+    for (aor, binding) in bindings {
+        let tx_c = tx.clone();
+        let sdp_c = sdp_offer.clone();
+        let call_id_c = call_id.clone();
+        match binding.transport {
+            ExtTransport::Sip => {
+                let inviter_c = inviter.clone();
+                let target_uri = binding.contact_uri.clone();
+                let aor_c = aor.clone();
+                tokio::spawn(async move {
+                    let outcome = inviter_c.invite(&target_uri, &sdp_c).await;
+                    let leg = match outcome {
+                        Ok(super::manager::LegOutcome::Established { response, .. }) => {
+                            LegResult::Established {
+                                aor: aor_c,
+                                winner_uri: target_uri,
+                                response,
+                            }
+                        }
+                        Ok(super::manager::LegOutcome::Failed { status, .. }) => {
+                            LegResult::Failed {
+                                aor: aor_c,
+                                status,
+                            }
+                        }
+                        Ok(super::manager::LegOutcome::Errored { .. }) | Err(_) => {
+                            LegResult::Errored { aor: aor_c }
+                        }
+                    };
+                    let _ = tx_c.send(leg);
+                });
+            }
+            ExtTransport::WebRtc { peer, ws, pending } => {
+                webrtc_legs.lock().await.push(WebRtcLegHandle {
+                    ws: ws.clone(),
+                    pending: pending.clone(),
+                    call_id: call_id_c.clone(),
+                });
+                let aor_c = aor.clone();
+                let target_uri = binding.contact_uri.clone();
+                let leg_timeout = overall_timeout;
+                tokio::spawn(async move {
+                    let leg = run_webrtc_leg(
+                        aor_c.clone(),
+                        target_uri,
+                        peer,
+                        ws,
+                        pending,
+                        sdp_c,
+                        call_id_c,
+                        leg_timeout,
+                    )
+                    .await;
+                    let _ = tx_c.send(leg);
+                });
+            }
+        }
+    }
+    drop(tx);
+
+    let mut last_status: Option<u16> = None;
+    let mut received = 0usize;
+    let deadline = tokio::time::Instant::now() + overall_timeout;
+
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break ForkResult::Timeout;
+        }
+        let next = match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(v)) => v,
+            Ok(None) => break ForkResult::AllFailed { last_status },
+            Err(_) => break ForkResult::Timeout,
+        };
+        received += 1;
+        match next {
+            LegResult::Established {
+                winner_uri,
+                response,
+                ..
+            } => {
+                info!(winner = %winner_uri, "fork_to_bindings: 内線 {} が応答", winner_uri);
+                break ForkResult::Answered {
+                    winner_uri,
+                    response,
+                };
+            }
+            LegResult::Failed { status, .. } => {
+                last_status = Some(status);
+            }
+            LegResult::Errored { .. } => {}
+        }
+        if received >= total {
+            break ForkResult::AllFailed { last_status };
+        }
+    };
+
+    // winner が決まった後、まだ走っている WebRTC leg に Cancel を流す
+    if matches!(result, ForkResult::Answered { .. }) {
+        let legs = webrtc_legs.lock().await.clone();
+        for leg in legs {
+            leg.pending.cancel(&leg.call_id).await;
+            let _ = leg.ws.send(ServerMessage::Cancel {
+                call_id: leg.call_id,
+            });
+        }
+    }
+    result
+}
+
+/// 1 つの WebRTC leg を駆動する。peer.handle_offer 診断 → pending 予約 →
+/// WS で Offer push → browser からの Answer を timeout 内に待つ。
+#[allow(clippy::too_many_arguments)]
+async fn run_webrtc_leg(
+    aor: String,
+    target_uri: String,
+    peer: Arc<dyn PeerSession>,
+    ws: WsSink,
+    pending: PendingAnswers,
+    sdp_offer: Vec<u8>,
+    call_id: String,
+    leg_timeout: Duration,
+) -> LegResult {
+    let offer_text = match std::str::from_utf8(&sdp_offer) {
+        Ok(t) => t.to_string(),
+        Err(e) => {
+            warn!(%aor, error=%e, "WebRTC leg: NGN SDP が UTF-8 でない");
+            return LegResult::Errored { aor };
+        }
+    };
+    let _peer_answer = match peer.handle_offer(&offer_text).await {
+        Ok(a) => Some(a),
+        Err(e) => {
+            debug!(%aor, error=%e, "WebRTC leg: peer.handle_offer 失敗 (継続)");
+            None
+        }
+    };
+
+    let waiter = pending.register(&call_id).await;
+    if let Err(e) = ws.send(ServerMessage::Offer {
+        call_id: call_id.clone(),
+        sdp: offer_text,
+    }) {
+        warn!(%aor, error=%e, "WebRTC leg: WS 送信失敗 (browser 切断?)");
+        pending.cancel(&call_id).await;
+        return LegResult::Errored { aor };
+    }
+
+    let answer = match tokio::time::timeout(leg_timeout, waiter).await {
+        Ok(Ok(sdp)) => sdp,
+        Ok(Err(_)) => {
+            debug!(%aor, "WebRTC leg: pending oneshot がキャンセルされた");
+            return LegResult::Errored { aor };
+        }
+        Err(_) => {
+            warn!(%aor, "WebRTC leg: browser から answer タイムアウト");
+            pending.cancel(&call_id).await;
+            return LegResult::Failed { aor, status: 408 };
+        }
+    };
+
+    let mut headers = SipHeaders::new();
+    headers.set("Via", "SIP/2.0/WS webrtc.peer;branch=z9hG4bKwebrtc");
+    headers.set("From", "<sip:webrtc>;tag=webrtc");
+    headers.set("To", format!("<{}>;tag=webrtc-{}", target_uri, aor));
+    headers.set("Call-ID", &call_id);
+    headers.set("CSeq", "1 INVITE");
+    headers.set("Content-Type", "application/sdp");
+    let response = SipResponse {
+        status_code: 200,
+        reason: "OK".to_string(),
+        headers,
+        body: answer.into_bytes(),
+    };
+    LegResult::Established {
+        aor,
+        winner_uri: target_uri,
+        response,
+    }
 }
 
 /// 既定の本番経路用 [`UacForker`] を構築するヘルパ。
@@ -2745,5 +2974,174 @@ mod tests {
         assert!(reg.get_pending("ext-cid").await.is_some());
         assert!(reg.take_pending("ext-cid").await.is_some());
         assert!(reg.get_pending("ext-cid").await.is_none());
+    }
+
+    /// NGN 着信 INVITE → WebRTC 内線への offer push → browser からの answer 受信
+    /// → NGN へ 200 OK (browser answer SDP を body に詰めて) を返すまでの round trip。
+    /// SIP UAC fork は使わず、WebRTC transport の binding 単独で動くことを確認する。
+    /// バンドエイドだった `webrtc.local` フィルタの代替動作を保証するテスト。
+    #[tokio::test]
+    async fn ngn_invite_to_webrtc_binding_offer_push_and_answer_round_trip() {
+        use crate::sip::message::parse_message;
+        use crate::sip::message::SipMessage;
+        use crate::sip::registrar::ExtTransport;
+        use crate::sip::transaction::TransactionLayer;
+        use crate::webrtc::peer::{PeerSession, StubPeerSession};
+        use crate::webrtc::signaling::{ClientMessage, PendingAnswers, ServerMessage, WsSink};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio::time::timeout;
+
+        // sabiden NGN SIP ソケット
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        // NGN 側ピア (フェイク UA)
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+
+        // WebRTC 内線をシミュレートする WS チャネル (browser 役)
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let ws_sink = WsSink::new(out_tx);
+        let pending = PendingAnswers::new();
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+
+        // ExtensionRegistrar に WebRTC transport で binding を入れる
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register_with_transport(
+                "alice",
+                "sip:alice@webrtc.peer".to_string(),
+                "127.0.0.1:65535".parse().unwrap(),
+                Duration::from_secs(60),
+                ExtTransport::WebRtc {
+                    peer: peer.clone(),
+                    ws: ws_sink.clone(),
+                    pending: pending.clone(),
+                },
+            )
+            .await;
+
+        // browser シミュレーション: ServerMessage::Offer を受け取ったら同じ call_id で
+        // ClientMessage::Answer { call_id, sdp } 相当の SDP を pending に届ける。
+        let pending_for_browser = pending.clone();
+        let browser_answer_sdp = "v=0\r\n\
+                                  o=- 9 9 IN IP4 192.0.2.99\r\n\
+                                  s=-\r\n\
+                                  c=IN IP4 192.0.2.99\r\n\
+                                  t=0 0\r\n\
+                                  m=audio 30000 RTP/AVP 0\r\n\
+                                  a=rtpmap:0 PCMU/8000\r\n";
+        let browser_answer_sdp_owned = browser_answer_sdp.to_string();
+        let browser_task = tokio::spawn(async move {
+            let msg = timeout(Duration::from_secs(3), out_rx.recv())
+                .await
+                .expect("browser へ offer push が来ない")
+                .expect("WS チャネルが閉じている");
+            match msg {
+                ServerMessage::Offer { call_id, sdp: _ } => {
+                    let delivered = pending_for_browser
+                        .deliver(&call_id, browser_answer_sdp_owned.clone())
+                        .await;
+                    assert!(delivered, "PendingAnswers::deliver が成功するはず");
+                }
+                other => panic!("offer 以外を受信: {:?}", other),
+            }
+        });
+
+        // SIP fork 用 inviter (本テストでは呼ばれないはずだが ExtInviter が必要)
+        let inviter = Arc::new(ScriptedInviter {
+            status: 200,
+            body: Vec::new(),
+            called: AtomicUsize::new(0),
+            seen_targets: StdMutex::new(Vec::new()),
+        });
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter.clone(),
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // NGN INVITE 送信 (PCMU 0 のコンパクト SDP)
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKwebrtc-ngn", ngn_addr),
+        );
+        invite
+            .headers
+            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn-w");
+        invite.headers.set("To", "<sip:0312345678@sabiden>");
+        invite.headers.set("Call-ID", "ngn-webrtc-cid");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Content-Type", "application/sdp");
+        invite.body = b"v=0\r\n\
+                        o=- 1 1 IN IP4 192.0.2.1\r\n\
+                        s=-\r\n\
+                        c=IN IP4 192.0.2.1\r\n\
+                        t=0 0\r\n\
+                        m=audio 20000 RTP/AVP 0\r\n\
+                        a=rtpmap:0 PCMU/8000\r\n\
+                        a=ptime:20\r\n\
+                        a=sendrecv\r\n"
+            .to_vec();
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // 100 Trying と 200 OK を待つ
+        let mut buf = vec![0u8; 8192];
+        let mut got_100 = false;
+        let mut got_200 = false;
+        let mut answer_body = Vec::new();
+        for _ in 0..5 {
+            match timeout(Duration::from_secs(3), ngn_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        match r.status_code {
+                            100 => got_100 = true,
+                            200 => {
+                                got_200 = true;
+                                answer_body = r.body.clone();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_100, "100 Trying が NGN 側に届くべき");
+        assert!(got_200, "200 OK が NGN 側に届くべき");
+
+        // 200 OK の body は browser が返した answer SDP で、SIP UAC fork は呼ばれていない
+        assert_eq!(
+            answer_body,
+            browser_answer_sdp.as_bytes(),
+            "200 OK の SDP body は browser の answer がそのまま入るべき"
+        );
+        assert_eq!(
+            inviter.called.load(AOrd::SeqCst),
+            0,
+            "WebRTC 専用 binding なので SIP fork inviter は呼ばれないはず"
+        );
+
+        // browser タスクが正常に完了している
+        browser_task.await.unwrap();
+
+        // ClientMessage::Answer のラウンドトリップ JSON 表現も serde で読み書きできる
+        let cm = ClientMessage::Answer {
+            call_id: "x".into(),
+            sdp: "v=0".into(),
+        };
+        let s = serde_json::to_string(&cm).unwrap();
+        assert!(s.contains("\"type\":\"answer\""));
+        assert!(s.contains("\"call_id\":\"x\""));
     }
 }

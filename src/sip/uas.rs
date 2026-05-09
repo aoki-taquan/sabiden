@@ -486,28 +486,18 @@ mod tests {
     use super::*;
     use crate::sip::auth::{DigestChallenge, DigestCredentials};
     use crate::sip::message::{parse_message, SipMessage};
-
-    fn ext(user: &str, pw: &str) -> ExtensionConfig {
-        ExtensionConfig {
-            username: user.to_string(),
-            password: pw.to_string(),
-        }
-    }
-
-    fn uas_config() -> UasConfig {
-        UasConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            realm: "sabiden-test".to_string(),
-            max_expires: 3600,
-        }
-    }
+    use crate::testing::builders;
+    use crate::testing::fixtures;
 
     /// 認証付き REGISTER の往復: クライアント側ソケットから REGISTER を送り、
     /// 401 → Authorization 付きで再送 → 200 OK を確認する。
+    /// (RFC 3261 §10.2 / §22.4)
     #[tokio::test]
     async fn register_with_digest_succeeds() {
-        let extensions = vec![ext("iphone", "secret")];
-        let uas = ExtensionUas::bind(uas_config(), &extensions).await.unwrap();
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
         let registrar = uas.registrar();
 
@@ -516,11 +506,11 @@ mod tests {
         });
 
         // テスト用クライアント
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
         // 1) 認証なし REGISTER
-        let req1 = build_register_request(&local, "z9hG4bKreg1", None);
+        let req1 = builders::register_from_phone(&local, "iphone", "z9hG4bKreg1", None);
         client.send_to(&req1.to_bytes(), server_addr).await.unwrap();
 
         let mut buf = vec![0u8; 4096];
@@ -539,7 +529,12 @@ mod tests {
         // 2) Authorization 付きで再送
         let creds = DigestCredentials::new("iphone", "secret");
         let auth = creds.compute(&challenge, "REGISTER", "sip:sabiden", 1);
-        let req2 = build_register_request(&local, "z9hG4bKreg2", Some(&auth.header_value));
+        let req2 = builders::register_from_phone(
+            &local,
+            "iphone",
+            "z9hG4bKreg2",
+            Some(&auth.header_value),
+        );
         client.send_to(&req2.to_bytes(), server_addr).await.unwrap();
 
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
@@ -560,8 +555,10 @@ mod tests {
     /// 不正パスワードでは 401 が再度返り、登録されない。
     #[tokio::test]
     async fn register_with_wrong_password_rejected() {
-        let extensions = vec![ext("iphone", "secret")];
-        let uas = ExtensionUas::bind(uas_config(), &extensions).await.unwrap();
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
         let registrar = uas.registrar();
 
@@ -569,10 +566,10 @@ mod tests {
             uas.run().await.unwrap();
         });
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
-        let req1 = build_register_request(&local, "z9hG4bKbad1", None);
+        let req1 = builders::register_from_phone(&local, "iphone", "z9hG4bKbad1", None);
         client.send_to(&req1.to_bytes(), server_addr).await.unwrap();
         let mut buf = vec![0u8; 4096];
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
@@ -588,7 +585,12 @@ mod tests {
 
         let creds = DigestCredentials::new("iphone", "WRONG");
         let auth = creds.compute(&challenge, "REGISTER", "sip:sabiden", 1);
-        let req2 = build_register_request(&local, "z9hG4bKbad2", Some(&auth.header_value));
+        let req2 = builders::register_from_phone(
+            &local,
+            "iphone",
+            "z9hG4bKbad2",
+            Some(&auth.header_value),
+        );
         client.send_to(&req2.to_bytes(), server_addr).await.unwrap();
 
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
@@ -606,14 +608,16 @@ mod tests {
     /// 未登録ユーザは 403。
     #[tokio::test]
     async fn unknown_user_gets_403() {
-        let extensions = vec![ext("iphone", "secret")];
-        let uas = ExtensionUas::bind(uas_config(), &extensions).await.unwrap();
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
         tokio::spawn(async move {
             uas.run().await.unwrap();
         });
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
         // 未登録ユーザで認証情報をでっち上げる
@@ -626,7 +630,12 @@ mod tests {
         };
         let creds = DigestCredentials::new("ghost", "anything");
         let auth = creds.compute(&challenge, "REGISTER", "sip:sabiden", 1);
-        let req = build_register_request(&local, "z9hG4bKghost", Some(&auth.header_value));
+        let req = builders::register_from_phone(
+            &local,
+            "ghost",
+            "z9hG4bKghost",
+            Some(&auth.header_value),
+        );
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
 
         let mut buf = vec![0u8; 4096];
@@ -644,18 +653,26 @@ mod tests {
     /// Call Manager 未接続なら認証済み INVITE は 503 で返る。
     #[tokio::test]
     async fn invite_without_handler_returns_503() {
-        let extensions = vec![ext("iphone", "secret")];
-        let uas = ExtensionUas::bind(uas_config(), &extensions).await.unwrap();
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
         tokio::spawn(async move {
             uas.run().await.unwrap();
         });
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
         // チャレンジを取得するため認証なし INVITE を送る
-        let mut req = build_invite_request(&local, "z9hG4bKinv1", None);
+        let mut req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKinv1",
+            None,
+        );
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
         let mut buf = vec![0u8; 4096];
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
@@ -673,7 +690,13 @@ mod tests {
         // Authorization 付きで再送
         let creds = DigestCredentials::new("iphone", "secret");
         let auth = creds.compute(&challenge, "INVITE", "sip:dest@sabiden", 1);
-        req = build_invite_request(&local, "z9hG4bKinv2", Some(&auth.header_value));
+        req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKinv2",
+            Some(&auth.header_value),
+        );
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
 
         // 100 Trying と 503 が来るはず (順不同に近いがどちらも届くまで読む)
@@ -698,8 +721,10 @@ mod tests {
     /// `with_handler` で接続したチャネルに INVITE が転送される。
     #[tokio::test]
     async fn invite_with_handler_forwards_event() {
-        let extensions = vec![ext("iphone", "secret")];
-        let uas = ExtensionUas::bind(uas_config(), &extensions).await.unwrap();
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
         let server_addr = uas.socket.local_addr().unwrap();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let uas = uas.with_handler(event_tx);
@@ -707,11 +732,17 @@ mod tests {
             uas.run().await.unwrap();
         });
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
         let local = client.local_addr().unwrap();
 
         // チャレンジ往復 (省略のため直接 challenge 値を作る代わりに UAS から取得)
-        let mut req = build_invite_request(&local, "z9hG4bKinvfwd1", None);
+        let mut req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKinvfwd1",
+            None,
+        );
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
         let mut buf = vec![0u8; 4096];
         let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
@@ -726,7 +757,13 @@ mod tests {
             DigestChallenge::parse(resp.headers.get("www-authenticate").unwrap()).unwrap();
         let creds = DigestCredentials::new("iphone", "secret");
         let auth = creds.compute(&challenge, "INVITE", "sip:dest@sabiden", 1);
-        req = build_invite_request(&local, "z9hG4bKinvfwd2", Some(&auth.header_value));
+        req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKinvfwd2",
+            Some(&auth.header_value),
+        );
         client.send_to(&req.to_bytes(), server_addr).await.unwrap();
 
         // 上位層がイベントを受け取る
@@ -763,51 +800,6 @@ mod tests {
             }
         }
         assert!(saw_2xx, "200 OK が届くべき");
-    }
-
-    fn build_register_request(
-        local: &SocketAddr,
-        branch: &str,
-        authorization: Option<&str>,
-    ) -> SipRequest {
-        let mut req = SipRequest::new(SipMethod::Register, "sip:sabiden");
-        req.headers
-            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
-        req.headers.set("Max-Forwards", "70");
-        req.headers
-            .set("From", format!("<sip:iphone@sabiden>;tag={}", new_tag()));
-        req.headers.set("To", "<sip:iphone@sabiden>");
-        req.headers.set("Call-ID", new_call_id());
-        req.headers.set("CSeq", "1 REGISTER");
-        req.headers
-            .set("Contact", format!("<sip:iphone@{}>", local));
-        req.headers.set("Expires", "300");
-        if let Some(a) = authorization {
-            req.headers.set("Authorization", a);
-        }
-        req
-    }
-
-    fn build_invite_request(
-        local: &SocketAddr,
-        branch: &str,
-        authorization: Option<&str>,
-    ) -> SipRequest {
-        let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
-        req.headers
-            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
-        req.headers.set("Max-Forwards", "70");
-        req.headers
-            .set("From", format!("<sip:iphone@sabiden>;tag={}", new_tag()));
-        req.headers.set("To", "<sip:dest@sabiden>");
-        req.headers.set("Call-ID", new_call_id());
-        req.headers.set("CSeq", "1 INVITE");
-        req.headers
-            .set("Contact", format!("<sip:iphone@{}>", local));
-        if let Some(a) = authorization {
-            req.headers.set("Authorization", a);
-        }
-        req
     }
 
     #[test]

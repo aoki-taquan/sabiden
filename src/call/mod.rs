@@ -17,6 +17,11 @@ pub mod manager;
 pub mod orchestrator;
 pub mod transcoder;
 
+// Issue #42: ハーネスを使った E2E テスト。`#[cfg(test)]` でゲートしているため
+// production ビルドには含まれない。
+#[cfg(test)]
+mod e2e_harness_tests;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 通話の状態 (RFC 3261 §13 + 内部状態)。

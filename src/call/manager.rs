@@ -341,132 +341,14 @@ pub fn extract_rtp_endpoint(sdp_bytes: &[u8]) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
-
-    /// テスト用 inviter: 各 target ごとに振る舞いをスクリプトで指定できる。
-    struct ScriptedInviter {
-        /// target_uri → outcome
-        scripts: StdMutex<HashMap<String, ScriptedAction>>,
-        /// 呼ばれた target_uri を順に記録 (順序は非決定)
-        called: StdMutex<Vec<String>>,
-        /// "200 OK" を返すまでの遅延
-        invocation_count: AtomicUsize,
-    }
-
-    enum ScriptedAction {
-        /// status_code (例: 200, 486, 408)
-        ImmediateStatus(u16),
-        /// 指定ミリ秒待ってから status_code を返す
-        DelayedStatus { delay_ms: u64, status: u16 },
-        /// `tokio::time::pause` 環境ではタイムアウトを期待する
-        NeverRespond,
-    }
-
-    fn build_resp(status: u16) -> SipResponse {
-        let mut headers = SipHeaders::new();
-        headers.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKtest");
-        headers.set("From", "<sip:caller@host>;tag=alice");
-        headers.set("To", "<sip:callee@host>;tag=ext-side");
-        headers.set("Call-ID", "scripted-callid");
-        headers.set("CSeq", "1 INVITE");
-        headers.set("Contact", "<sip:callee@127.0.0.1:5060>");
-        SipResponse {
-            status_code: status,
-            reason: "Test".to_string(),
-            headers,
-            body: Vec::new(),
-        }
-    }
-
-    fn dummy_plan() -> InvitePlan {
-        let mut req = SipRequest::new(SipMethod::Invite, "sip:dst@host");
-        req.headers
-            .set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKfoo");
-        req.headers.set("From", "<sip:src@host>;tag=alice");
-        req.headers.set("To", "<sip:dst@host>");
-        req.headers.set("Call-ID", "fake-callid");
-        req.headers.set("CSeq", "1 INVITE");
-        InvitePlan {
-            request: req,
-            cseq: 1,
-            target_uri: "sip:dst@host".to_string(),
-            session_expires: 300,
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LegInviter for ScriptedInviter {
-        async fn invite(&self, target_uri: &str, _sdp: &[u8]) -> Result<LegOutcome> {
-            self.invocation_count.fetch_add(1, Ordering::SeqCst);
-            self.called.lock().unwrap().push(target_uri.to_string());
-            let action = self
-                .scripts
-                .lock()
-                .unwrap()
-                .remove(target_uri)
-                .or_else(|| Some(ScriptedAction::ImmediateStatus(486))); // default Busy
-            match action.unwrap() {
-                ScriptedAction::ImmediateStatus(code) => Ok(if (200..300).contains(&code) {
-                    LegOutcome::Established {
-                        plan: dummy_plan(),
-                        response: build_resp(code),
-                    }
-                } else {
-                    LegOutcome::Failed {
-                        plan: dummy_plan(),
-                        status: code,
-                    }
-                }),
-                ScriptedAction::DelayedStatus { delay_ms, status } => {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    Ok(if (200..300).contains(&status) {
-                        LegOutcome::Established {
-                            plan: dummy_plan(),
-                            response: build_resp(status),
-                        }
-                    } else {
-                        LegOutcome::Failed {
-                            plan: dummy_plan(),
-                            status,
-                        }
-                    })
-                }
-                ScriptedAction::NeverRespond => {
-                    futures_no_resp().await;
-                    unreachable!()
-                }
-            }
-        }
-    }
-
-    /// 永久に応答しない (テストではタイムアウト パスを通す用途)。
-    async fn futures_no_resp() {
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    }
-
-    fn make_inviter(scripts: Vec<(&str, ScriptedAction)>) -> Arc<ScriptedInviter> {
-        let map = scripts
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
-        Arc::new(ScriptedInviter {
-            scripts: StdMutex::new(map),
-            called: StdMutex::new(Vec::new()),
-            invocation_count: AtomicUsize::new(0),
-        })
-    }
+    use crate::testing::scripted::{ScriptedAction, ScriptedInviter};
 
     /// 単一内線が即 200 を返すと Answered になる。
     #[tokio::test]
     async fn single_extension_answers() {
-        let inviter = make_inviter(vec![(
-            "sip:iphone@host",
-            ScriptedAction::ImmediateStatus(200),
-        )]);
+        let inviter = ScriptedInviter::builder()
+            .script("sip:iphone@host", ScriptedAction::ok())
+            .build();
         let result = fork_to_extensions(
             inviter,
             vec!["sip:iphone@host".to_string()],
@@ -485,23 +367,23 @@ mod tests {
     /// 複数内線で 1 つだけ 200 を返すと、それが winner になる。
     #[tokio::test]
     async fn multiple_extensions_first_to_answer_wins() {
-        let inviter = make_inviter(vec![
-            (
+        let inviter = ScriptedInviter::builder()
+            .script(
                 "sip:slow@host",
                 ScriptedAction::DelayedStatus {
                     delay_ms: 200,
                     status: 200,
                 },
-            ),
-            (
+            )
+            .script(
                 "sip:fast@host",
                 ScriptedAction::DelayedStatus {
                     delay_ms: 50,
                     status: 200,
                 },
-            ),
-            ("sip:busy@host", ScriptedAction::ImmediateStatus(486)),
-        ]);
+            )
+            .script("sip:busy@host", ScriptedAction::busy())
+            .build();
         let result = fork_to_extensions(
             inviter.clone(),
             vec![
@@ -520,17 +402,16 @@ mod tests {
             _ => panic!("fast が勝つはず"),
         }
         // 全レッグに INVITE が飛んでいることを確認
-        let calls = inviter.invocation_count.load(Ordering::SeqCst);
-        assert_eq!(calls, 3);
+        assert_eq!(inviter.call_count(), 3);
     }
 
     /// 全内線が拒否すると AllFailed。
     #[tokio::test]
     async fn all_extensions_busy_returns_all_failed() {
-        let inviter = make_inviter(vec![
-            ("sip:a@host", ScriptedAction::ImmediateStatus(486)),
-            ("sip:b@host", ScriptedAction::ImmediateStatus(486)),
-        ]);
+        let inviter = ScriptedInviter::builder()
+            .script("sip:a@host", ScriptedAction::busy())
+            .script("sip:b@host", ScriptedAction::busy())
+            .build();
         let result = fork_to_extensions(
             inviter,
             vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
@@ -547,7 +428,9 @@ mod tests {
     /// 誰も応答しないと Timeout。
     #[tokio::test]
     async fn timeout_when_nobody_responds() {
-        let inviter = make_inviter(vec![("sip:silent@host", ScriptedAction::NeverRespond)]);
+        let inviter = ScriptedInviter::builder()
+            .script("sip:silent@host", ScriptedAction::NeverRespond)
+            .build();
         let result = fork_to_extensions(
             inviter,
             vec!["sip:silent@host".to_string()],
@@ -561,7 +444,7 @@ mod tests {
     /// targets が空なら即 AllFailed。
     #[tokio::test]
     async fn empty_targets_is_all_failed() {
-        let inviter = make_inviter(vec![]);
+        let inviter = ScriptedInviter::builder().build();
         let result =
             fork_to_extensions(inviter, vec![], b"v=0\r\n".to_vec(), Duration::from_secs(1)).await;
         assert!(matches!(

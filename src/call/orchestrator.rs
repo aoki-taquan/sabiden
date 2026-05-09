@@ -851,63 +851,13 @@ pub fn wire_ngn_inbound_with_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call::manager::LegOutcome;
     use crate::sip::message::{parse_message, SipMessage};
     use crate::sip::transaction::TransactionLayer;
-    use crate::sip::uac::InvitePlan;
+    use crate::testing::builders;
+    use crate::testing::scripted::{ScriptedAction, ScriptedInviter};
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
     use std::sync::Mutex as StdMutex;
     use tokio::net::UdpSocket;
-
-    /// テスト用 inviter: 全ターゲットに対し指定 status を返す。
-    struct ScriptedInviter {
-        status: u16,
-        body: Vec<u8>,
-        called: AtomicUsize,
-        seen_targets: StdMutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl LegInviter for ScriptedInviter {
-        async fn invite(&self, target: &str, _sdp: &[u8]) -> Result<LegOutcome> {
-            self.called.fetch_add(1, AOrd::SeqCst);
-            self.seen_targets.lock().unwrap().push(target.to_string());
-            let mut headers = crate::sip::message::SipHeaders::new();
-            headers.set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKt");
-            headers.set("From", "<sip:test>;tag=t");
-            headers.set("To", "<sip:test>;tag=ext");
-            headers.set("Call-ID", "scripted");
-            headers.set("CSeq", "1 INVITE");
-            let response = SipResponse {
-                status_code: self.status,
-                reason: "Test".to_string(),
-                headers,
-                body: self.body.clone(),
-            };
-            let mut req = SipRequest::new(SipMethod::Invite, target);
-            req.headers
-                .set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKt");
-            req.headers.set("From", "<sip:test>;tag=t");
-            req.headers.set("To", "<sip:test>");
-            req.headers.set("Call-ID", "scripted");
-            req.headers.set("CSeq", "1 INVITE");
-            let plan = InvitePlan {
-                request: req,
-                cseq: 1,
-                target_uri: target.to_string(),
-                session_expires: 300,
-            };
-            if (200..300).contains(&self.status) {
-                Ok(LegOutcome::Established { plan, response })
-            } else {
-                Ok(LegOutcome::Failed {
-                    plan,
-                    status: self.status,
-                })
-            }
-        }
-    }
 
     /// NGN 着信 INVITE → 内線フォーク (200) → 200 OK が NGN 側に届く。
     #[tokio::test]
@@ -918,7 +868,6 @@ mod tests {
 
         // フェイク NGN クライアント (UA 役)
         let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _ngn_addr = ngn_sock.local_addr().unwrap();
 
         // 内線登録テーブルにダミー内線を 1 件入れておく
         let extensions = ExtensionRegistrar::new();
@@ -931,13 +880,11 @@ mod tests {
             )
             .await;
 
-        // モック inviter: 200 OK + ダミー SDP
-        let inviter = Arc::new(ScriptedInviter {
-            status: 200,
-            body: b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n".to_vec(),
-            called: AtomicUsize::new(0),
-            seen_targets: StdMutex::new(Vec::new()),
-        });
+        // モック inviter (testing ハーネス): 200 OK + ダミー SDP
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n".to_vec())
+            .build();
 
         // TransactionLayer + 着信ハンドラを起動
         let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
@@ -951,22 +898,13 @@ mod tests {
         );
 
         // フェイク NGN から INVITE を送信
-        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
-        invite.headers.set(
-            "Via",
-            format!(
-                "SIP/2.0/UDP {};branch=z9hG4bKngn1",
-                ngn_sock.local_addr().unwrap()
-            ),
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0312345678@sabiden",
+            "ngn-invite-cid",
+            "z9hG4bKngn1",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec(),
         );
-        invite
-            .headers
-            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn");
-        invite.headers.set("To", "<sip:0312345678@sabiden>");
-        invite.headers.set("Call-ID", "ngn-invite-cid");
-        invite.headers.set("CSeq", "1 INVITE");
-        invite.headers.set("Content-Type", "application/sdp");
-        invite.body = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
         ngn_sock
             .send_to(&invite.to_bytes(), sabiden_addr)
             .await
@@ -997,10 +935,7 @@ mod tests {
         }
         assert!(got_100, "100 Trying が NGN 側に届くべき");
         assert!(got_200, "200 OK が NGN 側に届くべき");
-        assert!(
-            inviter.called.load(AOrd::SeqCst) >= 1,
-            "内線へ INVITE される"
-        );
+        assert!(inviter.call_count() >= 1, "内線へ INVITE される");
     }
 
     /// 登録内線が 0 件なら 480 Temporarily Unavailable で返る。
@@ -1011,12 +946,9 @@ mod tests {
         let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let extensions = ExtensionRegistrar::new();
-        let inviter = Arc::new(ScriptedInviter {
-            status: 200,
-            body: Vec::new(),
-            called: AtomicUsize::new(0),
-            seen_targets: StdMutex::new(Vec::new()),
-        });
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
 
         let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
         let _handler = wire_ngn_inbound(
@@ -1028,20 +960,13 @@ mod tests {
             NgnInboundConfig::default(),
         );
 
-        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
-        invite.headers.set(
-            "Via",
-            format!(
-                "SIP/2.0/UDP {};branch=z9hG4bKngn-noext",
-                ngn_sock.local_addr().unwrap()
-            ),
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0312345678@sabiden",
+            "ngn-noext-cid",
+            "z9hG4bKngn-noext",
+            Vec::new(),
         );
-        invite
-            .headers
-            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn");
-        invite.headers.set("To", "<sip:0312345678@sabiden>");
-        invite.headers.set("Call-ID", "ngn-noext-cid");
-        invite.headers.set("CSeq", "1 INVITE");
         ngn_sock
             .send_to(&invite.to_bytes(), sabiden_addr)
             .await
@@ -1063,11 +988,7 @@ mod tests {
             }
         }
         assert!(got_480, "480 Temporarily Unavailable が返るべき");
-        assert_eq!(
-            inviter.called.load(AOrd::SeqCst),
-            0,
-            "内線が無ければ inviter は呼ばれない"
-        );
+        assert_eq!(inviter.call_count(), 0, "内線が無ければ inviter は呼ばれない");
     }
 
     /// `make_forker` は与えられた Uac を内包する forker を生成する。
@@ -1272,12 +1193,10 @@ mod tests {
             port = ext_peer_addr.port()
         );
 
-        let inviter = Arc::new(ScriptedInviter {
-            status: 200,
-            body: ext_answer_sdp.into_bytes(),
-            called: AtomicUsize::new(0),
-            seen_targets: StdMutex::new(Vec::new()),
-        });
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(ext_answer_sdp.into_bytes())
+            .build();
 
         // sabiden NGN 側 SIP ソケット
         let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1310,6 +1229,7 @@ mod tests {
             NgnInboundConfig::default(),
             mgr.clone(),
         );
+        let _ = inviter; // keep call_count alive (no-op)
 
         // NGN INVITE 送信 (SDP オファあり)
         let ngn_offer_sdp = format!(

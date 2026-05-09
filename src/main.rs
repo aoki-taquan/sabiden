@@ -20,8 +20,9 @@ mod webrtc;
 // Issue #42: テスト共通ハーネス。lib.rs と同じファイルを test ビルド時のみロードして
 // `crate::testing::*` で参照できるようにする (bin と lib で `mod call;` 等を二重に
 // 宣言する既存の構成上の対策。production ビルドには含まれない)。
+// `#![allow(dead_code)]` は `testing.rs` 自身が宣言しているのでここでは付けない
+// (clippy::duplicated_attributes 回避)。
 #[cfg(test)]
-#[allow(dead_code)]
 mod testing;
 
 use std::collections::HashMap;
@@ -34,8 +35,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use call::manager::UacForker;
-use call::orchestrator::{wire_ngn_inbound_with_metrics, NgnInboundConfig, UasEventHandler};
+use call::manager::{CallManager, UacForker};
+use call::orchestrator::{
+    wire_ngn_inbound_with_manager_and_metrics, NgnInboundConfig, UasEventHandler,
+};
 use config::Config;
 use observability::{Metrics, SipTraceWriter};
 use sip::register::Registrar;
@@ -237,11 +240,37 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
 
     // (6+7) UAS event ハンドラと NGN 着信ハンドラ。両者で OutboundCallRegistry を
     // 共有することで、NGN→内線方向の BYE が同じ通話エントリを引けるようにする。
-    let mut uas_handler = UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone());
-    if let (Some(uas_layer), uas_addr) = (uas_layer_for_b2bua.clone(), uas_local_addr) {
-        // 内線レッグへ in-dialog (BYE 等) を送るため UAS の TransactionLayer を借用。
-        uas_handler.attach_ext_layer(uas_layer, uas_addr);
-    }
+    //
+    // Issue #40: `CallManager` を生成して両ハンドラに注入する。
+    // - 内線→NGN 発信 (`UasEventHandler`): `prepare_outbound_bridge` 経由で
+    //   sabiden 中継用 RTP ソケットを bind し SDP の `m=audio` port まで書換える。
+    // - NGN→内線 着信 (`NgnInboundHandler`): `start_bridge_for_inbound` 経由で
+    //   200 OK 返送前に RTP ブリッジを起動する。
+    //
+    // RTP ブリッジ用 bind IP は SIP の sent-by IP (= NGN レッグ local_addr) を使う。
+    // `docs/asterisk-real-invite.md` §5.2 準拠: NGN へ広告する c=/m= は eth1 IP。
+    // 内線レッグ側はループバックでは無く同じ IP を使う (HGW 介さず ONU 直収では
+    // sabiden が NGN/LAN 双方を eth1 1 枚で持つ運用が現状の検証構成)。
+    let bridge_ngn_ip = local_addr_for_hdr.ip();
+    let uas_handler = if let Some(ext_registrar) = ext_registrar.clone() {
+        let call_manager = CallManager::new(ext_registrar);
+        let mut h = UasEventHandler::with_call_manager_and_metrics(
+            ngn_uac.clone(),
+            call_manager,
+            Some(bridge_ngn_ip),
+            Some(bridge_ngn_ip),
+            metrics.clone(),
+        );
+        if let (Some(uas_layer), uas_addr) = (uas_layer_for_b2bua.clone(), uas_local_addr) {
+            // 内線レッグへ in-dialog (BYE 等) を送るため UAS の TransactionLayer を借用。
+            h.attach_ext_layer(uas_layer, uas_addr);
+        }
+        h
+    } else {
+        // 内線が無いと CallManager の存在意義が無い (RTP ブリッジは内線レッグ前提)。
+        // 透過モードのままで内線→NGN プロキシも閉じておく。
+        UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone())
+    };
     let uas_handler_for_forwarder: Arc<dyn call::orchestrator::OutboundDialogForwarder> =
         uas_handler.clone();
 
@@ -272,23 +301,32 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         let cfg = NgnInboundConfig {
             fork_timeout: std::time::Duration::from_secs(20),
             realm: "sabiden".to_string(),
-            bridge_ngn_bind_ip: None,
-            bridge_ext_bind_ip: None,
+            // NGN→内線 着信時の RTP ブリッジ bind IP も sent-by IP に揃える
+            // (`docs/asterisk-real-invite.md` §5.2)。
+            bridge_ngn_bind_ip: Some(bridge_ngn_ip),
+            bridge_ext_bind_ip: Some(bridge_ngn_ip),
         };
-        let ngn_handler = wire_ngn_inbound_with_metrics(
+        // 着信 NGN→内線 用にも CallManager を渡す。outbound 側と同じ
+        // `ext_registrar` を共有することで、登録テーブルを 1 つに保つ。
+        let inbound_call_manager = CallManager::new(ext_registrar.clone());
+        let ngn_handler = wire_ngn_inbound_with_manager_and_metrics(
             ngn_layer.clone(),
             ngn_socket.clone(),
             ngn_inbound_rx,
             forker,
             ext_registrar,
             cfg,
+            inbound_call_manager,
             metrics.clone(),
         );
         // NGN→内線 BYE 伝搬の経路を結線する (B2BUA 双方向 BYE)。
         ngn_handler
             .set_outbound_forwarder(uas_handler_for_forwarder)
             .await;
-        info!("NGN 着信ハンドラ起動完了 (B2BUA registry 共有済)");
+        info!(
+            bridge_bind_ip = %bridge_ngn_ip,
+            "NGN 着信ハンドラ起動完了 (CallManager 注入済 / RTP ブリッジ有効)"
+        );
     } else {
         // 内線が無ければ着信を受けても捨てるしか無いので、ハンドラは作らない。
         // `inbound_rx` は drop しておく (TransactionLayer::recv_loop は

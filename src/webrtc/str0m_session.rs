@@ -195,6 +195,7 @@ impl Str0mPeerSession {
     /// DTLS-SRTP 必須なので拒絶する。代わりに sabiden は
     /// 1) NGN 側オファを `convert_avp_to_savpf` でブラウザ用に整形する
     /// 2) (or) 自身が新規 WebRTC オファを作ってブラウザに push する
+    ///
     /// のいずれかを行う。本メソッドは (2) のために str0m に SDP オファを
     /// 生成させる経路。
     pub async fn create_offer(&self) -> Result<String> {
@@ -713,7 +714,10 @@ mod tests {
             ice_servers: vec![],
         };
         let session = Str0mPeerSession::new(cfg).await.unwrap();
-        let p = session.local_dtls_params("passive").await.expect("取得成功");
+        let p = session
+            .local_dtls_params("passive")
+            .await
+            .expect("取得成功");
         assert!(!p.ice_ufrag.is_empty(), "ufrag が空");
         assert!(!p.ice_pwd.is_empty(), "pwd が空");
         // fingerprint は "<algo> <hex:...>" 形式 (DtlsIceParams の規約)
@@ -818,8 +822,7 @@ mod tests {
                           a=sendrecv\r\n";
 
         // (3) ブラウザ向け SAVPF SDP を生成
-        let browser_offer =
-            convert_avp_to_savpf(ngn_offer, &params).expect("AVP->SAVPF 変換");
+        let browser_offer = convert_avp_to_savpf(ngn_offer, &params).expect("AVP->SAVPF 変換");
         let s = std::str::from_utf8(&browser_offer).unwrap();
         assert!(s.contains("UDP/TLS/RTP/SAVPF"), "SAVPF proto 不在");
         assert!(s.contains("a=rtpmap:0 PCMU/8000"), "PCMU rtpmap 損失");

@@ -102,7 +102,11 @@ pub struct DtlsIceParams {
 
 impl DtlsIceParams {
     /// 既定値 (`setup=actpass`)。
-    pub fn new(ice_ufrag: impl Into<String>, ice_pwd: impl Into<String>, fingerprint: impl Into<String>) -> Self {
+    pub fn new(
+        ice_ufrag: impl Into<String>,
+        ice_pwd: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
         Self {
             ice_ufrag: ice_ufrag.into(),
             ice_pwd: ice_pwd.into(),
@@ -189,7 +193,9 @@ pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow:
                 | "end-of-candidates"
         )
     });
-    audio.attributes.push(Attribute::Property("rtcp-mux".to_string()));
+    audio
+        .attributes
+        .push(Attribute::Property("rtcp-mux".to_string()));
     audio.attributes.push(Attribute::Value {
         key: "ice-ufrag".to_string(),
         value: params.ice_ufrag.clone(),
@@ -462,15 +468,27 @@ a=rtcp-fb:* ccm tmmbr\r\n";
         let s = std::str::from_utf8(&restricted).expect("utf8");
 
         // 必ず残るべきもの
-        assert!(s.contains("m=audio 54205 RTP/AVP 0\r\n"), "m= が PCMU only に絞られてない: {s}");
-        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"), "PCMU rtpmap が無い: {s}");
+        assert!(
+            s.contains("m=audio 54205 RTP/AVP 0\r\n"),
+            "m= が PCMU only に絞られてない: {s}"
+        );
+        assert!(
+            s.contains("a=rtpmap:0 PCMU/8000\r\n"),
+            "PCMU rtpmap が無い: {s}"
+        );
 
         // 必ず消えるべきもの
         assert!(!s.to_lowercase().contains("opus"), "opus が残ってる: {s}");
         assert!(!s.to_lowercase().contains("speex"), "speex が残ってる: {s}");
-        assert!(!s.to_lowercase().contains("telephone-event"), "telephone-event が残ってる");
+        assert!(
+            !s.to_lowercase().contains("telephone-event"),
+            "telephone-event が残ってる"
+        );
         assert!(!s.contains("rtcp-fb"), "rtcp-fb が残ってる");
-        assert!(!s.contains("rtcp-xr"), "rtcp-xr が残ってる (セッションレベルのみ削除対象外なら見直し)");
+        assert!(
+            !s.contains("rtcp-xr"),
+            "rtcp-xr が残ってる (セッションレベルのみ削除対象外なら見直し)"
+        );
     }
 
     #[test]

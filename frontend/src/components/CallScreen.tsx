@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, onMount, Show, type Component } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show, type Component } from "solid-js";
 
 export type CallScreenProps = {
   peerLabel: string;
@@ -21,14 +21,20 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
       // iOS Safari ではバックグラウンド再生に playsinline 属性が必須。
       // SolidJS の型に当該プロパティが無いので setAttribute で付ける。
       audioEl.setAttribute("playsinline", "true");
-      if (props.remoteStream) {
-        audioEl.srcObject = props.remoteStream;
-        audioEl.play().catch((e) => console.warn("audio play blocked", e));
-      }
     }
     timer = window.setInterval(() => {
       if (props.state === "connected") setSeconds((s) => s + 1);
     }, 1000);
+  });
+
+  // `remoteStream` は ontrack で後から差し込まれる (特に着信経路では応答後)。
+  // onMount 時点では null なことがあるので createEffect で props 変化に追従する。
+  createEffect(() => {
+    const stream = props.remoteStream;
+    if (audioEl && stream && audioEl.srcObject !== stream) {
+      audioEl.srcObject = stream;
+      audioEl.play().catch((e) => console.warn("audio play blocked", e));
+    }
   });
 
   onCleanup(() => {
@@ -44,6 +50,12 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
   };
 
   const toggleMute = () => setMuted(props.onToggleMute());
+
+  const hangupLabel = (p: CallScreenProps): string => {
+    if (p.state === "ended") return "閉じる";
+    if (p.incoming && p.state === "ringing") return "拒否";
+    return "切断";
+  };
 
   return (
     <div class="call-screen">
@@ -82,7 +94,7 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
           <button onClick={toggleMute}>{muted() ? "解除" : "ミュート"}</button>
         </Show>
         <button class="danger" onClick={props.onHangup}>
-          {props.state === "ended" ? "閉じる" : "切断"}
+          {hangupLabel(props)}
         </button>
       </div>
     </div>

@@ -193,34 +193,55 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
 
     // (5) 内線 UAS bind + UasEvent チャネル
     let (uas_event_tx, uas_event_rx) = mpsc::unbounded_channel();
-    let (uas, ext_registrar, ext_socket_for_forker) = if let Some(uas_cfg) = uas_config_opt {
-        info!(
-            "内線 UAS 起動 ({} 内線): {}",
-            extensions_cfg.len(),
-            uas_cfg.bind_addr
-        );
-        let uas =
-            ExtensionUas::bind_with_metrics(uas_cfg, &extensions_cfg, metrics.clone()).await?;
-        let ext_registrar = uas.registrar();
-        // (6) 内線レッグ用 UAC を独立ソケットで構築
-        // 内線網と NGN 網は別のトランザクション層で動かす必要があるため
-        // 一時的な UDP ソケットを内線送信専用に bind する。
-        let ext_send_sock = Arc::new(
-            UdpSocket::bind(SocketAddr::new(ext_registrar_local_ip_or_loopback(), 0)).await?,
-        );
-        let uas = uas.with_handler(uas_event_tx.clone());
-        (Some(uas), Some(ext_registrar), Some(ext_send_sock))
-    } else {
-        info!("内線 UAS は未設定のためスキップ");
-        (None, None, None)
-    };
+    // UAS 関連情報をまとめて返す: (UAS, registrar, forker 用 send 専用 socket,
+    //                             UAS 自身の TransactionLayer, UAS bind 済み addr)
+    let (uas, ext_registrar, ext_socket_for_forker, uas_layer_for_b2bua, uas_local_addr) =
+        if let Some(uas_cfg) = uas_config_opt {
+            info!(
+                "内線 UAS 起動 ({} 内線): {}",
+                extensions_cfg.len(),
+                uas_cfg.bind_addr
+            );
+            let uas =
+                ExtensionUas::bind_with_metrics(uas_cfg, &extensions_cfg, metrics.clone()).await?;
+            let ext_registrar = uas.registrar();
+            // (6) 内線レッグ用 UAC を独立ソケットで構築
+            // 内線網と NGN 網は別のトランザクション層で動かす必要があるため
+            // 一時的な UDP ソケットを内線送信専用に bind する。
+            let ext_send_sock = Arc::new(
+                UdpSocket::bind(SocketAddr::new(ext_registrar_local_ip_or_loopback(), 0)).await?,
+            );
+            // B2BUA 用に UAS の Layer / addr を控えておく (内線へ BYE を送る経路)。
+            let uas_layer = uas.layer();
+            let uas_addr = uas.socket().local_addr()?;
+            let uas = uas.with_handler(uas_event_tx.clone());
+            (
+                Some(uas),
+                Some(ext_registrar),
+                Some(ext_send_sock),
+                Some(uas_layer),
+                Some(uas_addr),
+            )
+        } else {
+            info!("内線 UAS は未設定のためスキップ");
+            (None, None, None, None, None)
+        };
     drop(uas_event_tx); // 内線 UAS が無ければ受信側はすぐ終わる
 
-    // (6) NGN 着信ハンドラ: 内線レッグ用 forker を構築して spawn
+    // (6+7) UAS event ハンドラと NGN 着信ハンドラ。両者で OutboundCallRegistry を
+    // 共有することで、NGN→内線方向の BYE が同じ通話エントリを引けるようにする。
+    let mut uas_handler = UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone());
+    if let (Some(uas_layer), uas_addr) = (uas_layer_for_b2bua.clone(), uas_local_addr) {
+        // 内線レッグへ in-dialog (BYE 等) を送るため UAS の TransactionLayer を借用。
+        uas_handler.attach_ext_layer(uas_layer, uas_addr);
+    }
+    let uas_handler_for_forwarder: Arc<dyn call::orchestrator::OutboundDialogForwarder> =
+        uas_handler.clone();
+
     if let (Some(ext_registrar), Some(ext_send_sock)) =
         (ext_registrar.clone(), ext_socket_for_forker)
     {
-        // 内線レッグ送信ソケットもトレース対応
+        // 内線レッグ送信ソケットもトレース対応 (NGN→内線 着信フォーク用)
         let (ext_layer, _ext_inbound_rx) =
             TransactionLayer::spawn_with_tracer(ext_send_sock.clone(), tracer.clone());
         let ext_uac_cfg = UacConfig {
@@ -247,7 +268,7 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             bridge_ngn_bind_ip: None,
             bridge_ext_bind_ip: None,
         };
-        let _handler = wire_ngn_inbound_with_metrics(
+        let ngn_handler = wire_ngn_inbound_with_metrics(
             ngn_layer.clone(),
             ngn_socket.clone(),
             ngn_inbound_rx,
@@ -256,7 +277,11 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             cfg,
             metrics.clone(),
         );
-        info!("NGN 着信ハンドラ起動完了");
+        // NGN→内線 BYE 伝搬の経路を結線する (B2BUA 双方向 BYE)。
+        ngn_handler
+            .set_outbound_forwarder(uas_handler_for_forwarder)
+            .await;
+        info!("NGN 着信ハンドラ起動完了 (B2BUA registry 共有済)");
     } else {
         // 内線が無ければ着信を受けても捨てるしか無いので、ハンドラは作らない。
         // `inbound_rx` は drop しておく (TransactionLayer::recv_loop は
@@ -264,9 +289,6 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         drop(ngn_inbound_rx);
         info!("内線が無いため NGN 着信ハンドラはスキップ");
     }
-
-    // (7) UAS event ハンドラ
-    let uas_handler = UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone());
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ

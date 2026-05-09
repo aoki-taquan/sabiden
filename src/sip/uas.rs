@@ -52,8 +52,23 @@ pub enum UasEvent {
         /// レスポンスを送るためのハンドル。
         responder: ResponderHandle,
     },
-    /// 既存ダイアログに対する BYE。
+    /// 既存ダイアログに対する BYE。`responder` で 200 OK を返す。
     Bye {
+        request: SipRequest,
+        remote: SocketAddr,
+        responder: ResponderHandle,
+    },
+    /// 進行中 INVITE への CANCEL (RFC 3261 §9). `responder` は CANCEL 自身の
+    /// 200 OK を返すために使う (元 INVITE は別途 487 で閉じる必要がある)。
+    Cancel {
+        request: SipRequest,
+        remote: SocketAddr,
+        responder: ResponderHandle,
+    },
+    /// 内線からの ACK (2xx 確定後)。RFC 3261 §17.1.1.3 に従い応答は不要なので
+    /// `responder` は持たず、上位層が必要なら通話状態を Connected に遷移させる
+    /// マーカとして使う。
+    Ack {
         request: SipRequest,
         remote: SocketAddr,
     },
@@ -197,6 +212,13 @@ impl ExtensionUas {
         &self.socket
     }
 
+    /// 受信ループを駆動している `TransactionLayer` への参照。
+    /// 上位層 (B2BUA) が内線レッグへ in-dialog リクエスト (BYE 等) を
+    /// `send_request` で送るために必要。
+    pub fn layer(&self) -> Arc<TransactionLayer> {
+        self._layer.clone()
+    }
+
     /// 受信ループ。`Ctrl-C` などで中断されるまで終了しない。
     pub async fn run(mut self) -> Result<()> {
         // 期限切れエントリを掃除するタスクを並走させる。同時に
@@ -262,17 +284,28 @@ impl ExtensionUas {
                     }
                 }
                 SipMethod::Bye => {
-                    self.handle_bye(&request, remote, &responder).await;
+                    self.handle_bye(request.clone(), remote, responder).await;
                 }
                 SipMethod::Cancel => {
                     // CANCEL は元 INVITE と同じ branch を共有する。
-                    // 実装簡略化のため 200 OK で受け取り、INVITE は別途
-                    // 487 Request Terminated を上位層が返す前提とする。
+                    // RFC 3261 §9.2: CANCEL 自体には 200 OK を返し、元 INVITE は
+                    // 上位層 (B2BUA) が 487 Request Terminated で閉じる責務を負う。
                     let _ = responder.quick(200, "OK").await;
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(UasEvent::Cancel {
+                            request,
+                            remote,
+                            responder,
+                        });
+                    }
                 }
                 SipMethod::Ack => {
-                    // ACK にはレスポンスを返さない (RFC 3261 §17.2.7)
-                    debug!("ACK 受信 (上位層に処理を委譲)");
+                    // ACK 自体には応答しない (RFC 3261 §17.2.7)。
+                    // 上位 (B2BUA) には通話状態の Confirmed 遷移マーカとして渡す。
+                    debug!("ACK 受信 → 上位層へ転送");
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(UasEvent::Ack { request, remote });
+                    }
                 }
                 SipMethod::Options => {
                     // 単純な keep-alive 応答 (Linphone 等が定期送信する)
@@ -421,22 +454,29 @@ impl ExtensionUas {
 
     async fn handle_bye(
         &self,
-        request: &SipRequest,
+        request: SipRequest,
         remote: SocketAddr,
-        responder: &ResponderHandle,
+        responder: ResponderHandle,
     ) {
         // BYE は既存ダイアログ前提。UAS 自身は dialog テーブルを持たないので
-        // 上位層に丸投げし、未接続なら 200 OK で素朴に閉じる
-        // (RFC 3261 §15.1.2 では「既知でなければ 481」だが、内線側ダイアログ
-        // 状態は Call Manager 側にしかなく、ここで 481 を返すと UA が
-        // リソース解放を後回しにするため、無害な 200 で閉じる)。
+        // 上位層 (B2BUA) に渡し、200 OK の送出は上位層に任せる。上位層が
+        // 未接続のときは無害な 200 OK で閉じる (RFC 3261 §15.1.2 では
+        // 「既知でなければ 481」だが、内線側 dialog 状態は B2BUA 側にしか
+        // 無く、ここで 481 を返すと UA がリソース解放を後回しにする)。
         if let Some(tx) = &self.event_tx {
-            let _ = tx.send(UasEvent::Bye {
-                request: request.clone(),
-                remote,
-            });
+            if tx
+                .send(UasEvent::Bye {
+                    request,
+                    remote,
+                    responder,
+                })
+                .is_err()
+            {
+                warn!("Call Manager 受信側が閉じている → BYE は dropped");
+            }
+        } else {
+            let _ = responder.quick(200, "OK").await;
         }
-        let _ = responder.quick(200, "OK").await;
     }
 }
 

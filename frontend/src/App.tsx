@@ -26,6 +26,10 @@ type View =
       state: "ringing" | "connecting" | "connected" | "ended";
       stream: MediaStream | null;
       incoming: boolean;
+      /** NGN 着信時 sabiden 側で採番された Call-ID。answer 送信時に必要。 */
+      callId: string | null;
+      /** 着信中で、応答前の生 offer SDP。応答ボタンで `acceptIncomingOffer` に渡す。 */
+      pendingOfferSdp: string | null;
     };
 
 export const App: Component = () => {
@@ -55,6 +59,33 @@ export const App: Component = () => {
         } catch (e) {
           console.error("answer apply failed", e);
         }
+        break;
+      case "offer":
+        // NGN 着信: sabiden が生成した offer をブラウザに push してきた。
+        // ringing UI を出して、ユーザの応答ボタン待ち。
+        // 多重着信は後勝ち (現行の View が単一通話前提なので).
+        if (!signaling) break;
+        teardownCall();
+        // caller display name は Issue #41 のスコープ外: TODO で call_id を表示。
+        setView({
+          kind: "call",
+          peerLabel: "着信",
+          state: "ringing",
+          stream: null,
+          incoming: true,
+          callId: msg.call_id,
+          pendingOfferSdp: msg.sdp,
+        });
+        break;
+      case "cancel":
+        // 着信中に NGN 側がキャンセル → UI を閉じる。
+        // call_id 不一致のものは無視 (古い着信のフラッシュ等).
+        setView((v) => {
+          if (v.kind !== "call") return v;
+          if (v.callId !== null && v.callId !== msg.call_id) return v;
+          return { ...v, state: "ended", stream: null };
+        });
+        teardownCall();
         break;
       case "ice":
         await call?.addIce(msg.candidate);
@@ -131,6 +162,21 @@ export const App: Component = () => {
     setView({ kind: "login" });
   };
 
+  /** WebRtcCall を共通生成 (発信/着信で使い回す)。 */
+  const newCall = (sig: SignalingClient): WebRtcCall =>
+    new WebRtcCall(sig, {
+      onRemoteTrack: (s) => {
+        setView((v) => (v.kind === "call" ? { ...v, stream: s } : v));
+      },
+      onConnectionState: (s) => {
+        if (s === "connected") {
+          setView((v) => (v.kind === "call" ? { ...v, state: "connected" } : v));
+        } else if (s === "failed" || s === "disconnected" || s === "closed") {
+          setView((v) => (v.kind === "call" && v.state !== "ended" ? { ...v, state: "ended" } : v));
+        }
+      },
+    });
+
   const placeCall = async (number: string) => {
     if (!signaling) return;
     setView({
@@ -139,22 +185,11 @@ export const App: Component = () => {
       state: "connecting",
       stream: null,
       incoming: false,
+      callId: null,
+      pendingOfferSdp: null,
     });
     try {
-      call = new WebRtcCall(signaling, {
-        onRemoteTrack: (s) => {
-          setView((v) => (v.kind === "call" ? { ...v, stream: s } : v));
-        },
-        onConnectionState: (s) => {
-          if (s === "connected") {
-            setView((v) => (v.kind === "call" ? { ...v, state: "connected" } : v));
-          } else if (s === "failed" || s === "disconnected" || s === "closed") {
-            setView((v) =>
-              v.kind === "call" && v.state !== "ended" ? { ...v, state: "ended" } : v,
-            );
-          }
-        },
-      });
+      call = newCall(signaling);
       await call.acquireMic();
       await call.createOffer();
       // INVITE 送出はサーバ側 TODO (Issue #25 と協調). offer/answer 折返しのみ動作。
@@ -165,12 +200,43 @@ export const App: Component = () => {
     }
   };
 
+  /** 着信応答: 保留中の offer SDP に対して answer を返送する。 */
+  const acceptIncoming = async () => {
+    const v = view();
+    if (v.kind !== "call" || !v.incoming || !v.callId || !v.pendingOfferSdp || !signaling) {
+      return;
+    }
+    setView({ ...v, state: "connecting", pendingOfferSdp: null });
+    try {
+      call = newCall(signaling);
+      await call.acquireMic();
+      await call.acceptIncomingOffer(v.callId, v.pendingOfferSdp);
+    } catch (e) {
+      console.error("accept incoming failed", e);
+      setView((curr) => (curr.kind === "call" ? { ...curr, state: "ended" } : curr));
+      teardownCall();
+    }
+  };
+
   const hangup = () => {
     try {
       signaling?.send({ type: "bye" });
     } catch {
       /* ignore */
     }
+    teardownCall();
+    setView({ kind: "dialer" });
+  };
+
+  /**
+   * 着信を応答前に拒否する。
+   *
+   * `bye` は WS セッション (= 内線登録) ごと閉じる意味なので、
+   * ringing 中に押されても送らない。ローカル UI をクリアするのみで、
+   * サーバ側は browser 応答が来ないことを CANCEL タイムアウトで検出する。
+   * (将来サーバが `reject` C→S に対応したらここで送信を追加する)
+   */
+  const rejectIncoming = () => {
     teardownCall();
     setView({ kind: "dialer" });
   };
@@ -194,14 +260,17 @@ export const App: Component = () => {
       <Match when={view().kind === "call"}>
         {(() => {
           const v = view() as Extract<View, { kind: "call" }>;
+          // ringing 中の incoming は専用の「拒否」を出して bye で内線を落とさない。
+          const onHangup = v.incoming && v.state === "ringing" ? rejectIncoming : hangup;
           return (
             <CallScreen
               peerLabel={v.peerLabel}
               state={v.state}
               remoteStream={v.stream}
               incoming={v.incoming}
-              onHangup={hangup}
+              onHangup={onHangup}
               onToggleMute={toggleMute}
+              onAccept={v.incoming && v.state === "ringing" ? acceptIncoming : undefined}
             />
           );
         })()}

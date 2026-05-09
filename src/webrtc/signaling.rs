@@ -8,7 +8,8 @@
 //! C → S:
 //! ```json
 //! { "type": "register", "ext_id": "webrtc-alice" }    // 認証は WS 接続時
-//! { "type": "offer", "sdp": "v=0..." }
+//! { "type": "offer", "sdp": "v=0..." }                 // browser 発信 (将来)
+//! { "type": "answer", "call_id": "...", "sdp": "v=0..." }  // sabiden 発の offer に応答
 //! { "type": "ice", "candidate": "candidate:..." }
 //! { "type": "bye" }
 //! ```
@@ -16,7 +17,9 @@
 //! S → C:
 //! ```json
 //! { "type": "registered", "ext_id": "webrtc-alice" }
-//! { "type": "answer", "sdp": "v=0..." }
+//! { "type": "answer", "sdp": "v=0..." }                  // browser 発の offer 応答
+//! { "type": "offer",  "call_id": "...", "sdp": "v=0..." } // NGN 着信を browser へ push
+//! { "type": "cancel", "call_id": "..." }                 // NGN CANCEL 等の中止通知
 //! { "type": "ice", "candidate": "candidate:..." }
 //! { "type": "error", "code": "invalid_state", "message": "..." }
 //! { "type": "bye" }
@@ -40,6 +43,7 @@
 //! 動作のみを実装し、実 INVITE 送信は Issue #25 (Opus 並行) と協調しつつ
 //! 別 PR で結線する (TODO)。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -51,12 +55,81 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use super::auth::{AuthClaims, Verifier};
 use super::peer::{PeerSession, StubPeerSession};
-use crate::sip::registrar::ExtensionRegistrar;
+use crate::sip::registrar::{ExtTransport, ExtensionRegistrar};
+
+/// `ServerMessage` を WS 接続へ非同期に届けるためのチャネル送信側。
+///
+/// シグナリング層 (orchestrator や `process_client_message`) から
+/// WebRTC ブラウザに任意のタイミングで `Offer` / `Cancel` 等を push する
+/// ために、WS 送信タスクを `mpsc` 受信ループで分離する。実装としては
+/// `mpsc::UnboundedSender<ServerMessage>` の `Arc` ラップ。
+#[derive(Clone)]
+pub struct WsSink {
+    tx: mpsc::UnboundedSender<ServerMessage>,
+}
+
+impl WsSink {
+    pub fn new(tx: mpsc::UnboundedSender<ServerMessage>) -> Self {
+        Self { tx }
+    }
+
+    /// メッセージを WS 送信タスクへ enqueue する。WS が既に閉じていれば
+    /// `Err` を返す。
+    pub fn send(&self, msg: ServerMessage) -> Result<()> {
+        self.tx
+            .send(msg)
+            .map_err(|_| anyhow::anyhow!("WS シグナリングチャネルが閉じている"))
+    }
+
+    /// 送信側が生きているかを確認する (テスト・診断向け)。
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+/// 1 つの WebRTC バインディングに紐づく実行時状態。
+///
+/// `ExtTransport::WebRtc` から到達できる `peer` / `ws` に加えて、NGN 着信
+/// 時に sabiden が browser に offer を push したあと、対応する
+/// `ClientMessage::Answer` (call_id 付き) を待ち受ける oneshot のテーブル
+/// を保持する。シグナリング層と orchestrator の双方からアクセスする。
+#[derive(Clone, Default)]
+pub struct PendingAnswers {
+    inner: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+}
+
+impl PendingAnswers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 指定 `call_id` への answer 受信を予約し、待ち受け側の receiver を返す。
+    pub async fn register(&self, call_id: &str) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.lock().await.insert(call_id.to_string(), tx);
+        rx
+    }
+
+    /// 指定 `call_id` の予約を取り消す (タイムアウト・キャンセル時)。
+    pub async fn cancel(&self, call_id: &str) {
+        self.inner.lock().await.remove(call_id);
+    }
+
+    /// browser から届いた answer を該当 `call_id` の waiter に転送する。
+    /// waiter が居ない場合は `false` を返す。
+    pub async fn deliver(&self, call_id: &str, sdp: String) -> bool {
+        if let Some(tx) = self.inner.lock().await.remove(call_id) {
+            tx.send(sdp).is_ok()
+        } else {
+            false
+        }
+    }
+}
 
 /// PeerSession を WS セッションごとに生成するファクトリ。
 ///
@@ -116,10 +189,22 @@ impl SignalingState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMessage {
-    Register { ext_id: String },
-    Offer { sdp: String },
-    Answer { sdp: String },
-    Ice { candidate: String },
+    Register {
+        ext_id: String,
+    },
+    /// browser 発の offer (将来: WebRTC → NGN 発信用)
+    Offer {
+        sdp: String,
+    },
+    /// sabiden 発の offer (NGN 着信を browser へ push) に対する応答。
+    /// `call_id` で対応する着信を識別する。
+    Answer {
+        call_id: String,
+        sdp: String,
+    },
+    Ice {
+        candidate: String,
+    },
     Bye,
 }
 
@@ -127,10 +212,30 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerMessage {
-    Registered { ext_id: String },
-    Answer { sdp: String },
-    Ice { candidate: String },
-    Error { code: String, message: String },
+    Registered {
+        ext_id: String,
+    },
+    /// browser 発の offer に対する sabiden の answer。
+    Answer {
+        sdp: String,
+    },
+    /// NGN 着信 INVITE を browser へ push する offer。
+    /// browser は `ClientMessage::Answer { call_id, sdp }` で応答する。
+    Offer {
+        call_id: String,
+        sdp: String,
+    },
+    /// 進行中の着信が NGN CANCEL 等で中止されたことを browser に通知する。
+    Cancel {
+        call_id: String,
+    },
+    Ice {
+        candidate: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
     Bye,
 }
 
@@ -209,22 +314,48 @@ pub async fn run_session(
         }
     };
 
-    // sender は両方 (run_session 本体 と trickle ICE 出力タスク) で使うので
-    // Mutex で保護する。
+    // sender は trickle ICE タスク と server-push forwarder で共有する。
     let sender = Arc::new(Mutex::new(sender));
+
+    // server → client メッセージを enqueue する mpsc。NGN 着信時に
+    // orchestrator が `WsSink` 経由でこの送信側に offer を流し込み、
+    // forwarder タスクが WS フレームに変換して送る。`run_session` 自身も
+    // `process_client_message` の `Reply` をこの mpsc 経由で送ることで
+    // 排他制御を一元化する。
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let ws_sink = WsSink::new(out_tx.clone());
+    let pending_answers = PendingAnswers::new();
+
+    // 送信 forwarder タスク。`out_rx` を WS Text フレームに変換して送る。
+    {
+        let sender_clone = sender.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                let payload = match serde_json::to_string(&msg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error=%e, "ServerMessage シリアライズ失敗");
+                        continue;
+                    }
+                };
+                let mut s = sender_clone.lock().await;
+                if s.send(Message::Text(payload)).await.is_err() {
+                    debug!("server-push: WS 送信失敗、forwarder 終了");
+                    break;
+                }
+            }
+        });
+    }
 
     // str0m バックエンドが local candidates を流すので、その receiver を
     // 取り出して trickle 出力タスクを spawn する。stub は None を返すので
     // タスクは起動されない。
     if let Some(mut local_cand_rx) = peer.take_local_candidates().await {
-        let sender_clone = sender.clone();
+        let push = ws_sink.clone();
         tokio::spawn(async move {
             while let Some(cand) = local_cand_rx.recv().await {
-                let msg = ServerMessage::Ice { candidate: cand };
-                let payload = serde_json::to_string(&msg).unwrap();
-                let mut s = sender_clone.lock().await;
-                if s.send(Message::Text(payload)).await.is_err() {
-                    debug!("trickle ICE: WS 送信失敗、出力タスク終了");
+                if push.send(ServerMessage::Ice { candidate: cand }).is_err() {
+                    debug!("trickle ICE: forwarder 終了済み、出力タスク終了");
                     break;
                 }
             }
@@ -255,29 +386,31 @@ pub async fn run_session(
         let parsed: ClientMessage = match serde_json::from_str(&msg) {
             Ok(m) => m,
             Err(e) => {
-                let err = ServerMessage::error("bad_json", e.to_string());
-                let mut s = sender.lock().await;
-                let _ = s
-                    .send(Message::Text(serde_json::to_string(&err).unwrap()))
-                    .await;
+                let _ = ws_sink.send(ServerMessage::error("bad_json", e.to_string()));
                 continue;
             }
         };
 
         let mut aor_guard = registered_aor.lock().await;
-        let resp =
-            process_client_message(parsed, &state, &claims, &peer, remote, &mut aor_guard).await;
+        let resp = process_client_message(
+            parsed,
+            &state,
+            &claims,
+            &peer,
+            remote,
+            &mut aor_guard,
+            &ws_sink,
+            &pending_answers,
+        )
+        .await;
         drop(aor_guard);
 
         match resp {
             SessionAction::Reply(sm) => {
-                let payload = serde_json::to_string(&sm).unwrap();
                 let is_bye = matches!(sm, ServerMessage::Bye);
-                let mut s = sender.lock().await;
-                if s.send(Message::Text(payload)).await.is_err() {
+                if ws_sink.send(sm).is_err() {
                     break;
                 }
-                drop(s);
                 if is_bye {
                     break;
                 }
@@ -310,6 +443,10 @@ pub enum SessionAction {
 /// `aor_guard` は WS セッションが現在 Registrar に書いている AOR を
 /// `Mutex<Option<String>>` で外側から渡す。`register` で書き込み、
 /// `bye` または WS 切断で消える。
+/// `ws_sink` はサーバ → クライアント送信チャネル (NGN 着信を push する
+/// orchestrator もここに enqueue する)、`pending_answers` は sabiden 発の
+/// offer に対する browser 応答を待ち合わせるテーブル。
+#[allow(clippy::too_many_arguments)]
 pub async fn process_client_message(
     msg: ClientMessage,
     state: &SignalingState,
@@ -317,6 +454,8 @@ pub async fn process_client_message(
     peer: &Arc<dyn PeerSession>,
     remote: SocketAddr,
     aor_guard: &mut Option<String>,
+    ws_sink: &WsSink,
+    pending_answers: &PendingAnswers,
 ) -> SessionAction {
     match msg {
         ClientMessage::Register { ext_id } => {
@@ -327,10 +466,24 @@ pub async fn process_client_message(
                     format!("token issued for {}", claims.ext_id),
                 ));
             }
-            let contact_uri = format!("sip:{}@webrtc.local", ext_id);
+            // contact_uri は WebRTC では SIP UAC で発呼されないので意味を持たない。
+            // Phase 4 までの互換のため `webrtc.peer` ホストを残し、`transport` で
+            // 実体を判別する設計に切り替えた。
+            let contact_uri = format!("sip:{}@webrtc.peer", ext_id);
+            let transport = ExtTransport::WebRtc {
+                peer: peer.clone(),
+                ws: ws_sink.clone(),
+                pending: pending_answers.clone(),
+            };
             state
                 .extensions
-                .register(&ext_id, contact_uri, remote, state.register_ttl)
+                .register_with_transport(
+                    &ext_id,
+                    contact_uri,
+                    remote,
+                    state.register_ttl,
+                    transport,
+                )
                 .await;
             *aor_guard = Some(ext_id.clone());
             info!(aor=%ext_id, "WebRTC 内線登録");
@@ -340,12 +493,17 @@ pub async fn process_client_message(
             Ok(answer) => SessionAction::Reply(ServerMessage::Answer { sdp: answer }),
             Err(e) => SessionAction::Reply(ServerMessage::error("offer_failed", e.to_string())),
         },
-        ClientMessage::Answer { .. } => {
-            // sabiden が offer 側になるケースは Phase 4.5 (発信プッシュ) で対応
-            SessionAction::Reply(ServerMessage::error(
-                "not_implemented",
-                "sabiden-initiated offer は未対応",
-            ))
+        ClientMessage::Answer { call_id, sdp } => {
+            // sabiden が offer 側 (NGN 着信 push) になっているはずの call_id に対する応答。
+            if pending_answers.deliver(&call_id, sdp).await {
+                SessionAction::Continue
+            } else {
+                warn!(%call_id, "対応する pending offer が無い answer を受信");
+                SessionAction::Reply(ServerMessage::error(
+                    "unknown_call_id",
+                    format!("no pending offer for call_id={}", call_id),
+                ))
+            }
         }
         ClientMessage::Ice { candidate } => match peer.add_ice_candidate(&candidate).await {
             Ok(_) => SessionAction::Continue,
@@ -386,12 +544,35 @@ mod tests {
         }
     }
 
+    /// テスト用: ws_sink + pending_answers を準備し、enqueue されたメッセージを
+    /// 集めるバックグラウンドタスクを spawn する。
+    fn ws_sink_and_recv() -> (
+        WsSink,
+        PendingAnswers,
+        Arc<Mutex<Vec<ServerMessage>>>,
+        mpsc::UnboundedSender<()>,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let pending = PendingAnswers::new();
+        let collected: Arc<Mutex<Vec<ServerMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_c = collected.clone();
+        // 終了通知用のダミー (生存しているうちは forwarder も生きる)
+        let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                collected_c.lock().await.push(m);
+            }
+        });
+        (WsSink::new(tx), pending, collected, shutdown_tx)
+    }
+
     #[tokio::test]
     async fn register_message_writes_to_extension_registrar() {
         let (state, reg) = make_state(b"k");
         let claims = dummy_claims("alice");
         let peer: Arc<dyn PeerSession> = StubPeerSession::new();
         let mut aor: Option<String> = None;
+        let (sink, pending, _collected, _kg) = ws_sink_and_recv();
         let action = process_client_message(
             ClientMessage::Register {
                 ext_id: "alice".into(),
@@ -401,6 +582,8 @@ mod tests {
             &peer,
             dummy_addr(),
             &mut aor,
+            &sink,
+            &pending,
         )
         .await;
         assert!(matches!(
@@ -409,8 +592,10 @@ mod tests {
         ));
         assert_eq!(aor.as_deref(), Some("alice"));
         let b = reg.lookup("alice").await.expect("登録済み");
-        assert_eq!(b.contact_uri, "sip:alice@webrtc.local");
+        assert_eq!(b.contact_uri, "sip:alice@webrtc.peer");
         assert_eq!(b.remote, dummy_addr());
+        // transport は WebRtc であるべき
+        assert!(matches!(b.transport, ExtTransport::WebRtc { .. }));
     }
 
     #[tokio::test]
@@ -419,6 +604,7 @@ mod tests {
         let claims = dummy_claims("alice");
         let peer: Arc<dyn PeerSession> = StubPeerSession::new();
         let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
         let action = process_client_message(
             ClientMessage::Register {
                 ext_id: "mallory".into(),
@@ -428,6 +614,8 @@ mod tests {
             &peer,
             dummy_addr(),
             &mut aor,
+            &sink,
+            &pending,
         )
         .await;
         match action {
@@ -453,6 +641,7 @@ mod tests {
                      t=0 0\r\n\
                      m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
                      a=rtpmap:111 OPUS/48000/2\r\n";
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
         let action = process_client_message(
             ClientMessage::Offer { sdp: offer.into() },
             &state,
@@ -460,6 +649,8 @@ mod tests {
             &peer,
             dummy_addr(),
             &mut aor,
+            &sink,
+            &pending,
         )
         .await;
         match action {
@@ -476,6 +667,7 @@ mod tests {
         let claims = dummy_claims("alice");
         let peer: Arc<dyn PeerSession> = StubPeerSession::new();
         let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
         let action = process_client_message(
             ClientMessage::Ice {
                 candidate: "candidate:1 1 udp 1 1.2.3.4 1 typ host".into(),
@@ -485,6 +677,8 @@ mod tests {
             &peer,
             dummy_addr(),
             &mut aor,
+            &sink,
+            &pending,
         )
         .await;
         assert!(matches!(action, SessionAction::Continue));
@@ -496,7 +690,7 @@ mod tests {
         // 事前に register しておく
         reg.register(
             "alice",
-            "sip:alice@webrtc.local".into(),
+            "sip:alice@webrtc.peer".into(),
             dummy_addr(),
             Duration::from_secs(60),
         )
@@ -504,6 +698,7 @@ mod tests {
         let claims = dummy_claims("alice");
         let peer: Arc<dyn PeerSession> = StubPeerSession::new();
         let mut aor: Option<String> = Some("alice".into());
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
         let action = process_client_message(
             ClientMessage::Bye,
             &state,
@@ -511,11 +706,72 @@ mod tests {
             &peer,
             dummy_addr(),
             &mut aor,
+            &sink,
+            &pending,
         )
         .await;
         assert!(matches!(action, SessionAction::Reply(ServerMessage::Bye)));
         assert!(aor.is_none());
         assert!(reg.lookup("alice").await.is_none());
+    }
+
+    /// `Answer { call_id, sdp }` が pending oneshot にちゃんと届く。
+    #[tokio::test]
+    async fn answer_with_call_id_delivers_to_pending_oneshot() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        // orchestrator 側が予約している前提
+        let waiter = pending.register("call-xyz").await;
+        let action = process_client_message(
+            ClientMessage::Answer {
+                call_id: "call-xyz".into(),
+                sdp: "v=0 ANSWER".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(action, SessionAction::Continue));
+        let got = waiter.await.unwrap();
+        assert_eq!(got, "v=0 ANSWER");
+    }
+
+    /// 未予約の call_id への answer はエラー応答になる。
+    #[tokio::test]
+    async fn answer_with_unknown_call_id_replies_error() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        let action = process_client_message(
+            ClientMessage::Answer {
+                call_id: "missing".into(),
+                sdp: "v=0".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "unknown_call_id");
+            }
+            _ => panic!("error 期待"),
+        }
     }
 
     #[test]
@@ -620,7 +876,8 @@ mod tests {
         assert!(body.contains(r#""type":"registered""#), "got {}", body);
 
         let b = extensions.lookup("alice").await.expect("登録済み");
-        assert!(b.contact_uri.contains("alice@webrtc.local"));
+        assert!(b.contact_uri.contains("alice@webrtc.peer"));
+        assert!(matches!(b.transport, ExtTransport::WebRtc { .. }));
 
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"bye"}"#.to_string(),

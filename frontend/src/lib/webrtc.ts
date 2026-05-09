@@ -72,6 +72,24 @@ export class WebRtcCall {
     await this.pc.setRemoteDescription({ type: "answer", sdp });
   }
 
+  /**
+   * NGN 着信 (sabiden 発の `ServerMessage::offer`) を受理し、
+   * answer を生成してシグナリング経由で返送する。
+   *
+   * `acquireMic()` を先に呼んで送信トラックを準備しておくこと
+   * (応答ボタン押下時に App から呼ぶ想定)。
+   */
+  async acceptIncomingOffer(callId: string, offerSdp: string): Promise<void> {
+    await this.pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+    this.signaling.send({
+      type: "answer",
+      call_id: callId,
+      sdp: answer.sdp ?? "",
+    });
+  }
+
   /** サーバから受け取った ICE candidate を追加。 */
   async addIce(candidate: string): Promise<void> {
     if (!candidate) return;

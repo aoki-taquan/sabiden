@@ -634,6 +634,9 @@ pub struct OutboundCallEntry {
     pub ext_call_id: String,
     /// sabiden が NGN へ発行した INVITE の Call-ID (= UacDialog のもの)。
     pub ngn_call_id: String,
+    /// 通話を発信した内線 AOR (例: "iphone")。Issue #68 の登録抹消連動 BYE で
+    /// AOR ごとに通話エントリを引くために保持する。
+    pub from_aor: String,
     /// sabiden が UAS として保持する内線レッグのダイアログ。
     /// BYE 等を内線へ送るときに `build_bye` の起点として使う。
     pub ext_dialog: Mutex<Dialog>,
@@ -712,6 +715,27 @@ impl OutboundCallRegistry {
         let mut inner = self.inner.lock().await;
         let ext_id = inner.ngn_to_ext.remove(ngn_call_id)?;
         inner.by_ext.remove(&ext_id)
+    }
+
+    /// 指定 AOR に紐づく確立済み通話を全て取り出してテーブルから削除する。
+    /// Issue #68: 内線が登録抹消したとき、その AOR で進行中の NGN レッグ
+    /// 通話を全て BYE で閉じるためのヘルパ。
+    pub async fn drain_by_aor(&self, aor: &str) -> Vec<Arc<OutboundCallEntry>> {
+        let mut inner = self.inner.lock().await;
+        let ext_ids: Vec<String> = inner
+            .by_ext
+            .iter()
+            .filter(|(_, e)| e.from_aor == aor)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut out = Vec::with_capacity(ext_ids.len());
+        for ext_id in ext_ids {
+            if let Some(entry) = inner.by_ext.remove(&ext_id) {
+                inner.ngn_to_ext.remove(&entry.ngn_call_id);
+                out.push(entry);
+            }
+        }
+        out
     }
 }
 
@@ -881,7 +905,49 @@ impl UasEventHandler {
                 remote,
                 responder,
             } => self.handle_ext_info(request, remote, responder).await,
+            UasEvent::Unregister { aor } => self.handle_ext_unregister(&aor).await,
         }
+    }
+
+    /// 内線が登録抹消した (RFC 3261 §10.2.1.1 expires=0、または期限切れ)。
+    /// 当該 AOR で確立済みの通話を全て NGN レッグごと BYE で閉じる。
+    /// Issue #68 で観測された連続発信時 NGN 486 の根因 (内線サイレント切断時に
+    /// NGN 側 dialog が残存) を解消するための救済パス。
+    async fn handle_ext_unregister(&self, aor: &str) -> Result<()> {
+        let drained = self.registry.drain_by_aor(aor).await;
+        if drained.is_empty() {
+            debug!(%aor, "登録抹消: 該当する outbound 通話なし");
+            return Ok(());
+        }
+        info!(
+            %aor,
+            count = drained.len(),
+            "登録抹消検出 → NGN レッグへ BYE 送出 (Issue #68 / RFC 3261 §15.1.1)"
+        );
+        for entry in drained {
+            // NGN 側 BYE
+            {
+                let mut ngn_dlg = entry.ngn_dialog.lock().await;
+                if let Err(e) = ngn_dlg.send_bye().await {
+                    warn!(error=%e, ext_call_id=%entry.ext_call_id, "登録抹消連動 NGN BYE 失敗");
+                }
+            }
+            // 内線レッグ dialog も Terminated にしておく (内線がもう居なくても
+            // sabiden 側状態は閉じる; build_bye は呼ばない、相手が居ないので無駄)。
+            {
+                let mut ext_dlg = entry.ext_dialog.lock().await;
+                ext_dlg.terminate();
+            }
+            // RTP ブリッジ停止 + 観測
+            self.metrics.dec_call_active();
+            if let (Some(bridge_id), Some(mgr)) = (entry.bridge_call_id, self.call_manager.as_ref())
+            {
+                if let Err(e) = mgr.terminate(bridge_id).await {
+                    warn!(error=%e, "登録抹消連動 RTP ブリッジ停止失敗");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 内線からの INVITE を NGN へプロキシし、200 OK の往復まで完了させる。
@@ -1049,6 +1115,7 @@ impl UasEventHandler {
                         let entry = Arc::new(OutboundCallEntry {
                             ext_call_id: call_id.clone(),
                             ngn_call_id,
+                            from_aor: from_aor.clone(),
                             ext_dialog: Mutex::new(ext_dialog),
                             ngn_dialog: Mutex::new(call.dialog),
                             ext_responder: responder,

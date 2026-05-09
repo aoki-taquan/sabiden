@@ -827,3 +827,216 @@ async fn inbound_call_with_callmanager_relays_rtp_smoke() {
         "RtpBridge は受信した RTP ペイロードを SSRC ごとそのまま中継する"
     );
 }
+
+/// Issue #68 / RFC 3261 §10.2.1.1 / §15.1.1: 内線が REGISTER expires=0 で
+/// 登録抹消したとき、確立済みの NGN 側通話に対して sabiden が自発的に BYE を
+/// 送って dialog を完全クローズする。
+///
+/// 実機 trace で観察されたバグ:
+/// 1. baresip 内線で `/dial 117` → 200 OK で通話成立 (NGN レッグ確立)
+/// 2. baresip プロセス終了 (BYE を送らずサイレント切断)
+/// 3. 49 秒後、別の内線セッションで再度 `/dial 117` → NGN が **486 Busy Here**
+/// 4. NGN は内部 timer (約 4 分) で前 dialog の BYE を発出してようやく解放
+///
+/// 本テストは「baresip 終了 ≒ REGISTER expires=0 抹消」をシミュレートし、
+/// sabiden が NGN レッグを救済 BYE で閉じることを確認する。NGN レッグの
+/// dialog 完全クローズは連続発信 N 回成功の前提条件。
+#[tokio::test]
+async fn rfc3261_15_1_1_unregister_triggers_bye_to_ngn_leg_for_active_call() {
+    // (1) mock NGN: INVITE → 200 OK / BYE → 200 OK のシーケンスを駆動。
+    //     BYE が NGN に到着したかを記録する (Issue #68 の検証ポイント)。
+    let fake_ngn = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+    let fake_ngn_clone = fake_ngn.clone();
+    let bye_arrived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bye_arrived_c = bye_arrived.clone();
+    let ngn_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+
+        // INVITE 受信 → 100 → 200 OK + Contact + tag
+        let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+        let invite = match parse_message(&buf[..n]).unwrap() {
+            SipMessage::Request(r) => r,
+            _ => panic!("INVITE expected"),
+        };
+        assert_eq!(invite.method, SipMethod::Invite);
+        let trying = build_response_skeleton(&invite, 100, "Trying");
+        let _ = fake_ngn_clone.send_to(&trying.to_bytes(), peer).await;
+        let mut ok = build_response_skeleton(&invite, 200, "OK");
+        ok.headers.set(
+            "To",
+            format!("{};tag=ngn-tag-issue68", invite.headers.get("to").unwrap()),
+        );
+        ok.headers
+            .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+        fake_ngn_clone.send_to(&ok.to_bytes(), peer).await.unwrap();
+
+        // ACK 受信 (drop)
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), fake_ngn_clone.recv_from(&mut buf)).await;
+
+        // BYE 受信を待つ (Issue #68: 内線抹消で sabiden が自発的に投げるべき)
+        if let Ok(Ok((n2, peer2))) =
+            tokio::time::timeout(Duration::from_secs(5), fake_ngn_clone.recv_from(&mut buf)).await
+        {
+            if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n2]) {
+                if req.method == SipMethod::Bye {
+                    bye_arrived_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let bye_resp = build_response_skeleton(&req, 200, "OK");
+                    let _ = fake_ngn_clone.send_to(&bye_resp.to_bytes(), peer2).await;
+                }
+            }
+        }
+    });
+
+    // (2) sabiden NGN UAC
+    let ngn_client_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+    let ngn_uac = Arc::new(Uac::new(
+        UacConfig {
+            local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            local_addr: ngn_client_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+        },
+        ngn_layer,
+        fake_ngn_addr,
+    ));
+
+    // (3) sabiden 内線 UAS
+    let uas_cfg = UasConfig {
+        bind_addr: fixtures::loopback_any(),
+        realm: "sabiden-test".to_string(),
+        max_expires: 3600,
+    };
+    let extensions = vec![ExtensionConfig {
+        username: "iphone".to_string(),
+        password: "secret".to_string(),
+    }];
+    let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
+    let uas_addr = uas.socket().local_addr().unwrap();
+    let uas_layer = uas.layer();
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let uas = uas.with_handler(event_tx);
+    tokio::spawn(async move {
+        uas.run().await.unwrap();
+    });
+
+    // (4) UasEventHandler に NGN UAC + ext_layer を結線。ext_layer 必須
+    // (Issue #68 fix が `OutboundCallRegistry::insert_confirmed` で AOR を
+    //  キーにエントリ挿入する前提)。
+    let mut handler = UasEventHandler::new(ngn_uac);
+    handler.attach_ext_layer(uas_layer, Some(uas_addr));
+    handler.spawn(event_rx);
+
+    // (5) 内線 mock UA: REGISTER → INVITE → 200 OK 受信
+    let mut phone = MockExtensionUa::bind("iphone", "secret").await.unwrap();
+    phone.register_with_digest(uas_addr).await.unwrap();
+    let resp = phone
+        .invite_with_digest(uas_addr, "sip:117@ntt-east.ne.jp", Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        (200..300).contains(&resp.status_code),
+        "通話確立を期待: got {}",
+        resp.status_code
+    );
+    // 確立済みエントリが registry に入るのを待つ (handle_invite が完了するまで)。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // (6) 内線が **BYE を送らず** に登録抹消する (= サイレント切断シミュレート)。
+    //     RFC 3261 §10.2.1.1: REGISTER expires=0 = 登録抹消。
+    //     これを sabiden が検知して NGN レッグへ自発的に BYE を送るのが
+    //     Issue #68 の本流対処。
+    let unreg =
+        builders::register_from_phone(&phone.local_addr, "iphone", "z9hG4bKunreg-issue68", None);
+    phone.send_request(uas_addr, &unreg).await.unwrap();
+    // 401 challenge を読む
+    let chal_resp = phone
+        .recv_response(Duration::from_secs(2))
+        .await
+        .expect("401 を期待");
+    assert_eq!(chal_resp.status_code, 401);
+    let challenge = crate::sip::auth::DigestChallenge::parse(
+        chal_resp
+            .headers
+            .get("www-authenticate")
+            .expect("WWW-Authenticate"),
+    )
+    .unwrap();
+    let creds = crate::sip::auth::DigestCredentials::new("iphone", "secret");
+    let auth = creds.compute(&challenge, "REGISTER", "sip:sabiden", 2);
+    // expires=0 を載せた REGISTER (登録抹消)
+    let mut unreg2 = builders::register_from_phone(
+        &phone.local_addr,
+        "iphone",
+        "z9hG4bKunreg-issue68-2",
+        Some(&auth.header_value),
+    );
+    unreg2.headers.set("Expires", "0");
+    // Contact の expires=0 パラメータも付ける (RFC 3261 §10.2.1.1 互換)
+    unreg2.headers.set(
+        "Contact",
+        format!("<sip:iphone@{}>;expires=0", phone.local_addr),
+    );
+    phone.send_request(uas_addr, &unreg2).await.unwrap();
+    let unreg_resp = phone
+        .recv_response(Duration::from_secs(2))
+        .await
+        .expect("登録抹消応答");
+    assert_eq!(unreg_resp.status_code, 200, "REGISTER expires=0 → 200 OK");
+
+    // (7) sabiden が NGN へ自発的に BYE を送ったことを確認する。
+    //     ngn_task は BYE 受信を 5 秒間 await して bye_arrived フラグを立てる。
+    let _ = ngn_task.await;
+    assert!(
+        bye_arrived.load(std::sync::atomic::Ordering::SeqCst),
+        "Issue #68 / RFC 3261 §15.1.1: 内線登録抹消で sabiden が自発的に \
+         NGN へ BYE を送るべき (送られなければ NGN dialog が残存し連続発信時に 486)"
+    );
+}
+
+/// Issue #68 / RFC 3261 §8.1.1.5: 新規 INVITE は新しい Call-ID を持ち、
+/// CSeq は 1 から再採番される。
+///
+/// 過去実装では `Uac::cseq_counter` をプロセス全体で共有していたため、
+/// 連続発信で CSeq=1, 2, 3, ... と単調増加していた。RFC 3261 §8.1.1.5 では
+/// CSeq の番号空間は (Call-ID, From-tag, To-tag) のダイアログ単位で独立して
+/// おり、新規 Call-ID なら CSeq=1 から再採番してよい。Asterisk 実機 pcap
+/// (`docs/asterisk-real-invite.md`) でも各 INVITE は CSeq=1 から始まる。
+#[tokio::test]
+async fn rfc3261_8_1_1_5_consecutive_invites_use_cseq_1() {
+    let server_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let server_addr = server_sock.local_addr().unwrap();
+    let client_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+
+    let (layer, _rx) = TransactionLayer::spawn(client_sock.clone());
+    let uac = Uac::new(
+        UacConfig {
+            local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            local_addr: client_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+        },
+        layer,
+        server_addr,
+    );
+
+    // 3 回 build_invite して全部 CSeq=1 になることを確認 (RFC 3261 §8.1.1.5)。
+    let plan1 = uac.build_invite("sip:117@ntt-east.ne.jp", None, None);
+    let plan2 = uac.build_invite("sip:117@ntt-east.ne.jp", None, None);
+    let plan3 = uac.build_invite("sip:117@ntt-east.ne.jp", None, None);
+
+    assert_eq!(plan1.cseq, 1, "1 回目の INVITE CSeq は 1");
+    assert_eq!(plan2.cseq, 1, "2 回目の INVITE CSeq も 1 (新規 Call-ID)");
+    assert_eq!(plan3.cseq, 1, "3 回目の INVITE CSeq も 1 (新規 Call-ID)");
+
+    // 各 INVITE の Call-ID が異なることも確認 (`new_call_id` 採番)。
+    let cid1 = plan1.request.headers.get("call-id").unwrap();
+    let cid2 = plan2.request.headers.get("call-id").unwrap();
+    let cid3 = plan3.request.headers.get("call-id").unwrap();
+    assert_ne!(cid1, cid2);
+    assert_ne!(cid2, cid3);
+    assert_ne!(cid1, cid3);
+}

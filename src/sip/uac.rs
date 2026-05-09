@@ -17,7 +17,6 @@
 //! - [`UacDialog::send_reinvite`][] : Re-INVITE (Session Timer 更新)
 //! - [`Uac::cancel_pending`][] : 進行中の INVITE を CANCEL
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -70,9 +69,6 @@ pub struct Uac {
     config: UacConfig,
     layer: Arc<TransactionLayer>,
     server_addr: SocketAddr,
-    /// 発信ごとに採番される CSeq の起点。RFC 3261 §8.1.1.5 では新しい
-    /// Call-ID なら 1 から始めても良いが、テスト容易性のためここで管理。
-    cseq_counter: AtomicU32,
 }
 
 impl Uac {
@@ -81,19 +77,27 @@ impl Uac {
             config,
             layer,
             server_addr,
-            cseq_counter: AtomicU32::new(1),
         }
     }
 
     /// 進行中の INVITE を表すハンドル。
     /// 2xx 受信前に CANCEL したい場合は [`Uac::cancel_pending`] へこれを渡す。
+    ///
+    /// CSeq は **必ず 1 から始める**。RFC 3261 §8.1.1.5 / §12.2.1.1 によれば
+    /// CSeq の番号空間は (Call-ID, From-tag, To-tag) のダイアログ単位で独立して
+    /// おり、新しい Call-ID で発信する場合は CSeq=1 から再採番してよい。
+    /// Asterisk pcap (`docs/asterisk-real-invite.md`) でも各 INVITE は CSeq=1
+    /// から始まっており、NGN は同一線で連続する INVITE の CSeq 連番を期待しない
+    /// (連続発信時に CSeq=2,3,4,... と渡すと NGN が「同一ダイアログのリトライ」
+    /// と解釈してリジェクトする現象を Issue #68 で確認済み)。
     pub fn build_invite(
         &self,
         target_uri: &str,
         sdp_offer: Option<&[u8]>,
         session_expires_secs: Option<u32>,
     ) -> InvitePlan {
-        let cseq = self.cseq_counter.fetch_add(1, Ordering::SeqCst);
+        // RFC 3261 §8.1.1.5: 新規 Call-ID なら CSeq=1 から再採番する。
+        let cseq = 1u32;
         let call_id = new_call_id();
         let local_tag = new_tag();
         let branch = new_branch();

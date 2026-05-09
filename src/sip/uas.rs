@@ -86,6 +86,16 @@ pub enum UasEvent {
         remote: SocketAddr,
         responder: ResponderHandle,
     },
+    /// 内線が登録抹消した (REGISTER expires=0、または期限切れ purge 検出)。
+    /// RFC 3261 §10.2.1.1 / §10.3 に従う。Issue #68 の dialog 完全クローズ
+    /// 連鎖のため、上位 (B2BUA) はこのイベントを受けたら `OutboundCallRegistry`
+    /// 上の対応する通話を全て NGN へ BYE で閉じる責務を負う。
+    /// 内線がサイレント切断 (BYE を送らずに居なくなる) してもダイアログ漏れを
+    /// 防ぐためのフック。
+    Unregister {
+        /// 抹消された AOR (内線ユーザ名)。
+        aor: String,
+    },
 }
 
 /// 1 リクエストに対応するサーバ トランザクションの操作ハンドル。
@@ -237,15 +247,28 @@ impl ExtensionUas {
     pub async fn run(mut self) -> Result<()> {
         // 期限切れエントリを掃除するタスクを並走させる。同時に
         // `extension_registered` gauge をスナップショット長で更新する。
+        // Issue #68: 期限切れで失効した AOR は B2BUA 上位へ
+        // `UasEvent::Unregister` を送って NGN レッグを BYE で閉じさせる
+        // (内線がサイレント切断したケースの dialog 漏れ防止)。
         let registrar = self.registrar.clone();
         let metrics = self.metrics.clone();
+        let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_secs(30));
             loop {
                 ticker.tick().await;
-                let removed = registrar.purge_expired().await;
-                if removed > 0 {
-                    debug!("内線登録 {} 件を期限切れ削除", removed);
+                let removed_aors = registrar.purge_expired_returning_removed().await;
+                if !removed_aors.is_empty() {
+                    debug!(
+                        "内線登録 {} 件を期限切れ削除: {:?}",
+                        removed_aors.len(),
+                        removed_aors
+                    );
+                    if let Some(tx) = &event_tx {
+                        for aor in removed_aors {
+                            let _ = tx.send(UasEvent::Unregister { aor });
+                        }
+                    }
                 }
                 let n = registrar.snapshot().await.len() as u64;
                 metrics.set_extension_registered(n);
@@ -402,6 +425,11 @@ impl ExtensionUas {
             .unwrap_or_else(|| format!("sip:{}@{}", aor, remote));
         let expires = parse_register_expires(request).min(self.config.max_expires);
 
+        // RFC 3261 §10.2.1.1: expires=0 は登録抹消と等価。Issue #68 で
+        // 内線サイレント切断 → NGN 側 dialog 残存 → 連続発信 486 の根因のため、
+        // 抹消検出時は B2BUA 上位へ `UasEvent::Unregister` を送って通話を
+        // 強制終了 (NGN へ BYE) させる。
+        let is_unregister = expires == 0;
         self.registrar
             .register(
                 &aor,
@@ -413,10 +441,17 @@ impl ExtensionUas {
         // 観測: 登録直後に gauge を更新する (purge ループの 30 秒待たずに反映する)。
         let n = self.registrar.snapshot().await.len() as u64;
         self.metrics.set_extension_registered(n);
-        info!(
-            "内線 REGISTER 成功: {} → {} (expires={}s)",
-            aor, contact_uri, expires
-        );
+        if is_unregister {
+            info!("内線 REGISTER 抹消: {} (expires=0)", aor);
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(UasEvent::Unregister { aor: aor.clone() });
+            }
+        } else {
+            info!(
+                "内線 REGISTER 成功: {} → {} (expires={}s)",
+                aor, contact_uri, expires
+            );
+        }
 
         // 200 OK + Contact + Expires
         let mut resp = build_response_skeleton(request, 200, "OK");

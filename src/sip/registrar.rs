@@ -154,11 +154,28 @@ impl ExtensionRegistrar {
 
     /// 期限切れエントリを掃除する。受付ループで定期的に呼び出すことを想定。
     pub async fn purge_expired(&self) -> usize {
+        self.purge_expired_returning_removed().await.len()
+    }
+
+    /// 期限切れエントリを掃除し、削除された AOR 一覧を返す。
+    ///
+    /// Issue #68 の dialog 完全クローズ連鎖のため、purge ループは抹消された
+    /// AOR ごとに B2BUA へ通知して NGN レッグの BYE を撃てる必要がある。
+    /// `purge_expired` の上位互換ヘルパで、返り値の `Vec<String>` を上位層が
+    /// 走査して `OutboundCallRegistry` を引き、対応する通話を NGN へ BYE する。
+    pub async fn purge_expired_returning_removed(&self) -> Vec<String> {
         let now = Instant::now();
         let mut table = self.inner.write().await;
-        let before = table.len();
-        table.retain(|_, b| !b.is_expired(now));
-        before - table.len()
+        let mut removed = Vec::new();
+        table.retain(|aor, b| {
+            if b.is_expired(now) {
+                removed.push(aor.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 }
 

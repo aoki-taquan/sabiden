@@ -73,6 +73,10 @@ src/
   Path / Service-Route / Authentication-Info 多段で 8 KB を超える事例があるため、上限まで確保する
   (issue #88)。`n == buf.len()` で受信した場合は truncate の兆候として warn ログを残す
   (RFC 3261 §18.4 Error Handling)。
+- `parse_message` は **生バイト** ベース。 Content-Length (RFC 3261 §20.14)
+  を見て本文を切り出し、 truncate 検知時は `Err` で drop。 body は opaque
+  octet 列 (RFC 3261 §7.4) として扱い、UTF-8 妥当性は要求しない (詳細 →
+  [`architecture.md`](./architecture.md) §11.6)。
 
 ### SIP Transaction Layer (RFC 3261 §17)
 - トランザクション ID (branch + via-sent-by + cseq-method)

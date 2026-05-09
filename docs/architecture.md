@@ -1529,6 +1529,18 @@ graph LR
   あるべきは `400 Bad Request` (Phase R2)。
 - **メッセージサイズ上限**: `transaction.rs::recv_loop` の buf は 8192 bytes 固定 →
   大きい SIP メッセージは truncate 危険 (Phase R5 で 64KB に拡張予定)。
+- **Content-Length 整合検証** (RFC 3261 §18.3 / §20.14, Issue #82):
+  `parse_message` (`src/sip/message.rs`) は `Content-Length` ヘッダ値と
+  CRLFCRLF 以降の datagram 残バイト長を比較する。 宣言値が残バイト長より
+  大きい場合は **truncate** と見なして `Err` を返し、`recv_loop` で warn
+  と共に drop する (≒ 400 Bad Request 相当の silent drop)。 これにより
+  8192 byte buf を超えた INVITE / 200 OK が SDP 半分受信のまま下流に流れる
+  事故を防ぐ。 値が残より小さい場合は先頭 N バイトのみ採用し、残余は
+  別 datagram (もしくは garbage) として drop する。
+- **Body の opaque 性** (RFC 3261 §7.4): message-body は任意 octet 列で、
+  メッセージ全体に UTF-8 妥当性を要求しない。これにより、攻撃者が body に
+  非 UTF-8 バイトを 1 個混ぜただけで全 SIP メッセージが drop される DoS
+  経路を遮断 (旧実装は `from_utf8` をメッセージ全体に適用していた)。
 
 ---
 

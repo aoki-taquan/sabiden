@@ -448,14 +448,50 @@ fn parse_kv_list(s: &str, sep: char) -> Vec<(String, String)> {
         .collect()
 }
 
-/// SIP メッセージのパーサ
+/// SIP メッセージのパーサ。
+///
+/// 入力は **生バイト列**として扱い、ヘッダ部 (start-line + headers)
+/// だけを ASCII / UTF-8 として解釈する。本文 (message-body) は
+/// RFC 3261 §7.4 に従い **opaque な octet 列**として扱うため、
+/// メッセージ全体に UTF-8 妥当性は要求しない。
+///
+/// # 切出し規則 (RFC 3261 §18.3 / §20.14)
+///
+/// - `\r\n\r\n` (CRLFCRLF) でヘッダと本文を分離する (RFC 3261 §7)。
+/// - `Content-Length` (RFC 3261 §20.14) がある場合:
+///   - `N == 0` → 本文は空 (CRLFCRLF 以降のバイトは無視。
+///     UDP 1 datagram = 1 message 前提だが SBC が違反した場合の予防)。
+///   - `N <= body_len` → `body[..N]` のみ採用。残余は drop
+///     (1 datagram 内の余剰バイトは別 SIP メッセージまたは garbage と見なす。
+///     RFC 3261 §18.3)。
+///   - `N > body_len` → `400 Bad Request` 相当の `Err`
+///     (UDP 切詰め検知、TCP では §18.3 上必須エラー)。
+/// - `Content-Length` ヘッダが無い場合は datagram 末尾までを本文とする
+///   (RFC 3261 §18.3: UDP は datagram 長から決まる)。
+///
+/// # 文字コード (RFC 3261 §7.4 / §27.4)
+///
+/// SIP message-body は任意の octet 列で、media-type に拠る。
+/// 本パーサは `from_utf8` をメッセージ全体に適用しないので、
+/// SDP 拡張 (binary `k=` 等) や S/MIME 等の binary body も受理できる。
+/// ヘッダ行は ASCII/ISO-8859-1 サブセット (RFC 3261 §7.3.1 BNF) なので、
+/// `from_utf8_lossy` で解釈しても情報は欠落しない (lossy 化は invalid byte
+/// が ヘッダに混入した防御的ケースのみ)。
 pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
-    let text = std::str::from_utf8(data)?;
-    let (header_part, body_part) = text
-        .split_once("\r\n\r\n")
+    // ヘッダ末尾境界 (CRLFCRLF) を **生バイト** で検索する。
+    // RFC 3261 §7.5 で header-body 区切りは厳密に CRLFCRLF と規定。
+    let header_end = find_subslice(data, b"\r\n\r\n")
         .ok_or_else(|| anyhow::anyhow!("malformed SIP message: no CRLFCRLF"))?;
+    let header_bytes = &data[..header_end];
+    let body_bytes = &data[header_end + 4..];
 
-    let mut lines = header_part.split("\r\n");
+    // ヘッダ部だけを文字列化。RFC 3261 §7.3.1 で header field-value は
+    // UTF-8 (TEXT-UTF8) 範囲だが、安全側で lossy 変換とし、不正バイトは
+    // U+FFFD に置換 (パースを継続させ、上位層で 400 を返す機会を残す)。
+    let header_text = std::str::from_utf8(header_bytes)
+        .map_err(|e| anyhow::anyhow!("non-UTF8 in SIP header: {}", e))?;
+
+    let mut lines = header_text.split("\r\n");
     let first_line = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty SIP message"))?;
@@ -467,7 +503,31 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
         }
     }
 
-    let body = body_part.as_bytes().to_vec();
+    // RFC 3261 §20.14: Content-Length は 10 進バイト数。
+    // 受信時は値に従って本文を切り出し、不整合は parser error を返す。
+    let body = match headers.get("content-length") {
+        Some(raw) => {
+            let n: usize = raw
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("malformed Content-Length header value: {:?}", raw))?;
+            if n > body_bytes.len() {
+                // RFC 3261 §18.3: 宣言サイズより datagram の本文部が短い場合、
+                // 切詰め (truncation) として扱う。 UDP では `recv_loop` の
+                // 8192 byte buf を超えた INVITE で発生しうる。
+                anyhow::bail!(
+                    "Content-Length {} exceeds available body bytes {}",
+                    n,
+                    body_bytes.len()
+                );
+            }
+            // n <= body_bytes.len(): 余剰は別 datagram 扱い (drop)
+            body_bytes[..n].to_vec()
+        }
+        // Content-Length 欠落時は datagram 末尾まで (UDP) を本文とする。
+        // TCP 経路では §20.14 で MUST だが、UDP fallback の互換のため bail せず採用。
+        None => body_bytes.to_vec(),
+    };
 
     if let Some(rest) = first_line.strip_prefix("SIP/2.0 ") {
         let (code_str, reason) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -492,6 +552,20 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
             body,
         }))
     }
+}
+
+/// `haystack` 内から `needle` (固定パターン) の先頭 byte 位置を返す。
+///
+/// `slice::windows` ベースの素朴探索で、SIP メッセージ最大 64 KB 程度では
+/// 性能上問題にならない。生バイト列のままパースするため、UTF-8 妥当性を
+/// メッセージ全体に求めない方針 ([`parse_message`] docstring 参照)。
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -620,5 +694,179 @@ mod tests {
     fn test_parse_sip_uri_rejects_empty() {
         assert!(parse_sip_uri("").is_err());
         assert!(parse_sip_uri("bob@x.example").is_err());
+    }
+
+    /// RFC 3261 §20.14 / §18.3: `Content-Length: 0` のとき、
+    /// CRLFCRLF 以降に余剰バイトがあっても本文は空でなければならない。
+    /// (1 datagram に 2 メッセージを詰めるケースの保険)
+    #[test]
+    fn rfc3261_20_14_content_length_zero_ignores_trailing_body() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(
+            b"OPTIONS sip:bob@x SIP/2.0\r\n\
+              Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+              From: <sip:a@x>;tag=1\r\n\
+              To: <sip:b@x>\r\n\
+              Call-ID: 123@x\r\n\
+              CSeq: 1 OPTIONS\r\n\
+              Content-Length: 0\r\n\
+              \r\n",
+        );
+        // 余剰データ (別の SIP メッセージ片の混入を模擬)
+        msg.extend_from_slice(b"GARBAGE-EXTRA-DATA");
+        let parsed = parse_message(&msg).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert!(
+                    req.body.is_empty(),
+                    "Content-Length: 0 のとき body は空でなければならない"
+                );
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// RFC 3261 §20.14: `Content-Length: N` で実本文が N より短い場合、
+    /// truncate と見なして parse error を返す。
+    /// (UDP `recv_loop` の固定バッファ 8192 を超えた INVITE で起きうる)
+    #[test]
+    fn rfc3261_20_14_content_length_exceeds_body_returns_err() {
+        let msg = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 INVITE\r\n\
+                    Content-Length: 100\r\n\
+                    \r\n\
+                    short body";
+        let result = parse_message(msg);
+        assert!(
+            result.is_err(),
+            "Content-Length が body より大きい場合は parse 失敗 (truncate 検知)"
+        );
+        let err_text = format!("{}", result.unwrap_err());
+        assert!(
+            err_text.contains("Content-Length"),
+            "エラーメッセージは Content-Length 起因と分かること: {}",
+            err_text
+        );
+    }
+
+    /// RFC 3261 §20.14: `Content-Length: N` で実本文が N より長い場合、
+    /// 本文は先頭 N バイトのみ採用。残余は次 datagram 扱い (drop)。
+    #[test]
+    fn rfc3261_20_14_content_length_shorter_than_body_takes_prefix() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(
+            b"INVITE sip:bob@x SIP/2.0\r\n\
+              Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+              From: <sip:a@x>;tag=1\r\n\
+              To: <sip:b@x>\r\n\
+              Call-ID: 123@x\r\n\
+              CSeq: 1 INVITE\r\n\
+              Content-Type: application/sdp\r\n\
+              Content-Length: 5\r\n\
+              \r\n",
+        );
+        msg.extend_from_slice(b"HELLO" /* 5 bytes */);
+        // 後続の余剰 ASCII (= 別メッセージ片を模擬)
+        msg.extend_from_slice(b"TRAILING-EXTRA");
+        let parsed = parse_message(&msg).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.body, b"HELLO".to_vec());
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// RFC 3261 §7.4: message-body は任意 octet 列。 UTF-8 妥当性を
+    /// メッセージ全体に要求する parser はバイナリ body を受理できず
+    /// 不正。 ここでは body に non-UTF8 バイトを混ぜて受理されることを保証。
+    #[test]
+    fn rfc3261_7_4_non_utf8_body_is_accepted() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(
+            b"INVITE sip:bob@x SIP/2.0\r\n\
+              Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+              From: <sip:a@x>;tag=1\r\n\
+              To: <sip:b@x>\r\n\
+              Call-ID: 123@x\r\n\
+              CSeq: 1 INVITE\r\n\
+              Content-Type: application/octet-stream\r\n\
+              Content-Length: 4\r\n\
+              \r\n",
+        );
+        // 不正 UTF-8 シーケンス (lone 0xFF, 続く 0xFE はサロゲートではない非 ASCII)
+        msg.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80]);
+        let parsed = parse_message(&msg).expect("non-UTF8 body must be accepted");
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.body, vec![0xFF, 0xFE, 0x00, 0x80]);
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// RFC 3261 §18.3: `Content-Length` ヘッダが欠落した UDP datagram は
+    /// CRLFCRLF 以降を全て body として採用 (datagram 末尾で確定)。
+    /// 既存の `test_parse_response_401` 等が体感する後方互換性を保証。
+    #[test]
+    fn rfc3261_18_3_no_content_length_uses_remaining_bytes() {
+        let raw = b"BYE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>;tag=2\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 2 BYE\r\n\
+                    \r\n\
+                    SDP-LIKE-PAYLOAD";
+        let parsed = parse_message(raw).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.body, b"SDP-LIKE-PAYLOAD".to_vec());
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// RFC 3261 §20.14: Content-Length の compact form `l` も同様に解釈される。
+    /// `l: 0` で trailing data が drop されること。
+    #[test]
+    fn rfc3261_20_14_compact_content_length_form_works() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(
+            b"OPTIONS sip:bob@x SIP/2.0\r\n\
+              v: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+              f: <sip:a@x>;tag=1\r\n\
+              t: <sip:b@x>\r\n\
+              i: 123@x\r\n\
+              CSeq: 1 OPTIONS\r\n\
+              l: 0\r\n\
+              \r\n",
+        );
+        msg.extend_from_slice(b"EXTRA");
+        let parsed = parse_message(&msg).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert!(req.body.is_empty());
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// 不正な Content-Length 値 (非数値) は parse error。
+    #[test]
+    fn rfc3261_20_14_malformed_content_length_value_is_err() {
+        let raw = b"OPTIONS sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 OPTIONS\r\n\
+                    Content-Length: abc\r\n\
+                    \r\n";
+        assert!(parse_message(raw).is_err());
     }
 }

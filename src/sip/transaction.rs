@@ -225,6 +225,123 @@ fn parse_via(via: &str) -> Result<(String, String)> {
     Ok((branch, sent_by))
 }
 
+/// Via ヘッダの sent-by から host 部だけを取り出す。
+///
+/// `192.0.2.1:5060` → `192.0.2.1`、`[2001:db8::1]:5060` → `[2001:db8::1]`、
+/// ポート省略時は文字列をそのまま返す。RFC 3261 §18.2.1 で「Via host が
+/// UDP source IP と異なるか」を判定するための前処理。
+fn via_sent_by_host(sent_by: &str) -> &str {
+    let s = sent_by.trim();
+    // IPv6 リテラル `[..]:port` は `]` 以降の `:port` だけを切る。
+    if s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            return &s[..end + 1];
+        }
+        return s;
+    }
+    // IPv4 / FQDN の場合は最後の `:` でポートを切る。
+    match s.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => host,
+        _ => s,
+    }
+}
+
+/// `SocketAddr` を SIP Via ヘッダの host 表現にする。
+/// IPv6 は `[..]` でくくる (RFC 3261 §25.1 host)。
+fn ip_for_via_host(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(v4) => v4.ip().to_string(),
+        SocketAddr::V6(v6) => format!("[{}]", v6.ip()),
+    }
+}
+
+/// RFC 3581 §4 / RFC 3261 §18.2.1 に従い、UAS が応答に乗せる Via
+/// ヘッダを書き換える。
+///
+/// - 元 Via に `;rport` パラメータがあれば (値の有無を問わず):
+///   - `received=<UDP source IP>` を追加 (既存 `received=` は上書き)
+///   - `rport` を `rport=<UDP source port>` に書き換え (RFC 3581 §4)
+/// - `;rport` が無くても、Via sent-by host が UDP source IP と異なるなら
+///   `received=<UDP source IP>` を追加 (RFC 3261 §18.2.1)
+/// - 上記いずれにも該当しなければ Via をそのまま返す
+///
+/// パラメータ順序は元 Via のものを保持する。`branch` 等の他パラメータ
+/// (RFC 3261 §20.42) には触らない。
+pub fn apply_rport_to_via_for_response(via: &str, remote: &SocketAddr) -> String {
+    let trimmed = via.trim();
+    // sent-protocol + sent-by を切り離す
+    let mut iter = trimmed.split(';');
+    let head = match iter.next() {
+        Some(h) => h.trim().to_string(),
+        None => return via.to_string(),
+    };
+    // sent-by host (port 抜き) を取り出して remote.ip() と比較する
+    let sent_by = head.split_once(' ').map(|x| x.1.trim()).unwrap_or("");
+    let sent_by_host = via_sent_by_host(sent_by);
+    let remote_ip_for_via = ip_for_via_host(remote);
+
+    let mut params: Vec<String> = iter.map(|p| p.trim().to_string()).collect();
+    let has_rport = params
+        .iter()
+        .any(|p| p == "rport" || p.starts_with("rport="));
+    let need_received = has_rport || sent_by_host != remote_ip_for_via;
+
+    if !has_rport && !need_received {
+        return via.to_string();
+    }
+
+    // received= の上書き or 追加 (rport が無くても sent-by ≠ src のとき必要)
+    if need_received {
+        let received_val = format!("received={}", remote.ip());
+        if let Some(pos) = params
+            .iter()
+            .position(|p| p == "received" || p.starts_with("received="))
+        {
+            params[pos] = received_val;
+        } else {
+            params.push(received_val);
+        }
+    }
+    // rport= の上書き (rport があった場合のみ; RFC 3581 §4)
+    if has_rport {
+        let rport_val = format!("rport={}", remote.port());
+        if let Some(pos) = params
+            .iter()
+            .position(|p| p == "rport" || p.starts_with("rport="))
+        {
+            params[pos] = rport_val;
+        }
+    }
+
+    let mut out = head;
+    for p in params {
+        out.push(';');
+        out.push_str(&p);
+    }
+    out
+}
+
+/// RFC 3581 §4 / RFC 3261 §18.2.1: UAS が応答 UDP を送り返す宛先を決める。
+///
+/// - 元 Via に `;rport` があれば、UDP source (= `remote`) を使う。これに
+///   より NAT/VPN の外側からの REGISTER/INVITE に対しても応答が確実に
+///   到達する (本 issue #60 の VPN/NAT 越えの根本対処)。
+/// - `;rport` 無し、かつ Via host が UDP source IP と異なる場合も、
+///   実機到達性を優先して UDP source へ返す。Via host (例: Linphone の
+///   `192.0.2.1` ダミー) を信用すると黒穴行きになるため。
+/// - 上記いずれにも該当しなければ `remote` をそのまま返す (NAT/VPN を
+///   挟まないループバック等のテスト経路)。
+///
+/// 結局のところ「常に UDP source へ返す」ことになるが、本関数は将来
+/// rport 強制要件 (RFC 5626) や経路バインディングを足す際の単一切替点
+/// として残す。
+pub fn response_destination_for(via: &str, remote: SocketAddr) -> SocketAddr {
+    // 現状の SIP/UDP 実装では UDP source へ返すのが最も実機適合的。
+    // (`docs/architecture.md` §11 NAT 越え参照)
+    let _ = via;
+    remote
+}
+
 /// クライアント トランザクションの状態 (RFC 3261 §17.1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
@@ -554,7 +671,18 @@ impl ClientTransaction {
 pub struct ServerTransaction {
     id: TransactionId,
     request: SipRequest,
+    /// リクエストを受け取った UDP source。応答送信先 (`response_dest`) と
+    /// `received=` パラメータの計算に使う。診断ログでも参照する想定で残す。
+    #[allow(dead_code)]
     remote: SocketAddr,
+    /// 応答 UDP の宛先。RFC 3581 §4 / RFC 3261 §18.2.1 に従い、
+    /// rport の有無 / Via host と UDP source の一致を見て決定する。
+    /// 詳細は [`response_destination_for`] のコメント。
+    response_dest: SocketAddr,
+    /// 応答 Via に乗せる文字列 (RFC 3581 §4 / RFC 3261 §18.2.1 に従い、
+    /// 必要なら `received=` / `rport=` を埋めた値)。`build_response_skeleton`
+    /// が request からコピーした Via を、`respond` 直前にこの値で上書きする。
+    response_via: String,
     socket: Arc<UdpSocket>,
     state: ServerState,
     last_response: Option<SipResponse>,
@@ -591,10 +719,22 @@ impl ServerTransaction {
             SipMethod::Invite => ServerState::Proceeding,
             _ => ServerState::Trying,
         };
+        // RFC 3581 §4 / RFC 3261 §18.2.1: 応答 Via には received / rport を
+        // 埋め、UDP 宛先は Via host ではなく UDP source を使う。Linphone 等
+        // が Via host にダミー IP (RFC 5737 `192.0.2.x`) を入れる VPN/NAT
+        // 越えのケースで応答到達性を担保する (issue #60)。
+        let original_via = request
+            .headers
+            .get("via")
+            .ok_or_else(|| anyhow!("Via ヘッダがない"))?;
+        let response_via = apply_rport_to_via_for_response(original_via, &remote);
+        let response_dest = response_destination_for(original_via, remote);
         Ok(Self {
             id,
             request,
             remote,
+            response_dest,
+            response_via,
             socket,
             state,
             last_response: None,
@@ -612,10 +752,17 @@ impl ServerTransaction {
     /// - INVITE 2xx: 同様に Timer G/H でメッセージを保持する (RFC 6026 で
     ///   transaction が 2xx も保持する形に整理された)。ACK 受信で Confirmed。
     /// - non-INVITE: Completed に遷移し、Timer J (64*T1) で滞在。
-    pub async fn respond(&mut self, resp: SipResponse) -> Result<()> {
+    pub async fn respond(&mut self, mut resp: SipResponse) -> Result<()> {
         let code = resp.status_code;
+        // RFC 3581 §4 / RFC 3261 §18.2.1: 応答の top Via は元 request の Via を
+        // 反映しつつ、`received=` / `rport=` を UDP source で埋める。
+        // `build_response_skeleton` が単に request の Via をコピーしただけの
+        // 値を上書きする。
+        resp.headers.set("Via", self.response_via.clone());
         let bytes = resp.to_bytes();
-        self.socket.send_to(&bytes, self.remote).await?;
+        // 応答送信先は Via host ではなく UDP source。Via host が
+        // RFC 5737 ダミー (`192.0.2.x`) でも届く (issue #60)。
+        self.socket.send_to(&bytes, self.response_dest).await?;
         write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
         self.last_response = Some(resp);
 
@@ -645,7 +792,9 @@ impl ServerTransaction {
 
         let is_invite = matches!(self.request.method, SipMethod::Invite);
         let socket = self.socket.clone();
-        let remote = self.remote;
+        // 再送 (Timer G / J) も応答と同じ UDP 宛先 (rport / received 反映済) を
+        // 使う (RFC 3581 §4)。
+        let remote = self.response_dest;
         let tracer = self.tracer.clone();
         let id = self.id.clone();
         let last_bytes = self
@@ -753,7 +902,8 @@ impl ServerTransaction {
         }
         if let Some(resp) = &self.last_response {
             let bytes = resp.to_bytes();
-            self.socket.send_to(&bytes, self.remote).await?;
+            // 応答再送も rport / received 反映済の UDP 宛先へ (RFC 3581 §4)
+            self.socket.send_to(&bytes, self.response_dest).await?;
             write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
             trace!(?self.id, "server tx 応答再送 (タイマ未起動)");
         }
@@ -1804,5 +1954,203 @@ mod tests {
         assert_eq!(resp.status_code, 403);
 
         uas_handle.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 3581 §4 / RFC 3261 §18.2.1: UAS rport / received 対応 (issue #60)
+    // -----------------------------------------------------------------------
+
+    /// RFC 3581 §4: 受信 Via に `;rport` があれば、応答 Via に
+    /// `received=<UDP src ip>;rport=<UDP src port>` が埋め込まれる。
+    #[test]
+    fn rfc3581_uas_adds_received_and_rport_when_present() {
+        let via = "SIP/2.0/UDP 192.0.2.1:59983;branch=z9hG4bKabc;rport";
+        let remote: SocketAddr = "203.0.113.7:55442".parse().unwrap();
+        let updated = apply_rport_to_via_for_response(via, &remote);
+        assert!(
+            updated.contains("received=203.0.113.7"),
+            "received= に UDP source IP: {}",
+            updated
+        );
+        assert!(
+            updated.contains("rport=55442"),
+            "rport= に UDP source port: {}",
+            updated
+        );
+        // 元の branch は保持される
+        assert!(updated.contains("branch=z9hG4bKabc"), "{}", updated);
+    }
+
+    /// RFC 3581 §4: 既に `;rport=NNN` が入った Via が来た場合 (proxy 経由など)、
+    /// 応答 Via では UDP source の port で上書きする。
+    #[test]
+    fn rfc3581_uas_overwrites_existing_rport_value() {
+        let via = "SIP/2.0/UDP 192.0.2.1:5060;rport=11111;branch=z9hG4bKxyz";
+        let remote: SocketAddr = "203.0.113.7:55442".parse().unwrap();
+        let updated = apply_rport_to_via_for_response(via, &remote);
+        assert!(
+            updated.contains("rport=55442"),
+            "rport= が UDP source port で上書きされる: {}",
+            updated
+        );
+        assert!(
+            !updated.contains("rport=11111"),
+            "古い rport= 値が残ってはいけない: {}",
+            updated
+        );
+    }
+
+    /// RFC 3261 §18.2.1: `;rport` が無くても、Via host が UDP source IP と
+    /// 異なるときは `received=<UDP src ip>` を追加する (rport は付けない)。
+    #[test]
+    fn rfc3261_18_2_1_uas_adds_received_when_via_host_differs_from_src() {
+        let via = "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKnoport";
+        let remote: SocketAddr = "203.0.113.7:55442".parse().unwrap();
+        let updated = apply_rport_to_via_for_response(via, &remote);
+        assert!(
+            updated.contains("received=203.0.113.7"),
+            "received= 追加: {}",
+            updated
+        );
+        assert!(
+            !updated.contains("rport"),
+            ";rport が無いなら rport= も追加しない: {}",
+            updated
+        );
+    }
+
+    /// RFC 3261 §18.2.1: Via host と UDP source IP が一致 (NAT 越えなし)
+    /// かつ `;rport` 無しなら Via は手付かず。
+    #[test]
+    fn rfc3261_18_2_1_uas_keeps_via_when_host_matches() {
+        let via = "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKsame";
+        let remote: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+        let updated = apply_rport_to_via_for_response(via, &remote);
+        assert_eq!(updated, via);
+    }
+
+    /// IPv6 sent-by の host 部抽出が `[::1]:5060` → `[::1]` で動く。
+    #[test]
+    fn via_sent_by_host_handles_ipv6_literal() {
+        assert_eq!(via_sent_by_host("[2001:db8::1]:5060"), "[2001:db8::1]");
+        assert_eq!(via_sent_by_host("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(via_sent_by_host("192.0.2.1:5060"), "192.0.2.1");
+        assert_eq!(via_sent_by_host("192.0.2.1"), "192.0.2.1");
+        assert_eq!(
+            via_sent_by_host("host.example.com:5061"),
+            "host.example.com"
+        );
+    }
+
+    /// VPN/NAT 越え再現: Via host が RFC 5737 ダミー (`192.0.2.1`) でも、
+    /// `ServerTransaction` の応答 UDP destination は UDP source (= remote)
+    /// になる (issue #60 の症状根本対処、RFC 3581 §4)。
+    #[tokio::test]
+    async fn rfc3581_uas_uses_udp_source_for_response_when_rport_present() {
+        // UAS ソケット
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // 「真の UDP source」(VPN 出口) を別ソケットで模擬する
+        let vpn_egress = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let vpn_addr = vpn_egress.local_addr().unwrap();
+
+        // INVITE 風 request (Via host は VPN 内 IP `192.0.2.1` ダミー)。
+        let mut req = make_invite_request("z9hG4bKvpn");
+        req.headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:59983;branch=z9hG4bKvpn;rport");
+
+        // ServerTransaction を vpn_addr (UDP source) で生成
+        let mut stx = ServerTransaction::new(req, vpn_addr, uas_sock.clone()).unwrap();
+        // 200 OK を返す
+        let mut resp = make_response("z9hG4bKvpn", 200, "INVITE");
+        resp.headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:59983;branch=z9hG4bKvpn;rport");
+        stx.respond(resp).await.unwrap();
+
+        // VPN 出口ソケットが応答を **受け取れる** ことを確認 (Via host
+        // `192.0.2.1` 黒穴行きではない)
+        let mut buf = vec![0u8; 4096];
+        let (n, _peer) =
+            tokio::time::timeout(Duration::from_secs(1), vpn_egress.recv_from(&mut buf))
+                .await
+                .expect("応答が UDP source に届かない (issue #60 再発)")
+                .unwrap();
+        let resp_text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp_text.contains("SIP/2.0 200"));
+        // received= / rport= が乗っている
+        assert!(
+            resp_text.contains(&format!("received={}", vpn_addr.ip())),
+            "received= が無い: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains(&format!("rport={}", vpn_addr.port())),
+            "rport= が無い: {}",
+            resp_text
+        );
+        drop(stx);
+    }
+
+    /// E2E: 内線 UAS が VPN 経由 (Via host が RFC 5737 ダミー) からの REGISTER
+    /// 風リクエストに対して、応答 UDP を **UDP source** へ向けることを確認する。
+    /// issue #60 の Linphone/VPN 経路の最小再現。
+    #[tokio::test]
+    async fn vpn_dummy_via_host_response_routes_to_udp_source() {
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uas_addr = uas_sock.local_addr().unwrap();
+        // recv_loop を起動して TU に流す
+        let (_layer, mut inbound_rx) = TransactionLayer::spawn(uas_sock.clone());
+
+        // VPN 出口の UDP socket
+        let vpn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Linphone-like REGISTER: Via host = 192.0.2.1 (RFC 5737), rport 付き
+        let mut req = SipRequest::new(SipMethod::Register, "sip:sabiden");
+        req.headers.set(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.1:59983;branch=z9hG4bKvpne2e;rport",
+        );
+        req.headers.set("From", "<sip:alice@sabiden>;tag=alice");
+        req.headers.set("To", "<sip:alice@sabiden>");
+        req.headers.set("Call-ID", "vpn-e2e@host");
+        req.headers.set("CSeq", "1 REGISTER");
+        vpn.send_to(&req.to_bytes(), uas_addr).await.unwrap();
+
+        // TU 受信
+        let inbound = tokio::time::timeout(Duration::from_secs(1), inbound_rx.recv())
+            .await
+            .expect("inbound timeout")
+            .expect("inbound dropped");
+        // ServerTransaction を構築し、200 OK を返す (UAS 模擬)
+        let mut stx =
+            ServerTransaction::new(inbound.request.clone(), inbound.remote, uas_sock.clone())
+                .unwrap();
+        let resp = build_response_skeleton(&inbound.request, 200, "OK");
+        stx.respond(resp).await.unwrap();
+
+        // VPN 側で応答が受け取れる (Via host `192.0.2.1` ではなく UDP source
+        // = vpn の local_addr に到達) ことを確認
+        let mut buf = vec![0u8; 4096];
+        let (n, _peer) = tokio::time::timeout(Duration::from_secs(1), vpn.recv_from(&mut buf))
+            .await
+            .expect("応答が UDP source に届かない (issue #60 再発)")
+            .unwrap();
+        let resp_text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            resp_text.starts_with("SIP/2.0 200"),
+            "200 が来ない: {}",
+            resp_text
+        );
+        let vpn_local = vpn.local_addr().unwrap();
+        assert!(
+            resp_text.contains(&format!("received={}", vpn_local.ip())),
+            "received= が UDP src IP: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains(&format!("rport={}", vpn_local.port())),
+            "rport= が UDP src port: {}",
+            resp_text
+        );
+        drop(stx);
     }
 }

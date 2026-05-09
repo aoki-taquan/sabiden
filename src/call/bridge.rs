@@ -72,6 +72,29 @@ impl MediaBridge {
             }
         }
     }
+
+    /// Issue #69: NGN レッグ socket から NGN ピア宛に任意 RTP datagram を 1 つ
+    /// 注入する。SIP INFO で受け取った DTMF を RFC 4733 telephone-event RTP
+    /// packet に変換して NGN レッグへ流す用途。
+    ///
+    /// `MediaBridge::Relay` (両側 PCMU) でも `MediaBridge::Transcode` (Opus⇔PCMU)
+    /// でも同じ NGN socket / NGN peer を使うので、変種に関わらず同一インタフェース
+    /// で扱える。
+    pub async fn send_to_ngn(&self, datagram: &[u8]) -> Result<()> {
+        match self {
+            MediaBridge::Relay(b) => b.send_to_ngn(datagram).await,
+            MediaBridge::Transcode(b) => b.send_to_ngn(datagram).await,
+        }
+    }
+
+    /// Issue #69: 内線レッグ socket から内線ピア宛に任意 RTP datagram を 1 つ
+    /// 注入する (NGN→内線 INFO 経路の placeholder)。
+    pub async fn send_to_ext(&self, datagram: &[u8]) -> Result<()> {
+        match self {
+            MediaBridge::Relay(b) => b.send_to_ext(datagram).await,
+            MediaBridge::Transcode(b) => b.send_to_web(datagram).await,
+        }
+    }
 }
 
 impl From<RtpBridge> for MediaBridge {
@@ -106,6 +129,12 @@ pub struct RtpBridge {
     ext_handle: Option<JoinHandle<()>>,
     /// 内側状態: 統計・peer など。`stop` 後でもアクセスできるよう保持する。
     state: Arc<BridgeState>,
+    /// NGN 側 socket / 学習済 peer。DTMF 注入 (Issue #69) で使う。
+    ngn_socket: Arc<UdpSocket>,
+    ngn_state: Arc<LegState>,
+    /// 内線側 socket / 学習済 peer。NGN→内線 INFO 経路の DTMF 注入で使う。
+    ext_socket: Arc<UdpSocket>,
+    ext_state: Arc<LegState>,
 }
 
 #[derive(Default)]
@@ -171,10 +200,10 @@ impl RtpBridge {
         // 内線 -> NGN 方向
         let ext_handle = tokio::spawn(forward_loop(
             "ext→NGN",
-            ext_socket,
-            ngn_socket,
-            ext_state,
-            ngn_state,
+            ext_socket.clone(),
+            ngn_socket.clone(),
+            ext_state.clone(),
+            ngn_state.clone(),
             state.clone(),
             false,
             metrics,
@@ -184,7 +213,42 @@ impl RtpBridge {
             ngn_handle: Some(ngn_handle),
             ext_handle: Some(ext_handle),
             state,
+            ngn_socket,
+            ngn_state,
+            ext_socket,
+            ext_state,
         })
+    }
+
+    /// NGN 側ソケットから NGN ピアへ任意の RTP datagram を 1 つ送る。
+    ///
+    /// Issue #69 (DTMF interop): 内線が SIP INFO で送ってきた DTMF を
+    /// RFC 4733 telephone-event RTP packet に変換して NGN レッグに乗せる用途。
+    /// NGN ピアが学習されていない (= まだ RTP を受信していない) 場合は
+    /// `Err` を返し、呼び出し側でバッファリング or drop する。
+    ///
+    /// 通常の音声 RTP は `forward_loop` がそのまま転送するので本メソッド
+    /// 経由で送る必要はない。本メソッドは「外部から bridge に新規 RTP を
+    /// 注入する」用途専用。
+    pub async fn send_to_ngn(&self, datagram: &[u8]) -> Result<()> {
+        let dest = { *self.ngn_state.peer.lock().await };
+        let dest = dest.ok_or_else(|| anyhow::anyhow!("NGN peer 未確定"))?;
+        self.ngn_socket.send_to(datagram, dest).await?;
+        Ok(())
+    }
+
+    /// 内線側ソケットから内線ピアへ任意の RTP datagram を 1 つ送る。
+    ///
+    /// Issue #69: NGN レッグから来た RFC 4733 telephone-event を、内線 UA が
+    /// INFO 派の場合に SIP INFO へ変換するのではなく、PT=101 をそのまま
+    /// 内線レッグに流すケースで使う (本実装では bridge がそもそも PT=101 を
+    /// 透過するため、本メソッドは将来 NGN→内線 で INFO→RFC 4733 変換が
+    /// 必要になった時用の placeholder)。
+    pub async fn send_to_ext(&self, datagram: &[u8]) -> Result<()> {
+        let dest = { *self.ext_state.peer.lock().await };
+        let dest = dest.ok_or_else(|| anyhow::anyhow!("ext peer 未確定"))?;
+        self.ext_socket.send_to(datagram, dest).await?;
+        Ok(())
     }
 
     /// 両ループを停止して JoinHandle を待ち合わせる。
@@ -557,8 +621,126 @@ mod tests {
         let (to_ext, to_ngn) = bridge.stats();
         assert!(to_ext >= 1, "NGN→Web 統計 = {}", to_ext);
         assert!(to_ngn >= 1, "Web→NGN 統計 = {}", to_ngn);
+        let _ = web_peer_addr;
 
         // MediaBridge::stop で両ループがちゃんと畳まれる。
+        bridge.stop().await;
+    }
+
+    /// Issue #69: `send_to_ngn` は NGN 側 socket を使って NGN ピア宛に
+    /// 任意 RTP datagram を 1 つ送れる。学習済 peer が無い場合は Err。
+    #[tokio::test]
+    async fn rfc4733_send_to_ngn_injects_dtmf_packet() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ext_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+        let ext_peer_addr = ext_peer_sock.local_addr().unwrap();
+
+        let bridge = RtpBridge::start(BridgeConfig {
+            ngn_socket: ngn_sock,
+            ext_socket: ext_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            ext_peer: Some(ext_peer_addr),
+            metrics: None,
+        })
+        .unwrap();
+
+        // RFC 4733 telephone-event RTP packet を NGN レッグへ注入する。
+        let dtmf_pkt = RtpPacket {
+            payload_type: 101, // telephone-event
+            marker: true,
+            sequence: 5000,
+            timestamp: 100000,
+            ssrc: 0xDEAD_BEEF,
+            payload: vec![1, 0x0a, 0x03, 0x20], // event=1, vol=10, dur=800
+        }
+        .to_bytes();
+        bridge.send_to_ngn(&dtmf_pkt).await.expect("send_to_ngn");
+
+        let mut buf = vec![0u8; 1500];
+        let (n, _src) = timeout(Duration::from_secs(1), ngn_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("NGN ピアで DTMF が受信できない")
+            .unwrap();
+        let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(recv.payload_type, 101);
+        assert_eq!(recv.sequence, 5000);
+        assert_eq!(recv.payload, vec![1, 0x0a, 0x03, 0x20]);
+        let _ = ext_peer_sock;
+        let _ = ext_peer_addr;
+
+        bridge.stop().await;
+    }
+
+    /// Issue #69: PT=101 telephone-event RTP packet も `forward_loop` で
+    /// 透過される (内線→NGN 方向、SDP に PT=101 が乗っている前提)。
+    /// PCMU と並走しても整合性が保たれる。
+    #[tokio::test]
+    async fn rfc4733_telephone_event_pt_101_forwards_transparently() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_addr = ext_sock.local_addr().unwrap();
+
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ext_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+        let ext_peer_addr = ext_peer_sock.local_addr().unwrap();
+
+        let bridge = RtpBridge::start(BridgeConfig {
+            ngn_socket: ngn_sock,
+            ext_socket: ext_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            ext_peer: Some(ext_peer_addr),
+            metrics: None,
+        })
+        .unwrap();
+
+        // ext→NGN: 1) PCMU (PT=0) を 1 個、2) telephone-event (PT=101) を 1 個。
+        let pcmu = RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: false,
+            sequence: 1,
+            timestamp: 0,
+            ssrc: 0xCAFE,
+            payload: vec![0xff; 160],
+        }
+        .to_bytes();
+        let dtmf = RtpPacket {
+            payload_type: 101,
+            marker: true,
+            sequence: 2,
+            timestamp: 160,
+            ssrc: 0xCAFE,
+            payload: vec![3, 0x80 | 10, 0x03, 0x20], // event=3, end=1
+        }
+        .to_bytes();
+        ext_peer_sock.send_to(&pcmu, ext_addr).await.unwrap();
+        ext_peer_sock.send_to(&dtmf, ext_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let mut got_pcmu = false;
+        let mut got_dtmf = false;
+        for _ in 0..2 {
+            let (n, _src) = timeout(Duration::from_secs(1), ngn_peer_sock.recv_from(&mut buf))
+                .await
+                .expect("forward 待機 timeout")
+                .unwrap();
+            let pkt = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            match pkt.payload_type {
+                PAYLOAD_TYPE_ULAW => got_pcmu = true,
+                101 => got_dtmf = true,
+                other => panic!("予期しない PT={other}"),
+            }
+        }
+        assert!(
+            got_pcmu && got_dtmf,
+            "PT=0 と PT=101 の両方が forward されるべき"
+        );
+        let _ = ext_peer_addr;
+
         bridge.stop().await;
     }
 

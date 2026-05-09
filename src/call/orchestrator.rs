@@ -54,7 +54,7 @@ use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, 
 use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
-use crate::sdp::builder::{restrict_audio_to_pcmu, rewrite_rtp_endpoint};
+use crate::sdp::builder::{restrict_audio_to_pcmu_with_dtmf, rewrite_rtp_endpoint};
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
@@ -517,10 +517,12 @@ impl NgnInboundHandler {
         );
 
         // NGN へ返す 200 OK SDP は sabiden の NGN 側ソケットを指すように書き換える。
-        // `restrict_audio_to_pcmu` で内線 UA が乗せた WebRTC 由来属性 (rtcp-fb /
-        // rtcp-mux / fingerprint 等) を除去し、コーデックを PCMU (PT 0) に絞り込む
-        // (`docs/asterisk-real-invite.md` §2 / `CLAUDE.md` §5: NGN は PCMU only)。
-        let pcmu_only = restrict_audio_to_pcmu(ext_answer);
+        // `restrict_audio_to_pcmu_with_dtmf` で内線 UA が乗せた WebRTC 由来属性
+        // (rtcp-fb / rtcp-mux / fingerprint 等) を除去し、コーデックを PCMU (PT 0)
+        // + telephone-event (PT 101 / RFC 4733) に絞り込む
+        // (`docs/asterisk-real-invite.md` §2 / `CLAUDE.md` §5: NGN は音声 PCMU only。
+        // ただし PT 101 telephone-event は in-band DTMF 用途で並走可能 / Issue #69)。
+        let pcmu_only = restrict_audio_to_pcmu_with_dtmf(ext_answer);
         let rewritten =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
 
@@ -874,6 +876,11 @@ impl UasEventHandler {
                 responder,
             } => self.handle_ext_cancel(request, remote, responder).await,
             UasEvent::Ack { request, remote } => self.handle_ext_ack(request, remote).await,
+            UasEvent::Info {
+                request,
+                remote,
+                responder,
+            } => self.handle_ext_info(request, remote, responder).await,
         }
     }
 
@@ -940,12 +947,12 @@ impl UasEventHandler {
                     }
                 };
 
-            // NGN は PCMU(0) しか受け入れない。Linphone/Zoiper 等が送ってくる
-            // multi-codec オファ (Opus 等) を素通しすると 488 で蹴られるので、
-            // NGN へ送る直前で PCMU のみに絞る。RTP ブリッジ用に書き換え済の
-            // SDP に対してさらにコーデック絞りを適用しても既に endpoint は
-            // sabiden 側を指しており整合性は崩れない。
-            let sdp_for_ngn = sdp_for_ngn.map(|s| crate::sdp::builder::restrict_audio_to_pcmu(&s));
+            // NGN は PCMU(0) しか **音声** として受け入れないが、Issue #69 で
+            // RFC 4733 telephone-event (PT=101) を **in-band DTMF** 用に並走
+            // させる。NGN 側の SIP プロキシ (Asterisk 等) は telephone-event を
+            // 素通しするので、PCMU + telephone-event だけ残せば 200 OK が返る。
+            // Opus / Speex / G.729 等は引き続き削除する。
+            let sdp_for_ngn = sdp_for_ngn.map(|s| restrict_audio_to_pcmu_with_dtmf(&s));
 
             let plan = self
                 .ngn_uac
@@ -1187,6 +1194,142 @@ impl UasEventHandler {
         }
         // メトリクス: NGN INVITE は cancel された (= 失敗扱い)。
         self.metrics.record_invite_ngn(InviteResult::Error);
+        Ok(())
+    }
+
+    /// 内線からの SIP INFO を扱う (RFC 6086)。
+    ///
+    /// 主用途は DTMF 中継 (Issue #69)。内線 UA が `application/dtmf-relay`
+    /// または `application/dtmf` body で DTMF を送ってきた場合、本実装は
+    /// RFC 4733 §2.5 telephone-event RTP packet 列に展開し、`CallManager`
+    /// 経由で NGN レッグへ注入する。INFO 自身には 200 OK を返す (RFC 6086
+    /// §3 / §4: 既存ダイアログの確認応答)。
+    ///
+    /// # 動作
+    /// 1. `Content-Type` から body 形式を判定
+    /// 2. body をパースして DTMF digit を取り出す
+    /// 3. `CallManager` がある場合のみ RTP packet 列を生成し NGN レッグへ送る
+    /// 4. responder で 200 OK を返す (失敗時は 415 Unsupported Media Type)
+    async fn handle_ext_info(
+        &self,
+        request: SipRequest,
+        _remote: SocketAddr,
+        responder: ResponderHandle,
+    ) -> Result<()> {
+        let call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_default();
+        let content_type = request
+            .headers
+            .get("content-type")
+            .map(str::to_string)
+            .unwrap_or_default();
+        let ct_lower = content_type.to_lowercase();
+
+        // RFC 6086: INFO 自身の 200 OK は body 解釈に関わらず先に返す。
+        // NGN への DTMF 注入が失敗しても内線 UA に対する INFO 応答は
+        // 200 OK で確認するのが各 UA 実装と整合的 (Linphone / Polycom)。
+        let dtmf_digit = if ct_lower.contains("application/dtmf-relay") {
+            match super::dtmf::parse_application_dtmf_relay(&request.body) {
+                Ok((digit, _dur)) => Some(digit),
+                Err(e) => {
+                    warn!(error=%e, "INFO dtmf-relay body パース失敗 → 415");
+                    return responder.quick(415, "Unsupported Media Type").await;
+                }
+            }
+        } else if ct_lower.contains("application/dtmf") {
+            match super::dtmf::parse_application_dtmf(&request.body) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    warn!(error=%e, "INFO dtmf body パース失敗 → 415");
+                    return responder.quick(415, "Unsupported Media Type").await;
+                }
+            }
+        } else {
+            // DTMF 以外の INFO body は対応しない。RFC 6086 §10.4 に従い
+            // 415 が無難 (200 OK を返すと「処理した」と誤解させる)。
+            warn!(content_type=%content_type, "未対応 INFO Content-Type → 415");
+            return responder.quick(415, "Unsupported Media Type").await;
+        };
+
+        // INFO 受領を 200 OK で確認 (RFC 6086 §4)。
+        if let Err(e) = responder.quick(200, "OK").await {
+            warn!(error=%e, "INFO 200 OK 送出失敗");
+        }
+
+        let Some(digit) = dtmf_digit else {
+            return Ok(());
+        };
+        let Some(event) = super::dtmf::digit_to_event(digit) else {
+            warn!(?digit, "RFC 4733 範囲外の DTMF digit → drop");
+            return Ok(());
+        };
+
+        // CallManager / 該当通話の bridge_call_id が無いと注入できない。
+        let entry = match self.registry.lookup_by_ext(&call_id).await {
+            Some(e) => e,
+            None => {
+                debug!(%call_id, "INFO: 該当通話なし → DTMF drop");
+                return Ok(());
+            }
+        };
+        let Some(bridge_id) = entry.bridge_call_id else {
+            debug!(%call_id, "INFO: bridge 未確立 → DTMF drop");
+            return Ok(());
+        };
+        let Some(mgr) = self.call_manager.as_ref() else {
+            debug!("CallManager 未注入 → DTMF drop");
+            return Ok(());
+        };
+
+        // RFC 4733 §2.5.1.1: 同 1 押下で timestamp は固定。sabiden は
+        // bridge 内の audio timestamp 系列と独立に DTMF 用 timestamp / SSRC を
+        // 払い出す (RFC 4733 §2.4 が許容する)。簡易実装として:
+        // - timestamp は当該イベント発生時刻のミリ秒下位 32 bit
+        // - SSRC は call-id ベースのハッシュ (1 通話で固定)
+        let now_ts = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+            & 0xFFFF_FFFF) as u32;
+        let ssrc = {
+            // 衝突を最小化する単純な FNV-1a 風ハッシュ
+            let mut h: u32 = 0x811c_9dc5;
+            for &b in call_id.as_bytes() {
+                h ^= b as u32;
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            // SSRC=0 を避ける
+            if h == 0 {
+                0xCAFE_BABE
+            } else {
+                h
+            }
+        };
+        // start_seq はランダムでよいが時刻下位 16bit で十分 (1 通話で重複しない範囲)。
+        let start_seq = (now_ts & 0xFFFF) as u16;
+
+        // RFC 4733 §2.5.1.1: 50ms 区切りで重複 packet を送り、終端は triplet。
+        // duration は 100ms (DTMF として最低限聞こえる長さ)。
+        let seq = super::dtmf::build_dtmf_packet_sequence(
+            event, start_seq, now_ts, ssrc, /* duration_ms */ 100, /* period_ms */ 50,
+            /* volume */ 10,
+        );
+        debug!(
+            %call_id,
+            digit = %digit,
+            packets = seq.packets.len(),
+            "INFO→RFC 4733 telephone-event 変換 → NGN へ注入"
+        );
+        for pkt in seq.packets {
+            let bytes = pkt.to_bytes();
+            if let Err(e) = mgr.inject_to_ngn(bridge_id, &bytes).await {
+                warn!(error=%e, "DTMF RTP 注入失敗");
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -2756,14 +2899,12 @@ mod tests {
 
         let mgr = CallManager::new(ExtensionRegistrar::new());
 
-        let handler = UasEventHandler::with_call_manager(
+        let mut handler = UasEventHandler::with_call_manager(
             ngn_uac,
             mgr.clone(),
             Some("127.0.0.1".parse().unwrap()),
             Some("127.0.0.1".parse().unwrap()),
         );
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        handler.spawn(event_rx);
 
         // 内線が出すであろう INVITE を擬似的に作成 (responder は ServerTransaction が必要)。
         // 内線ピア役の SIP トランザクションを 1 個作成し ResponderHandle を握る。
@@ -2772,6 +2913,13 @@ mod tests {
         // 内線→sabiden 用ソケット (内線 UAS 役を簡易的に手書きする)
         let sabiden_uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+
+        // 内線レッグの TransactionLayer を結線する (Issue #69 INFO 経路で必要)。
+        // attach_ext_layer は Arc::get_mut を使うので、共有前 (= spawn 前) に呼ぶ。
+        let (ext_layer, _ext_rx) = TransactionLayer::spawn(sabiden_uas_sock.clone());
+        handler.attach_ext_layer(ext_layer, Some(sabiden_uas_addr));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        handler.spawn(event_rx);
 
         let mut invite_from_phone = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
         invite_from_phone.headers.set(
@@ -2786,6 +2934,11 @@ mod tests {
             .set("To", "<sip:0312345678@sabiden>");
         invite_from_phone.headers.set("Call-ID", "uas-bridge-cid");
         invite_from_phone.headers.set("CSeq", "1 INVITE");
+        // RFC 3261 §12.1.2: in-dialog 確立には Contact が必要 (sabiden 側で
+        // ext-leg dialog を組むのに必須)。
+        invite_from_phone
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_addr));
         invite_from_phone
             .headers
             .set("Content-Type", "application/sdp");
@@ -2894,6 +3047,104 @@ mod tests {
             .unwrap();
         let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
         assert_eq!(recv.ssrc, 0xDEAD_BEEF);
+
+        // ===== Issue #69: 内線が SIP INFO で DTMF を送ったら、 NGN レッグへ
+        //       RFC 4733 telephone-event RTP packet が流れることを確認する。 =====
+        // 内線→NGN INFO body は `Signal=5\r\nDuration=200\r\n` (Cisco/Avaya 形式)。
+        let mut info_req = SipRequest::new(SipMethod::Info, "sip:sabiden");
+        info_req.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKuasinfo", phone_addr),
+        );
+        info_req
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=phonet");
+        info_req
+            .headers
+            .set("To", "<sip:0312345678@sabiden>;tag=ngn-tag");
+        info_req.headers.set("Call-ID", "uas-bridge-cid");
+        info_req.headers.set("CSeq", "2 INFO");
+        info_req
+            .headers
+            .set("Content-Type", "application/dtmf-relay");
+        info_req.body = b"Signal=5\r\nDuration=200\r\n".to_vec();
+        let info_stx =
+            ServerTransaction::new(info_req.clone(), phone_addr, sabiden_uas_sock.clone()).unwrap();
+        let info_responder = crate::sip::uas::ResponderHandle::__test_new(info_stx);
+        event_tx
+            .send(UasEvent::Info {
+                request: info_req,
+                remote: phone_addr,
+                responder: info_responder,
+            })
+            .unwrap();
+
+        // INFO への 200 OK が内線に届く (RFC 6086 §4)
+        let mut got_info_ok = false;
+        for _ in 0..3 {
+            match timeout(Duration::from_secs(2), phone_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        if r.status_code == 200 {
+                            // CSeq から INFO 応答であることを確認
+                            if r.headers
+                                .get("cseq")
+                                .map(|v| v.contains("INFO"))
+                                .unwrap_or(false)
+                            {
+                                got_info_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_info_ok, "RFC 6086 §4: INFO への 200 OK が必要");
+
+        // NGN ピアは RFC 4733 の telephone-event RTP packet を受け取る (event=5)。
+        // build_dtmf_packet_sequence(duration=100ms, period=50ms) なので
+        // 中間 2 + 終端 3 = 5 packet 来る。最初の packet は marker=1。
+        let mut got_pt101 = 0usize;
+        let mut got_marker = false;
+        let mut got_event_5 = false;
+        let mut got_end_bit = false;
+        for _ in 0..6 {
+            match timeout(Duration::from_secs(1), ngn_peer_rtp.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    let pkt = RtpPacket::from_bytes(&buf[..n]).unwrap();
+                    if pkt.payload_type == 101 {
+                        got_pt101 += 1;
+                        if pkt.marker {
+                            got_marker = true;
+                        }
+                        let evt =
+                            crate::call::dtmf::TelephoneEvent::from_payload(&pkt.payload).unwrap();
+                        if evt.event == 5 {
+                            got_event_5 = true;
+                        }
+                        if evt.end {
+                            got_end_bit = true;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            got_pt101 >= 4,
+            "RFC 4733: PT=101 packet が複数届くべき (got {got_pt101})"
+        );
+        assert!(
+            got_marker,
+            "RFC 4733 §2.5.1.1: 押下開始 packet で marker=1 必須"
+        );
+        assert!(got_event_5, "RFC 4733 §3.2: digit '5' は event=5 必須");
+        assert!(
+            got_end_bit,
+            "RFC 4733 §2.5.1.2: 押下終了 packet (E=1) が必要"
+        );
     }
 
     // ===== B2BUA 双方向シグナリング テスト群 =====

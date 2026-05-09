@@ -72,6 +72,20 @@ pub enum UasEvent {
         request: SipRequest,
         remote: SocketAddr,
     },
+    /// 既存ダイアログに対する INFO (RFC 6086)。
+    ///
+    /// 主用途は DTMF 中継 (Issue #69 / RFC 4733 + RFC 6086)。
+    /// 内線 UA が `application/dtmf-relay` または `application/dtmf` body で
+    /// DTMF を送る場合、上位層 (`UasEventHandler`) が NGN レッグへ
+    /// RFC 4733 telephone-event RTP packet として変換する。
+    ///
+    /// `responder` は INFO 自身の 200 OK を返すために使う。本実装は INFO の
+    /// 応答コードを上位層に委ねる (RFC 6086 §3 / §4)。
+    Info {
+        request: SipRequest,
+        remote: SocketAddr,
+        responder: ResponderHandle,
+    },
 }
 
 /// 1 リクエストに対応するサーバ トランザクションの操作ハンドル。
@@ -310,6 +324,27 @@ impl ExtensionUas {
                 SipMethod::Options => {
                     // 単純な keep-alive 応答 (Linphone 等が定期送信する)
                     let _ = responder.quick(200, "OK").await;
+                }
+                SipMethod::Info => {
+                    // RFC 6086 §3: INFO は既存ダイアログ内で送られる中間情報。
+                    // 主用途は DTMF (Issue #69)。応答 (200 OK or 481) は上位層
+                    // (`UasEventHandler`) に委ねる。Call Manager 未接続なら
+                    // RFC 6086 §4 に従い 481 で返す (該当ダイアログ無しと同等)。
+                    debug!("INFO 受信 → 上位層へ転送");
+                    if let Some(tx) = &self.event_tx {
+                        let event = UasEvent::Info {
+                            request,
+                            remote,
+                            responder,
+                        };
+                        if tx.send(event).is_err() {
+                            warn!("Call Manager 受信側が閉じている → INFO は dropped");
+                        }
+                    } else {
+                        let _ = responder
+                            .quick(481, "Call/Transaction Does Not Exist")
+                            .await;
+                    }
                 }
                 other => {
                     warn!(?other, "未対応メソッド → 405");

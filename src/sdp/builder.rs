@@ -491,6 +491,99 @@ a=rtcp-fb:* ccm tmmbr\r\n";
         );
     }
 
+    /// Issue #69 / RFC 4733 §3.2: PCMU + telephone-event を残す変種では
+    /// PT=0 と PT=101 だけが残り、`a=fmtp:101 0-15` が補完される。
+    #[test]
+    fn rfc4733_3_2_restrict_audio_to_pcmu_with_dtmf_keeps_pt_0_and_101() {
+        // Linphone から来る multi-codec オファに PT=101 telephone-event/8000 が
+        // 既に乗っているケース。`fmtp:101 0-16` のように DTMF 範囲外まで含む
+        // 値が来ても、フィルタ後の fmtp はそのまま (RFC 4733 §3.2 の `0-15` を
+        // 越える dynamic 範囲を許容する UA はそのまま素通しでよい)。
+        let linphone_sdp = b"v=0\r\n\
+o=iphone 1 1 IN IP4 192.168.30.162\r\n\
+s=Talk\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 54205 RTP/AVP 96 0 8 101\r\n\
+a=rtpmap:96 opus/48000/2\r\n\
+a=fmtp:96 useinbandfec=1\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=fmtp:101 0-15\r\n";
+
+        let restricted = restrict_audio_to_pcmu_with_dtmf(linphone_sdp);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+
+        // m= 行に PT=0 と PT=101 が両方残る
+        assert!(
+            s.contains("m=audio 54205 RTP/AVP 0 101\r\n"),
+            "PT 0 + 101 のみであるべき: {s}"
+        );
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(s.contains("a=fmtp:101 0-15\r\n"));
+
+        // Opus / PCMA は消える
+        assert!(!s.to_lowercase().contains("opus"), "opus が残ってる: {s}");
+        assert!(!s.contains("PCMA"), "PCMA が残ってる: {s}");
+    }
+
+    /// Issue #69: PT=101 が **48000Hz** で来た場合 (Linphone デフォ) は破棄し、
+    /// 8000Hz 用 rtpmap を補う。NGN audio は 8kHz 固定のため 48k だと整合しない。
+    #[test]
+    fn rfc4733_3_2_restrict_audio_drops_48khz_telephone_event_and_inserts_8khz() {
+        let sdp = b"v=0\r\n\
+o=- 1 1 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 54205 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/48000\r\n";
+
+        let restricted = restrict_audio_to_pcmu_with_dtmf(sdp);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(
+            !s.contains("telephone-event/48000"),
+            "48k は捨てるべき: {s}"
+        );
+        assert!(s.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(s.contains("a=fmtp:101 0-15\r\n"));
+    }
+
+    /// Issue #69: PT=101 が SDP に無くても (PCMU only オファ) 補完される。
+    #[test]
+    fn rfc4733_3_2_restrict_audio_inserts_dtmf_into_pcmu_only_offer() {
+        let pcmu_only = b"v=0\r\n\
+o=- 0 0 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n";
+        let restricted = restrict_audio_to_pcmu_with_dtmf(pcmu_only);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(s.contains("m=audio 30000 RTP/AVP 0 101\r\n"));
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(s.contains("a=fmtp:101 0-15\r\n"));
+        assert!(s.contains("a=ptime:20\r\n"));
+    }
+
+    /// `pcmu_offer_with_dtmf` ヘルパが PT=0 + PT=101 を提示する SDP を生成する。
+    #[test]
+    fn rfc4733_3_2_pcmu_offer_with_dtmf_emits_telephone_event() {
+        let addr: IpAddr = "192.168.1.10".parse().unwrap();
+        let offer = SessionDescription::pcmu_offer_with_dtmf(addr, 30000, 20);
+        let s = offer.to_string_crlf();
+        assert!(s.contains("m=audio 30000 RTP/AVP 0 101\r\n"));
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(s.contains("a=fmtp:101 0-15\r\n"));
+    }
+
     #[test]
     fn restrict_audio_to_pcmu_passes_through_already_pcmu_only() {
         let pcmu_only = b"v=0\r\n\
@@ -510,6 +603,12 @@ a=sendrecv\r\n";
         assert!(s.contains("a=sendrecv\r\n"));
     }
 }
+
+/// DTMF 用 telephone-event の RTP payload type 番号 (動的だが de-facto 101)。
+///
+/// SDP の `a=rtpmap:101 telephone-event/8000` で合意される (RFC 4733 §3.2)。
+/// sabiden は B2BUA として両レッグに同一値を提示する。
+pub const DTMF_PAYLOAD_TYPE: u8 = 101;
 
 impl SessionDescription {
     /// NGN / SIP UAC で典型的に使う G.711 μ-law (PCMU) オファーを作る。
@@ -555,6 +654,164 @@ impl SessionDescription {
             }],
         }
     }
+
+    /// `pcmu_offer` に **RFC 4733 telephone-event (DTMF)** PT=101 を追加した
+    /// オファー。NGN レッグでも内線レッグでも DTMF in-band 中継するための
+    /// SDP を発行する用途。
+    ///
+    /// - `m=audio <port> RTP/AVP 0 101`
+    /// - `a=rtpmap:0 PCMU/8000`
+    /// - `a=rtpmap:101 telephone-event/8000`
+    /// - `a=fmtp:101 0-15` (RFC 4733 §3.2: 0-9, *, #, A-D の全 DTMF event)
+    /// - `a=ptime:<ptime_ms>`
+    pub fn pcmu_offer_with_dtmf(addr: IpAddr, port: u16, ptime_ms: u32) -> Self {
+        let mut sdp = Self::pcmu_offer(addr, port, ptime_ms);
+        let media = &mut sdp.media[0];
+        media.formats.push(DTMF_PAYLOAD_TYPE.to_string());
+        media.attributes.push(Attribute::Value {
+            key: "rtpmap".to_string(),
+            value: format!("{} telephone-event/8000", DTMF_PAYLOAD_TYPE),
+        });
+        media.attributes.push(Attribute::Value {
+            key: "fmtp".to_string(),
+            // RFC 4733 §3.2: 0-15 を全許容するのが最も互換性が高い。
+            value: format!("{} 0-15", DTMF_PAYLOAD_TYPE),
+        });
+        sdp
+    }
+}
+
+/// audio メディアを **G.711 μ-law (PT 0) + telephone-event (PT 101)** に絞った
+/// SDP を返す。`restrict_audio_to_pcmu` の DTMF 対応版。
+///
+/// NGN は PCMU (PT 0) しか音声として受け入れないが、telephone-event (RFC 4733)
+/// は in-band DTMF 中継のため一緒に提示してよい (NGN 側の Asterisk 等の
+/// SIP プロキシは telephone-event を素通しする)。Linphone / Zoiper 等が
+/// 送ってくる multi-codec オファ (Opus / Speex / G.729 等) を素通しすると
+/// 488 で蹴られるが、PCMU + telephone-event だけ残せば 200 OK が返る。
+///
+/// 動作:
+/// - audio media の `formats` を `["0", "101"]` に置換
+/// - rtpmap / fmtp 系のうち payload_type=0 / 101 以外を削除
+/// - WebRTC/DTLS-SRTP/ICE 由来属性 (`restrict_audio_to_pcmu` と同じセット) を削除
+/// - PCMU の `a=rtpmap:0 PCMU/8000` が無ければ補う
+/// - telephone-event の `a=rtpmap:101 telephone-event/8000` と
+///   `a=fmtp:101 0-15` が無ければ補う (RFC 4733 §3.2)
+///
+/// パース不能ならそのまま返す (ベストエフォート)。
+pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
+    let text = match std::str::from_utf8(sdp_bytes) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+    let mut sdp = match SessionDescription::parse(text) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+
+    // 削除対象: NGN が解釈しない WebRTC / DTLS-SRTP / ICE / multiplex 系。
+    fn is_unsupported_by_ngn(a: &Attribute) -> bool {
+        match a {
+            Attribute::Value { key, .. } => matches!(
+                key.as_str(),
+                "rtcp-fb"
+                    | "rtcp-xr"
+                    | "fingerprint"
+                    | "setup"
+                    | "ice-ufrag"
+                    | "ice-pwd"
+                    | "ice-options"
+                    | "ice-mismatch"
+                    | "candidate"
+                    | "msid"
+                    | "mid"
+                    | "ssrc"
+                    | "ssrc-group"
+                    | "extmap"
+                    | "rtcp-mux"
+                    | "record"
+            ),
+            Attribute::Property(p) => {
+                matches!(p.as_str(), "rtcp-mux" | "ice-lite" | "rtcp-rsize")
+            }
+        }
+    }
+    sdp.attributes.retain(|a| !is_unsupported_by_ngn(a));
+
+    if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
+        let dtmf_pt_str = DTMF_PAYLOAD_TYPE.to_string();
+        audio.formats = vec!["0".to_string(), dtmf_pt_str.clone()];
+
+        let mut have_pcmu_rtpmap = false;
+        let mut have_dtmf_rtpmap = false;
+        let mut have_dtmf_fmtp = false;
+        audio.attributes.retain(|a| {
+            if is_unsupported_by_ngn(a) {
+                return false;
+            }
+            match a {
+                Attribute::Value { key, value } => {
+                    let pt_of_value = || {
+                        value
+                            .split_whitespace()
+                            .next()
+                            .and_then(|p| p.parse::<u8>().ok())
+                    };
+                    match key.as_str() {
+                        "rtpmap" => match pt_of_value() {
+                            Some(0) => {
+                                have_pcmu_rtpmap = true;
+                                true
+                            }
+                            Some(pt) if pt == DTMF_PAYLOAD_TYPE => {
+                                // 既存の telephone-event/8000 のみ採用 (48000 等は破棄)
+                                let is_8khz = value.contains("/8000");
+                                if is_8khz {
+                                    have_dtmf_rtpmap = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        },
+                        "fmtp" => match pt_of_value() {
+                            Some(0) => true,
+                            Some(pt) if pt == DTMF_PAYLOAD_TYPE => {
+                                have_dtmf_fmtp = true;
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => true,
+                    }
+                }
+                Attribute::Property(_) => true,
+            }
+        });
+        if !have_pcmu_rtpmap {
+            audio.attributes.insert(
+                0,
+                Attribute::Value {
+                    key: "rtpmap".to_string(),
+                    value: "0 PCMU/8000".to_string(),
+                },
+            );
+        }
+        if !have_dtmf_rtpmap {
+            audio.attributes.push(Attribute::Value {
+                key: "rtpmap".to_string(),
+                value: format!("{} telephone-event/8000", DTMF_PAYLOAD_TYPE),
+            });
+        }
+        if !have_dtmf_fmtp {
+            audio.attributes.push(Attribute::Value {
+                key: "fmtp".to_string(),
+                value: format!("{} 0-15", DTMF_PAYLOAD_TYPE),
+            });
+        }
+    }
+    sdp.to_string_crlf().into_bytes()
 }
 
 #[cfg(test)]

@@ -311,6 +311,39 @@ impl CallManager {
         Ok(())
     }
 
+    /// 指定 CallId のブリッジ socket / peer 経由で NGN レッグへ任意 RTP
+    /// datagram を 1 つ注入する。
+    ///
+    /// Issue #69 (DTMF interop): SIP INFO で受け取った DTMF を RFC 4733
+    /// telephone-event の RTP packet へ変換し、NGN レッグに乗せる用途。
+    /// 該当 CallId にブリッジが付いていない / NGN ピア未学習の場合は `Err`。
+    pub async fn inject_to_ngn(&self, id: CallId, datagram: &[u8]) -> Result<()> {
+        let inner = self.inner.lock().await;
+        let entry = inner
+            .calls
+            .get(&id)
+            .ok_or_else(|| anyhow!("不明な call: {}", id))?;
+        let bridge = entry
+            .bridge
+            .as_ref()
+            .ok_or_else(|| anyhow!("call {} に RtpBridge が付いていない", id))?;
+        bridge.send_to_ngn(datagram).await
+    }
+
+    /// 内線レッグへの注入版 (NGN→内線 INFO 経路の interop placeholder)。
+    pub async fn inject_to_ext(&self, id: CallId, datagram: &[u8]) -> Result<()> {
+        let inner = self.inner.lock().await;
+        let entry = inner
+            .calls
+            .get(&id)
+            .ok_or_else(|| anyhow!("不明な call: {}", id))?;
+        let bridge = entry
+            .bridge
+            .as_ref()
+            .ok_or_else(|| anyhow!("call {} に RtpBridge が付いていない", id))?;
+        bridge.send_to_ext(datagram).await
+    }
+
     /// 現在登録済みの通話数。テスト用。
     pub async fn len(&self) -> usize {
         self.inner.lock().await.calls.len()

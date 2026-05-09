@@ -199,6 +199,11 @@ impl Uac {
     pub fn config(&self) -> &UacConfig {
         &self.config
     }
+
+    /// 上流 SIP サーバ (NGN 経路では P-CSCF) のアドレス。
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server_addr
+    }
 }
 
 /// 構築済み INVITE と関連メタデータ。

@@ -235,6 +235,70 @@ fn canonical_header_name(lower: &str) -> &str {
     }
 }
 
+/// 簡易 SIP URI 分解結果。RFC 3261 §19.1 完全準拠ではなく、
+/// `sip:user@host[:port][;params][?headers]` の主要部分のみを抜き出す。
+/// `<>` などの display-name angle-brackets は含めずに渡すこと。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SipUriParts<'a> {
+    /// "sip" / "sips" / "tel" 等のスキーム (小文字化はしない)。
+    pub scheme: &'a str,
+    /// `@` の左側 (ユーザ部)。`None` なら `host` のみ。
+    pub user: Option<&'a str>,
+    /// host (IPv4 / IPv6 リテラル `[..]` / FQDN)。port やパラメータは除外済み。
+    pub host: &'a str,
+    /// `:port` 部 (省略可)。
+    pub port: Option<&'a str>,
+}
+
+/// `sip:user@host[:port][;params]` 形式の SIP URI を分解する。
+///
+/// - `<sip:..>` の山括弧は事前に剥がしてから渡すこと
+/// - `;params` `?headers` は捨てる
+/// - IPv6 リテラル `[2001:db8::1]:5060` を扱える
+///
+/// 失敗時は `None`。本格的な RFC 3261 §19.1 パーサは用意しない。
+pub fn parse_sip_uri(uri: &str) -> Option<SipUriParts<'_>> {
+    let uri = uri.trim();
+    // angle-brackets が残っている場合は剥がす
+    let uri = uri
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(uri);
+    let (scheme, rest) = uri.split_once(':')?;
+    // パラメータ / ヘッダ部を捨てる
+    let rest = rest.split(';').next()?;
+    let rest = rest.split('?').next()?;
+
+    let (user, hostport) = match rest.split_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+
+    // IPv6 リテラル `[..]` を考慮した host:port 分離
+    let (host, port) = if let Some(rest_after_bracket) = hostport.strip_prefix('[') {
+        let (h, after) = rest_after_bracket.split_once(']')?;
+        // `[host]:port` または `[host]` のみ
+        let port = after.strip_prefix(':');
+        // host 部に `[]` を含めて返す形にもできるが、比較しやすさを優先して中身のみ。
+        (h, port)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        // ":" を 1 つ含む通常の IPv4/FQDN
+        (h, Some(p))
+    } else {
+        (hostport, None)
+    };
+
+    if host.is_empty() {
+        return None;
+    }
+    Some(SipUriParts {
+        scheme,
+        user,
+        host,
+        port,
+    })
+}
+
 /// SIP メッセージのパーサ
 pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
     let text = std::str::from_utf8(data)?;
@@ -300,7 +364,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn test_parse_response_compact_headers_ngn_200ok() {
         // NTT NGN P-CSCF が REGISTER 200 OK で実際に使うコンパクトヘッダ形式
         // (v=Via, f=From, t=To, i=Call-ID, m=Contact, l=Content-Length)。
@@ -327,6 +390,45 @@ l: 0\r\n\
             }
             _ => panic!("expected response"),
         }
+    }
+
+    #[test]
+    fn parse_sip_uri_user_host() {
+        let p = parse_sip_uri("sip:117@192.168.20.239").unwrap();
+        assert_eq!(p.scheme, "sip");
+        assert_eq!(p.user, Some("117"));
+        assert_eq!(p.host, "192.168.20.239");
+        assert_eq!(p.port, None);
+    }
+
+    #[test]
+    fn parse_sip_uri_strips_params_and_port() {
+        let p = parse_sip_uri("sip:117@192.168.20.239:5060;transport=udp").unwrap();
+        assert_eq!(p.user, Some("117"));
+        assert_eq!(p.host, "192.168.20.239");
+        assert_eq!(p.port, Some("5060"));
+    }
+
+    #[test]
+    fn parse_sip_uri_strips_angle_brackets() {
+        let p = parse_sip_uri("<sip:0312345678@ntt-east.ne.jp>").unwrap();
+        assert_eq!(p.user, Some("0312345678"));
+        assert_eq!(p.host, "ntt-east.ne.jp");
+    }
+
+    #[test]
+    fn parse_sip_uri_ipv6_literal() {
+        let p = parse_sip_uri("sip:bob@[2001:db8::1]:5060").unwrap();
+        assert_eq!(p.user, Some("bob"));
+        assert_eq!(p.host, "2001:db8::1");
+        assert_eq!(p.port, Some("5060"));
+    }
+
+    #[test]
+    fn parse_sip_uri_no_user() {
+        let p = parse_sip_uri("sip:ntt-east.ne.jp").unwrap();
+        assert_eq!(p.user, None);
+        assert_eq!(p.host, "ntt-east.ne.jp");
     }
 
     #[test]

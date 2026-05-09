@@ -56,7 +56,7 @@ use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::rewrite_rtp_endpoint;
 use crate::sip::dialog::{Dialog, DialogConfig};
-use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
+use crate::sip::message::{parse_sip_uri, SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
 use crate::sip::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
@@ -523,6 +523,47 @@ impl NgnInboundHandler {
         let mut resp = build_response_skeleton(tx.request(), status, reason);
         ensure_to_tag(&mut resp);
         tx.respond(resp).await
+    }
+}
+
+/// 内線→NGN プロキシ時の Request-URI 正規化。
+///
+/// 内線 (Linphone 等) は `INVITE sip:<dial>@<sabiden-LAN-IP>` を吐くため、
+/// このまま NGN にプロキシすると P-CSCF が LAN IP 宛 URI を 403 で蹴る。
+/// host 部が NGN ドメインでも NGN P-CSCF アドレスでもない場合は、
+/// host を `ngn_domain` に置換し、ユーザ部 (= dial 番号) を保持して返す。
+/// `;params` `?headers` は捨てる (NGN 直収では transport=udp 等は不要)。
+///
+/// 既に NGN ドメインや P-CSCF アドレスを指している場合は変更しない。
+/// パースに失敗した場合 (相対 URI 等) はフェイルセーフとして元 URI を返す。
+fn normalize_request_uri_for_ngn(req_uri: &str, ngn_domain: &str, ngn_server_host: &str) -> String {
+    let Some(parts) = parse_sip_uri(req_uri) else {
+        return req_uri.to_string();
+    };
+    let host_lower = parts.host.to_ascii_lowercase();
+    let domain_lower = ngn_domain.to_ascii_lowercase();
+    let server_lower = ngn_server_host.to_ascii_lowercase();
+    if host_lower == domain_lower || host_lower == server_lower {
+        return rebuild_sip_uri(parts.scheme, parts.user, parts.host, parts.port);
+    }
+    rebuild_sip_uri(parts.scheme, parts.user, ngn_domain, None)
+}
+
+/// `parse_sip_uri` の結果から `;params` を剥がした URI を再構築する。
+/// IPv6 リテラルの場合は `[..]` を付け直す。
+fn rebuild_sip_uri(scheme: &str, user: Option<&str>, host: &str, port: Option<&str>) -> String {
+    let host_part = if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    let host_with_port = match port {
+        Some(p) => format!("{}:{}", host_part, p),
+        None => host_part,
+    };
+    match user {
+        Some(u) => format!("{}:{}@{}", scheme, u, host_with_port),
+        None => format!("{}:{}", scheme, host_with_port),
     }
 }
 

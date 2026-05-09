@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -24,6 +24,10 @@ pub struct Config {
     /// NGN 直収モード設定 (Issue #37)。`direct_mode = true` で auth=none REGISTER。
     #[serde(default)]
     pub ngn: NgnConfig,
+    /// RTP ブリッジ用 bind IP (Issue #66)。NGN レッグと内線レッグで bind IP を
+    /// 個別に指定できる。未設定時は SIP local_addr (eth1 NGN 側) にフォールバック。
+    #[serde(default)]
+    pub bridge: BridgeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -210,6 +214,36 @@ fn default_vendor_class() -> String {
     "RX-600KI".to_string()
 }
 
+/// RTP ブリッジ用 bind IP の設定 (Issue #66)。
+///
+/// sabiden は B2BUA として NGN レッグ ⇔ 内線レッグの 2 つの UDP socket を
+/// bind し、間で RTP/RTCP を中継する。各 socket をどの IP で bind するかは
+/// NIC レイアウトに依存するため、以下の 2 つを個別指定できる:
+///
+/// - `ngn_bind_ip`: NGN 側 RTP socket の bind IP。`docs/asterisk-real-invite.md`
+///   §5.2 準拠で **NGN 側 NIC (eth1) の IPv4** を指定するのが正解。SDP の
+///   `c=` / `o=` で NGN へ広告する IP もこれと一致する。
+/// - `ext_bind_ip`: 内線側 RTP socket の bind IP。**内線 UA (Linphone 等) から
+///   到達可能な IP** を指定する必要がある。LAN 上の内線端末が 192.168.x.x の
+///   私設 IP 空間にいる場合、sabiden の eth0 LAN IP (例 `192.168.20.239`) を
+///   指定しないと、内線 UA からの RTP が sabiden に届かず無音になる
+///   (Issue #66 で発覚)。
+///
+/// 両方未設定時は SIP の `local_addr` (= eth1 NGN 側 IP) を両側で使う。
+/// これは 1 NIC 構成 (= NGN 直収だが LAN 経由内線が無いテスト構成) では
+/// 動くが、内線が別 NIC にいる本番構成では `ext_bind_ip` を明示する必要が
+/// ある。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BridgeConfig {
+    /// NGN 側 RTP socket の bind IP。`None` なら SIP local_addr に従う。
+    #[serde(default)]
+    pub ngn_bind_ip: Option<IpAddr>,
+    /// 内線側 RTP socket の bind IP。`None` なら `ngn_bind_ip` (or SIP local_addr) に従う。
+    /// 内線 UA から到達可能な IP を設定すること (LAN 経由内線なら eth0 LAN IP)。
+    #[serde(default)]
+    pub ext_bind_ip: Option<IpAddr>,
+}
+
 fn default_webrtc_register_ttl() -> u64 {
     300
 }
@@ -325,6 +359,7 @@ impl Config {
                 ..WebRtcConfig::default()
             },
             ngn: NgnConfig::default(),
+            bridge: BridgeConfig::default(),
         })
     }
 
@@ -416,6 +451,14 @@ impl Config {
                 self.ngn.vendor_class = v;
             }
         }
+        // [bridge] セクション (Issue #66): RTP ブリッジ bind IP の上書き。
+        // 空文字列は明示的なリセット (= None フォールバック) として扱う。
+        if let Ok(v) = std::env::var("SABIDEN_BRIDGE_NGN_BIND_IP") {
+            self.bridge.ngn_bind_ip = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Ok(v) = std::env::var("SABIDEN_BRIDGE_EXT_BIND_IP") {
+            self.bridge.ext_bind_ip = if v.is_empty() { None } else { v.parse().ok() };
+        }
     }
 
     pub fn example() -> String {
@@ -486,6 +529,16 @@ max_expires = 3600
 # udp_port_range = "40000-40999"
 # # STUN/TURN URL (現状は SDP に乗せるのみ、relay allocate は将来実装)
 # ice_servers = ["turn:turn.example.com:3478"]
+
+# RTP ブリッジ用 bind IP (任意, Issue #66)
+# 内線 UA (Linphone 等) が NGN 側 NIC とは別 NIC (eth0 LAN 等) にいる場合、
+# 内線レッグ RTP socket を LAN 側 IP で bind する必要がある (内線 UA から
+# 到達可能な IP でないと SDP 広告先に RTP が届かない)。
+# - ngn_bind_ip: NGN 側 RTP socket bind IP (省略時は sip.local_addr に従う)
+# - ext_bind_ip: 内線側 RTP socket bind IP (省略時は ngn_bind_ip にフォールバック)
+# [bridge]
+# ngn_bind_ip = "118.177.72.242"
+# ext_bind_ip = "192.168.20.239"
 "#
         .to_string()
     }
@@ -522,6 +575,7 @@ mod tests {
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
+            bridge: BridgeConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -541,6 +595,7 @@ mod tests {
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
+            bridge: BridgeConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -560,6 +615,7 @@ mod tests {
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
+            bridge: BridgeConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -623,6 +679,46 @@ password = "secret"
         assert!(!cfg.ngn.direct_mode);
         assert_eq!(cfg.ngn.vendor_class, "RX-600KI");
         assert_eq!(cfg.sip.password.as_deref(), Some("secret"));
+    }
+
+    /// Issue #66: `[bridge]` セクションで RTP ブリッジ bind IP を NGN 側と
+    /// 内線側で個別指定できる。省略時は両方 `None` (= SIP local_addr に
+    /// フォールバック) のまま。
+    #[test]
+    fn toml_parses_bridge_section_with_per_leg_bind_ip() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[bridge]
+ngn_bind_ip = "118.177.72.242"
+ext_bind_ip = "192.168.20.239"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.bridge.ngn_bind_ip,
+            Some("118.177.72.242".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            cfg.bridge.ext_bind_ip,
+            Some("192.168.20.239".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// Issue #66: `[bridge]` セクション省略時は両 IP とも `None`。
+    #[test]
+    fn toml_default_bridge_section_is_unset() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.bridge.ngn_bind_ip.is_none());
+        assert!(cfg.bridge.ext_bind_ip.is_none());
     }
 
     /// Issue #37: vendor_class は将来の機種変更に備えて上書き可能。

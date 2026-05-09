@@ -1323,6 +1323,30 @@ impl UasEventHandler {
     }
 
     /// NGN 200 OK の SDP answer を内線へ返す前に書き換え、`RtpBridge` を起動。
+    ///
+    /// B2BUA として内線レッグへ返す 200 OK SDP は、NGN 側エンドポイント
+    /// (`118.177.125.1:28196` 等) ではなく **sabiden 自身の ext bridge socket**
+    /// (`<bridge_ext_bind_ip>:<port>`) を広告する。これで内線 UA は sabiden に
+    /// RTP を送り、sabiden が NGN 側へリレーする (= B2BUA media anchoring)。
+    ///
+    /// RFC 3264 §6 (Offer/Answer):
+    /// > The answer MUST contain exactly the same number of "m=" lines as the offer.
+    /// > The transport address from the answer (in the "c=" and "m=" lines) is
+    /// > used by the offerer to send RTP.
+    ///
+    /// すなわち内線 UA が送る RTP の宛先は本関数が組み立てる SDP の `c=`/`m=`
+    /// で決まる。ここを sabiden の ext bridge socket に向けないと内線 UA が
+    /// 直接 NGN P-CSCF RTP 端点に送ろうとして LAN 越えできず音声無音になる
+    /// (Issue #66 の根因)。
+    ///
+    /// RFC 4566 §5.7 / §5.14: rewrite 対象は session-level `c=` と最初の
+    /// `m=audio` の port (および media-level `c=` があればそれも)。書き換えに
+    /// 使う「元 SDP」は **内線オファ** をベースとする — オファに乗っていた
+    /// `a=ptime`, `a=rtpmap`, `a=fmtp` 等は内線 UA 自身が提示した値なので
+    /// そのまま answer に映るのが Offer/Answer の自然な形。NGN answer の
+    /// SDP 属性をそのまま使うと NGN 由来の `c=` IP / port が混入するリスクが
+    /// あるため避ける。
+    ///
     /// 戻り値: (内線へ返す SDP body, 起動したブリッジの CallId)。
     /// `bridge_ctx` が `None` の場合は透過 (元 body をそのまま返す, CallId は None)。
     async fn finalize_outbound_bridge(
@@ -1343,8 +1367,9 @@ impl UasEventHandler {
         let ngn_peer = extract_rtp_endpoint(ngn_answer)?;
         let sabiden_ext_addr = ctx.ext_sock.local_addr()?;
 
-        // 内線へ返す SDP は sabiden の ext 側ソケットを指すように書き換える。
-        // 元の SDP オファをベースにすると ptime / rtpmap が保たれて好ましい。
+        // 内線 UA へ返す SDP は sabiden の ext 側ソケットを指すように書き換える。
+        // 元の SDP オファをベースにすると ptime / rtpmap が保たれて好ましい
+        // (RFC 3264 §6: answer は offer と同じ m= 数 + 同等メディア種別)。
         let rewritten_for_ext =
             rewrite_rtp_endpoint(ext_offer, sabiden_ext_addr.ip(), sabiden_ext_addr.port())?;
 
@@ -3570,5 +3595,185 @@ mod tests {
         let s = serde_json::to_string(&cm).unwrap();
         assert!(s.contains("\"type\":\"answer\""));
         assert!(s.contains("\"call_id\":\"x\""));
+    }
+
+    /// Issue #66 の核心: `finalize_outbound_bridge` が NGN 200 OK の SDP answer
+    /// を **そのまま** 内線へ返さず、 sabiden の ext bridge socket を指す
+    /// `c=` / `m=audio port` に書き換えていることを直接検証する。
+    ///
+    /// RFC 3264 §6: answer の transport address (c= / m=) で offerer は RTP 宛先を決める。
+    /// よって内線 UA は本関数が返す SDP に書かれた IP:port へ RTP を送る。
+    /// ここが NGN の `118.177.125.1:28196` のままだと LAN 経由の Linphone は
+    /// NGN P-CSCF へ直送ろうとして到達せず無音になる (Issue #66)。
+    #[tokio::test]
+    async fn finalize_outbound_bridge_rewrites_ngn_answer_to_ext_bridge_endpoint() {
+        use crate::call::manager::CallManager;
+
+        // sabiden NGN 側 UAC は本テストの finalize_outbound_bridge ロジックには
+        // 直接影響しないが、UasEventHandler コンストラクタには必須なので
+        // 最小実装で通す。
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            "127.0.0.1:5060".parse().unwrap(),
+        ));
+
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr,
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+
+        // ext bridge socket と NGN bridge socket を bind し、ext_peer は適当な内線
+        // RTP エンドポイントとして埋める (RtpBridge 起動には必要だが、本テストは
+        // 戻り SDP の検証だけが目的)。
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_local = ext_sock.local_addr().unwrap();
+        let ctx = OutboundBridgeCtx {
+            ngn_sock,
+            ext_sock,
+            ext_peer: "127.0.0.1:40000".parse().unwrap(),
+        };
+
+        // 内線 UA が出したオファ (ext_offer) — `a=ptime:20` 等が乗っているのが
+        // 自然形。c=/m= ともこの段階では内線 UA 自身の LAN IP/port が乗る。
+        let ext_offer = b"v=0\r\n\
+            o=- 1 1 IN IP4 192.168.20.50\r\n\
+            s=-\r\n\
+            c=IN IP4 192.168.20.50\r\n\
+            t=0 0\r\n\
+            m=audio 7078 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=ptime:20\r\n";
+
+        // NGN が返してきた 200 OK answer — Issue #66 の発火条件と全く同じ:
+        // c= / m=audio 共に NGN P-CSCF 側の RTP エンドポイント。
+        let ngn_answer = b"v=0\r\n\
+            o=- 9 9 IN IP4 118.177.125.1\r\n\
+            s=-\r\n\
+            c=IN IP4 118.177.125.1\r\n\
+            t=0 0\r\n\
+            m=audio 28196 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+
+        let (rewritten, bridge_id) = handler
+            .finalize_outbound_bridge(Some(ctx), ext_offer, ngn_answer)
+            .await
+            .expect("finalize_outbound_bridge");
+
+        let body = std::str::from_utf8(&rewritten).expect("utf8");
+        // 1. NGN 側 IP がそのまま素通しされていないこと (= 根本回避できている)。
+        assert!(
+            !body.contains("118.177.125.1"),
+            "NGN P-CSCF IP が内線レッグ SDP に残っている: {body}"
+        );
+        assert!(
+            !body.contains("28196"),
+            "NGN 側 RTP port が内線レッグ SDP に残っている: {body}"
+        );
+        // 2. ext bridge socket の IP/port が広告されていること。
+        assert!(
+            body.contains(&format!("c=IN IP4 {}\r\n", ext_local.ip())),
+            "session-level c= が ext bridge IP に書き換わっていない: {body}"
+        );
+        assert!(
+            body.contains(&format!("m=audio {} RTP/AVP 0", ext_local.port())),
+            "m=audio port が ext bridge port に書き換わっていない: {body}"
+        );
+        // 3. オファ由来の rtpmap / ptime が保持されていること (RFC 3264 §6)。
+        assert!(
+            body.contains("a=rtpmap:0 PCMU/8000"),
+            "rtpmap が失われている: {body}"
+        );
+        assert!(body.contains("a=ptime:20"), "ptime が失われている: {body}");
+        // 4. RtpBridge が起動して CallId が返ってきていること。
+        assert!(bridge_id.is_some(), "RTP ブリッジが起動していない");
+    }
+
+    /// Issue #66: `finalize_outbound_bridge` は ext_bind_ip と ngn_bind_ip を
+    /// 個別に指定したときも、内線レッグ SDP に書き出されるのは ext socket の
+    /// 実際の bind 先 (ext_bind_ip 側) であること。NGN 側 IP が漏れない。
+    #[tokio::test]
+    async fn finalize_outbound_bridge_uses_ext_bind_ip_not_ngn_bind_ip() {
+        use crate::call::manager::CallManager;
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            "127.0.0.1:5060".parse().unwrap(),
+        ));
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr,
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+
+        // ngn_sock と ext_sock を別ポートで bind (実環境では別 NIC を想定)。
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let ext_addr = ext_sock.local_addr().unwrap();
+        assert_ne!(
+            ngn_addr.port(),
+            ext_addr.port(),
+            "テスト前提: NGN bridge と ext bridge は別ポート"
+        );
+
+        let ctx = OutboundBridgeCtx {
+            ngn_sock,
+            ext_sock,
+            ext_peer: "127.0.0.1:40000".parse().unwrap(),
+        };
+        let ext_offer = b"v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 7000 RTP/AVP 0\r\n";
+        let ngn_answer = b"v=0\r\n\
+            o=- 9 9 IN IP4 118.177.125.1\r\n\
+            s=-\r\n\
+            c=IN IP4 118.177.125.1\r\n\
+            t=0 0\r\n\
+            m=audio 28196 RTP/AVP 0\r\n";
+
+        let (rewritten, _) = handler
+            .finalize_outbound_bridge(Some(ctx), ext_offer, ngn_answer)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&rewritten).unwrap();
+
+        // ext_addr.port() が広告されているべき (NGN bridge port ではない)。
+        assert!(
+            body.contains(&format!("m=audio {}", ext_addr.port())),
+            "ext bridge port {} が SDP に出ていない: {}",
+            ext_addr.port(),
+            body
+        );
+        assert!(
+            !body.contains(&format!("m=audio {}", ngn_addr.port())),
+            "NGN bridge port {} が誤って ext SDP に出ている: {}",
+            ngn_addr.port(),
+            body
+        );
     }
 }

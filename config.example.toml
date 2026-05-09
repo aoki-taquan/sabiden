@@ -65,3 +65,16 @@ max_expires = 3600
 # udp_port_range = "40000-40999"
 # # 任意の TURN/STUN URL (本 PR では SDP 提示のみ、relay allocate は TODO)
 # ice_servers = ["turn:turn.example.com:3478"]
+
+# RTP ブリッジ用 bind IP (Issue #66)
+# B2BUA media anchoring 用に NGN レッグと内線レッグの 2 つの UDP socket を
+# bind する。各 socket をどの NIC で bind するかを個別指定する。
+# - ngn_bind_ip: NGN 側 (eth1 NGN P-CSCF へ送出する IP)。
+#   省略時は sip.local_addr (= eth1) にフォールバック。
+# - ext_bind_ip: 内線側 (Linphone 等の内線 UA から到達可能な IP)。
+#   省略時は ngn_bind_ip と同じ値にフォールバック (1 NIC 構成の場合)。
+#   内線 UA が LAN (192.168.x.x 等) にいる本番構成では eth0 LAN IP を必ず指定する
+#   (内線レッグ 200 OK SDP の c=/m= に載るので、ここが内線 UA から不達だと無音)。
+# [bridge]
+# ngn_bind_ip = "118.177.72.242"
+# ext_bind_ip = "192.168.20.239"

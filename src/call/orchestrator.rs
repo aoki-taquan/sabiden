@@ -1839,8 +1839,26 @@ pub async fn fork_to_bindings(
     result
 }
 
-/// 1 つの WebRTC leg を駆動する。peer.handle_offer 診断 → pending 予約 →
-/// WS で Offer push → browser からの Answer を timeout 内に待つ。
+/// 1 つの WebRTC leg を駆動する (Issue #73 / PR #50 統合漏れ修正)。
+///
+/// # 流れ (RFC 3264 §5-6: SDP offer/answer model)
+///
+/// 1. `peer.create_offer()` で sabiden 自身が DTLS-SRTP/SAVPF オファを生成する
+///    (NGN の生 RTP/AVP オファをそのまま push してもブラウザは DTLS
+///    fingerprint / ICE 認証情報不在で拒絶するため; RFC 8827 §6.5,
+///    RFC 8839 §4.1)。
+/// 2. `pending.register(call_id)` で answer 待ち oneshot を予約する。
+/// 3. `ServerMessage::Offer` で WS にオファを push する。
+/// 4. ブラウザ answer を `leg_timeout` 内に受信する。
+/// 5. `peer.accept_answer(answer)` で str0m に渡し DTLS/ICE 確立を進める。
+/// 6. NGN へ返す 200 OK の SDP body はブラウザ answer (SAVPF) を
+///    `convert_savpf_to_avp` で NGN 仕様 (`docs/asterisk-real-invite.md` §2:
+///    PCMU only, `RTP/AVP`) に変換したものを使う。最終的な
+///    `c=`/`m= port` 書換は呼出側 `start_bridge_for_inbound`
+///    (`rewrite_rtp_endpoint` 経由) が行う。
+///
+/// `_sdp_offer` (NGN 由来オファ) は 200 OK 用の SDP 構造ヒントとしては使わず、
+/// あくまで `start_bridge_for_inbound` が ngn_peer 抽出に再度使う。
 #[allow(clippy::too_many_arguments)]
 async fn run_webrtc_leg(
     aor: String,
@@ -1848,35 +1866,33 @@ async fn run_webrtc_leg(
     peer: Arc<dyn PeerSession>,
     ws: WsSink,
     pending: PendingAnswers,
-    sdp_offer: Vec<u8>,
+    _sdp_offer: Vec<u8>,
     call_id: String,
     leg_timeout: Duration,
 ) -> LegResult {
-    let offer_text = match std::str::from_utf8(&sdp_offer) {
-        Ok(t) => t.to_string(),
+    // (1) sabiden を offerer として SAVPF オファを生成
+    let offer_for_browser = match peer.create_offer().await {
+        Ok(sdp) => sdp,
         Err(e) => {
-            warn!(%aor, error=%e, "WebRTC leg: NGN SDP が UTF-8 でない");
+            warn!(%aor, error=%e, "WebRTC leg: peer.create_offer 失敗");
             return LegResult::Errored { aor };
         }
     };
-    let _peer_answer = match peer.handle_offer(&offer_text).await {
-        Ok(a) => Some(a),
-        Err(e) => {
-            debug!(%aor, error=%e, "WebRTC leg: peer.handle_offer 失敗 (継続)");
-            None
-        }
-    };
 
+    // (2) answer 待ち oneshot を先に登録 (race 回避: WS push 前に登録する)
     let waiter = pending.register(&call_id).await;
+
+    // (3) ブラウザに WS で offer を push
     if let Err(e) = ws.send(ServerMessage::Offer {
         call_id: call_id.clone(),
-        sdp: offer_text,
+        sdp: offer_for_browser,
     }) {
         warn!(%aor, error=%e, "WebRTC leg: WS 送信失敗 (browser 切断?)");
         pending.cancel(&call_id).await;
         return LegResult::Errored { aor };
     }
 
+    // (4) ブラウザ answer を timeout 内で受信
     let answer = match tokio::time::timeout(leg_timeout, waiter).await {
         Ok(Ok(sdp)) => sdp,
         Ok(Err(_)) => {
@@ -1887,6 +1903,22 @@ async fn run_webrtc_leg(
             warn!(%aor, "WebRTC leg: browser から answer タイムアウト");
             pending.cancel(&call_id).await;
             return LegResult::Failed { aor, status: 408 };
+        }
+    };
+
+    // (5) str0m に answer を流し込み DTLS/ICE 確立を促す
+    if let Err(e) = peer.accept_answer(&answer).await {
+        warn!(%aor, error=%e, "WebRTC leg: peer.accept_answer 失敗 (browser SDP 不正?)");
+        return LegResult::Errored { aor };
+    }
+
+    // (6) NGN の 200 OK には PCMU AVP に変換した SDP を載せる
+    //   (docs/asterisk-real-invite.md §2: NGN は SAVPF / DTLS / ICE 属性を解釈しない)
+    let body_for_ngn = match crate::sdp::builder::convert_savpf_to_avp(answer.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%aor, error=%e, "WebRTC leg: SAVPF→AVP 変換失敗、生 answer を返す");
+            answer.clone().into_bytes()
         }
     };
 
@@ -1901,7 +1933,7 @@ async fn run_webrtc_leg(
         status_code: 200,
         reason: "OK".to_string(),
         headers,
-        body: answer.into_bytes(),
+        body: body_for_ngn,
     };
     LegResult::Established {
         aor,
@@ -3834,24 +3866,40 @@ mod tests {
             )
             .await;
 
+        // NGN 由来の生 SDP (RTP/AVP)。Issue #73 の修正により、 これがそのまま
+        // browser に push されてはいけない (browser は DTLS/ICE 不在で拒絶する)。
+        let ngn_raw_sdp_marker = "192.0.2.1";
+
         // browser シミュレーション: ServerMessage::Offer を受け取ったら同じ call_id で
         // ClientMessage::Answer { call_id, sdp } 相当の SDP を pending に届ける。
+        // ブラウザは setRemoteDescription(offer) → answer 生成の流れだが、
+        // ここではテスト都合上、固定の SAVPF answer を返す。
         let pending_for_browser = pending.clone();
         let browser_answer_sdp = "v=0\r\n\
-                                  o=- 9 9 IN IP4 192.0.2.99\r\n\
+                                  o=mozilla 9 9 IN IP4 0.0.0.0\r\n\
                                   s=-\r\n\
-                                  c=IN IP4 192.0.2.99\r\n\
+                                  c=IN IP4 0.0.0.0\r\n\
                                   t=0 0\r\n\
-                                  m=audio 30000 RTP/AVP 0\r\n\
-                                  a=rtpmap:0 PCMU/8000\r\n";
+                                  m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                                  a=rtpmap:0 PCMU/8000\r\n\
+                                  a=ice-ufrag:browser\r\n\
+                                  a=ice-pwd:browserpasswordbrowserpassword\r\n\
+                                  a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+                                  a=setup:active\r\n\
+                                  a=mid:0\r\n\
+                                  a=rtcp-mux\r\n\
+                                  a=sendrecv\r\n";
         let browser_answer_sdp_owned = browser_answer_sdp.to_string();
+        let captured_offer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_offer_c = captured_offer.clone();
         let browser_task = tokio::spawn(async move {
             let msg = timeout(Duration::from_secs(3), out_rx.recv())
                 .await
                 .expect("browser へ offer push が来ない")
                 .expect("WS チャネルが閉じている");
             match msg {
-                ServerMessage::Offer { call_id, sdp: _ } => {
+                ServerMessage::Offer { call_id, sdp } => {
+                    *captured_offer_c.lock().await = Some(sdp);
                     let delivered = pending_for_browser
                         .deliver(&call_id, browser_answer_sdp_owned.clone())
                         .await;
@@ -3931,12 +3979,58 @@ mod tests {
         assert!(got_100, "100 Trying が NGN 側に届くべき");
         assert!(got_200, "200 OK が NGN 側に届くべき");
 
-        // 200 OK の body は browser が返した answer SDP で、SIP UAC fork は呼ばれていない
-        assert_eq!(
-            answer_body,
-            browser_answer_sdp.as_bytes(),
-            "200 OK の SDP body は browser の answer がそのまま入るべき"
+        // Issue #73: 200 OK の body は browser answer (SAVPF) を NGN 用 (AVP) に
+        // 変換した SDP であるべき (生 SAVPF/DTLS/ICE 属性を NGN に流すと NGN は解釈不能)。
+        let body_text = std::str::from_utf8(&answer_body).expect("UTF-8");
+        assert!(
+            body_text.contains("RTP/AVP"),
+            "NGN 200 OK の m= proto は RTP/AVP であるべき: {}",
+            body_text
         );
+        assert!(
+            !body_text.contains("UDP/TLS/RTP/SAVPF"),
+            "SAVPF proto を NGN に流してはいけない: {}",
+            body_text
+        );
+        assert!(
+            !body_text.contains("a=fingerprint"),
+            "DTLS fingerprint を NGN に流してはいけない: {}",
+            body_text
+        );
+        assert!(
+            !body_text.contains("a=ice-ufrag"),
+            "ICE ufrag を NGN に流してはいけない: {}",
+            body_text
+        );
+        assert!(
+            body_text.contains("a=rtpmap:0 PCMU/8000"),
+            "PCMU rtpmap が欠落: {}",
+            body_text
+        );
+
+        // Issue #73: browser に push した SDP は NGN 由来生 SDP ではなく、
+        // sabiden が `peer.create_offer()` で作った SAVPF オファであるべき。
+        let pushed_offer = captured_offer
+            .lock()
+            .await
+            .clone()
+            .expect("browser へ offer が push されているはず");
+        assert!(
+            !pushed_offer.contains(ngn_raw_sdp_marker),
+            "NGN 生 SDP がそのまま browser に push されている (#73 バグ): {}",
+            pushed_offer
+        );
+        assert!(
+            pushed_offer.contains("UDP/TLS/RTP/SAVPF"),
+            "browser 向け offer は SAVPF であるべき: {}",
+            pushed_offer
+        );
+        assert!(
+            pushed_offer.to_uppercase().contains("PCMU"),
+            "browser 向け offer に PCMU が含まれるべき: {}",
+            pushed_offer
+        );
+
         assert_eq!(
             inviter.call_count(),
             0,
@@ -3954,6 +4048,156 @@ mod tests {
         let s = serde_json::to_string(&cm).unwrap();
         assert!(s.contains("\"type\":\"answer\""));
         assert!(s.contains("\"call_id\":\"x\""));
+    }
+
+    /// Issue #73 unit: `run_webrtc_leg` 経路で
+    ///   1. `peer.create_offer()` が呼ばれる
+    ///   2. その戻り値が `ServerMessage::Offer` で WS に push される
+    ///   3. ブラウザ answer 受信後 `peer.accept_answer()` が呼ばれる
+    ///   4. NGN 200 OK 用の SDP は SAVPF→AVP 変換済 (RTP/AVP) になる
+    /// が満たされることを、 `fork_to_bindings` 経由で直接検証する。
+    /// fork_to_bindings は内部で run_webrtc_leg を spawn するので、 run_webrtc_leg
+    /// が private のままでも経路は同じ。
+    #[tokio::test]
+    async fn run_webrtc_leg_uses_create_offer_and_accept_answer() {
+        use crate::sip::registrar::Binding;
+        use crate::webrtc::peer::PeerSession;
+        use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 呼び出し回数を数える PeerSession モック。
+        struct CountingPeer {
+            create_offer_count: AtomicUsize,
+            accept_answer_count: AtomicUsize,
+            offer_sdp: String,
+        }
+        #[async_trait::async_trait]
+        impl PeerSession for CountingPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!(
+                    "本フローでは handle_offer を呼んではいけない (Issue #73)"
+                ))
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                self.create_offer_count.fetch_add(1, Ordering::SeqCst);
+                Ok(self.offer_sdp.clone())
+            }
+            async fn accept_answer(&self, sdp: &str) -> anyhow::Result<()> {
+                self.accept_answer_count.fetch_add(1, Ordering::SeqCst);
+                // 受け取った SDP が browser の SAVPF answer であることを軽く確認
+                assert!(sdp.contains("UDP/TLS/RTP/SAVPF"));
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _candidate: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let peer_inner = Arc::new(CountingPeer {
+            create_offer_count: AtomicUsize::new(0),
+            accept_answer_count: AtomicUsize::new(0),
+            offer_sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                        t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                        a=ice-ufrag:srvuf\r\na=ice-pwd:srvpasswordsrvpassword\r\n\
+                        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+                        a=setup:actpass\r\na=mid:0\r\na=rtcp-mux\r\na=sendrecv\r\n"
+                .to_string(),
+        });
+        let peer: Arc<dyn PeerSession> = peer_inner.clone();
+
+        // WS チャネル + pending
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+        let ws_sink = WsSink::new(out_tx);
+        let pending = PendingAnswers::new();
+
+        // browser タスク: offer push を受け、 SAVPF answer を pending に届ける。
+        let browser_answer = "v=0\r\no=mozilla 9 9 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                              t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                              a=ice-ufrag:browser\r\na=ice-pwd:browserpwdbrowserpwdbrowserpwd\r\n\
+                              a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+                              a=setup:active\r\na=mid:0\r\na=rtcp-mux\r\na=sendrecv\r\n"
+            .to_string();
+        let pending_for_browser = pending.clone();
+        let captured: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let captured_c = captured.clone();
+        let browser_task = tokio::spawn(async move {
+            let msg = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+                .await
+                .expect("offer push 不在")
+                .expect("WS チャネル閉鎖");
+            if let ServerMessage::Offer { call_id, sdp } = msg {
+                *captured_c.lock().await = Some(sdp);
+                let ok = pending_for_browser.deliver(&call_id, browser_answer).await;
+                assert!(ok);
+            } else {
+                panic!("offer 以外を受信");
+            }
+        });
+
+        // fork_to_bindings 経由で run_webrtc_leg を駆動する。
+        // SIP inviter は使われないが ExtInviter として渡す必要がある。
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
+        let bindings = vec![(
+            "alice".to_string(),
+            Binding {
+                contact_uri: "sip:alice@webrtc.peer".to_string(),
+                remote: "127.0.0.1:65535".parse().unwrap(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(60),
+                transport: ExtTransport::WebRtc {
+                    peer: peer.clone(),
+                    ws: ws_sink.clone(),
+                    pending: pending.clone(),
+                },
+            },
+        )];
+        // NGN 由来オファ (run_webrtc_leg の新設計では 200 OK 構築には使わない;
+        // browser に push されてもいけない)
+        let ngn_offer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\n\
+                          t=0 0\r\nm=audio 20000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+            .to_vec();
+        let result = fork_to_bindings(
+            inviter,
+            bindings,
+            ngn_offer,
+            "ut-cid".to_string(),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        browser_task.await.unwrap();
+
+        // (1) create_offer が呼ばれた / (3) accept_answer も呼ばれた
+        assert_eq!(peer_inner.create_offer_count.load(Ordering::SeqCst), 1);
+        assert_eq!(peer_inner.accept_answer_count.load(Ordering::SeqCst), 1);
+
+        // (2) push された SDP は peer.create_offer の返値である
+        let pushed = captured.lock().await.clone().expect("offer push");
+        assert!(pushed.contains("UDP/TLS/RTP/SAVPF"));
+        assert!(!pushed.contains("192.0.2.1"), "NGN 由来 SDP が混入");
+
+        // (4) 200 OK の SDP は AVP に変換されている
+        match result {
+            ForkResult::Answered { response, .. } => {
+                let body = std::str::from_utf8(&response.body).unwrap();
+                assert!(body.contains("RTP/AVP"));
+                assert!(!body.contains("UDP/TLS/RTP/SAVPF"));
+                assert!(!body.contains("a=fingerprint"));
+                assert!(body.contains("a=rtpmap:0 PCMU/8000"));
+            }
+            ForkResult::AllFailed { last_status } => {
+                panic!(
+                    "Answered 期待だが AllFailed (last_status={:?})",
+                    last_status
+                )
+            }
+            ForkResult::Timeout => panic!("Answered 期待だが Timeout"),
+        }
     }
 
     /// Issue #66 の核心: `finalize_outbound_bridge` が NGN 200 OK の SDP answer

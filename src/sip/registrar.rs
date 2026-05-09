@@ -6,6 +6,12 @@
 //!
 //! 永続化は今のところ行わず、再起動時には UA 側からの再 REGISTER で
 //! 再構築する。Issue #4 の Phase 1 では in-memory のみで十分。
+//!
+//! # トランスポート
+//!
+//! 内線は SIP UDP UA (Linphone 等) と WebRTC ブラウザの 2 種類があり、
+//! [`Binding::transport`] で区別する。NGN 着信フォークは transport ごとに
+//! 別経路 (SIP UAC fork / WebSocket push) を呼び分ける。
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,18 +19,57 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
+use crate::webrtc::peer::PeerSession;
+use crate::webrtc::signaling::{PendingAnswers, WsSink};
+
+/// 内線がどのプロトコルで接続しているか。NGN 着信時の経路選択に使う。
+#[derive(Clone)]
+pub enum ExtTransport {
+    /// 通常の SIP UDP UA (Linphone / iPhone 等)。
+    /// `Binding::contact_uri` (または `remote`) を target に SIP UAC で
+    /// `fork_to_extensions` する。
+    Sip,
+    /// WebRTC ブラウザ。SIP では呼び出せず、専用 WebSocket シグナリングで
+    /// `ServerMessage::Offer` を push し、ブラウザが返す
+    /// `ClientMessage::Answer` を待ち受ける。
+    /// `pending` は orchestrator が `register(call_id)` で待機 oneshot を
+    /// 確保し、`Answer { call_id, sdp }` 受信時に WS 受信ループから
+    /// `deliver` で渡される共有テーブル。
+    WebRtc {
+        peer: Arc<dyn PeerSession>,
+        ws: WsSink,
+        pending: PendingAnswers,
+    },
+}
+
+impl std::fmt::Debug for ExtTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtTransport::Sip => f.write_str("Sip"),
+            ExtTransport::WebRtc { .. } => f.write_str("WebRtc"),
+        }
+    }
+}
+
 /// 1 つの内線が現在登録している Contact の状態。
 #[derive(Debug, Clone)]
 pub struct Binding {
     /// Contact ヘッダの URI (例: `sip:iphone@192.0.2.10:5060`)。
+    /// WebRTC バインディングの場合はシグナリング層で組み立てた擬似 URI
+    /// (例: `sip:alice@webrtc.peer`) になるが、`transport` で実体を判別する
+    /// ので URI 文字列に意味は持たせない。
     pub contact_uri: String,
     /// UA から実際にパケットが届いた送信元アドレス。
     /// REGISTER の Contact がプライベート IP の場合があるため、UAS から
     /// 内線を呼び出す際は基本的にこちらを使う (RFC 5626 で言うところの
     /// "received" と同等の扱い)。
+    /// WebRTC バインディングでは WS 接続時の TCP リモートアドレスが入るが、
+    /// SIP の宛先には使われない。
     pub remote: SocketAddr,
     /// 期限。`Instant::now()` がこれを過ぎたら失効。
     pub expires_at: Instant,
+    /// この Binding をどのプロトコルで呼び出すか。
+    pub transport: ExtTransport,
 }
 
 impl Binding {
@@ -47,14 +92,28 @@ impl ExtensionRegistrar {
         Arc::new(Self::default())
     }
 
-    /// AOR に Binding を上書き登録する。expires が 0 のときは [`unregister`]
+    /// AOR に SIP Binding を上書き登録する。expires が 0 のときは [`unregister`]
     /// と等価 (RFC 3261 §10.2.1.1)。
+    /// 既定の transport は [`ExtTransport::Sip`]。
     pub async fn register(
         &self,
         aor: &str,
         contact_uri: String,
         remote: SocketAddr,
         expires: Duration,
+    ) {
+        self.register_with_transport(aor, contact_uri, remote, expires, ExtTransport::Sip)
+            .await;
+    }
+
+    /// AOR に任意の transport の Binding を上書き登録する。
+    pub async fn register_with_transport(
+        &self,
+        aor: &str,
+        contact_uri: String,
+        remote: SocketAddr,
+        expires: Duration,
+        transport: ExtTransport,
     ) {
         if expires.is_zero() {
             self.unregister(aor).await;
@@ -64,6 +123,7 @@ impl ExtensionRegistrar {
             contact_uri,
             remote,
             expires_at: Instant::now() + expires,
+            transport,
         };
         self.inner.write().await.insert(aor.to_string(), binding);
     }
@@ -153,6 +213,7 @@ mod tests {
             contact_uri: "sip:x@192.0.2.10".into(),
             remote: addr(),
             expires_at: Instant::now() - Duration::from_secs(1),
+            transport: ExtTransport::Sip,
         };
         r.inner.write().await.insert("x".into(), binding);
         assert!(r.lookup("x").await.is_none());

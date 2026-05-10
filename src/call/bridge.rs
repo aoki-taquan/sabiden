@@ -26,7 +26,7 @@ use tracing::{debug, trace, warn};
 
 use super::transcoder::{TranscodingBridge, WebRtcAudioBridge};
 use crate::observability::Metrics;
-use crate::rtp::set_rtp_dscp;
+use crate::rtp::{set_rtp_dscp, RECV_BUF_SIZE};
 
 /// NGN レッグと内線レッグの SDP に応じて、純リレーまたはトランスコードの
 /// どちらかで動く統一ブリッジハンドル (Issue #29)。
@@ -333,7 +333,10 @@ async fn forward_loop(
     // RTP ホットパスは hot loop だが、`tracing::Span` の発行は最初の 1 回のみ。
     let span = tracing::trace_span!("rtp_bridge", direction);
     let _enter = span.enter();
-    let mut buf = vec![0u8; 1500];
+    // RFC 3550 §5.1 (RTP header + optional CSRC/extension) と §6.4 (compound RTCP)
+    // が 1500 byte IP MTU を超え得るため、 jumbo frame 上限 9000 byte で受ける
+    // (Issue #96)。 PCMU 20ms = 172 byte の 117 通話パスには影響なし。
+    let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         let (n, src) = match from_socket.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -342,6 +345,17 @@ async fn forward_loop(
                 return;
             }
         };
+        // tokio は Linux `MSG_TRUNC` を expose しないため、 上限張り付きを
+        // truncate 疑いとして警告する (RFC 3550 §5.1 / §6.4, Issue #96)。
+        if n == RECV_BUF_SIZE {
+            warn!(
+                direction,
+                bytes = n,
+                "RTP datagram が受信バッファ上限 ({} byte) に達しました — \
+                 truncate の可能性",
+                RECV_BUF_SIZE
+            );
+        }
         // 送信元を学習: 既に SDP から既知の peer が登録されていてもポート
         // が違う可能性がある (NAT 後ろでなくても UA 実装差で起こる)。
         // 受信元が変わったら更新する。

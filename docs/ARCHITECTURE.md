@@ -150,9 +150,12 @@ local-tag を保持** する (RFC 3261 §12.2.2)。
 ```
 スマホ ──Re-INVITE (To-tag=existing)──► sabiden(UAS)
                                              │
-                                             │ Call-ID で OutboundCallRegistry を引く
-                                             │   見つからない → 481 Call/Transaction Does Not Exist
-                                             │   見つかれば 100 Trying を返し:
+                                             │ Call-ID で OutboundCallRegistry を引く:
+                                             │   confirmed dialog あり → 100 Trying を返し下記の通り伝搬
+                                             │   confirmed 無し / pending INVITE あり → 491 Request Pending
+                                             │       (RFC 3261 §14.2: glare 検出)
+                                             │   confirmed も pending も無し → 481 Call/Transaction Does Not Exist
+                                             │       (RFC 3261 §12.2.2)
                                              │
 sabiden(UAC) ──Re-INVITE (新 SDP offer)──► NGN
                                              │
@@ -166,8 +169,20 @@ sabiden(UAC) ──ACK──► NGN
 **判定基準** (`src/sip/uas.rs::handle_invite`):
 
 - `To` ヘッダに `;tag=...` がある → `UasEvent::Reinvite` を上位に通知
-  (binding 検証 skip; in-dialog request は既存 dialog state で認可される)
+  (binding 検証 skip; in-dialog request は既存 dialog state で認可される)。
+  パラメータ名 `tag` は **case-insensitive** 比較 (RFC 3261 §7.3.1 / §25.1)
+  なので `;Tag=` `;TAG=` も Re-INVITE と判定する。
 - `To` に tag が無い → 従来通り `UasEvent::Invite` (新規 dialog 確立経路)
+
+**491 Request Pending (RFC 3261 §14.2 glare)**:
+
+確立済み dialog (`lookup_by_ext`) が無いが、 同じ Call-ID で進行中 INVITE
+(`get_pending`) がある場合 (= 初回 INVITE 完了前に同 Call-ID で再度 INVITE
+が来た = race / glare) は **491 Request Pending** で返す。 RFC 3261 §14.2:
+"If a UA receives a re-INVITE for an existing dialog while it has an INVITE
+it had sent in the same dialog still pending, it MUST return a 491 (Request
+Pending) response to the received INVITE"。 内線 UA は 491 を受けて
+Section 14.1 のバックオフ (T1 数倍の random jitter) で Re-INVITE を再試行する。
 
 **既知の制限** (Phase R3 で改善):
 

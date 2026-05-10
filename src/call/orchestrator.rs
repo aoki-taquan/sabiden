@@ -1331,13 +1331,22 @@ impl UasEventHandler {
     ///   (= 受信 INVITE の To-tag をそのままエコー)。 `build_response_skeleton`
     ///   が To ヘッダ全体をコピーするため `ensure_to_tag` は no-op となり、
     ///   既存 tag が保たれる。
-    /// - 既存 dialog が見つからない場合は **481 Call/Transaction Does Not Exist**
-    ///   (RFC 3261 §12.2.2) で返す。
+    /// - 確立済み dialog (`lookup_by_ext`) が無く、 かつ **同じ Call-ID で
+    ///   進行中の INVITE が存在する場合** (= 初回 INVITE 完了前の Re-INVITE
+    ///   競合) は **491 Request Pending** で返す (RFC 3261 §14.2: "If a UA
+    ///   receives a re-INVITE for an existing dialog while it has an
+    ///   INVITE it had sent in the same dialog still pending, it MUST
+    ///   return a 491 (Request Pending) response to the received INVITE")。
+    /// - 確立済み dialog も pending も無い場合は **481 Call/Transaction
+    ///   Does Not Exist** (RFC 3261 §12.2.2) で返す。
     ///
     /// # 動作 (B2BUA)
     ///
-    /// 1. Call-ID で `OutboundCallRegistry` を引き、 内線→NGN 通話エントリを取得
-    /// 2. 該当が無ければ 481 を返して終了
+    /// 1. Call-ID で `OutboundCallRegistry::lookup_by_ext` を引き、 内線→NGN
+    ///    通話エントリを取得
+    /// 2. 該当が無ければ `get_pending` で進行中 INVITE があるか確認:
+    ///    - あり: 491 Request Pending (RFC 3261 §14.2)
+    ///    - 無し: 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)
     /// 3. NGN レッグの [`UacDialog`] に対して `send_reinvite` を呼び、 NGN から
     ///    新しい 200 OK + SDP answer を受領
     /// 4. 内線レッグへ 200 OK を返す。 SDP body は NGN answer をそのまま中継
@@ -1376,6 +1385,17 @@ impl UasEventHandler {
             let entry = match self.registry.lookup_by_ext(&call_id).await {
                 Some(e) => e,
                 None => {
+                    // RFC 3261 §14.2: 確立済み dialog は無いが、 **同じ Call-ID で
+                    // 進行中の INVITE がある** (= 初回 INVITE 完了前の Re-INVITE
+                    // 競合) なら 491 Request Pending を返す。 進行中も無いなら
+                    // 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)。
+                    if self.registry.get_pending(&call_id).await.is_some() {
+                        warn!(
+                            %call_id,
+                            "Re-INVITE: 初回 INVITE 進行中 → 491 Request Pending (RFC 3261 §14.2)",
+                        );
+                        return responder.quick(491, "Request Pending").await;
+                    }
                     warn!(%call_id, "Re-INVITE: 既存 dialog 無し → 481");
                     return responder
                         .quick(481, "Call/Transaction Does Not Exist")
@@ -4403,6 +4423,154 @@ mod tests {
         assert!(
             got_481,
             "未知の Call-ID の Re-INVITE は 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)"
+        );
+    }
+
+    /// RFC 3261 §14.2 / PR #136 review fix:
+    /// 確立済み dialog ではないが、 同じ Call-ID で **進行中の INVITE がある**
+    /// (= 初回 INVITE の応答完了前に再度 INVITE を受けた glare 状態) 場合、
+    /// `handle_ext_reinvite` は **491 Request Pending** を返さなければならない
+    /// (RFC 3261 §14.2: "If a UA receives a re-INVITE for an existing dialog
+    /// while it has an INVITE it had sent in the same dialog still pending,
+    /// it MUST return a 491 (Request Pending)")。
+    ///
+    /// 481 経路 (pending も confirmed も無い) との切り分けを確認する。
+    #[tokio::test]
+    async fn rfc3261_14_2_ext_reinvite_with_pending_invite_returns_491() {
+        use crate::sip::message::parse_message;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // NGN UAC は使わない (491 で返るので Re-INVITE 送出には至らない)
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        let phone_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_addr = phone_sock.local_addr().unwrap();
+        let sabiden_uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+
+        let handler = UasEventHandler::new(ngn_uac);
+
+        // 同じ Call-ID で **pending** な INVITE が registry にあるという状態を作る。
+        // ResponderHandle は実 socket を必要とするので、 別途 server-side socket
+        // から ServerTransaction を起こして埋め込む (production code の経路と
+        // 同じ生成手順)。
+        let pending_call_id = "race-cid";
+        let pending_responder_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending_resp_addr = pending_responder_sock.local_addr().unwrap();
+        let pending_responder = {
+            let mut req = SipRequest::new(SipMethod::Invite, "sip:dst@host");
+            req.headers.set(
+                "Via",
+                format!("SIP/2.0/UDP {};branch=z9hG4bKpending", pending_resp_addr),
+            );
+            req.headers.set("From", "<sip:src@host>;tag=alice");
+            req.headers.set("To", "<sip:dst@host>");
+            req.headers.set("Call-ID", pending_call_id);
+            req.headers.set("CSeq", "1 INVITE");
+            let stx =
+                ServerTransaction::new(req, pending_resp_addr, pending_responder_sock).unwrap();
+            crate::sip::uas::ResponderHandle::__test_new(stx)
+        };
+        let pending = Arc::new(PendingOutbound {
+            ext_call_id: pending_call_id.to_string(),
+            invite_plan: {
+                let mut req = SipRequest::new(SipMethod::Invite, "sip:dst@ntt-east.ne.jp");
+                req.headers
+                    .set("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKngnsend");
+                req.headers
+                    .set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=ng");
+                req.headers.set("To", "<sip:dst@ntt-east.ne.jp>");
+                req.headers.set("Call-ID", "ngn-side-cid");
+                req.headers.set("CSeq", "1 INVITE");
+                crate::sip::uac::InvitePlan {
+                    request: req,
+                    cseq: 1,
+                    target_uri: "sip:dst@ntt-east.ne.jp".to_string(),
+                    session_expires: 300,
+                }
+            },
+            ext_responder: pending_responder,
+            cancelled: tokio::sync::Notify::new(),
+            cancelled_flag: std::sync::atomic::AtomicBool::new(false),
+        });
+        handler.registry.insert_pending(pending).await;
+
+        // 同 Call-ID で Re-INVITE を投げる。 lookup_by_ext は None だが
+        // get_pending が Some なので 491 が返るはず。
+        let mut reinvite = SipRequest::new(SipMethod::Invite, "sip:dst@sabiden");
+        reinvite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKrace", phone_addr),
+        );
+        reinvite
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=phonet");
+        reinvite
+            .headers
+            .set("To", "<sip:dst@sabiden>;tag=stale-uas-tag");
+        reinvite.headers.set("Call-ID", pending_call_id);
+        reinvite.headers.set("CSeq", "2 INVITE");
+        reinvite
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_addr));
+
+        phone_sock
+            .send_to(&reinvite.to_bytes(), sabiden_uas_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) = timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() else {
+            panic!("Re-INVITE 期待");
+        };
+        let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
+        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+
+        handler
+            .handle_ext_reinvite(req, remote, responder)
+            .await
+            .unwrap();
+
+        // 491 を受信
+        let mut got_491 = false;
+        for _ in 0..3 {
+            let (n, _) = match timeout(Duration::from_secs(1), phone_sock.recv_from(&mut buf)).await
+            {
+                Ok(Ok(v)) => v,
+                _ => break,
+            };
+            if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                if r.status_code == 491 {
+                    got_491 = true;
+                    break;
+                }
+                // 481 が来たら fail (今回は pending があるので 491 が正解)
+                assert_ne!(
+                    r.status_code, 481,
+                    "pending INVITE がある場合は 491 (RFC 3261 §14.2) であって 481 ではない"
+                );
+            }
+        }
+        assert!(
+            got_491,
+            "進行中 INVITE と Race した Re-INVITE は 491 Request Pending (RFC 3261 §14.2)"
         );
     }
 

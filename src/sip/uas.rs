@@ -67,7 +67,10 @@ pub enum UasEvent {
     ///
     /// 上位 (B2BUA) は本イベント受信時に:
     /// - 既存 dialog (Call-ID + From-tag + To-tag で同定) を lookup する
-    ///   - 見つからない: 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)
+    ///   - 見つからない、 かつ進行中 INVITE もない: 481 Call/Transaction
+    ///     Does Not Exist (RFC 3261 §12.2.2)
+    ///   - 見つからないが **進行中 INVITE がある** (初回 INVITE 完了前の
+    ///     Re-INVITE 競合): 491 Request Pending (RFC 3261 §14.2)
     /// - 見つかれば NGN レッグへ Re-INVITE を伝搬し、200 OK を内線へ返す。
     ///   200 OK の To-tag は **既存 dialog の local-tag を保持** する
     ///   (= 受信 INVITE の To-tag をそのままエコーする)
@@ -698,6 +701,12 @@ fn extract_user_from_addr(value: &str) -> Option<String> {
 /// `;` で分割した各パラメータを `tag=` プレフィックスで判定する
 /// (`tag=` を含む URI 値部分 (`<sip:user;tag-x@host>` のような) を誤検出
 /// しないように、 `<...>` 内の `;` は無視する)。
+///
+/// パラメータ名 (`tag`) は **case-insensitive** に比較する
+/// (RFC 3261 §7.3.1 / §25.1: header parameter name は token であり、
+/// token の比較は大文字小文字を区別しない)。 そのため `;Tag=`、 `;TAG=` 等
+/// も Re-INVITE として扱う。 値部分は token 比較ではなく原文を保持するが、
+/// ここでは「空でないか」だけ検査する。
 fn has_to_tag(value: &str) -> bool {
     // RFC 3261 §20.10: To = ( name-addr / addr-spec ) *( SEMI to-param )
     // name-addr の山括弧 `<...>` 内には任意のセミコロンが現れるが、
@@ -711,11 +720,8 @@ fn has_to_tag(value: &str) -> bool {
             b'<' => depth += 1,
             b'>' => depth -= 1,
             b';' if depth == 0 => {
-                if after_semi {
-                    let p = value[start..i].trim();
-                    if p.strip_prefix("tag=").is_some_and(|v| !v.is_empty()) {
-                        return true;
-                    }
+                if after_semi && param_is_nonempty_tag(value[start..i].trim()) {
+                    return true;
                 }
                 after_semi = true;
                 start = i + 1;
@@ -723,13 +729,24 @@ fn has_to_tag(value: &str) -> bool {
             _ => {}
         }
     }
-    if after_semi {
-        let p = value[start..].trim();
-        if p.strip_prefix("tag=").is_some_and(|v| !v.is_empty()) {
-            return true;
-        }
+    if after_semi && param_is_nonempty_tag(value[start..].trim()) {
+        return true;
     }
     false
+}
+
+/// `tag=<value>` (パラメータ名 case-insensitive、 値非空) かを判定する。
+///
+/// RFC 3261 §7.3.1 / §25.1: header parameter name は token として
+/// case-insensitive 比較。 値 (token) は仕様上 case-sensitive だが、
+/// ここでは "tag が付いているか" だけが必要なので空チェックのみ。
+fn param_is_nonempty_tag(param: &str) -> bool {
+    let Some(eq_idx) = param.find('=') else {
+        return false;
+    };
+    let name = &param[..eq_idx];
+    let value = &param[eq_idx + 1..];
+    name.eq_ignore_ascii_case("tag") && !value.is_empty()
 }
 
 /// `Contact: <sip:user@host:port>;expires=...` から URI 部分を抽出。
@@ -1286,8 +1303,10 @@ mod tests {
         );
     }
 
-    /// RFC 3261 §20.10 / Issue #94: To ヘッダの tag パラメータ抽出は
-    /// `tag=` を含む URI ユーザ部などを誤検出してはならない。
+    /// RFC 3261 §20.10 / §7.3.1 / §25.1 / Issue #94 / PR #136 review:
+    /// To ヘッダの tag パラメータ抽出は `tag=` を含む URI ユーザ部などを
+    /// 誤検出してはならず、 また parameter name (`tag`) は **case-insensitive**
+    /// 比較である。
     #[test]
     fn rfc3261_20_10_has_to_tag_detects_top_level_tag_only() {
         // 通常の Re-INVITE 形式: name-addr + ;tag=
@@ -1305,6 +1324,16 @@ mod tests {
         // display-name 入りでも先頭 `<` の前に `;tag=` は出ない (構文上)。
         // 例: `"alice" <sip:a@b>;tag=t1`
         assert!(has_to_tag("\"alice\" <sip:a@b>;tag=t1"));
+        // RFC 3261 §7.3.1 / §25.1: parameter name は case-insensitive。
+        // `Tag=` `TAG=` `tAg=` 等も Re-INVITE として認識する必要がある。
+        assert!(has_to_tag("<sip:dest@sabiden>;Tag=abc"));
+        assert!(has_to_tag("<sip:dest@sabiden>;TAG=abc"));
+        assert!(has_to_tag("<sip:dest@sabiden>;tAg=abc"));
+        // 別パラメータ後の混在も正しく検出する
+        assert!(has_to_tag("<sip:dest@sabiden>;user=phone;Tag=abc"));
+        // `tag` で始まるが別名のパラメータ (`tagx=`) は検出しない
+        assert!(!has_to_tag("<sip:dest@sabiden>;tagx=abc"));
+        assert!(!has_to_tag("<sip:dest@sabiden>;TAGGED=abc"));
     }
 
     #[test]

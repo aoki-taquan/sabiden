@@ -562,7 +562,23 @@ pub struct WebRtcAudioConfig {
 
 impl WebRtcAudioBridge {
     /// ブリッジを起動する。両方向のループを spawn する。
-    pub fn start(cfg: WebRtcAudioConfig) -> Result<Self> {
+    ///
+    /// # 戻り値が `Self` (not `Result<Self>`) である理由 (Issue #135 🟡 3)
+    ///
+    /// 本関数は内部で fallible な操作を一切しない:
+    /// - `set_rtp_dscp` は失敗しても `warn` で握る (DSCP は QoS 最適化、
+    ///   設定不可でも通話自体は成立する。 `src/main.rs::set_dscp` 参照)。
+    /// - `tokio::spawn` は infallible (panic を `JoinError` として後段で
+    ///   検知する設計、 spawn 自体は `Err` を返さない)。
+    ///
+    /// よって `Result<Self>` を返すと呼出側 (`orchestrator.rs::run_inbound_*`
+    /// および PWA outbound 経路) が形式上 `?` で error path を書く必要が生じ、
+    /// **存在しない error path** を扱うことになる。 これは「unreachable な
+    /// failure mode を API に晒さない」(Rust API guidelines C-FAILURE) 観点で
+    /// 誠実でないため、 `Self` を直接返す。 RFC 直接参照は無いが、
+    /// `CLAUDE.md §6.5` の `unwrap`/`expect` 禁止と同じ精神 (production code
+    /// で出ない error path を晒さない) に則る。
+    pub fn start(cfg: WebRtcAudioConfig) -> Self {
         let WebRtcAudioConfig {
             ngn_socket,
             ngn_peer,
@@ -606,13 +622,13 @@ impl WebRtcAudioBridge {
             metrics,
         ));
 
-        Ok(Self {
+        Self {
             ngn_to_peer: Some(ngn_to_peer),
             peer_to_ngn: Some(peer_to_ngn),
             state,
             ngn_socket,
             ngn_state,
-        })
+        }
     }
 
     /// Issue #69: NGN 側 socket から NGN ピア宛に任意 RTP datagram を 1 つ送る。
@@ -1150,8 +1166,7 @@ mod tests {
             opus_payload_type: DEFAULT_OPUS_PT,
             direct_pcmu_passthrough: false,
             metrics: None,
-        })
-        .unwrap();
+        });
 
         // 8 kHz 1 kHz トーン (160 samples) を μ-law 化して NGN socket に投入
         let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
@@ -1224,8 +1239,7 @@ mod tests {
             opus_payload_type: DEFAULT_OPUS_PT,
             direct_pcmu_passthrough: false,
             metrics: None,
-        })
-        .unwrap();
+        });
 
         // 48 kHz 1 kHz トーンを Opus encode し、 MediaFrame として peer_tx に push
         let mut enc = OpusEncoder::new().unwrap();
@@ -1334,8 +1348,7 @@ mod tests {
             opus_payload_type: DEFAULT_OPUS_PT,
             direct_pcmu_passthrough: true,
             metrics: None,
-        })
-        .unwrap();
+        });
 
         // 8 kHz 1 kHz トーン (160 samples) を μ-law 化
         let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
@@ -1461,8 +1474,7 @@ mod tests {
             opus_payload_type: DEFAULT_OPUS_PT,
             direct_pcmu_passthrough: true,
             metrics: None,
-        })
-        .unwrap();
+        });
 
         // 8 kHz 1 kHz トーン → μ-law 化 (160 byte payload)
         let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
@@ -1576,5 +1588,62 @@ mod tests {
             "コーデックチェーン後の RMS が小さすぎる: {}",
             last_rms
         );
+    }
+
+    /// Issue #135 🟡 3: `WebRtcAudioBridge::start` は infallible シグネチャ
+    /// (`-> Self`)。 `?` / `match Result` を呼出側に要求しない API 形を
+    /// コンパイル時に強制するため、 `Self` の field と spawn された 2 つの
+    /// JoinHandle が即座に観測可能であることを確認する。
+    ///
+    /// 旧 `Result<Self>` 戻り値での error path は実行時に到達不能だったため
+    /// (CLAUDE.md §6.5 「production code で出ない error path を晒さない」
+    /// 精神)、 本テストは戻り値型のみを契約として検証する。
+    #[tokio::test]
+    async fn webrtc_audio_bridge_start_returns_self_directly() {
+        use std::sync::Arc as SArc;
+        use tokio::sync::mpsc;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl crate::webrtc::peer::PeerSession for NoopPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(1);
+
+        // `start` の戻り値は `Self` であり `Result` ではない。
+        // 型注釈で `Result<Self>` だとコンパイルエラーになる契約を
+        // 明示する (variable 名 `bridge: WebRtcAudioBridge`)。
+        let bridge: WebRtcAudioBridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: None,
+            peer: Arc::new(NoopPeer),
+            peer_media_rx: peer_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: true,
+            metrics: None,
+        });
+
+        // 2 ループは spawn 直後で生存している (drop されていない)。
+        let (sent, recv, errs) = bridge.stats();
+        assert_eq!(sent, 0);
+        assert_eq!(recv, 0);
+        assert_eq!(errs, 0);
+        bridge.stop().await;
     }
 }

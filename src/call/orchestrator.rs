@@ -796,8 +796,8 @@ impl NgnInboundHandler {
             };
             let rewritten =
                 rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
-            let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
-                super::transcoder::WebRtcAudioConfig {
+            let bridge: MediaBridge =
+                super::transcoder::WebRtcAudioBridge::start(super::transcoder::WebRtcAudioConfig {
                     ngn_socket: ngn_bridge_sock,
                     ngn_peer: Some(ngn_peer),
                     peer: handle.peer,
@@ -810,9 +810,8 @@ impl NgnInboundHandler {
                     // で全パケット消える (実機検証 2026-05-10)。
                     direct_pcmu_passthrough: true,
                     metrics: Some(self.metrics.clone()),
-                },
-            )?
-            .into();
+                })
+                .into();
             let cid = mgr.create_call().await;
             mgr.attach_media_bridge(cid, bridge).await?;
             self.active
@@ -2326,7 +2325,10 @@ impl PwaOutboundHandler for UasEventHandler {
                             browser_answer_for_opus.as_bytes(),
                         )
                         .unwrap_or(super::transcoder::DEFAULT_OPUS_PT);
-                        let bridge_res = super::transcoder::WebRtcAudioBridge::start(
+                        // Issue #135 🟡 3: `WebRtcAudioBridge::start` は infallible。
+                        // 旧 `Result<Self>` 戻り値での error path は実行時に到達不能
+                        // だったので、 戻り値を `Self` に変更し match を省く。
+                        let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
                             super::transcoder::WebRtcAudioConfig {
                                 ngn_socket: ngn_bridge_sock,
                                 ngn_peer: Some(ngn_peer),
@@ -2337,22 +2339,8 @@ impl PwaOutboundHandler for UasEventHandler {
                                 direct_pcmu_passthrough: true,
                                 metrics: Some(metrics.clone()),
                             },
-                        );
-                        let bridge: MediaBridge = match bridge_res {
-                            Ok(b) => b.into(),
-                            Err(e) => {
-                                warn!(error=%e, "WebRtcAudioBridge 起動失敗");
-                                metrics.record_invite_pwa_outbound(InviteResult::Error);
-                                let _ = ws_sink_clone.send(ServerMessage::error(
-                                    "outbound_failed",
-                                    format!("bridge 起動失敗: {}", e),
-                                ));
-                                if let Err(be) = ngn_dialog.send_bye().await {
-                                    warn!(error=%be, "NGN BYE (cleanup) 失敗");
-                                }
-                                return Err(anyhow!("WebRtcAudioBridge 起動失敗: {}", e));
-                            }
-                        };
+                        )
+                        .into();
 
                         let mgr = match call_manager.as_ref() {
                             Some(m) => m,

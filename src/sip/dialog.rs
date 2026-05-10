@@ -357,6 +357,13 @@ impl Dialog {
         &self.remote_target
     }
 
+    /// ダイアログ確立時に固定したローカル Contact URI を返す (RFC 3261 §12.1.2)。
+    /// in-dialog で B2BUA が「自分側」を指し示す Contact ヘッダを構築するために
+    /// 利用する (`UasEventHandler::handle_ngn_reinvite` 等)。
+    pub fn local_contact_uri(&self) -> &str {
+        &self.local_contact
+    }
+
     /// in-dialog リクエストの **次ホップ URI** を返す (RFC 3261 §12.2.1.1)。
     ///
     /// **strict / loose のどちらでも `route_set[0]` の URI を返す** (空なら

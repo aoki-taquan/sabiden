@@ -126,15 +126,32 @@ pub type ExtInviter = Arc<dyn LegInviter>;
 
 /// NGN→内線方向の BYE / リクエストを内線レッグへ伝搬する責務を持つトレイト。
 ///
-/// `NgnInboundHandler` が NGN 側で BYE を受け取ったとき、まずこのフォワーダに
-/// 「この Call-ID の外向け通話 (内線→NGN 発信) はあるか?」を問い合わせる。
-/// 該当があれば内線レッグへ BYE を伝搬する責務はフォワーダ側が負う。
+/// `NgnInboundHandler` が NGN 側で BYE / Re-INVITE を受け取ったとき、まずこの
+/// フォワーダに「この Call-ID の外向け通話 (内線→NGN 発信) はあるか?」を
+/// 問い合わせる。 該当があれば内線レッグへリクエストを伝搬する責務は
+/// フォワーダ側が負う (`UasEventHandler` が `OutboundCallRegistry` を保持
+/// しているため、 dialog state 引きから内線レッグ送信まで一貫して扱える)。
 #[async_trait::async_trait]
 pub trait OutboundDialogForwarder: Send + Sync {
     /// 指定 Call-ID が外向け通話なら true を返し、内線レッグへ BYE を投げる。
     /// 該当しなければ false を返す (= NgnInboundHandler が通常の inbound BYE
     /// 処理にフォールバックする)。
     async fn try_forward_bye(&self, ngn_call_id: &str) -> bool;
+
+    /// 指定 Call-ID が外向け通話 (内線→NGN 発信) で、 かつ NGN 側 dialog
+    /// に属する Re-INVITE (in-dialog INVITE) なら true を返し、 内線レッグへ
+    /// Re-INVITE を伝搬してその応答を NGN に返すまでを完結させる。
+    /// 該当しなければ false を返す (= NgnInboundHandler が通常の inbound
+    /// INVITE 経路 (= 新規 dialog 作成) にフォールバックする)。
+    ///
+    /// RFC 3261 §14.2 (UAS Behavior on Re-INVITE) / Issue #138:
+    /// sabiden は B2BUA であり、 NGN 側ピアが起こした hold/un-hold や
+    /// Session-Timer refresh (refresher=uas) を内線へ届ける義務がある。
+    async fn try_forward_ngn_reinvite(
+        &self,
+        request: SipRequest,
+        stx: Arc<Mutex<ServerTransaction>>,
+    ) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -145,6 +162,24 @@ impl OutboundDialogForwarder for UasEventHandler {
         }
         if let Err(e) = self.handle_ngn_bye(ngn_call_id).await {
             warn!(error=%e, "NGN→内線 BYE 伝搬中にエラー");
+        }
+        true
+    }
+
+    async fn try_forward_ngn_reinvite(
+        &self,
+        request: SipRequest,
+        stx: Arc<Mutex<ServerTransaction>>,
+    ) -> bool {
+        let call_id = match request.headers.get("call-id") {
+            Some(c) => c.to_string(),
+            None => return false,
+        };
+        if self.registry.lookup_by_ngn(&call_id).await.is_none() {
+            return false;
+        }
+        if let Err(e) = self.handle_ngn_reinvite(request, stx).await {
+            warn!(error=%e, "NGN→内線 Re-INVITE 伝搬中にエラー");
         }
         true
     }
@@ -592,6 +627,49 @@ impl NgnInboundHandler {
                 let mut tx = stx.lock().await;
                 let trying = build_response_skeleton(tx.request(), 100, "Trying");
                 tx.respond(trying).await?;
+            }
+
+            // Issue #138: RFC 3261 §12.2.2 / §14.2 — 受信 INVITE の To に tag
+            // が乗っていれば in-dialog request (= Re-INVITE)。 初回 INVITE
+            // (新規 dialog) と分岐し、 既存 outbound 通話 (内線→NGN 発信)
+            // に該当すれば内線レッグへ伝搬する。
+            //
+            // NGN から到来する Re-INVITE は典型的に NGN 側ピアが起こす
+            // hold/un-hold (RFC 3264 §8) や、 NGN 側 refresher が refresher=uas
+            // を選択した Session-Timer 更新 (RFC 4028 §7)。 sabiden は通常
+            // refresher=uac で送るため稀だが、 RFC 4028 §7.4 で UAS への
+            // refresh 委譲は許容されており、 透過処理は必須。
+            //
+            // 該当 outbound 通話が無い場合は初回 INVITE 経路にフォールバック
+            // する: NGN 直収では初回 INVITE 自体は To-tag 無しが期待されるが、
+            // 一部の SIP UA は無関係な To-tag を載せて初回送出するケースも
+            // ある (RFC 3261 §8.1.1.2 では新規 dialog の To は tag 無しを
+            // 推奨だが MUST ではない)。 そのため tag 有りでも registry に
+            // 該当が無ければ 481 ではなく通常 fork に進む安全側挙動とする。
+            if let Some(to) = request.headers.get("to") {
+                if crate::sip::utils::has_to_tag(to) {
+                    let fw = self.outbound_forwarder.lock().await.clone();
+                    if let Some(fw) = fw {
+                        if fw
+                            .try_forward_ngn_reinvite(request.clone(), stx.clone())
+                            .await
+                        {
+                            // pending は ACK 受信時に消える経路に乗せておく
+                            // (handle_inbound の SipMethod::Ack 分岐参照)。
+                            debug!(%call_id, "NGN Re-INVITE 伝搬完了");
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                    // forwarder 未注入 or 該当無し → 481 を返す (RFC 3261 §12.2.2)。
+                    // 初回 INVITE のはずなのに To-tag 付いていたケースで、
+                    // 既存 dialog 無し: 受信側 UAS は 481 が安全 (= NGN UAC は
+                    // ACK + 新規 Call-ID で再試行する)。
+                    warn!(%call_id, "NGN in-dialog INVITE で該当 outbound 通話無し → 481");
+                    self.respond(&stx, 481, "Call/Transaction Does Not Exist")
+                        .await?;
+                    self.pending.lock().await.remove(&call_id);
+                    return Ok(());
+                }
             }
 
             // 登録済み内線の AOR 一覧を取得し target URI に変換する
@@ -1887,6 +1965,32 @@ impl UasEventHandler {
     ///    (B2BUA media anchoring が無効な現実装では rewrite せず、 RFC 3264
     ///    Offer/Answer の素直な伝搬として扱う)
     ///
+    /// # SDP 書換 (Issue #138)
+    ///
+    /// 内線が出した Re-INVITE オファ SDP を **NGN へ転送する前に必ず**
+    /// `force_rewrite_sdp_for_ngn` (= `c=`/`o=` を eth1 IP に強制) +
+    /// `restrict_audio_to_pcmu_with_dtmf` (= PCMU + telephone-event のみ残す)
+    /// を通す。 これは初回 INVITE 経路 (`UasEventHandler::handle_invite`
+    /// L1603-1625) と同じ前処理であり、 CLAUDE.md §5 「NGN 実機制約」
+    /// (PCMU only / c=/o= は eth1 IP) を Re-INVITE でも遵守する。
+    ///
+    /// 透過モード (Phase R3 Negotiator 前) では RTP ブリッジ port 差替は
+    /// 未対応のため、 m=audio port は内線オファのままで NGN に流す。
+    /// hold/un-hold (= a=sendonly / a=sendrecv 切替) や `a=ptime` 変更は
+    /// この前処理を通しても保存される。
+    ///
+    /// # Min-SE / Retry-After relay (Issue #138, RFC 4028 §6 / §7.1 / §10)
+    ///
+    /// NGN レッグから 422 Session Interval Too Small が返った場合、
+    /// レスポンスに **Min-SE ヘッダ必須** (RFC 4028 §7.1 / §10):
+    /// > "When this response is received, the UAC MUST examine the
+    /// >  Min-SE header field in the response."
+    ///
+    /// sabiden は B2BUA であり、 NGN→sabiden の 422 で得た Min-SE を
+    /// **そのまま** sabiden→内線 422 に乗せる必要がある (内線 UA が
+    /// 同じ Re-INVITE を Min-SE 整合値で再送するため)。 同様に 5xx 系の
+    /// Retry-After (RFC 3261 §20.33) も中継する。
+    ///
     /// # 既知の制限 (Phase R3 で改善)
     ///
     /// - RTP ブリッジ媒介時の SDP 書換 (port / IP の sabiden 側差し替え) は
@@ -1895,7 +1999,6 @@ impl UasEventHandler {
     ///   `finalize_outbound_bridge` を Re-INVITE 経路にも結線する必要がある
     ///   (`docs/refactor-plan.md` §1.4 / Phase R3 Negotiator)。
     /// - PRACK / 100rel (RFC 3262) や UPDATE (RFC 3311) は未対応 (Phase R2)。
-    /// - NGN 側 Re-INVITE 失敗 (4xx/5xx) は内線へそのまま中継する (491 含む)。
     async fn handle_ext_reinvite(
         &self,
         request: SipRequest,
@@ -1939,17 +2042,28 @@ impl UasEventHandler {
 
             info!(%call_id, "Re-INVITE 受信 → NGN レッグへ伝搬 (RFC 3261 §14.2)");
 
-            // NGN レッグへ Re-INVITE 送信。 SDP は内線が出した新オファをそのまま
-            // 渡す (NGN PCMU 制約は RFC 3264 で当初オファに従っており Re-INVITE
-            // でも同じ codec set のまま、 ptime / direction (sendrecv↔sendonly 等)
-            // が変わるのが典型的)。 PCMU 制約フィルタは将来 Phase R3 Negotiator
-            // で再適用するが、 現状は内線が出したまま流す (hold = a=sendonly /
-            // un-hold = a=sendrecv 切替を NGN まで運ぶのが目的)。
-            let new_offer = if request.body.is_empty() {
+            // Issue #138: 内線オファ SDP を NGN へ流す前に **必ず** NGN 制約に
+            // 揃える (CLAUDE.md §5):
+            // - `force_rewrite_sdp_for_ngn`: c=/o= IP を eth1 IP に強制
+            // - `restrict_audio_to_pcmu_with_dtmf`: PCMU(0) + telephone-event(101)
+            //   以外のコーデックを削除 (LAN 由来 Opus / G.722 が NGN レッグへ
+            //   漏れて 488 になるのを防ぐ)
+            //
+            // Re-INVITE で sendonly/sendrecv 切替 (hold / un-hold) や ptime 変更を
+            // 行うのが典型なので、 これらの属性は前処理を通しても保持される。
+            // 元 SDP が空 (= SDP 無し Session-Timer 更新のみ) なら書換せず None。
+            let ngn_local_ip = self.ngn_uac.config().local_addr.ip();
+            let rewritten_offer: Option<Vec<u8>> = if request.body.is_empty() {
                 None
             } else {
-                Some(request.body.as_slice())
+                let rewritten = force_rewrite_sdp_for_ngn(&request.body, ngn_local_ip)
+                    .map(|s| restrict_audio_to_pcmu_with_dtmf(&s));
+                if rewritten.is_none() {
+                    debug!(%call_id, "Re-INVITE: SDP 書換が None (空) → SDP 無しで送信");
+                }
+                rewritten
             };
+            let new_offer = rewritten_offer.as_deref();
             let ngn_resp = {
                 let mut ngn_dlg = entry.ngn_dialog.lock().await;
                 ngn_dlg.send_reinvite(new_offer).await
@@ -1963,18 +2077,59 @@ impl UasEventHandler {
                     // tag 既存ならスキップするため、 既存 dialog の To-tag が保たれる。
                     let body = resp.body.clone();
                     let contact_uri = self.ext_contact_uri();
-                    let response_to_ext = build_2xx_to_ext(&request, &body, &contact_uri);
+                    let mut response_to_ext = build_2xx_to_ext(&request, &body, &contact_uri);
+                    // RFC 4028 §7.4: Session-Timer 更新の 2xx には Session-Expires
+                    // を載せる。 NGN が refresher を確定した値があれば中継、
+                    // 無ければ載せない (内線 UA は INVITE 送信時の値で動く)。
+                    if let Some(se) = resp.headers.get("session-expires") {
+                        response_to_ext.headers.set("Session-Expires", se);
+                    }
+                    if let Some(req_h) = resp.headers.get("require") {
+                        if req_h
+                            .split(',')
+                            .any(|t| t.trim().eq_ignore_ascii_case("timer"))
+                        {
+                            response_to_ext.headers.set("Require", "timer");
+                        }
+                    }
                     if let Err(e) = responder.respond(response_to_ext).await {
                         warn!(error=%e, "Re-INVITE 200 OK の内線送出失敗");
                     }
                     Ok(())
                 }
                 Ok(resp) => {
-                    // 4xx/5xx/6xx を中継 (491 Request Pending 含む、 RFC 3261 §14.2)
+                    // 4xx/5xx/6xx を中継 (491 Request Pending 含む、 RFC 3261 §14.2)。
+                    // Issue #138: 422 Session Interval Too Small (RFC 4028 §7.1)
+                    // や 5xx Retry-After (RFC 3261 §20.33) のリレー必須ヘッダを
+                    // NGN レスポンスからコピーして内線へ返す。 これを欠くと
+                    // 内線 UA は Min-SE 整合値で再送できず Session-Timer 更新が
+                    // 失敗し続ける (= 通話途中切断の温床)。
                     warn!(code = resp.status_code, "NGN Re-INVITE 失敗 → 内線へ中継");
-                    responder
-                        .quick(resp.status_code, resp.reason.as_str())
-                        .await
+                    let mut relay =
+                        build_response_skeleton(&request, resp.status_code, resp.reason.as_str());
+                    // RFC 4028 §10: 422 には Min-SE 必須。 NGN が乗せて来た
+                    // Min-SE をそのまま中継し、 内線 UA がその値で再送できるよう
+                    // にする。 422 でも欠落していたらログだけ残す (NGN 側違反)。
+                    if let Some(min_se) = resp.headers.get("min-se") {
+                        relay.headers.set("Min-SE", min_se);
+                    } else if resp.status_code == 422 {
+                        warn!(
+                            %call_id,
+                            "Re-INVITE 422 だが NGN レスポンスに Min-SE が無い (RFC 4028 §10 違反)"
+                        );
+                    }
+                    // RFC 3261 §20.33: 5xx (+ 404/413/480/486/600/603) の
+                    // Retry-After は中継推奨。 422 や 423 の Min-SE 経路と
+                    // 併存可能なので独立に判定して両方コピーされても問題ない。
+                    if let Some(ra) = resp.headers.get("retry-after") {
+                        relay.headers.set("Retry-After", ra);
+                    }
+                    // dialog を作らない 4xx/5xx 応答にも To-tag は必須
+                    // (RFC 3261 §8.2.6.2)。 Re-INVITE は in-dialog なので
+                    // request の To に既存 tag が乗っており ensure_to_tag は
+                    // no-op。 念のため明示的に通しておく。
+                    ensure_to_tag(&mut relay);
+                    responder.respond(relay).await
                 }
                 Err(e) => {
                     warn!(error=%e, "NGN Re-INVITE トランスポート失敗 → 500");
@@ -2189,6 +2344,163 @@ impl UasEventHandler {
             }
         }
         Ok(())
+    }
+
+    /// NGN→内線方向の **Re-INVITE** を扱う (`NgnInboundHandler` から委譲される)。
+    ///
+    /// Issue #138: sabiden は通常 `refresher=uac` で Session-Timer refresh を
+    /// 自分から打つため NGN 由来の Re-INVITE は稀だが、 NGN 側ピアが起こす
+    /// hold / un-hold (`a=sendonly` ↔ `a=sendrecv`) を内線へ届けないと
+    /// 通話状態が片側だけ更新される (= B2BUA としての透過性破綻)。
+    ///
+    /// RFC 3261 §14.2 (UAS Behavior on Re-INVITE) / §12.2.2:
+    /// > "A UAS that receives a re-INVITE for an existing dialog ... MUST
+    /// >  generate a response. ... If the re-INVITE contains an SDP body,
+    /// >  the UAS MUST use the Offer/Answer model (RFC 3264) to negotiate."
+    ///
+    /// RFC 3264 §8: hold / un-hold は新しい SDP オファとして送られ、
+    /// UAS は対称な answer を返さねばならない。
+    ///
+    /// # B2BUA 動作 (Issue #138)
+    ///
+    /// 1. registry から `OutboundCallEntry` を引く (call-id = NGN 側 Call-ID)
+    /// 2. 内線レッグの `ext_dialog` (sabiden=UAS で確立) を流用して
+    ///    `build_reinvite` で内線向け Re-INVITE を組み立てる。 SDP は NGN
+    ///    オファをそのまま使用 (内線→NGN 透過モード)。
+    /// 3. `ext_layer.send_request` で内線へ送出し、 応答を待つ
+    /// 4. 受領した内線応答を NGN 側 ServerTransaction で中継:
+    ///    - 2xx: SDP answer + Contact / Session-Expires を載せる
+    ///    - 4xx/5xx: status + Min-SE / Retry-After を載せる (RFC 4028 §10 /
+    ///      RFC 3261 §20.33)
+    ///
+    /// # 既知の制限 (Phase R3 で改善予定)
+    ///
+    /// - RTP ブリッジ媒介時の SDP 書換 (sabiden 側 RTP port への差替) は
+    ///   未実装。 透過モード前提。
+    /// - 内線が応答しない / Timeout した場合は NGN へ 408 Request Timeout
+    ///   を返す (RFC 3261 §13.3.1.1)。
+    /// - ACK は新規 transaction で NGN から sabiden へ来るが、
+    ///   `NgnInboundHandler::handle_inbound` の `SipMethod::Ack` 分岐で
+    ///   pending を掃除して終わる (= 既存挙動と同じ)。
+    pub(crate) async fn handle_ngn_reinvite(
+        &self,
+        request: SipRequest,
+        stx: Arc<Mutex<ServerTransaction>>,
+    ) -> Result<()> {
+        let call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_default();
+        let entry = match self.registry.lookup_by_ngn(&call_id).await {
+            Some(e) => e,
+            None => {
+                // try_forward_ngn_reinvite が事前にチェックしている想定だが、
+                // 競合で消えた場合の安全策として 481 を返す (RFC 3261 §12.2.2)。
+                debug!(%call_id, "NGN Re-INVITE: 対応する outbound call が消失 → 481");
+                let mut tx = stx.lock().await;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                ensure_to_tag(&mut resp);
+                return tx.respond(resp).await;
+            }
+        };
+        info!(%call_id, "NGN Re-INVITE 受信 → 内線レッグへ伝搬 (RFC 3261 §14.2)");
+
+        let layer = entry.ext_layer.clone();
+        let ext_remote = entry.ext_remote;
+
+        // 内線レッグ向け Re-INVITE 組み立て。 SDP は NGN オファを透過
+        // (Phase R3 まで RTP ブリッジ port 差替は未対応)。 sabiden は
+        // 内線レッグでも refresher=uac として Session-Timer を更新する
+        // (= UacDialog::send_reinvite と同じ既定値 300/90)。
+        let sdp_body: Option<&[u8]> = if request.body.is_empty() {
+            None
+        } else {
+            Some(request.body.as_slice())
+        };
+        let ext_reinvite = {
+            let dlg = entry.ext_dialog.lock().await;
+            dlg.build_reinvite(sdp_body, 300, crate::sip::uac::MIN_SE)
+        };
+        if !request.body.is_empty() {
+            // dialog.build_reinvite は SDP 有無を内部判定して Content-Type を
+            // セットするので追加処理不要だが、 Content-Type 完全性を念のため確認
+            // (空 body → set されない、 非空 → application/sdp が set される)。
+            debug!(
+                ?call_id,
+                "NGN Re-INVITE SDP を内線へ透過 ({} bytes)",
+                request.body.len()
+            );
+        }
+        let ext_resp_result = layer.send_request(ext_reinvite, ext_remote).await;
+
+        let mut tx = stx.lock().await;
+        match ext_resp_result {
+            Ok(resp) if (200..300).contains(&resp.status_code) => {
+                // 内線 200 OK を NGN へ中継。 SDP answer / Session-Expires /
+                // Require: timer をコピーする (RFC 4028 §7.4 / §9)。
+                let mut to_ngn = build_response_skeleton(tx.request(), 200, "OK");
+                if !resp.body.is_empty() {
+                    to_ngn.body = resp.body.clone();
+                    to_ngn.headers.set("Content-Type", "application/sdp");
+                }
+                // Contact は NGN 側 (sabiden=UAC for NGN) のローカル sent-by
+                // を載せる必要がある。 既存 ngn_dialog の local_contact を
+                // 利用すれば NGN レッグの整合が取れる。
+                {
+                    let ngn_dlg = entry.ngn_dialog.lock().await;
+                    let contact = ngn_dlg.dialog().local_contact_uri();
+                    to_ngn.headers.set("Contact", format!("<{}>", contact));
+                }
+                if let Some(se) = resp.headers.get("session-expires") {
+                    to_ngn.headers.set("Session-Expires", se);
+                }
+                if let Some(req_h) = resp.headers.get("require") {
+                    if req_h
+                        .split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("timer"))
+                    {
+                        to_ngn.headers.set("Require", "timer");
+                    }
+                }
+                // RFC 3261 §8.2.6.2: To-tag 必須。 既存 dialog の To-tag は
+                // request の To から build_response_skeleton がコピー済み。
+                ensure_to_tag(&mut to_ngn);
+                tx.respond(to_ngn).await
+            }
+            Ok(resp) => {
+                warn!(code = resp.status_code, "内線 Re-INVITE 失敗 → NGN へ中継");
+                let mut to_ngn =
+                    build_response_skeleton(tx.request(), resp.status_code, resp.reason.as_str());
+                // RFC 4028 §10: 422 で内線が Min-SE を返したらそのまま NGN へ。
+                // 内線 UA が refresher=uas として早く更新したい意思表示でも
+                // 重要なので削らずに中継する。
+                if let Some(min_se) = resp.headers.get("min-se") {
+                    to_ngn.headers.set("Min-SE", min_se);
+                } else if resp.status_code == 422 {
+                    warn!(
+                        %call_id,
+                        "NGN→内線 Re-INVITE 422 だが内線応答に Min-SE が無い (RFC 4028 §10 違反)"
+                    );
+                }
+                if let Some(ra) = resp.headers.get("retry-after") {
+                    to_ngn.headers.set("Retry-After", ra);
+                }
+                ensure_to_tag(&mut to_ngn);
+                tx.respond(to_ngn).await
+            }
+            Err(e) => {
+                warn!(error=%e, "内線 Re-INVITE トランスポート失敗 → NGN へ 408");
+                // RFC 3261 §13.3.1.1: 内線 UA が応答しないなら 408 Request Timeout
+                // を NGN へ返す (Timer F 相当の上位扱い)。 NGN→sabiden Re-INVITE
+                // を失敗扱いとし、 NGN 側 UAC は ACK + BYE で dialog を畳む選択を
+                // 取ることになる。
+                let mut to_ngn = build_response_skeleton(tx.request(), 408, "Request Timeout");
+                ensure_to_tag(&mut to_ngn);
+                tx.respond(to_ngn).await
+            }
+        }
     }
 
     /// NGN→内線方向の BYE を扱う (`NgnInboundHandler` から委譲される)。
@@ -6273,6 +6585,715 @@ mod tests {
         assert!(
             got_491,
             "進行中 INVITE と Race した Re-INVITE は 491 Request Pending (RFC 3261 §14.2)"
+        );
+    }
+
+    /// Issue #138 / RFC 3264 §8 / CLAUDE.md §5: 内線が Re-INVITE オファとして
+    /// LAN private IP + Opus を含む SDP を出してきた場合、 sabiden は NGN レッグ
+    /// へ送信する前に **必ず** `c=`/`o=` を eth1 IP に強制書換し、 PCMU(0) +
+    /// telephone-event(101) 以外のコーデックを削除しなければならない
+    /// (NGN は PCMU only, c=/o= は eth1 IP のみ受理する `docs/asterisk-real-invite.md`
+    /// §5.2)。 これを欠くと LAN IP 漏洩 → 488 NotAcceptable で hold/un-hold が
+    /// 失敗する。
+    #[tokio::test]
+    async fn rfc3264_8_ext_reinvite_offer_is_rewritten_for_ngn_before_relay() {
+        use crate::config::{ExtensionConfig, UasConfig};
+        use crate::sip::message::parse_message;
+        use crate::sip::uas::ExtensionUas;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // フェイク NGN: 初回 INVITE + Re-INVITE 両方を受ける。 Re-INVITE 受信時の
+        // SDP body を共有 buffer に保存して assertion に使う。
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let reinv_sdp: Arc<StdMutex<Option<Vec<u8>>>> = Arc::new(StdMutex::new(None));
+        let reinv_sdp_c = reinv_sdp.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 初回 INVITE
+            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(req1) = parse_message(&buf[..n]).unwrap() else {
+                panic!("初回 INVITE 期待");
+            };
+            let mut resp1 = build_response_skeleton(&req1, 200, "OK");
+            resp1.headers.set(
+                "To",
+                format!("{};tag=ngn-tag", req1.headers.get("to").unwrap()),
+            );
+            resp1
+                .headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            fake_ngn_clone
+                .send_to(&resp1.to_bytes(), peer)
+                .await
+                .unwrap();
+            let _ = fake_ngn_clone.recv_from(&mut buf).await; // ACK
+                                                              // Re-INVITE 受信して body をキャプチャ
+            let (n, peer2) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(req2) = parse_message(&buf[..n]).unwrap() else {
+                panic!("Re-INVITE 期待");
+            };
+            *reinv_sdp_c.lock().unwrap() = Some(req2.body.clone());
+            let mut resp2 = build_response_skeleton(&req2, 200, "OK");
+            resp2.headers.set("Content-Type", "application/sdp");
+            resp2
+                .headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            resp2.body = b"v=0\r\no=- 2 2 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_vec();
+            fake_ngn_clone
+                .send_to(&resp2.to_bytes(), peer2)
+                .await
+                .unwrap();
+            let _ = timeout(Duration::from_secs(2), fake_ngn_clone.recv_from(&mut buf)).await;
+        });
+
+        // ngn_local_addr = 127.0.0.1 (テスト用)。 LAN 192.168 を eth1 = 127.0.0.1
+        // に書き換える挙動を観察する (production では 118.177.x.x になる)。
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_local_addr = ngn_client_sock.local_addr().unwrap();
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_local_addr,
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // 内線 UAS bind
+        let uas_cfg = UasConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm: "sabiden-test".to_string(),
+            max_expires: 3600,
+        };
+        let extensions = vec![ExtensionConfig {
+            username: "iphone".to_string(),
+            password: "secret".to_string(),
+        }];
+        let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
+        let uas_addr = uas.socket().local_addr().unwrap();
+        let registrar = uas.registrar();
+        let ext_layer_for_handler = uas.layer();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let uas = uas.with_handler(event_tx);
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+        let mut handler = UasEventHandler::new(ngn_uac);
+        handler.attach_ext_layer(ext_layer_for_handler, Some(uas_addr));
+        handler.spawn(event_rx);
+
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_local = phone.local_addr().unwrap();
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", phone_local),
+                phone_local,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 初回 INVITE
+        let call_id = "rewr-cid";
+        let from_tag = "phonet";
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        req.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKfirst", phone_local),
+        );
+        req.headers.set("Max-Forwards", "70");
+        req.headers
+            .set("From", format!("<sip:iphone@sabiden>;tag={}", from_tag));
+        req.headers.set("To", "<sip:dest@sabiden>");
+        req.headers.set("Call-ID", call_id);
+        req.headers.set("CSeq", "1 INVITE");
+        req.headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_local));
+        phone.send_to(&req.to_bytes(), uas_addr).await.unwrap();
+
+        // 200 OK を取って To-tag を採取
+        let mut buf = vec![0u8; 8192];
+        let mut sabiden_to_tag: Option<String> = None;
+        for _ in 0..5 {
+            match timeout(Duration::from_secs(3), phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        if (200..300).contains(&r.status_code) {
+                            let to = r.headers.get("to").unwrap().to_string();
+                            if let Some(idx) = to.find(";tag=") {
+                                sabiden_to_tag =
+                                    Some(to[idx + 5..].split(';').next().unwrap().to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let sabiden_to_tag = sabiden_to_tag.expect("初回 200 OK の To-tag");
+
+        // Re-INVITE: LAN IP 192.168.20.42 + Opus 109 を含む multi-codec SDP
+        let mut reinv = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        reinv.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKsecond", phone_local),
+        );
+        reinv.headers.set("Max-Forwards", "70");
+        reinv
+            .headers
+            .set("From", format!("<sip:iphone@sabiden>;tag={}", from_tag));
+        reinv
+            .headers
+            .set("To", format!("<sip:dest@sabiden>;tag={}", sabiden_to_tag));
+        reinv.headers.set("Call-ID", call_id);
+        reinv.headers.set("CSeq", "2 INVITE");
+        reinv
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_local));
+        reinv.headers.set("Content-Type", "application/sdp");
+        reinv.body = b"v=0\r\no=iphone 1 2 IN IP4 192.168.20.42\r\ns=-\r\nc=IN IP4 192.168.20.42\r\nt=0 0\r\nm=audio 40000 RTP/AVP 109 0 101\r\na=rtpmap:109 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=sendrecv\r\n".to_vec();
+        phone.send_to(&reinv.to_bytes(), uas_addr).await.unwrap();
+
+        // NGN が Re-INVITE を受け、 200 OK で完了するのを待つ
+        let _ = timeout(Duration::from_secs(3), ngn_task).await;
+        let got = reinv_sdp
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NGN レッグへ Re-INVITE が届くべき");
+        let sdp = std::str::from_utf8(&got).unwrap();
+        // RFC 4566 §5.7 / CLAUDE.md §5: c=/o= の LAN IP は eth1 IP に書き換わる
+        assert!(
+            !sdp.contains("192.168.20.42"),
+            "Re-INVITE NGN レッグの SDP に LAN IP が残ってはいけない: {}",
+            sdp
+        );
+        let eth1_ip_str = ngn_local_addr.ip().to_string();
+        assert!(
+            sdp.contains(&format!("c=IN IP4 {}", eth1_ip_str)),
+            "Re-INVITE NGN レッグの c= は eth1 IP ({}) であるべき: {}",
+            eth1_ip_str,
+            sdp
+        );
+        // CLAUDE.md §5 / RFC 3551: Opus は NGN レッグに流してはいけない
+        assert!(
+            !sdp.contains("opus"),
+            "Re-INVITE NGN レッグの SDP から Opus が削除されているべき: {}",
+            sdp
+        );
+        // RFC 4733 §2.4.1: telephone-event は PCMU と並走可
+        assert!(
+            sdp.contains("PCMU"),
+            "Re-INVITE NGN レッグの SDP に PCMU は残るべき: {}",
+            sdp
+        );
+        assert!(
+            sdp.contains("telephone-event"),
+            "Re-INVITE NGN レッグの SDP に telephone-event は残るべき: {}",
+            sdp
+        );
+    }
+
+    /// Issue #138 / RFC 4028 §7.1 / §10: NGN レッグから 422 Session Interval
+    /// Too Small が **Min-SE ヘッダ付き** で返った場合、 sabiden は同 Min-SE 値を
+    /// 内線レッグの 422 にも乗せて中継しなければならない。 これを欠くと
+    /// 内線 UA が再送値を知らず Session-Timer 更新が失敗し続ける。
+    #[tokio::test]
+    async fn rfc4028_10_ext_reinvite_relays_min_se_from_ngn_422() {
+        use crate::config::{ExtensionConfig, UasConfig};
+        use crate::sip::message::parse_message;
+        use crate::sip::uas::ExtensionUas;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let fake_ngn_clone = fake_ngn.clone();
+        // フェイク NGN: 1) 初回 INVITE → 200 OK, 2) Re-INVITE → **422 + Min-SE: 1800**
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 初回
+            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(req1) = parse_message(&buf[..n]).unwrap() else {
+                panic!("INVITE 期待");
+            };
+            let mut resp1 = build_response_skeleton(&req1, 200, "OK");
+            resp1.headers.set(
+                "To",
+                format!("{};tag=ngn-tag", req1.headers.get("to").unwrap()),
+            );
+            resp1
+                .headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            fake_ngn_clone
+                .send_to(&resp1.to_bytes(), peer)
+                .await
+                .unwrap();
+            let _ = fake_ngn_clone.recv_from(&mut buf).await; // ACK
+
+            // Re-INVITE → 422 Session Interval Too Small + Min-SE: 1800
+            let (n, peer2) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(req2) = parse_message(&buf[..n]).unwrap() else {
+                panic!("Re-INVITE 期待");
+            };
+            let mut resp422 = build_response_skeleton(&req2, 422, "Session Interval Too Small");
+            resp422.headers.set("Min-SE", "1800");
+            fake_ngn_clone
+                .send_to(&resp422.to_bytes(), peer2)
+                .await
+                .unwrap();
+            // 422 への ACK は内部で送られる
+            let _ = timeout(Duration::from_secs(2), fake_ngn_clone.recv_from(&mut buf)).await;
+        });
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+        let uas_cfg = UasConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm: "sabiden-test".to_string(),
+            max_expires: 3600,
+        };
+        let extensions = vec![ExtensionConfig {
+            username: "iphone".to_string(),
+            password: "secret".to_string(),
+        }];
+        let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
+        let uas_addr = uas.socket().local_addr().unwrap();
+        let registrar = uas.registrar();
+        let ext_layer_for_handler = uas.layer();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let uas = uas.with_handler(event_tx);
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+        let mut handler = UasEventHandler::new(ngn_uac);
+        handler.attach_ext_layer(ext_layer_for_handler, Some(uas_addr));
+        handler.spawn(event_rx);
+
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_local = phone.local_addr().unwrap();
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", phone_local),
+                phone_local,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 初回 INVITE
+        let call_id = "minse-cid";
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        req.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKfirst", phone_local),
+        );
+        req.headers.set("Max-Forwards", "70");
+        req.headers.set("From", "<sip:iphone@sabiden>;tag=phonet");
+        req.headers.set("To", "<sip:dest@sabiden>");
+        req.headers.set("Call-ID", call_id);
+        req.headers.set("CSeq", "1 INVITE");
+        req.headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_local));
+        phone.send_to(&req.to_bytes(), uas_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 8192];
+        let mut sabiden_to_tag: Option<String> = None;
+        for _ in 0..5 {
+            match timeout(Duration::from_secs(3), phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        if (200..300).contains(&r.status_code) {
+                            let to = r.headers.get("to").unwrap().to_string();
+                            if let Some(idx) = to.find(";tag=") {
+                                sabiden_to_tag =
+                                    Some(to[idx + 5..].split(';').next().unwrap().to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let sabiden_to_tag = sabiden_to_tag.expect("初回 200 OK To-tag");
+
+        // Re-INVITE (Session-Timer 更新狙い)
+        let mut reinv = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        reinv.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKsecond", phone_local),
+        );
+        reinv.headers.set("Max-Forwards", "70");
+        reinv.headers.set("From", "<sip:iphone@sabiden>;tag=phonet");
+        reinv
+            .headers
+            .set("To", format!("<sip:dest@sabiden>;tag={}", sabiden_to_tag));
+        reinv.headers.set("Call-ID", call_id);
+        reinv.headers.set("CSeq", "2 INVITE");
+        reinv
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_local));
+        reinv.headers.set("Session-Expires", "60");
+        reinv.headers.set("Min-SE", "60");
+        phone.send_to(&reinv.to_bytes(), uas_addr).await.unwrap();
+
+        // 内線が 422 + Min-SE を受信
+        let mut got_422_with_minse = false;
+        for _ in 0..6 {
+            match timeout(Duration::from_secs(3), phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        let cseq = r.headers.get("cseq").unwrap_or("");
+                        if r.status_code == 422 && cseq.contains("2 ") {
+                            let min_se = r.headers.get("min-se").unwrap_or("");
+                            assert_eq!(
+                                min_se.trim(),
+                                "1800",
+                                "RFC 4028 §10: 422 の Min-SE は NGN レスポンスから中継"
+                            );
+                            got_422_with_minse = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            got_422_with_minse,
+            "内線へ 422 Session Interval Too Small + Min-SE が中継されるべき (RFC 4028 §7.1 / §10)"
+        );
+        let _ = timeout(Duration::from_secs(1), ngn_task).await;
+    }
+
+    /// Issue #138 / RFC 3261 §14.2: NGN→sabiden 方向の Re-INVITE
+    /// (内線→NGN 発信通話に対して NGN 側ピアが起こす hold/un-hold) は
+    /// 内線レッグへ Re-INVITE として伝搬されなければならない。
+    ///
+    /// シナリオ: 1) 内線が発信 INVITE → sabiden が NGN へ INVITE → 確立。
+    /// 2) NGN がフェイクで in-dialog INVITE (= Re-INVITE) を sabiden に送る。
+    /// 3) sabiden は内線レッグへ Re-INVITE を投げ、 内線が 200 OK を返す。
+    /// 4) sabiden が NGN へ 200 OK を中継する。
+    #[tokio::test]
+    async fn rfc3261_14_2_ngn_reinvite_forwards_to_extension() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+            )
+            .with_test_writer()
+            .try_init();
+        use crate::config::{ExtensionConfig, UasConfig};
+        use crate::sip::message::parse_message;
+        use crate::sip::uas::ExtensionUas;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // フェイク NGN: 1) 初回 INVITE 受信 → 200 OK, 2) ACK 受信,
+        // 3) 自分から in-dialog INVITE を撃って 200 OK を待つ
+        let fake_ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn_sock.local_addr().unwrap();
+        // (NGN フェイクは後ほど socket 共有で sabiden 側に振る)。
+
+        // 内線 UAS bind
+        let uas_cfg = UasConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm: "sabiden-test".to_string(),
+            max_expires: 3600,
+        };
+        let extensions = vec![ExtensionConfig {
+            username: "iphone".to_string(),
+            password: "secret".to_string(),
+        }];
+        let uas = ExtensionUas::bind(uas_cfg, &extensions).await.unwrap();
+        let uas_addr = uas.socket().local_addr().unwrap();
+        let registrar = uas.registrar();
+        let ext_layer_for_handler = uas.layer();
+
+        // NGN 側 UAC + Inbound handler を **同じ socket** に共有する。
+        // production と同じ「P-CSCF 通信用 UDP socket は 1 つ」を再現。
+        let ngn_shared_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_shared_addr = ngn_shared_sock.local_addr().unwrap();
+        let (ngn_layer, ngn_inbound_rx) = TransactionLayer::spawn(ngn_shared_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_shared_addr,
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // UasEventHandler 構築 + ext_layer 接続
+        let mut handler = UasEventHandler::new(ngn_uac);
+        handler.attach_ext_layer(ext_layer_for_handler, Some(uas_addr));
+
+        // NgnInboundHandler 起動 (ngn_uac とは別の socket / layer)
+        // outbound_forwarder に handler を渡すことで NGN→sabiden Re-INVITE 経路を結線
+        // 本テストでは NGN 着信フォーク経路は走らない (NGN→sabiden Re-INVITE は
+        // outbound_forwarder で短絡される) ため、 dummy inviter で十分。
+        let dummy_inviter: ExtInviter = crate::testing::scripted::ScriptedInviter::builder()
+            .default_action(crate::testing::scripted::ScriptedAction::busy())
+            .build();
+        let ngn_handler = NgnInboundHandler::with_metrics(
+            ngn_shared_sock.clone(),
+            dummy_inviter,
+            registrar.clone(),
+            NgnInboundConfig::default(),
+            Metrics::new(),
+        );
+        ngn_handler.set_outbound_forwarder(handler.clone()).await;
+        ngn_handler.clone().spawn(ngn_inbound_rx);
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let uas = uas.with_handler(event_tx);
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+        handler.spawn(event_rx);
+
+        // 内線登録
+        let phone = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_local = phone.local_addr().unwrap();
+        registrar
+            .register(
+                "iphone",
+                format!("sip:iphone@{}", phone_local),
+                phone_local,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // フェイク NGN: 初回 INVITE を受けて 200 OK を返し、 同 dialog で
+        // Re-INVITE (in-dialog INVITE) を sabiden に向けて送る。
+        // ext_reinv_seen を共有して内線が Re-INVITE を受けたことを観測する。
+        let ngn_ack_seen: Arc<StdMutex<bool>> = Arc::new(StdMutex::new(false));
+        let ngn_ack_seen_c = ngn_ack_seen.clone();
+        let fake_ngn_sock_c = fake_ngn_sock.clone();
+        let ngn_call_id_for_reinv: Arc<StdMutex<Option<(SipRequest, std::net::SocketAddr)>>> =
+            Arc::new(StdMutex::new(None));
+        let captured_initial = ngn_call_id_for_reinv.clone();
+        let ngn_200_seen: Arc<StdMutex<Option<u16>>> = Arc::new(StdMutex::new(None));
+        let ngn_200_seen_c = ngn_200_seen.clone();
+
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 1) 初回 INVITE を受信
+            let (n, peer) = fake_ngn_sock_c.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(req1) = parse_message(&buf[..n]).unwrap() else {
+                panic!("初回 INVITE 期待");
+            };
+            *captured_initial.lock().unwrap() = Some((req1.clone(), peer));
+            let mut resp1 = build_response_skeleton(&req1, 200, "OK");
+            // To-tag を付ける (新規 dialog なので)
+            let to_in = req1.headers.get("to").unwrap();
+            resp1.headers.set("To", format!("{};tag=ngnsidetag", to_in));
+            resp1
+                .headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            fake_ngn_sock_c
+                .send_to(&resp1.to_bytes(), peer)
+                .await
+                .unwrap();
+            // 2) ACK を受ける
+            let _ = fake_ngn_sock_c.recv_from(&mut buf).await;
+            *ngn_ack_seen_c.lock().unwrap() = true;
+
+            // 3) NGN 側ピアが Re-INVITE を sabiden に向けて発射
+            let (orig, sabiden_peer) = captured_initial.lock().unwrap().clone().unwrap();
+            let mut reinv = SipRequest::new(SipMethod::Invite, orig.uri.clone());
+            reinv.headers.set(
+                "Via",
+                format!("SIP/2.0/UDP {};branch=z9hG4bKreinv-ngn", fake_ngn_addr),
+            );
+            reinv.headers.set("Max-Forwards", "70");
+            // From は元 INVITE の To (sabiden 側)、 To は元 INVITE の From (NGN 側ピア)
+            // を反転して in-dialog request を作る形だが、 sabiden=UAC for NGN な
+            // dialog 視点では「NGN ピア → sabiden」方向。
+            // 元 INVITE の From/To をそのまま使うと dialog tag が逆になる:
+            //   - sabiden=UAC, NGN=UAS だったので
+            //   - in-dialog request from NGN to sabiden は From(NGN 側)=元 To+tag(NGN),
+            //     To(sabiden 側)=元 From+tag(sabiden) になる。
+            // build_response_skeleton で付けた "ngnsidetag" を NGN→sabiden 方向の
+            // remote tag として再利用する。
+            let orig_from = orig.headers.get("from").unwrap();
+            let orig_from_tag = orig_from
+                .split(";tag=")
+                .nth(1)
+                .map(|s| s.split(';').next().unwrap_or(s))
+                .unwrap_or("");
+            // sabiden 側の URI (= 元 To URI without tag) と既存 sabiden tag を抽出
+            let orig_to = orig.headers.get("to").unwrap();
+            let orig_to_uri = orig_to
+                .split(";tag=")
+                .next()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| orig_to.to_string());
+            // NGN 側の URI (= 元 From URI without tag)
+            let orig_from_uri = orig_from
+                .split(";tag=")
+                .next()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| orig_from.to_string());
+            reinv
+                .headers
+                .set("From", format!("{};tag=ngnsidetag", orig_to_uri));
+            reinv
+                .headers
+                .set("To", format!("{};tag={}", orig_from_uri, orig_from_tag));
+            reinv
+                .headers
+                .set("Call-ID", orig.headers.get("call-id").unwrap());
+            reinv.headers.set("CSeq", "200 INVITE");
+            reinv
+                .headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            reinv.headers.set("Content-Type", "application/sdp");
+            // a=sendonly = NGN ピアが hold を要求するパターン (RFC 3264 §8)
+            reinv.body = b"v=0\r\no=- 9 10 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 30002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\n".to_vec();
+
+            fake_ngn_sock_c
+                .send_to(&reinv.to_bytes(), sabiden_peer)
+                .await
+                .unwrap();
+
+            // 4) sabiden が NGN へ返す 200 OK を待つ
+            for _ in 0..6 {
+                match timeout(Duration::from_secs(3), fake_ngn_sock_c.recv_from(&mut buf)).await {
+                    Ok(Ok((n, _))) => {
+                        if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                            let cseq = r.headers.get("cseq").unwrap_or("");
+                            if cseq.contains("200 ") && (200..300).contains(&r.status_code) {
+                                *ngn_200_seen_c.lock().unwrap() = Some(r.status_code);
+                                break;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // 内線フェイク UA: 単一タスクで INVITE / Re-INVITE / 200 OK 応答 / ACK
+        // 自動送出を全部担当する。 socket は phone を排他で持つ。
+        let phone_c = phone.clone();
+        let ext_reinv_seen: Arc<StdMutex<bool>> = Arc::new(StdMutex::new(false));
+        let ext_reinv_seen_c = ext_reinv_seen.clone();
+        let phone_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            for _ in 0..12 {
+                let (n, peer) =
+                    match timeout(Duration::from_secs(6), phone_c.recv_from(&mut buf)).await {
+                        Ok(Ok(v)) => v,
+                        _ => break,
+                    };
+                let msg = parse_message(&buf[..n]).unwrap();
+                match msg {
+                    SipMessage::Request(req) if req.method == SipMethod::Invite => {
+                        // Re-INVITE (To に既に tag あり) を検出
+                        let to_in = req.headers.get("to").unwrap_or("").to_string();
+                        if to_in.contains(";tag=") {
+                            *ext_reinv_seen_c.lock().unwrap() = true;
+                        }
+                        let mut resp = build_response_skeleton(&req, 200, "OK");
+                        if !to_in.contains(";tag=") {
+                            resp.headers.set("To", format!("{};tag=phonetag", to_in));
+                        }
+                        resp.headers.set(
+                            "Contact",
+                            format!("<sip:iphone@{}>", phone_c.local_addr().unwrap()),
+                        );
+                        resp.headers.set("Content-Type", "application/sdp");
+                        resp.body = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 50000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_vec();
+                        phone_c.send_to(&resp.to_bytes(), peer).await.unwrap();
+                    }
+                    SipMessage::Response(r) => {
+                        let cseq = r.headers.get("cseq").unwrap_or("").to_string();
+                        if (200..300).contains(&r.status_code) && cseq.ends_with("INVITE") {
+                            // 内線が UAC として発信した INVITE への 200 OK → ACK
+                            let mut ack =
+                                SipRequest::new(SipMethod::Ack, "sip:dest@sabiden".to_string());
+                            ack.headers.set(
+                                "Via",
+                                format!(
+                                    "SIP/2.0/UDP {};branch=z9hG4bKack",
+                                    phone_c.local_addr().unwrap()
+                                ),
+                            );
+                            ack.headers.set("Max-Forwards", "70");
+                            ack.headers
+                                .set("From", r.headers.get("from").unwrap().to_string());
+                            ack.headers
+                                .set("To", r.headers.get("to").unwrap().to_string());
+                            ack.headers
+                                .set("Call-ID", r.headers.get("call-id").unwrap().to_string());
+                            let n_cseq = cseq.split_whitespace().next().unwrap_or("1");
+                            ack.headers.set("CSeq", format!("{} ACK", n_cseq));
+                            phone_c.send_to(&ack.to_bytes(), peer).await.unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // (5) 内線が **発信側**: INVITE を sabiden へ向けて投げる
+        let call_id = "ngn-reinv-cid";
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        req.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKout", phone_local),
+        );
+        req.headers.set("Max-Forwards", "70");
+        req.headers.set("From", "<sip:iphone@sabiden>;tag=phonet");
+        req.headers.set("To", "<sip:dest@sabiden>");
+        req.headers.set("Call-ID", call_id);
+        req.headers.set("CSeq", "1 INVITE");
+        req.headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_local));
+        req.headers.set("Content-Type", "application/sdp");
+        req.body = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 50000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_vec();
+        phone.send_to(&req.to_bytes(), uas_addr).await.unwrap();
+
+        // NGN タスク完了 (Re-INVITE 完了)
+        let _ = timeout(Duration::from_secs(10), ngn_task).await;
+        let _ = timeout(Duration::from_secs(1), phone_task).await;
+
+        assert!(
+            *ext_reinv_seen.lock().unwrap(),
+            "NGN→sabiden Re-INVITE が内線レッグへ伝搬されるべき (RFC 3261 §14.2)"
+        );
+        assert!(
+            ngn_200_seen.lock().unwrap().is_some(),
+            "sabiden は NGN へ Re-INVITE の 200 OK を返すべき (RFC 3261 §14.2)"
         );
     }
 

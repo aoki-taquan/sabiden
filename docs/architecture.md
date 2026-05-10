@@ -631,6 +631,14 @@ sequenceDiagram
   Peer-->>Trans: Event::MediaData → media_in_tx → MediaFrame
   Trans-->>NgnInb: Opus decode → 48k PCM → downsample 8k → μ-law encode
   NgnInb-->>Pcscf: RTP PCMU (NGN UDP socket)
+
+  Note over NgnInb,Browser: 通話終了 (Issue #81: NGN BYE → PWA 伝搬)
+  Pcscf->>NgnInb: BYE (in-dialog)
+  NgnInb->>Pcscf: 200 OK (BYE)
+  NgnInb->>NgnInb: webrtc_active.remove(call_id) → WsSink
+  NgnInb-->>Sig: ws.send(ServerMessage::Bye)
+  Sig-->>Browser: { type: "bye" }
+  Browser->>Browser: case "bye" → teardownCall() (UI 解放)
 ```
 
 > なお `start_bridge_for_inbound` が起動できなかった場合、 WebRTC leg の
@@ -640,6 +648,22 @@ sequenceDiagram
 > Issue #15 互換) でも、 `is_unrewritten_webrtc_sdp` が `0.0.0.0:9` を
 > 検知したら 502 に切り替える。 SIP leg のみの transparent 動作は従来どおり。
 
+> **BYE 伝搬 (Issue #81 / RFC 3261 §15.1.2 + RFC 5853 §3.2.2 SBC framework)**:
+> SIP 内線レッグは UAS 側ダイアログから build_bye → ext_layer.send_request で
+> 内線へ送るが、 WebRTC peer は SIP dialog を持たないため、 専用 WS
+> シグナリング (`ServerMessage::Bye`) で通知する。 `NgnInboundHandler` は
+> 確立通話時に `WsSink` を `webrtc_active: HashMap<Call-ID, WsSink>` に保存し、
+> NGN BYE 受信時に該当エントリを引いて `ws.send(ServerMessage::Bye)` を発火、
+> PWA 側の `App.tsx::case "bye"` ハンドラが `teardownCall()` で UI を解放する。
+
+> **fork cleanup (Issue #83 / W3C WebRTC §4.4.1)**: `fork_to_bindings` の
+> WebRTC leg cleanup ループは旧実装で `Answered` 限定だったが、 `Timeout` /
+> `AllFailed` でも browser に `ServerMessage::Cancel` を発火するよう拡張済。
+> winner 自身は cleanup から除外する (`WsSink::same_channel` で同一性判定)。
+> Offer push 前に失敗した leg (例: `peer.create_offer` 失敗) は browser が
+> 当該 call_id を見ていないので cleanup 対象から除外する (`webrtc_legs`
+> への登録は Offer push 成功後に行う)。
+
 #### 現状実装と「あるべき」のギャップ
 
 | 項目 | 現状 | あるべき (Phase R6) |
@@ -648,6 +672,8 @@ sequenceDiagram
 | NGN SDP → browser SDP 変換 | Issue #73 で `peer.create_offer()` 経由に切替済 (SAVPF/PCMU オファを sabiden 側生成、DTLS fingerprint / ICE 認証情報込み)。Negotiator API (RFC 3264 統合) は別 Issue (Phase R3) | `Negotiator::for_webrtc()` で NGN ⇔ browser のコーデック折衝を Opus 含めて一元化 |
 | WebRTC peer ↔ RtpBridge 結線 | **Issue #121 で解消済**: `MediaBridge::WebRtcAudio` を新設し、 内線側 UDP socket を bind せず `peer.send_media` / `peer.take_media_rx` の MediaFrame mpsc で双方向結線。 NGN UDP socket とは Opus⇔PCMU トランスコードで橋渡し | (現状で完成) |
 | ICE candidate pre-buffer | **Issue #91 で解消済**: PWA `App.tsx` が `call` 生成前に届いた `ServerMessage::Ice` を `pendingIceCandidates: string[]` に蓄積、 `acceptIncomingOffer` / `placeCall` 直後に `flushPendingIce()` で順次 `addIce` する (RFC 8445 §6.1.2.1) | (現状で完成) |
+| NGN BYE → PWA 伝搬 | **Issue #81 で解消済**: `NgnInboundHandler::webrtc_active: HashMap<Call-ID, WsSink>` で確立済 WebRTC 通話の WS を保持、 `handle_bye` が `ServerMessage::Bye` を push、 PWA の `case "bye"` で UI teardown (RFC 3261 §15.1.2 / RFC 5853 §3.2.2) | (現状で完成) |
+| fork timeout/AllFailed → PWA Cancel | **Issue #83 で解消済**: `fork_to_bindings` cleanup を `Answered` 限定から `Answered \| Timeout \| AllFailed` に拡張、 winner 以外の WebRTC leg に `ServerMessage::Cancel` を一律 push (W3C WebRTC §4.4.1) | (現状で完成) |
 | ICE failure 通知 | `local_cand_rx` が drop されたら run_loop 終了するだけ | `B2buaCall` に通知 → NGN レッグで CANCEL 発射 |
 | `ExtTransport::WebRtc` の bind 構造 | `registrar.rs` が `webrtc::peer::PeerSession` を直接 import (層越境) | `ExtCallTarget` trait 経由 |
 
@@ -732,6 +758,7 @@ sequenceDiagram
   and
     Pcscf->>NgnInb: BYE
     NgnInb->>NgnInb: active.remove(call_id)<br/>(または try_forward_bye 経由)
+    NgnInb->>NgnInb: webrtc_active.remove(call_id)<br/>→ ServerMessage::Bye push (Issue #81)
     NgnInb->>Pcscf: 200 OK (BYE)
   end
 ```
@@ -739,6 +766,11 @@ sequenceDiagram
 ポイント:
 - **どちらが先に来ても通話は終了** で、内側ブリッジは 1 度しか stop されない
   (`HashMap::remove` の 2 回目は `None` を返すので idempotent)。
+- **WebRTC 内線レッグは webrtc_active 経由で SIP dialog なし伝搬** (Issue #81):
+  `NgnInboundHandler::webrtc_active` が `Call-ID → WsSink` を保持しており、
+  NGN BYE 受信時に `handle_bye` がこのテーブルから WS を引いて
+  `ServerMessage::Bye` を browser に push する。 PWA は `App.tsx::case "bye"`
+  で `teardownCall()` を呼び UI を解放する。
 - **現状の問題**: 「内線→NGN BYE を NGN へ伝搬する」処理が `UasEventHandler::handle_event`
   の `UasEvent::Bye` 分岐に **存在しない** (`orchestrator.rs:679-695`)。
   あるべきは `ngn_dialog.send_bye()` を発射すること (Phase R4 の `B2buaCall::handle_ext_bye`)。

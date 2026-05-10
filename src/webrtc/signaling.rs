@@ -91,6 +91,15 @@ impl WsSink {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// 同一の送信チャネル (= 同じ WS セッション) を指すかを判定する。
+    ///
+    /// Issue #83 で `fork_to_bindings` の cleanup が winner 自身を Cancel し
+    /// ないようにするために使う。 `mpsc::UnboundedSender::same_channel` は
+    /// 「同じレシーバを共有しているか」を返す (tokio 1.x docs)。
+    pub fn same_channel(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
 }
 
 /// 1 つの WebRTC バインディングに紐づく実行時状態。

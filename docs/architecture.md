@@ -286,7 +286,7 @@ graph LR
 | `src/sip/auth.rs` | Digest 認証 (challenge / credential) | RFC 2617, RFC 7616 | ◎ | MD5 のみ。`auth-int` / SHA-256 / `stale=true` 未対応 |
 | `src/sip/transaction.rs` | UAC/UAS トランザクション + Timer A/B/D/E/F/G/H/I/J/K/L | RFC 3261 §17, RFC 6026 §7.1 | ▲ | UAC 側 Timer A/B/D は実装。**Timer G/H/I (UAS), Timer J (non-INVITE UAS), Timer K (UAC), Timer L (RFC 6026)** は未実装。`server_tx_table` 不在 → **§17.2.3 の "match request to server tx"** に違反し、`pending` HashMap (Call-ID 単位) で代用 ([refactor-plan §1.6](./refactor-plan.md)) |
 | `src/sip/dialog.rs` | UAC/UAS ダイアログ (Call-ID + tag triple), Route Set, in-dialog request 構築 | RFC 3261 §12, §13.2.2.4 (2xx ACK) | ◎ | `build_reinvite` / `build_ack_for_2xx` 実装済。**UAS 側 Re-INVITE 受信ハンドラは未実装** (`uas.rs::handle_invite` が dialog 既存判定をしない) |
-| `src/sip/uac.rs` | INVITE / Re-INVITE / BYE / CANCEL の TU 駆動 | RFC 3261 §8 / §13, RFC 4028 | ▲ | INVITE は `TransactionLayer::send_request` (Timer B 1 本)。401/407 再認証経路なし。Allow ヘッダは Asterisk 互換改善余地 ([asterisk-ngn-invite-spec.md §4.4](./asterisk-ngn-invite-spec.md))。NGN 直収では PPI/Privacy なしで通った ([asterisk-real-invite.md §5.3](./asterisk-real-invite.md)) |
+| `src/sip/uac.rs` | INVITE / Re-INVITE / BYE / CANCEL の TU 駆動 | RFC 3261 §8 / §13 / §22.2 / §22.3, RFC 4028 | ▲ | INVITE は `TransactionLayer::send_request` (Timer B 1 本)。401/407 を受けたら 1 回まで Authorization / Proxy-Authorization 付きで再送 (RFC 3261 §22.2 / §22.3 / §8.1.3.5、 PR #144 / Issue #113)。 retry 時は CSeq+1・新 branch (§17.1.1.3) で送信し、 ACK / Dialog `local_cseq` も retry CSeq に整合させる (§13.2.2.4 / §12.2.1.1)。 Allow ヘッダは Asterisk 互換改善余地 ([asterisk-ngn-invite-spec.md §4.4](./asterisk-ngn-invite-spec.md))。NGN 直収では PPI/Privacy なしで通った ([asterisk-real-invite.md §5.3](./asterisk-real-invite.md)) |
 | `src/sip/uas.rs` | 内線 UAS: REGISTER 受付 / INVITE/BYE 受信 → 上位層イベント発行 | RFC 3261 §8.2, §10, §22 | ▲ | `_layer: Arc<TransactionLayer>` 保持だが server tx 登録なし。`SipMethod::Other` を全部 405 で返す (Notify は §3.2 by RFC 3265 で 481、PRACK は RFC 3262 で 481 が望ましい) |
 | `src/sip/register.rs` | UAC 側 REGISTER + Session refresh | RFC 3261 §10, RFC 4028 (一部) | ◎ | NGN 直収 (`Authorization` 無し) を分岐。`static CSEQ` (line 23) はプロセス全体で 1 つ → 多回線対応時に衝突 (Phase R5 で struct field 化) |
 | `src/sip/registrar.rs` | 内線 binding テーブル (AOR → contact_uri + remote + expires_at) | RFC 3261 §10.3 | ◎ | `register` と `register_with_transport` が API 二重化 (現 worktree では `register` のみ)。後段で WebRTC binding 統合時は trait object 化 (§3.5) |
@@ -485,9 +485,17 @@ sequenceDiagram
 
 #### 失敗パスの分岐
 
-- **NGN 側 401/407**: `Uac::invite` は `InviteOutcome::Failed` を返し、
-  UasEventHandler は `responder.quick(<status>, ...)` で内線へ転送
-  (`uac.rs:185`)。**現状は再認証経路なし** (Phase R5 で 401 リトライ追加予定)。
+- **NGN 側 401/407**: `Uac::invite` は RFC 3261 §22.2 / §22.3 / §8.1.3.5 に
+  従い **1 回まで** Authorization / Proxy-Authorization 付きで INVITE を
+  再送する (PR #144 で実装、 Issue #113)。 再送 INVITE は CSeq+1 と新
+  branch (§17.1.1.3) を採用し、 challenge ヘッダ解釈には `DigestChallenge`
+  / `DigestCredentials` を共用する (REGISTER 経路と同じ `src/sip/auth.rs`)。
+  2 段目も 401/407 が返ったら `InviteOutcome::Failed` を返し、
+  UasEventHandler が `responder.quick(<status>, ...)` で内線へ転送する
+  (`uac.rs:185` 周辺、 `consecutive_401_gives_up` テストで検証)。
+  credentials が `UacConfig` に無い (= NGN 直収モード) ときは challenge を
+  受けても再送せず即 Failed (regression テスト
+  `invite_401_without_credentials_stays_failed_for_ngn_direct_mode`)。
 - **NGN 側 408 / トランスポートエラー**: `NgnTx::send_request` が `Err`
   → `responder.quick(503, "Service Unavailable")` (`orchestrator.rs:670`)。
 - **NGN 側 488 (Not Acceptable Here)**: SDP に PCMU 以外を残したまま送る

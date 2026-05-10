@@ -48,14 +48,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::auth::{AuthClaims, Verifier};
@@ -161,6 +162,16 @@ pub struct SignalingState {
     /// PeerSession を生成するファクトリ。`stub_peer_factory()` か、
     /// 本番なら str0m バックエンドを返すクロージャ。
     pub peer_factory: PeerFactory,
+    /// サーバ → クライアント方向への WebSocket Ping 送信間隔。
+    ///
+    /// Cloudflare Tunnel は idle 100 秒で WS を切断するため (`docs/CLOUDFLARE.md`)、
+    /// 既定では 30 秒周期で Ping を送る (RFC 6455 §5.5.2: Ping は keepalive 用途
+    /// として MAY、 経路上の idle timer リセットに用いてよい)。
+    pub keepalive_interval: Duration,
+    /// 最後に何らかのフレーム (特に Pong) を受信してからこの時間が経過したら
+    /// アイドル切断する。 既定 60 秒 = `keepalive_interval` の 2 倍。
+    /// Cloudflare の 100 秒 timeout より十分小さい値を選んでいる。
+    pub idle_timeout: Duration,
 }
 
 impl SignalingState {
@@ -175,12 +186,21 @@ impl SignalingState {
             extensions,
             register_ttl,
             peer_factory: stub_peer_factory(),
+            keepalive_interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 
     /// 任意の [`PeerFactory`] を指定する。
     pub fn with_peer_factory(mut self, factory: PeerFactory) -> Self {
         self.peer_factory = factory;
+        self
+    }
+
+    /// keepalive 周期 / idle timeout を上書きする (テスト・調整用途)。
+    pub fn with_keepalive(mut self, interval: Duration, idle_timeout: Duration) -> Self {
+        self.keepalive_interval = interval;
+        self.idle_timeout = idle_timeout;
         self
     }
 }
@@ -314,7 +334,7 @@ pub async fn run_session(
         }
     };
 
-    // sender は trickle ICE タスク と server-push forwarder で共有する。
+    // sender は trickle ICE タスク・server-push forwarder・keepalive タスクで共有する。
     let sender = Arc::new(Mutex::new(sender));
 
     // server → client メッセージを enqueue する mpsc。NGN 着信時に
@@ -326,9 +346,20 @@ pub async fn run_session(
     let ws_sink = WsSink::new(out_tx.clone());
     let pending_answers = PendingAnswers::new();
 
+    // keepalive watchdog 用: 受信時刻を tokio::time::Instant で共有する。
+    // tokio::time::pause/advance 下でも仮想時計で揃うので、 テストは
+    // `start_paused = true` + `tokio::time::advance` で短時間に検証できる。
+    let last_recv: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
+    // 全タスク (forwarder / keepalive / trickle) の協調終了用シャットダウン
+    // シグナル。 keepalive がアイドル検知で trip させると、 受信ループ側の
+    // `tokio::select!` がこちらを優先で抜ける。
+    let shutdown = Arc::new(Notify::new());
+
     // 送信 forwarder タスク。`out_rx` を WS Text フレームに変換して送る。
     {
         let sender_clone = sender.clone();
+        let shutdown_c = shutdown.clone();
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 let payload = match serde_json::to_string(&msg) {
@@ -341,9 +372,30 @@ pub async fn run_session(
                 let mut s = sender_clone.lock().await;
                 if s.send(Message::Text(payload)).await.is_err() {
                     debug!("server-push: WS 送信失敗、forwarder 終了");
+                    shutdown_c.notify_waiters();
                     break;
                 }
             }
+        });
+    }
+
+    // keepalive タスク (RFC 6455 §5.5.2 Ping frame)。 詳細は
+    // [`run_keepalive_loop`] の docstring を参照。
+    {
+        let sender_clone = sender.clone();
+        let last_recv_c = last_recv.clone();
+        let shutdown_c = shutdown.clone();
+        let interval = state.keepalive_interval;
+        let idle_to = state.idle_timeout;
+        tokio::spawn(async move {
+            run_keepalive_loop(
+                AxumPingSender(sender_clone),
+                last_recv_c,
+                shutdown_c,
+                interval,
+                idle_to,
+            )
+            .await;
         });
     }
 
@@ -364,7 +416,28 @@ pub async fn run_session(
 
     let registered_aor: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    while let Some(frame) = receiver.next().await {
+    loop {
+        let frame = tokio::select! {
+            _ = shutdown.notified() => {
+                debug!("受信ループ: keepalive watchdog から shutdown 通知");
+                break;
+            }
+            f = receiver.next() => f,
+        };
+
+        let Some(frame) = frame else {
+            break;
+        };
+
+        // 何らかのフレームが届いた = 経路は生きている。 last_recv を更新する
+        // ことで idle watchdog をリセットする。 Pong だけでなく Text/Ping も
+        // すべて活動シグナルとして扱う (RFC 6455 §5.5.3 Pong は keepalive 用
+        // 単方向 frame として送ってもよい、 と明記。 このため Ping/Text 受信
+        // でも timeout はリセットされるべき)。
+        if frame.is_ok() {
+            *last_recv.lock().await = Instant::now();
+        }
+
         let msg = match frame {
             Ok(Message::Text(t)) => t,
             Ok(Message::Close(_)) => {
@@ -374,6 +447,12 @@ pub async fn run_session(
             Ok(Message::Ping(p)) => {
                 let mut s = sender.lock().await;
                 let _ = s.send(Message::Pong(p)).await;
+                continue;
+            }
+            Ok(Message::Pong(_)) => {
+                // last_recv は上で更新済み。 ブラウザは Ping を能動送出できない
+                // 仕様 (axum.rs::extract::ws ws.rs:582-585 自動応答) なので、
+                // 通常はここを通る。
                 continue;
             }
             Ok(_) => continue,
@@ -420,6 +499,9 @@ pub async fn run_session(
         }
     }
 
+    // 周辺タスク (forwarder / keepalive) を確実に止める。
+    shutdown.notify_waiters();
+
     // クリーンアップ: AOR 失効 + PeerSession close
     if let Some(aor) = registered_aor.lock().await.take() {
         state.extensions.unregister(&aor).await;
@@ -436,6 +518,108 @@ pub enum SessionAction {
     Continue,
     /// 即座に切断。
     Close,
+}
+
+/// keepalive タスクが Ping / Close frame を流す送信先の最小抽象。
+///
+/// 本番では axum の `WebSocket` の split sender、 テストでは送信記録用の
+/// 偽実装を渡せるように trait 化している。
+#[async_trait::async_trait]
+pub trait KeepaliveSender: Send {
+    /// `Message::Ping(payload)` 相当を送信する。 失敗時 (相手切断等) は `Err`。
+    async fn send_ping(&self, payload: Vec<u8>) -> Result<()>;
+    /// idle timeout 検知時の Close frame 送信。
+    async fn send_close(&self, code: u16, reason: String) -> Result<()>;
+}
+
+/// axum の `WebSocket` の SplitSink を `Arc<Mutex<...>>` で共有しつつ、
+/// `KeepaliveSender` インターフェースで使えるようにする薄ラッパ。
+struct AxumPingSender(Arc<Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>);
+
+#[async_trait::async_trait]
+impl KeepaliveSender for AxumPingSender {
+    async fn send_ping(&self, payload: Vec<u8>) -> Result<()> {
+        let mut s = self.0.lock().await;
+        s.send(Message::Ping(payload))
+            .await
+            .map_err(|e| anyhow::anyhow!("WS Ping 送信失敗: {}", e))
+    }
+
+    async fn send_close(&self, code: u16, reason: String) -> Result<()> {
+        let mut s = self.0.lock().await;
+        s.send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await
+        .map_err(|e| anyhow::anyhow!("WS Close 送信失敗: {}", e))
+    }
+}
+
+/// keepalive ループ本体: 周期 Ping 送出 + idle 検知 close。
+///
+/// # 仕様
+///
+/// - **RFC 6455 §5.5.2 (Ping frame)**: `interval` ごとに opcode 0x9 (Ping) を
+///   サーバ → クライアント方向に送る。 application data は keepalive 用途
+///   では意味を持たないので空 payload。
+/// - **RFC 6455 §5.5.3 (Pong frame)**: クライアントは Ping 受信時に Pong を
+///   "as soon as is practical" で返す MUST。 ブラウザ WebSocket API は
+///   library 任せで自動応答する (RFC 6455 §5.5.2 implementer note)。
+/// - **idle timeout**: `last_recv` (受信ループが任意フレーム受信時に更新する
+///   `tokio::time::Instant`) と現在時刻の差が `idle_timeout` を超えたら、
+///   Close frame (code 1011) を送って `shutdown.notify_waiters()` する。
+///   受信ループ側はこの通知を `tokio::select!` で観測して終了する。
+/// - **Cloudflare Tunnel 100 秒 idle (`docs/CLOUDFLARE.md`)**: 既定値
+///   `interval=30s` / `idle_timeout=60s` はこれより十分小さい。
+///
+/// # キャンセル安全性
+///
+/// `shutdown.notified()` を `tokio::select!` の片足に入れているので、
+/// 受信ループ側が先に終了したケースでも Ping 送信中にハングしない。
+pub async fn run_keepalive_loop<S: KeepaliveSender>(
+    sender: S,
+    last_recv: Arc<Mutex<Instant>>,
+    shutdown: Arc<Notify>,
+    interval: Duration,
+    idle_timeout: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // 起動直後の即発火 tick を捨てる。 これで初回の Ping は最低
+    // `interval` 経過後に送られる (実機経路の idle timer と一致する挙動)。
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                debug!("keepalive: shutdown 通知でタスク終了");
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+
+        // idle 検知: 前回受信から idle_timeout 超なら撤収。
+        let elapsed = {
+            let last = *last_recv.lock().await;
+            Instant::now().saturating_duration_since(last)
+        };
+        if elapsed >= idle_timeout {
+            warn!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                idle_timeout_ms = idle_timeout.as_millis() as u64,
+                "WS keepalive: Pong 不在で idle timeout、 Close を送って撤収"
+            );
+            let _ = sender.send_close(1011, "idle timeout".to_string()).await;
+            shutdown.notify_waiters();
+            return;
+        }
+
+        // Ping 送信。 失敗 (相手切断) なら撤収。
+        if sender.send_ping(Vec::new()).await.is_err() {
+            debug!("keepalive: WS 送信失敗 (相手切断)、 keepalive タスク終了");
+            shutdown.notify_waiters();
+            return;
+        }
+    }
 }
 
 /// シグナリングのメッセージ処理本体。テスト用に分離。
@@ -926,5 +1110,260 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3_600
+    }
+
+    /// keepalive 設定の builder API が値を保持すること。
+    #[test]
+    fn signaling_state_with_keepalive_overrides_defaults() {
+        let v = Arc::new(Verifier::new(b"k".to_vec()));
+        let s = SignalingState::new(v, ExtensionRegistrar::new(), Duration::from_secs(60))
+            .with_keepalive(Duration::from_secs(10), Duration::from_secs(25));
+        assert_eq!(s.keepalive_interval, Duration::from_secs(10));
+        assert_eq!(s.idle_timeout, Duration::from_secs(25));
+    }
+
+    /// 既定値: 30 秒 / 60 秒 (Issue #98 / docs/CLOUDFLARE.md の 100 秒 idle に対する余裕)。
+    #[test]
+    fn signaling_state_default_keepalive_is_30s_idle_60s() {
+        let v = Arc::new(Verifier::new(b"k".to_vec()));
+        let s = SignalingState::new(v, ExtensionRegistrar::new(), Duration::from_secs(60));
+        assert_eq!(s.keepalive_interval, Duration::from_secs(30));
+        assert_eq!(s.idle_timeout, Duration::from_secs(60));
+    }
+
+    /// keepalive ループの観測用フェイク。 Ping / Close 呼び出しを記録するだけ。
+    struct FakeKeepaliveSender {
+        pings: Arc<std::sync::Mutex<u32>>,
+        closes: Arc<std::sync::Mutex<Vec<(u16, String)>>>,
+        fail_after: Option<u32>, // 指定回数 Ping 後 Err を返す (相手切断シミュレーション)
+    }
+
+    #[async_trait::async_trait]
+    impl KeepaliveSender for FakeKeepaliveSender {
+        async fn send_ping(&self, _payload: Vec<u8>) -> Result<()> {
+            let mut g = self.pings.lock().unwrap();
+            *g += 1;
+            if let Some(limit) = self.fail_after {
+                if *g > limit {
+                    return Err(anyhow::anyhow!("simulated peer disconnect"));
+                }
+            }
+            Ok(())
+        }
+        async fn send_close(&self, code: u16, reason: String) -> Result<()> {
+            self.closes.lock().unwrap().push((code, reason));
+            Ok(())
+        }
+    }
+
+    /// 30 秒周期で Ping が送出されること。
+    /// `tokio::time::pause` で仮想時間を進めて、 数 ms で複数周期分検証する。
+    ///
+    /// `start_paused = true` 下の auto-advance は「全タスクが idle」になった
+    /// ときに最も近い timer まで時計を進める仕様。 そのため `loop_handle` を
+    /// `select!` で待ち、 一定 (仮想) 時間 sleep してから shutdown を送って
+    /// 観測する。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_sends_ping_every_interval() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: None,
+        };
+
+        // last_recv をループと並行して更新し続けるタスク (Pong が
+        // 規則的に来ている状況をシミュレート、 idle timeout は発火しない)。
+        let last_recv_c = last_recv.clone();
+        let shutdown_c = shutdown.clone();
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_c.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        *last_recv_c.lock().await = Instant::now();
+                    }
+                }
+            }
+        });
+
+        let shutdown_for_loop = shutdown.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown_for_loop,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        // 仮想時計を 5 周期分進める。 sleep が auto-advance を駆動する。
+        tokio::time::sleep(Duration::from_secs(151)).await;
+
+        shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), updater).await;
+
+        let n = *pings.lock().unwrap();
+        assert!(
+            n >= 4,
+            "30 秒周期で 150 秒経過したら少なくとも 4-5 回 Ping が出るはず: 実測 {} 回",
+            n
+        );
+        assert!(
+            closes.lock().unwrap().is_empty(),
+            "活動ありなら Close は出ないはず"
+        );
+    }
+
+    /// idle_timeout を超えて last_recv が更新されないと、 keepalive ループは
+    /// Close frame を送って撤収する (Issue #98 DoD)。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_closes_ws_after_idle_timeout() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: None,
+        };
+
+        // last_recv は更新しない (Pong 不在 = idle 状態)。
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        // ループは last_recv が更新されないので 2 回目の tick (60s) で
+        // idle_timeout に到達して自発的に終了する。 timeout は仮想時計上 2
+        // 周期分待つ。
+        let waited = tokio::time::timeout(Duration::from_secs(120), loop_handle).await;
+        assert!(waited.is_ok(), "ループが idle timeout で終了しなかった");
+
+        let cs = closes.lock().unwrap().clone();
+        assert_eq!(cs.len(), 1, "Close は 1 回送られるはず: {:?}", cs);
+        assert_eq!(
+            cs[0].0, 1011,
+            "Close code は 1011 (内部エラー / abnormal idle)"
+        );
+        assert!(cs[0].1.contains("idle"), "reason に idle が含まれる");
+    }
+
+    /// shutdown 通知でループが速やかに終了すること。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_exits_on_shutdown_notify() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: None,
+        };
+
+        let shutdown_c = shutdown.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown_c,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        // ループに spawn の機会を与える。
+        tokio::task::yield_now().await;
+        // すぐ shutdown を送る → ループは tick を待たずに抜ける。
+        shutdown.notify_waiters();
+        let waited = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        assert!(waited.is_ok(), "shutdown でループが終わらなかった");
+        assert_eq!(*pings.lock().unwrap(), 0, "tick 前 shutdown なら Ping 0");
+    }
+
+    /// Ping 送信が Err を返した (相手切断) 場合、 ループは shutdown を
+    /// notify して終了する。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_exits_when_send_ping_errors() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+
+        // 0 回成功 → 1 回目の Ping 呼び出しから Err (即時失敗)。
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: Some(0),
+        };
+
+        let observed = Arc::new(std::sync::Mutex::new(false));
+        let observed_c = observed.clone();
+        let shutdown_c = shutdown.clone();
+        let watcher = tokio::spawn(async move {
+            shutdown_c.notified().await;
+            *observed_c.lock().unwrap() = true;
+        });
+
+        // last_recv は更新し続ける (idle ではない、 純粋に send 失敗で抜ける)。
+        let last_recv_c = last_recv.clone();
+        let updater_shutdown = shutdown.clone();
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = updater_shutdown.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        *last_recv_c.lock().await = Instant::now();
+                    }
+                }
+            }
+        });
+
+        let shutdown_for_loop = shutdown.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown_for_loop,
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+            )
+            .await
+        });
+
+        // 1 周期で Err、 ループ終了 + shutdown 通知。
+        let _ = tokio::time::timeout(Duration::from_secs(60), loop_handle).await;
+
+        // watcher は notify を観測してから返る。
+        let _ = tokio::time::timeout(Duration::from_secs(5), watcher).await;
+        assert!(*observed.lock().unwrap(), "shutdown 通知が出ていない");
+        assert_eq!(
+            *pings.lock().unwrap(),
+            1,
+            "1 回だけ Ping されてから Err で抜ける"
+        );
+
+        // updater も止める。
+        // (shutdown は keepalive ループから来ているはずだが、 念の為再送)。
+        shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), updater).await;
     }
 }

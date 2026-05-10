@@ -304,7 +304,7 @@ graph LR
 | `src/call/bridge.rs` | RTP リレー (G.711 透過) — late-binding peer learning | RFC 3550 (transparent relay) | ◎ | 設計クリーン |
 | `src/call/transcoder.rs` | Opus ↔ G.711 トランスコード (双方向 spawn) | RFC 6716, RFC 3551 | ◎ | bridge と並列にあるが responsibilities は分離。**現状 orchestrator から呼ばれていない** (Phase R6 致命的欠落) |
 | `src/webrtc/auth.rs` | HMAC-SHA256 トークン検証 (`AuthClaims`) | (実装独自 / Cloudflare 連携) | ◎ | constant-time 比較 |
-| `src/webrtc/signaling.rs` | WS シグナリング (`/signal`): register / offer / answer / ice / bye | (アプリ独自 JSON) | ◎ | `process_client_message` 分離テスト容易性あり |
+| `src/webrtc/signaling.rs` | WS シグナリング (`/signal`): register / offer / answer / ice / bye + サーバ → ブラウザ keepalive Ping (RFC 6455 §5.5.2, 既定 30s 周期 / 60s idle close, Issue #98) | (アプリ独自 JSON) | ◎ | `process_client_message` 分離テスト容易性あり、 keepalive ループは `KeepaliveSender` trait + `run_keepalive_loop` で fake 注入できる構造 |
 | `src/webrtc/peer.rs` | `PeerSession` trait + stub | (抽象) | ◎ | trait 設計良い |
 | `src/webrtc/str0m_session.rs` | str0m バックエンド (Sans-IO + tokio run-loop) | RFC 5245 (ICE), RFC 8445, RFC 5763/5764 (DTLS-SRTP) | ▲ | ICE-Lite で接続まで動くが **`Event::MediaData` を drop**。Issue #29 で `TranscodingBridge` 結線。IPv6 public_ip 未対応 |
 | `src/observability/mod.rs` | メトリクス + SIP トレース dump (`Authorization` redact) | (Prometheus text) | ◎ | 自前 atomic counter |
@@ -586,6 +586,11 @@ sequenceDiagram
   Sig->>ExtReg: register(ext_id, contact=webrtc.peer, remote=ws-peer)
   Sig->>Browser: { type: registered, ext_id }
   Note over Browser,Sig: WebRTC peer 着信待ち
+  loop keepalive (RFC 6455 §5.5.2 / Issue #98)
+    Sig-->>Browser: WS Ping (interval=30s, 既定)
+    Browser-->>Sig: WS Pong (auto by browser per RFC 6455 §5.5.3)
+    Note over Sig: Pong が idle_timeout=60s 以内に来なければ<br/>Close (1011) を送って撤収<br/>(Cloudflare Tunnel idle 100s 切断対策)
+  end
 
   Pcscf->>NgnInb: INVITE (NGN SDP: RTP/AVP PCMU)
   NgnInb->>ExtReg: snapshot() → [..., (ext_id, webrtc.peer)]

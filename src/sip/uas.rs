@@ -145,17 +145,16 @@ impl std::fmt::Debug for ResponderHandle {
 }
 
 impl ResponderHandle {
-    fn new(tx: ServerTransaction) -> Self {
+    /// `ServerTransaction` から `ResponderHandle` を構築する。
+    ///
+    /// 通常経路では [`ExtensionUas::handle_request`] 内でしか作られないが、
+    /// クレート内のテストハーネス (`crate::testing::builders`) からも
+    /// 構築できるよう `pub(crate)` で公開する。production-side test hook
+    /// (CLAUDE.md §6.3) ではなく、純粋なクレート内コンストラクタ。
+    pub(crate) fn new(tx: ServerTransaction) -> Self {
         Self {
             inner: Arc::new(Mutex::new(tx)),
         }
-    }
-
-    /// テスト用に `ServerTransaction` から直接構築するヘルパ。
-    /// 通常経路では `ExtensionUas` 内部でしか作られない。
-    #[doc(hidden)]
-    pub fn __test_new(tx: ServerTransaction) -> Self {
-        Self::new(tx)
     }
 
     /// 任意の応答を送信する。

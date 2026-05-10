@@ -617,9 +617,17 @@ mod tests {
         .into();
 
         // NGN→WebRTC: μ-law (160 サンプル無音) を投入 → Opus が出てくる。
+        // Issue #105: ジッタバッファ統合により depth=4 を満たす 5 packet 必要。
         let silence_nb = vec![0i16; NB_FRAME_SAMPLES];
-        let pkt_ulaw = build_ulaw_rtp_packet(1, 0, 0xAAAA_AAAA, &silence_nb);
-        ngn_peer.send_to(&pkt_ulaw, ngn_addr).await.unwrap();
+        for i in 0..5u16 {
+            let pkt_ulaw = build_ulaw_rtp_packet(
+                i + 1,
+                i as u32 * SAMPLES_PER_FRAME as u32,
+                0xAAAA_AAAA,
+                &silence_nb,
+            );
+            ngn_peer.send_to(&pkt_ulaw, ngn_addr).await.unwrap();
+        }
         let mut buf = vec![0u8; 1500];
         let (n, _) = timeout(Duration::from_secs(2), web_peer.recv_from(&mut buf))
             .await
@@ -630,14 +638,23 @@ mod tests {
         assert!(!received_opus.payload.is_empty());
 
         // WebRTC→NGN: Opus (48k 無音) を投入 → μ-law 160 サンプルが出てくる。
+        // Issue #105: 同じく 5 packet 投入で jitter buffer を充足させる。
         let mut enc = OpusEncoder::new().unwrap();
         let silence_wb = AudioFrame::new(OPUS_SAMPLE_RATE, vec![0i16; OPUS_FRAME_SAMPLES]);
-        let pkt_opus =
-            build_opus_rtp_packet(DEFAULT_OPUS_PT, 1, 0, 0xBBBB_BBBB, &mut enc, &silence_wb)
-                .unwrap();
         // RTP のホットパスの順序保証のため、念のためサンプルレート明示
         let _ = NARROW_BAND_RATE;
-        web_peer.send_to(&pkt_opus, web_addr).await.unwrap();
+        for i in 0..5u16 {
+            let pkt_opus = build_opus_rtp_packet(
+                DEFAULT_OPUS_PT,
+                i + 1,
+                i as u32 * OPUS_FRAME_SAMPLES as u32,
+                0xBBBB_BBBB,
+                &mut enc,
+                &silence_wb,
+            )
+            .unwrap();
+            web_peer.send_to(&pkt_opus, web_addr).await.unwrap();
+        }
         let (n2, _) = timeout(Duration::from_secs(2), ngn_peer.recv_from(&mut buf))
             .await
             .expect("Transcode 経由で μ-law が届かない")

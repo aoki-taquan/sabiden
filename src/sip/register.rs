@@ -154,10 +154,20 @@ impl Registrar {
 
         let mut req = SipRequest::new(SipMethod::Register, format!("sip:{}", domain));
 
-        // Via ヘッダ: rport を付けない (NTT NGN 必須)
+        // RFC 3581 §4 (Symmetric Response Routing): UAC が Via に `;rport` を
+        // 付与すると、 UAS は応答時に UDP source port を `rport=<n>` で埋めて
+        // 応答する (NAT/PAT で port 変換されていても応答が届く)。
+        //
+        // NGN 直収では rport 有無いずれでも 200 OK が返る (両対応、
+        // `docs/asterisk-real-invite.md` §3 / §5.5、 CLAUDE.md §5)。 ここで
+        // rport を付ける理由は (a) sabiden 内 UAC (`uac.rs` の INVITE) が
+        // 既に rport 付きで送っており、 同一線で REGISTER だけ非対称になる
+        // 状態を解消するため (Issue #120)、 (b) Asterisk 実機 pcap も
+        // rport 付きで成立しているため (`docs/asterisk-real-invite.md`
+        // §5.5 INVITE 例 L158)。
         req.headers.set(
             "Via",
-            format!("SIP/2.0/UDP {};branch={}", local_addr, new_branch()),
+            format!("SIP/2.0/UDP {};rport;branch={}", local_addr, new_branch()),
         );
         req.headers.set("Max-Forwards", "70");
         req.headers.set(
@@ -198,6 +208,41 @@ mod tests {
     use crate::sip::transaction::{build_response_skeleton, TransactionLayer};
     use std::sync::Arc;
     use tokio::net::UdpSocket;
+
+    /// RFC 3581 §4 (Symmetric Response Routing): UAC は Via に `;rport`
+    /// パラメータを付与してよく、 UAS はそれを見て応答先 port を
+    /// `received`/`rport` で学習する。 sabiden 内 UAC (`uac.rs` の INVITE) と
+    /// REGISTER 間の非対称を防ぐため、 REGISTER も `;rport` を出力する
+    /// (Issue #120、 `docs/asterisk-real-invite.md` §3 / §5.5)。
+    #[tokio::test]
+    async fn rfc3581_4_register_via_includes_rport() {
+        let cfg = SipConfig {
+            server_addr: "127.0.0.1:5060".parse().unwrap(),
+            bind_addr: None,
+            local_addr: Some("127.0.0.1:5060".parse().unwrap()),
+            phone_number: "0312345678".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            password: None,
+            register_expires: 3600,
+        };
+        let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(dummy_sock);
+        let registrar = Registrar::new(Arc::new(cfg), layer, "127.0.0.1:5060".parse().unwrap());
+        let req = registrar.build_register(1, None);
+        let via = req
+            .headers
+            .get("via")
+            .expect("Via must be present on REGISTER");
+        assert!(
+            via.contains(";rport"),
+            "RFC 3581 §4: REGISTER Via must include `;rport` (got: {via})"
+        );
+        // branch も同時に存在すること (RFC 3261 §8.1.1.7、 magic cookie 必須)。
+        assert!(
+            via.contains(";branch=z9hG4bK"),
+            "RFC 3261 §8.1.1.7: Via branch must use magic cookie z9hG4bK (got: {via})"
+        );
+    }
 
     /// Issue #37: NGN 直収モード (password=None) では Authorization ヘッダ
     /// が一切付かないこと。`build_register` の単体検証。
@@ -269,6 +314,13 @@ mod tests {
         assert!(
             !raw_str.contains("authorization:"),
             "wire bytes must not contain Authorization header in auth=none mode"
+        );
+        // Issue #120 / RFC 3581 §4: REGISTER も Via に `;rport` を載せて送る。
+        // 文字列マッチは Via ヘッダ表記 (full / compact) と大文字小文字に関わらず
+        // `;rport` トークンが現れることだけ確認する。
+        assert!(
+            raw_str.contains(";rport"),
+            "RFC 3581 §4: wire bytes must contain `;rport` on Via (got: {raw_str})"
         );
     }
 

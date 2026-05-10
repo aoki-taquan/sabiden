@@ -23,7 +23,7 @@ use anyhow::{anyhow, Result};
 use tracing::{debug, warn};
 
 use super::dialog::{Dialog, DialogConfig};
-use super::message::{SipMethod, SipRequest, SipResponse};
+use super::message::{parse_sip_uri, SipMethod, SipRequest, SipResponse};
 use super::transaction::TransactionLayer;
 use super::utils::{new_branch, new_call_id, new_tag};
 
@@ -182,10 +182,14 @@ impl Uac {
             // RFC 3261 §13.2.2.4: 2xx ACK は新規トランザクション。
             // 再送制御は TU の責務だが、本実装は単発送信に留める (NGN 上では
             // 200 OK の再送に応じて再生成する将来拡張ポイントとして後述コメント)。
+            //
+            // RFC 3261 §12.2.1.1 / §8.1.2: in-dialog リクエストの宛先は
+            // dialog の next-hop (topmost Route があればその host:port、
+            // 無ければ remote target = 2xx Contact)。 旧実装は server_addr
+            // (= P-CSCF 固定) に流していたが Issue #79 で本流対応。
             let ack = dialog.build_ack_for_2xx(plan.cseq);
-            self.layer
-                .send_request_no_wait(ack, self.server_addr)
-                .await?;
+            let next_hop = resolve_next_hop_addr(&dialog, self.server_addr);
+            self.layer.send_request_no_wait(ack, next_hop).await?;
             Ok(InviteOutcome::Established(Box::new(EstablishedCall {
                 dialog: UacDialog::new(
                     dialog,
@@ -257,7 +261,11 @@ pub struct UacDialog {
     /// Session-Expires 値 (秒)
     session_expires: u32,
     layer: Arc<TransactionLayer>,
-    peer: SocketAddr,
+    /// dialog next-hop URI から SocketAddr が抽出できないとき (例:
+    /// FQDN に解決できない、 port 省略の host のみ) の最終フォールバック。
+    /// 通常は INVITE 送信先 = NGN P-CSCF。 RFC 3261 §12.2.1.1 / RFC 3263
+    /// §4 完全準拠の DNS / SRV 解決は将来の Issue で対応する。
+    fallback_peer: SocketAddr,
 }
 
 impl UacDialog {
@@ -266,14 +274,14 @@ impl UacDialog {
         invite_cseq: u32,
         session_expires: u32,
         layer: Arc<TransactionLayer>,
-        peer: SocketAddr,
+        fallback_peer: SocketAddr,
     ) -> Self {
         Self {
             inner,
             invite_cseq,
             session_expires,
             layer,
-            peer,
+            fallback_peer,
         }
     }
 
@@ -285,10 +293,23 @@ impl UacDialog {
         &mut self.inner
     }
 
-    /// BYE を送信してダイアログを終了する。
+    /// in-dialog リクエストの宛先 SocketAddr (RFC 3261 §12.2.1.1)。
+    ///
+    /// dialog の next-hop URI (= topmost Route または remote target) から
+    /// host:port を取り出し SocketAddr に解決する。 解決不能 (FQDN /
+    /// port 省略 / 不正 URI) のときは `fallback_peer` を返す。
+    fn next_hop_socket(&self) -> SocketAddr {
+        resolve_next_hop_addr(&self.inner, self.fallback_peer)
+    }
+
+    /// BYE を送信してダイアログを終了する (RFC 3261 §15.1.1)。
+    ///
+    /// 宛先は dialog の next-hop (RFC 3261 §12.2.1.1) で決まり、
+    /// `fallback_peer` (= INVITE 送信先 = 通常 P-CSCF) に固定しない。
     pub async fn send_bye(&mut self) -> Result<SipResponse> {
         let bye = self.inner.build_bye();
-        let resp = self.layer.send_request(bye, self.peer).await?;
+        let peer = self.next_hop_socket();
+        let resp = self.layer.send_request(bye, peer).await?;
         self.inner.terminate();
         Ok(resp)
     }
@@ -298,6 +319,8 @@ impl UacDialog {
     /// `sdp_body` を渡せば SDP を更新でき、`None` ならば SDP 無しの
     /// Session Timer 更新専用 Re-INVITE になる。422 Session Interval Too
     /// Small が返ったら `min_se` を再交渉する用途で呼び出し側が再送する。
+    ///
+    /// 宛先は BYE と同様 dialog next-hop (RFC 3261 §12.2.1.1) を使う。
     pub async fn send_reinvite(&mut self, sdp_body: Option<&[u8]>) -> Result<SipResponse> {
         let reinv = self
             .inner
@@ -305,11 +328,16 @@ impl UacDialog {
         // CSeq は build_reinvite が予約済み。応答が 2xx なら ACK を送る。
         // CSeq を ACK 用に取り出す。
         let cseq = parse_cseq_number(reinv.headers.get("cseq").unwrap_or("0 INVITE"))?;
-        let resp = self.layer.send_request(reinv, self.peer).await?;
+        let peer = self.next_hop_socket();
+        let resp = self.layer.send_request(reinv, peer).await?;
         if (200..300).contains(&resp.status_code) {
             // Re-INVITE 2xx の ACK
             let ack = self.inner.build_ack_for_2xx(cseq);
-            self.layer.send_request_no_wait(ack, self.peer).await?;
+            // ACK の宛先も dialog next-hop。 200 OK で Contact / Record-Route が
+            // 更新されたら本来 confirm() で route_set / remote_target を再計算
+            // するが、 既存実装はここで confirm を呼ばないため Re-INVITE 中の
+            // 経路変更には未対応 (将来 Issue 化)。
+            self.layer.send_request_no_wait(ack, peer).await?;
             // Session-Expires が応答で更新されていれば反映 (UAC が refresher)
             if let Some(se) = resp.headers.get("session-expires") {
                 if let Some(num) = se
@@ -361,6 +389,55 @@ pub fn build_cancel(invite: &SipRequest, invite_cseq: u32) -> SipRequest {
     req
 }
 
+/// dialog の next-hop URI (RFC 3261 §12.2.1.1) を SocketAddr に解決する。
+///
+/// 次ホップ host:port が **IP リテラル + 明示 port** の場合のみ確定。
+/// FQDN / port 省略の場合は `fallback` を返す (RFC 3263 SRV / NAPTR 解決は
+/// 未実装、 別 Issue 扱い)。 NGN 直収では P-CSCF が Record-Route で
+/// `118.177.125.1:5060` を返すため確定経路で動く (`docs/asterisk-real-invite.md`
+/// §3 / §5.1 / `docs/asterisk-real-invite.md` Contact 例 §5.6)。
+fn resolve_next_hop_addr(dialog: &Dialog, fallback: SocketAddr) -> SocketAddr {
+    let uri = dialog.next_hop_uri();
+    let parts = match parse_sip_uri(&uri) {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(
+                target_uri = %uri,
+                ?err,
+                "dialog next-hop URI のパースに失敗、 fallback (= server_addr) を使う"
+            );
+            return fallback;
+        }
+    };
+    let Some(port) = parts.port else {
+        // port 省略時は SRV / NAPTR が必要 (RFC 3263 §4)。 未実装のため fallback。
+        debug!(
+            target_uri = %uri,
+            "dialog next-hop URI に port 指定なし (RFC 3263 SRV 未実装)、 fallback を使う"
+        );
+        return fallback;
+    };
+    // host が "[v6]" 形式なら strip して parse、 それ以外は IPv4 リテラルを試す。
+    let host = parts.host.as_str();
+    let parsed_ip = if let Some(stripped) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+    {
+        stripped.parse::<std::net::IpAddr>().ok()
+    } else {
+        host.parse::<std::net::IpAddr>().ok()
+    };
+    match parsed_ip {
+        Some(ip) => SocketAddr::new(ip, port),
+        None => {
+            // FQDN: 名前解決は別 Issue。 fallback を使う。
+            debug!(
+                host = %host,
+                "dialog next-hop の host が IP リテラルでない (FQDN)、 fallback を使う"
+            );
+            fallback
+        }
+    }
+}
+
 fn parse_cseq_number(value: &str) -> Result<u32> {
     value
         .split_whitespace()
@@ -390,6 +467,94 @@ mod tests {
             local_addr: "[::1]:0".parse().unwrap(),
             user_agent: "hikari-sip-test/0.1".to_string(),
         }
+    }
+
+    fn make_dialog_with(remote_target: &str, record_routes: &[&str]) -> Dialog {
+        // INVITE 風 SipRequest と 200 OK 風 SipResponse をでっち上げて
+        // Dialog::from_uac_response を経由する。 production に test hook は出さない。
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@example.com");
+        invite
+            .headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKxxx");
+        invite
+            .headers
+            .set("From", "<sip:alice@example.com>;tag=alice");
+        invite.headers.set("To", "<sip:bob@example.com>");
+        invite.headers.set("Call-ID", "cidA");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Contact", "<sip:alice@192.0.2.1:5060>");
+
+        let mut headers = crate::sip::message::SipHeaders::new();
+        headers.set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKxxx");
+        headers.set("From", "<sip:alice@example.com>;tag=alice");
+        headers.set("To", "<sip:bob@example.com>;tag=bob");
+        headers.set("Call-ID", "cidA");
+        headers.set("CSeq", "1 INVITE");
+        headers.set("Contact", format!("<{}>", remote_target));
+        for rr in record_routes {
+            headers.add("Record-Route", *rr);
+        }
+        let response = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: Vec::new(),
+        };
+        let cfg = DialogConfig {
+            local_uri: "sip:alice@example.com".to_string(),
+            remote_uri: "sip:bob@example.com".to_string(),
+            local_contact: "sip:alice@192.0.2.1:5060".to_string(),
+            sent_by: "192.0.2.1:5060".to_string(),
+        };
+        Dialog::from_uac_response(&invite, &response, cfg).unwrap()
+    }
+
+    #[test]
+    fn rfc3261_12_2_1_1_resolve_next_hop_uses_contact_when_route_set_empty() {
+        let dlg = make_dialog_with("sip:remote@198.51.100.5:5070", &[]);
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = resolve_next_hop_addr(&dlg, fallback);
+        assert_eq!(addr, "198.51.100.5:5070".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn rfc3261_12_2_1_1_resolve_next_hop_uses_topmost_route_when_loose_routing() {
+        // Record-Route 受信順 [proxy_a, proxy_b] → UAC route_set 逆順 [proxy_b, proxy_a]
+        // 次ホップは route_set[0] = proxy_b。
+        let dlg = make_dialog_with(
+            "sip:remote@198.51.100.5:5070",
+            &["<sip:198.51.100.10:5060;lr>", "<sip:198.51.100.11:5061;lr>"],
+        );
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = resolve_next_hop_addr(&dlg, fallback);
+        // route_set 逆順なので次ホップ = 受信順 2 番目 = proxy_b = 198.51.100.11:5061
+        assert_eq!(addr, "198.51.100.11:5061".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_next_hop_falls_back_when_host_is_fqdn() {
+        // FQDN は SRV 解決が必要 (RFC 3263)。 未実装なので fallback を返す。
+        let dlg = make_dialog_with("sip:remote@proxy.example.com:5060", &[]);
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = resolve_next_hop_addr(&dlg, fallback);
+        assert_eq!(addr, fallback);
+    }
+
+    #[test]
+    fn resolve_next_hop_falls_back_when_port_omitted() {
+        // port 省略は RFC 3263 SRV 必要。 未実装なので fallback。
+        let dlg = make_dialog_with("sip:remote@198.51.100.5", &[]);
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = resolve_next_hop_addr(&dlg, fallback);
+        assert_eq!(addr, fallback);
+    }
+
+    #[test]
+    fn resolve_next_hop_handles_ipv6_literal() {
+        let dlg = make_dialog_with("sip:remote@[2001:db8::99]:5070", &[]);
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = resolve_next_hop_addr(&dlg, fallback);
+        assert_eq!(addr, "[2001:db8::99]:5070".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -554,6 +719,124 @@ mod tests {
         let bye_resp = dlg.send_bye().await.expect("bye");
         assert_eq!(bye_resp.status_code, 200);
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rfc3261_12_2_1_1_bye_goes_to_dialog_remote_target_not_server_addr() {
+        // Issue #79 の核となる shape:
+        //   server_addr (= INVITE 送信先 = ダミー P-CSCF) と
+        //   200 OK の Contact が **異なる SocketAddr** のとき、
+        //   BYE が Contact 側 (= dialog remote target) に飛ばないと
+        //   RFC 3261 §12.2.1.1 違反になる。
+        //
+        // ここでは
+        //   - INVITE 受け口: server_a (= server_addr 役、 P-CSCF 役)
+        //   - BYE 受け口   : server_b (= 200 OK Contact 側、 真の対向)
+        // を立て、 200 OK で Contact = server_b の URI を返す。
+        // BYE が server_b に届けば PASS、 server_a に届いたら FAIL (旧バグ)。
+        let server_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_a_addr = server_a.local_addr().unwrap();
+        let server_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_b_addr = server_b.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_local = client_sock.local_addr().unwrap();
+
+        let server_a_clone = server_a.clone();
+        let server_b_clone = server_b.clone();
+        let server_b_addr_for_resp = server_b_addr;
+        let server_a_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // INVITE 受信
+            let (n, peer) = server_a_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(invite) = parsed else {
+                panic!("INVITE expected on server_a");
+            };
+            assert_eq!(invite.method, SipMethod::Invite);
+            // 200 OK with Contact = server_b (= 真の対向)、 Record-Route 無し。
+            // RFC 3261 §12.2.1.1: route_set 空 → Request-URI = remote target,
+            // 次ホップ = remote target host:port = server_b。
+            let mut resp = crate::sip::transaction::build_response_skeleton(&invite, 200, "OK");
+            resp.headers.set(
+                "To",
+                format!("{};tag=server-tag", invite.headers.get("to").unwrap()),
+            );
+            resp.headers.set(
+                "Contact",
+                format!("<sip:remote@{}>", server_b_addr_for_resp),
+            );
+            server_a_clone
+                .send_to(&resp.to_bytes(), peer)
+                .await
+                .unwrap();
+
+            // 2xx ACK は dialog next-hop = server_b に飛ぶので、 server_a には来ない。
+            // server_a 側はここで終了。
+        });
+
+        let bye_received = Arc::new(tokio::sync::Notify::new());
+        let bye_received_for_task = bye_received.clone();
+        let server_b_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 1) 2xx ACK 受信
+            let (n, _peer) = server_b_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(ack) = parsed else {
+                panic!("ACK expected on server_b");
+            };
+            assert_eq!(ack.method, SipMethod::Ack, "server_b に ACK が届くべき");
+
+            // 2) BYE 受信 → 200 OK
+            let (n2, peer2) = server_b_clone.recv_from(&mut buf).await.unwrap();
+            let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
+            let SipMessage::Request(bye) = parsed2 else {
+                panic!("BYE expected on server_b");
+            };
+            assert_eq!(
+                bye.method,
+                SipMethod::Bye,
+                "BYE が dialog remote target (= server_b) に届くべき"
+            );
+            // RFC 3261 §12.2.1.1: Request-URI = remote target = Contact URI。
+            assert!(
+                bye.uri.contains(&format!("@{}", server_b_addr_for_resp)),
+                "BYE の Request-URI は Contact (server_b) を指すべき: {}",
+                bye.uri
+            );
+            let bye_resp = crate::sip::transaction::build_response_skeleton(&bye, 200, "OK");
+            server_b_clone
+                .send_to(&bye_resp.to_bytes(), peer2)
+                .await
+                .unwrap();
+            bye_received_for_task.notify_one();
+        });
+
+        let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
+        let mut uac_cfg = cfg();
+        uac_cfg.local_addr = client_local;
+        // server_addr は server_a (= INVITE 送信先 = P-CSCF 役)。 BYE は dialog
+        // 次ホップ (= server_b) に向かわなければバグ。
+        let uac = Uac::new(uac_cfg, layer, server_a_addr);
+
+        let target_uri = format!("sip:remote@{}", server_a_addr);
+        let plan = uac.build_invite(&target_uri, None, Some(300));
+        let outcome = uac.invite(plan, None).await.expect("invite");
+        let mut dlg = match outcome {
+            InviteOutcome::Established(call) => call.dialog,
+            InviteOutcome::Failed { response } => {
+                panic!("expected established, got {}", response.status_code)
+            }
+        };
+
+        let bye_resp = dlg.send_bye().await.expect("bye");
+        assert_eq!(bye_resp.status_code, 200);
+
+        server_a_handle.await.unwrap();
+        // タイムアウト保護で notify を待つ
+        tokio::time::timeout(std::time::Duration::from_secs(2), bye_received.notified())
+            .await
+            .expect("BYE が server_b に届かなかった (server_addr に飛んでいる可能性)");
+        server_b_handle.await.unwrap();
     }
 
     #[tokio::test]

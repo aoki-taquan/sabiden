@@ -87,7 +87,18 @@ src/
 ### SIP Dialog Layer (RFC 3261 §12)
 - ダイアログ ID (Call-ID + From-tag + To-tag)
 - CSeq 管理
-- Route Set 管理
+- Route Set 管理 (UAC 視点では Record-Route の **逆順**, RFC 3261 §12.1.2)
+- **Next-hop 計算 (RFC 3261 §12.2.1.1, Issue #79)**: in-dialog リクエスト
+  (2xx ACK / BYE / Re-INVITE / その ACK / INFO 等) の **宛先 SocketAddr**
+  は dialog の next-hop URI から導出する。 INVITE 送信先 (= 通常 P-CSCF) を
+  そのまま流用しない。
+  - `route_set` 空: next-hop = remote target (= 2xx 応答の Contact)。
+  - `route_set` 非空 (loose / strict 共通): next-hop = 先頭 Route URI。
+  - host が IPv4 / IPv6 リテラル + 明示 port のときのみ確定し、 FQDN /
+    port 省略時は INVITE 送信先 (`server_addr`) にフォールバック (RFC 3263
+    SRV / NAPTR 解決は別 Issue)。
+  - NGN 直収では Contact / Record-Route が `<IP>:5060` 確定 (`docs/asterisk-real-invite.md` §5.6)
+    なので、 結果として既存 117 通話パスは挙動不変 (NGN P-CSCF == Contact-host)。
 
 ### Call Manager
 - 着信を全内線にフォーク (Asterisk 風)

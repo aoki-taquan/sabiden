@@ -61,6 +61,11 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
         );
 
       // RTP が来てるかを 3 秒おきに統計確認 (デバッグ用)。
+      // createEffect は `props.remoteStream` 変化で再走するため、 interval id を
+      // onCleanup でこの effect run の終了 (= 次走 / unmount) 時に必ず clear する。
+      // これがないと effect 再走毎に interval が累積し、 unmount しても leak する
+      // (SolidJS reactivity guide: onCleanup inside an effect runs on re-execution
+      // and on owner disposal).
       const id = window.setInterval(() => {
         if (!audioEl?.srcObject) {
           window.clearInterval(id);
@@ -77,6 +82,7 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
           });
         }
       }, 3000);
+      onCleanup(() => window.clearInterval(id));
     }
   });
 

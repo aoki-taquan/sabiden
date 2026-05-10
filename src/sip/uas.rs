@@ -164,11 +164,32 @@ impl ResponderHandle {
     }
 
     /// 元リクエストから組み立てた簡易応答を送る。
+    ///
+    /// RFC 3261 §8.2.6.2 (Headers and Tags):
+    /// > The To header field in a response (with the exception of the 100
+    /// > (Trying) response, in which a tag is permitted but not required)
+    /// > MUST contain a tag.
+    ///
+    /// initial INVITE / REGISTER などの「To に tag が無い」リクエストに対する
+    /// final 応答 (200 OK / 4xx / 5xx / 6xx) と provisional 1xx (180 Ringing
+    /// 等; 100 Trying は除外) は、UAS が新しい To-tag を付けて返す責務を負う
+    /// (Issue #100)。`quick` は CANCEL 200 OK / REGISTER 403 / INVITE 4xx 5xx
+    /// 等の **dialog を作らない final 応答** で多用されるため、ここで
+    /// `ensure_to_tag` を通さないと strict UA (Asterisk pjsip 旧版 / Cisco /
+    /// Polycom) が応答を silently drop する。100 Trying のみ §8.2.6.2 の
+    /// 例外条項に従い tag 付与をスキップする (許容はされるが必須ではなく、
+    /// `request()` 由来の To に既に tag が無いまま発射される)。
+    ///
+    /// 既に To に tag がある (in-dialog request への応答 = BYE 200 OK 等) は
+    /// `ensure_to_tag` 内で no-op になるため副作用なし。
     pub async fn quick(&self, status: u16, reason: &str) -> Result<()> {
-        let resp = {
+        let mut resp = {
             let tx = self.inner.lock().await;
             build_response_skeleton(tx.request(), status, reason)
         };
+        if status != 100 {
+            ensure_to_tag(&mut resp);
+        }
         self.respond(resp).await
     }
 
@@ -1336,6 +1357,155 @@ mod tests {
         assert!(
             !to.contains(";tag=;") && !to.ends_with(";tag="),
             "値が空でない tag が付くべき: To={}",
+            to
+        );
+    }
+
+    /// テスト用ヘルパ: ローカル UDP ソケット 2 個を bind し、`SipRequest` を
+    /// 1 通流して `ResponderHandle` (= ServerTransaction) を作る。 `quick` が
+    /// 送信した応答パケットを受信側ソケットから読み出して [`SipResponse`] と
+    /// して返す。
+    ///
+    /// `to_header` は `From` の To に対応する初期値 (例 `<sip:dest@sabiden>`).
+    /// 通常 initial INVITE / REGISTER では tag 無し、in-dialog request では
+    /// tag 付き。
+    async fn quick_response_for_to(to_header: &str, status: u16, reason: &str) -> SipResponse {
+        // `responder` 側の socket (応答送信元) と `client` 側 socket (応答受信)
+        let server_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+        let client_sock = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        // 最低限の INVITE-like SipRequest を組み立てる。 Via branch / CSeq /
+        // Call-ID / From-tag は `ServerTransaction::new` の ID 計算に必要。
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:dest@sabiden");
+        req.headers.set(
+            "Via",
+            format!(
+                "SIP/2.0/UDP {};branch=z9hG4bK-test-{}",
+                client_addr,
+                new_call_id()
+            ),
+        );
+        req.headers
+            .set("From", "<sip:caller@sabiden>;tag=from-tag-1");
+        req.headers.set("To", to_header);
+        req.headers.set("Call-ID", new_call_id());
+        req.headers.set("CSeq", "1 INVITE");
+        req.headers.set("Max-Forwards", "70");
+        req.headers.set("Content-Length", "0");
+
+        let server_tx = ServerTransaction::new(req, client_addr, server_sock).unwrap();
+        let responder = ResponderHandle::new(server_tx);
+        responder.quick(status, reason).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(2), client_sock.recv_from(&mut buf))
+            .await
+            .expect("response timeout")
+            .unwrap();
+        match parse_message(&buf[..n]).unwrap() {
+            SipMessage::Response(r) => r,
+            _ => panic!("response expected"),
+        }
+    }
+
+    /// RFC 3261 §8.2.6.2 / Issue #100:
+    /// `ResponderHandle::quick` は initial INVITE への final 応答 (4xx 等)
+    /// で **必ず** To-tag を付与しなければならない。tag 無し To を持つ INVITE
+    /// に 403 Forbidden を返した結果、To に `;tag=...` が含まれていることを
+    /// 確認する。
+    #[tokio::test]
+    async fn rfc3261_8_2_6_2_quick_adds_to_tag_for_403_on_initial_invite() {
+        let resp = quick_response_for_to("<sip:dest@sabiden>", 403, "Forbidden").await;
+        assert_eq!(resp.status_code, 403);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            has_to_tag(to),
+            "RFC 3261 §8.2.6.2: 403 final 応答に To-tag が必須: To={}",
+            to
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 / Issue #100:
+    /// 200 OK (CANCEL / OPTIONS / BYE) でも To-tag 必須。 BYE のように元 To が
+    /// 既に tag 付き (in-dialog) なケースは別テストで確認するので、 ここでは
+    /// To-tag 無しの request (= initial CANCEL/OPTIONS 相当) に 200 OK を
+    /// 返したケースを検証する。
+    #[tokio::test]
+    async fn rfc3261_8_2_6_2_quick_adds_to_tag_for_200_ok() {
+        let resp = quick_response_for_to("<sip:dest@sabiden>", 200, "OK").await;
+        assert_eq!(resp.status_code, 200);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            has_to_tag(to),
+            "RFC 3261 §8.2.6.2: 200 OK 応答に To-tag が必須: To={}",
+            to
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 / Issue #100:
+    /// 481 / 487 / 503 など UAS が `quick` で多用する非 2xx final 応答も
+    /// To-tag 必須。 代表値 487 (Request Terminated; CANCEL→INVITE 経路) を
+    /// 確認する。
+    #[tokio::test]
+    async fn rfc3261_8_2_6_2_quick_adds_to_tag_for_487_request_terminated() {
+        let resp = quick_response_for_to("<sip:dest@sabiden>", 487, "Request Terminated").await;
+        assert_eq!(resp.status_code, 487);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            has_to_tag(to),
+            "RFC 3261 §8.2.6.2: 487 Request Terminated 応答に To-tag が必須: To={}",
+            to
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 例外条項 / Issue #100:
+    /// > with the exception of the 100 (Trying) response, in which a tag is
+    /// > permitted but not required
+    ///
+    /// 100 Trying では `quick` は To-tag を **付与しない** (例外条項に従い、
+    /// 元 request の To をそのまま echo する)。 付与しても RFC 違反では
+    /// ないが、 `quick` を経由する 100 Trying 経路 (`handle_invite` /
+    /// `handle_invite` re-INVITE) の元 To が tag 無しなら、 そのまま tag 無し
+    /// の 100 を返す挙動を保証する (Issue #100 完了条件)。
+    #[tokio::test]
+    async fn rfc3261_8_2_6_2_quick_skips_to_tag_for_100_trying() {
+        let resp = quick_response_for_to("<sip:dest@sabiden>", 100, "Trying").await;
+        assert_eq!(resp.status_code, 100);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            !has_to_tag(to),
+            "RFC 3261 §8.2.6.2 例外: 100 Trying では quick が tag を付与しない: To={}",
+            to
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 / §12.2.2 / Issue #100:
+    /// **既に To-tag が付いた** request (= in-dialog request、 例 BYE / Re-INVITE)
+    /// への final 応答では既存 tag を保持し、 二重付与しない。 BYE 200 OK の
+    /// dialog 整合性で重要 (元 dialog の local-tag を echo するのが正しい)。
+    #[tokio::test]
+    async fn rfc3261_12_2_2_quick_preserves_existing_to_tag() {
+        let resp =
+            quick_response_for_to("<sip:dest@sabiden>;tag=existing-uas-tag", 200, "OK").await;
+        assert_eq!(resp.status_code, 200);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            to.contains("tag=existing-uas-tag"),
+            "既存 To-tag が保持されている: To={}",
+            to
+        );
+        // 二重 tag になっていないことを確認 (`tag=` が 1 個だけ)
+        let tag_count = to
+            .to_ascii_lowercase()
+            .matches(";tag=")
+            .count()
+            // bare `tag=` (parameter 区切り無しで先頭) のケースもありうるが、
+            // ここでは `;tag=` に限定して数える (本テストの to_header は `;tag=` 形)
+            ;
+        assert_eq!(
+            tag_count, 1,
+            "RFC 3261 §12.2.2: 二重 tag になってはならない: To={}",
             to
         );
     }

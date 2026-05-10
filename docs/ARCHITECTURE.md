@@ -91,6 +91,14 @@ src/
 ### SIP Dialog Layer (RFC 3261 §12)
 - ダイアログ ID (Call-ID + From-tag + To-tag)
 - CSeq 管理
+- **UAS To-tag 付与の不変条件 (RFC 3261 §8.2.6.2 / Issue #100)**: 内線 UAS
+  (`src/sip/uas.rs::ResponderHandle`) は **100 Trying を除く全応答**
+  (1xx provisional / 2xx / 3xx / 4xx / 5xx / 6xx) で To に tag を付与する。
+  `respond_with_body` は元から `ensure_to_tag` を通すが、 `quick` も同様に
+  通す (二重付与防止は `has_to_tag` の case-insensitive 比較で in-dialog
+  request の既存 tag を保持)。 100 Trying のみ §8.2.6.2 例外条項に従い tag
+  付与をスキップ。 これにより strict UA (Asterisk pjsip 旧版 / Cisco /
+  Polycom) が tag 無し final 応答を silently drop する経路を遮断する。
 - Route Set 管理 (UAC 視点では Record-Route の **逆順**, RFC 3261 §12.1.2)
 - **Next-hop 計算 (RFC 3261 §12.2.1.1, Issue #79 / Issue #133)**: in-dialog
   リクエスト (2xx ACK / BYE / Re-INVITE / その ACK / INFO 等) の **宛先

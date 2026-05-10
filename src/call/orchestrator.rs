@@ -3689,9 +3689,29 @@ async fn run_webrtc_leg(
         return LegResult::Errored { aor };
     }
 
-    // (4) ブラウザ answer を timeout 内で受信
+    // (4) ブラウザ answer / decline を timeout 内で受信
+    //
+    // Issue #107 (RFC 3261 §21.6.2 603 Decline):
+    //   browser が「拒否」 ボタンで `ClientMessage::Decline { call_id }` を
+    //   送ってくると、 sabiden WS ハンドラ (`process_client_message`) が
+    //   `pending.decline(call_id, 603)` を呼び、 oneshot に
+    //   `AnswerOutcome::Decline { status }` が流れる。 ここでそれを観測して
+    //   `LegResult::Failed { status }` に変換し、 fork 全体としては
+    //   他レッグも全部失敗していれば `ForkResult::AllFailed { last_status: Some(603) }`
+    //   で抜けて NGN へ 603 Decline を返す (RFC 3261 §16.7 best response)。
+    //   他レッグ (SIP 内線端末) が 200 OK を返せば通話成立で本レッグの 603 は
+    //   破棄される (Asterisk 風フォーク semantics)。
     let answer = match tokio::time::timeout(leg_timeout, waiter).await {
-        Ok(Ok(sdp)) => sdp,
+        Ok(Ok(crate::webrtc::signaling::AnswerOutcome::Sdp(sdp))) => sdp,
+        Ok(Ok(crate::webrtc::signaling::AnswerOutcome::Decline { status })) => {
+            // pending は (4) の `decline`/`deliver` で既に消費済みなので
+            // 追加クリーンアップ不要。 fork 側の cleanup (`close_and_drain_webrtc_legs`)
+            // は引き続き当該レッグに `ServerMessage::Cancel` を送るが、 browser
+            // 側 PWA は既に手元で UI を閉じているため idempotent (App.tsx の
+            // `case "cancel"` ハンドラは既終了状態を変更しない)。
+            info!(%aor, status, "WebRTC leg: browser が着信を拒否 (RFC 3261 §21.6.2)");
+            return LegResult::Failed { aor, status };
+        }
         Ok(Err(_)) => {
             debug!(%aor, "WebRTC leg: pending oneshot がキャンセルされた");
             return LegResult::Errored { aor };
@@ -7982,6 +8002,142 @@ mod tests {
             1,
             "accept_answer 失敗時は peer.close() を 1 度だけ呼ぶべき (Issue #122 🟡 #3)"
         );
+    }
+
+    /// Issue #107: browser が `ClientMessage::Decline` を送ると、
+    /// `run_webrtc_leg` は `LegResult::Failed { status: 603 }` を返し、
+    /// `fork_to_bindings` は `ForkResult::AllFailed { last_status: Some(603) }` で抜ける
+    /// (RFC 3261 §21.6.2 603 Decline / §16.7 best response selection)。
+    ///
+    /// 旧挙動: browser が何も送らず、 `fork_to_bindings` は `leg_timeout` 経過まで
+    /// 待ってから `Timeout` で抜けていた (NGN 側は応答無しで 30 秒以上保留)。
+    /// 新挙動: 即時 (= browser が decline を送った瞬間) 603 で抜ける。
+    #[tokio::test]
+    async fn rfc3261_21_6_2_run_webrtc_leg_propagates_decline_as_failed_603() {
+        use crate::sip::registrar::Binding;
+        use crate::webrtc::peer::PeerSession;
+        use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 必要最低限の Peer。 create_offer は SAVPF SDP を返す。
+        /// accept_answer は呼ばれてはいけない (decline 経路なので)。
+        struct DeclinePathPeer {
+            create_calls: AtomicUsize,
+            offer_sdp: String,
+        }
+        #[async_trait::async_trait]
+        impl PeerSession for DeclinePathPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!("unused"))
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                self.create_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.offer_sdp.clone())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                panic!("decline 経路では accept_answer を呼んではいけない");
+            }
+            async fn add_ice_candidate(&self, _candidate: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let peer_inner = Arc::new(DeclinePathPeer {
+            create_calls: AtomicUsize::new(0),
+            offer_sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                        t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                        a=ice-ufrag:srvuf\r\na=ice-pwd:srvpasswordsrvpassword\r\n\
+                        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+                        a=setup:actpass\r\na=mid:0\r\na=rtcp-mux\r\na=sendrecv\r\n"
+                .to_string(),
+        });
+        let peer: Arc<dyn PeerSession> = peer_inner.clone();
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+        let ws_sink = WsSink::new(out_tx);
+        let pending = PendingAnswers::new();
+
+        // browser タスク: offer push を受け取った瞬間に decline を送る (= 拒否ボタン)
+        let pending_for_browser = pending.clone();
+        let browser_task = tokio::spawn(async move {
+            let msg = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+                .await
+                .expect("offer push 不在")
+                .expect("WS チャネル閉鎖");
+            if let ServerMessage::Offer { call_id, sdp: _ } = msg {
+                let ok = pending_for_browser.decline(&call_id, 603).await;
+                assert!(ok, "PendingAnswers::decline 成功すべき");
+            } else {
+                panic!("offer 以外を受信");
+            }
+            // fork_to_bindings の cleanup から Cancel が来るかもしれないが、
+            // 本テストでは観測しなくてよい (drained Cancel は PWA UI で
+            // idempotent に処理される)。 drain しておく。
+            while let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await
+            {}
+        });
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
+        let bindings = vec![(
+            "alice".to_string(),
+            Binding {
+                contact_uri: "sip:alice@webrtc.peer".to_string(),
+                remote: "127.0.0.1:65535".parse().unwrap(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(60),
+                transport: ExtTransport::WebRtc {
+                    peer: peer.clone(),
+                    ws: ws_sink.clone(),
+                    pending: pending.clone(),
+                },
+            },
+        )];
+        let start = std::time::Instant::now();
+        let result = fork_to_bindings(
+            inviter,
+            bindings,
+            b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+              m=audio 20000 RTP/AVP 0\r\n"
+                .to_vec(),
+            "ut-cid-decline".to_string(),
+            // 旧挙動なら 30 秒以上待つはず。 即時 603 が返ることを確認するため、
+            // 短い fork_timeout (3s) を渡し、 さらに elapsed < 1s を assert する。
+            Duration::from_secs(3),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        browser_task.await.unwrap();
+
+        // create_offer は呼ばれた (= decline は post-create_offer のタイミング)
+        assert_eq!(peer_inner.create_calls.load(Ordering::SeqCst), 1);
+
+        // 即時 603 で抜ける (旧挙動 = fork_timeout 待ちでは 3 秒以上かかる)
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "decline 経路は即時 (< 1s) 撤収するはず: elapsed={:?}",
+            elapsed
+        );
+
+        // fork 全体としては 603 で AllFailed (= SIP 内線端末が居ない構成なので)
+        match result {
+            ForkResult::AllFailed { last_status } => {
+                assert_eq!(
+                    last_status,
+                    Some(603),
+                    "browser decline は 603 Decline として fork に伝搬 (RFC 3261 §21.6.2)"
+                );
+            }
+            ForkResult::Answered { .. } => panic!("AllFailed 期待だが Answered"),
+            ForkResult::Timeout => panic!(
+                "AllFailed 期待だが Timeout (Issue #107 旧挙動の症状: decline が伝搬していない)"
+            ),
+        }
     }
 
     /// Issue #66 の核心: `finalize_outbound_bridge` が NGN 200 OK の SDP answer

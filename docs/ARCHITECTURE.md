@@ -139,6 +139,47 @@ sabiden ◄──200 OK── NGN
 [RTPブリッジ確立]
 ```
 
+### Re-INVITE (内線 → sabiden、 RFC 3261 §14.2 / Issue #94)
+
+確立済み dialog 内で内線 UA が SDP renegotiation (hold/un-hold) や
+Session-Timer (RFC 4028) 更新を要求する場合、 **To-tag 付き INVITE** を送る。
+sabiden は新規 dialog として扱わず、 既存 B2BUA dialog ペアを引いて NGN
+レッグへ Re-INVITE を伝搬する。 200 OK の To-tag は **既存 dialog の
+local-tag を保持** する (RFC 3261 §12.2.2)。
+
+```
+スマホ ──Re-INVITE (To-tag=existing)──► sabiden(UAS)
+                                             │
+                                             │ Call-ID で OutboundCallRegistry を引く
+                                             │   見つからない → 481 Call/Transaction Does Not Exist
+                                             │   見つかれば 100 Trying を返し:
+                                             │
+sabiden(UAC) ──Re-INVITE (新 SDP offer)──► NGN
+                                             │
+sabiden ◄──200 OK + 新 SDP answer── NGN
+sabiden(UAC) ──ACK──► NGN
+スマホ ◄──200 OK + 新 SDP answer (To-tag=existing 保持)── sabiden
+
+[RTP は既存ブリッジを継続使用; SDP direction (sendrecv↔sendonly) のみ変化]
+```
+
+**判定基準** (`src/sip/uas.rs::handle_invite`):
+
+- `To` ヘッダに `;tag=...` がある → `UasEvent::Reinvite` を上位に通知
+  (binding 検証 skip; in-dialog request は既存 dialog state で認可される)
+- `To` に tag が無い → 従来通り `UasEvent::Invite` (新規 dialog 確立経路)
+
+**既知の制限** (Phase R3 で改善):
+
+- RTP ブリッジ媒介時の Re-INVITE SDP 書換 (sabiden 側 port / IP 差替) は
+  未実装。 現状は SDP 透過モードでの hold/un-hold / Session-Timer 更新のみ
+  正しく動く。 ブリッジ媒介時の Re-INVITE 経路は `prepare_outbound_bridge` /
+  `finalize_outbound_bridge` を `handle_ext_reinvite` にも結線する必要がある
+  (`docs/refactor-plan.md` §1.4 / Phase R3 Negotiator)。
+- PRACK / 100rel (RFC 3262)、 UPDATE (RFC 3311) は別 Issue (Phase R2)。
+- NGN 側 Re-INVITE が 4xx/5xx で失敗した場合は同コードを内線へ中継する
+  (491 Request Pending を含む RFC 3261 §14.2 glare 解消は内線 UA の責務)。
+
 ## Phase 計画
 
 ### Phase 1: 基本機能（現在）

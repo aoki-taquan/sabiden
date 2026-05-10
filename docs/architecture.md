@@ -661,8 +661,24 @@ sequenceDiagram
 > `AllFailed` でも browser に `ServerMessage::Cancel` を発火するよう拡張済。
 > winner 自身は cleanup から除外する (`WsSink::same_channel` で同一性判定)。
 > Offer push 前に失敗した leg (例: `peer.create_offer` 失敗) は browser が
-> 当該 call_id を見ていないので cleanup 対象から除外する (`webrtc_legs`
-> への登録は Offer push 成功後に行う)。
+> 当該 call_id を見ていないので cleanup 対象から除外する (登録は
+> `try_register_webrtc_leg` で `peer.create_offer` 成功後 / Offer push 直前に行う)。
+>
+> **Race fix (review #1 / RFC 3261 §9.1 CANCEL semantics の WS 通知形)**:
+> `peer.create_offer` 中に他レッグが winner 確定すると、 旧実装は当該 slow
+> leg を winner cleanup snapshot から取り逃して browser へ Offer を push し、
+> PWA を ringing で固めていた。 修正後は `WebRtcLegRegistry { closed: bool,
+> legs: Vec<...> }` を導入し、 winner 確定時に `close_and_drain_webrtc_legs`
+> でアトミックに `closed = true` 化 + 既存 leg snapshot 取り出しを行う。
+> slow leg は `try_register_webrtc_leg` がアトミックに `closed` を確認し、
+> closed なら **Offer push せず自前 Cancel を送って終了** する。
+>
+> **502 fallback Cancel (review #2 / RFC 3261 §9.1)**:
+> `start_bridge_for_inbound` が失敗して 502 Bad Gateway を NGN に返す経路で、
+> winner 確定済みの WebRTC peer (browser) は ringing/connected 状態のまま
+> hang していた。 502 を返す前に `ServerMessage::Cancel` を browser に push
+> し PWA UI を解放する (確立に至らなかった呼の通知としては Bye より Cancel
+> が semantic 自然)。
 
 #### 現状実装と「あるべき」のギャップ
 

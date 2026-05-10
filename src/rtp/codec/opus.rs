@@ -24,6 +24,17 @@ pub const OPUS_FRAME_SAMPLES: usize = (OPUS_SAMPLE_RATE as usize * 20) / 1000;
 pub const OPUS_DEFAULT_BITRATE: i32 = 24_000;
 /// libopus 推奨の出力バッファ最大サイズ (4000 bytes)。
 const OPUS_MAX_PACKET: usize = 4000;
+/// 1 Opus packet が表現可能な最大サンプル数 = 120 ms × 48 kHz = 5760 samples。
+///
+/// RFC 6716 §3.2 (Frame Packing): "The largest number of samples that an
+/// Opus packet can represent is 120 ms" — code-3 (multi-frame) packets で
+/// 例えば 48×2.5ms 等の組合せで 120ms に達しうる。
+/// RFC 7587 §4.1 (Frame Sizes): 単体フレーム長は 2.5/5/10/20/40/60 ms。
+///
+/// `OpusDecoder::decode` の出力バッファはこの上限を満たすサイズで確保し、
+/// 40ms / 60ms (および将来の multi-frame 集約) を silently truncate しない
+/// 契約とする (Issue #89)。
+pub const OPUS_MAX_FRAME_SAMPLES: usize = (OPUS_SAMPLE_RATE as usize * 120) / 1000;
 
 /// Opus エンコーダ (mono / 48 kHz / 20ms フレーム)。
 pub struct OpusEncoder {
@@ -71,6 +82,40 @@ impl OpusEncoder {
         out.truncate(n);
         Ok(out)
     }
+
+    /// テスト専用: 任意の Opus 有効フレーム長 (RFC 7587 §4.1: 2.5/5/10/20/40/60 ms)
+    /// の PCM を直接 libopus に渡してエンコードする。 production 経路では
+    /// [`Self::encode`] が 20 ms 固定で十分なため呼ばないが、 transcoder の
+    /// 40 ms / 60 ms 入力分割を契約として固定するテスト ([Issue #89]) でだけ使う。
+    ///
+    /// CLAUDE.md §6.3 「production-side test hook 禁止」 と整合させるため
+    /// `#[cfg(test)]` でゲートし、 production binary には含めない。
+    #[cfg(test)]
+    pub(crate) fn encode_test_variable_duration(&mut self, frame: &AudioFrame) -> Result<Vec<u8>> {
+        if frame.sample_rate != OPUS_SAMPLE_RATE {
+            anyhow::bail!(
+                "Opus エンコード入力レート不正: {} Hz (48000 を要求)",
+                frame.sample_rate
+            );
+        }
+        // RFC 6716 §3.2.1: 有効な frame_size は 120/240/480/960/1920/2880 samples。
+        // ここでは N×20ms (= N×960) のみ受け付け、 sabiden の出力 PCMU (20ms) と
+        // フレーム境界が一致する組合せに限定する。
+        let len = frame.samples.len();
+        if len == 0 || !len.is_multiple_of(OPUS_FRAME_SAMPLES) {
+            anyhow::bail!(
+                "テスト用 encode: PCM 長が 20ms (960 samples) の整数倍でない: {}",
+                len
+            );
+        }
+        let mut out = vec![0u8; OPUS_MAX_PACKET];
+        let n = self
+            .encoder
+            .encode(&frame.samples, &mut out)
+            .context("Opus エンコード失敗 (variable duration)")?;
+        out.truncate(n);
+        Ok(out)
+    }
 }
 
 /// Opus デコーダ (mono / 48 kHz)。
@@ -85,12 +130,43 @@ impl OpusDecoder {
         Ok(Self { decoder })
     }
 
-    /// Opus パケットを 1 つデコードして 20ms PCM (48 kHz mono) を返す。
+    /// Opus パケットを 1 つデコードして PCM (48 kHz mono) を返す。
     ///
-    /// `packet` が空の場合は PLC (パケットロスコンシールメント) を行う
-    /// (FEC なし、`fec=false`)。
+    /// 戻り値のサンプル数は **パケットのフレーム長に依存** する:
+    /// - RFC 7587 §4.1: 単体フレームは 2.5 / 5 / 10 / 20 / 40 / 60 ms
+    ///   (= 120 / 240 / 480 / 960 / 1920 / 2880 samples @ 48 kHz)
+    /// - RFC 6716 §3.2 (code-3 multi-frame packet): 複数フレームを 1 packet に
+    ///   concatenation 可能、 合算 120 ms (= 5760 samples) まで
+    ///
+    /// libopus の `opus_decode` は出力バッファサイズ (= `frame_size` 引数) が
+    /// 実 packet の duration 以上である必要があるため、 受信 packet 長から
+    /// `opus_packet_get_nb_samples` で正確なサンプル数を取得して
+    /// 必要十分なバッファを確保する。 これにより 20ms / 40ms / 60ms / multi-frame
+    /// いずれも silently truncate しない (Issue #89)。
+    ///
+    /// `packet` が空の場合は PLC (パケットロスコンシールメント) を行う。
+    /// RFC 7587 §6.2 / RFC 6716 §6: PLC は直前 packet と同じ duration を
+    /// 合成すべき。 libopus は PLC モードでは `frame_size` ぴったりの
+    /// サンプルを返すため、 ここでは [`OPUS_FRAME_SAMPLES`] (= 20ms = 960) を
+    /// 確保する (sabiden の通常運用 = 20ms フレーム前提)。 直前 packet が
+    /// 40/60ms だった場合の最適 duration 検出は libopus の
+    /// `opus_decoder_ctl(OPUS_GET_LAST_PACKET_DURATION)` で可能だが、
+    /// 現状の上位層 (transcoder) が PLC 結果を直接消費しないため簡素化する。
     pub fn decode(&mut self, packet: &[u8]) -> Result<AudioFrame> {
-        let mut samples = vec![0i16; OPUS_FRAME_SAMPLES];
+        let buf_len = if packet.is_empty() {
+            // PLC モード: 20ms 固定 (RFC 7587 §6.2 / RFC 6716 §6)
+            OPUS_FRAME_SAMPLES
+        } else {
+            // packet のサンプル数を libopus に問い合わせる (RFC 6716 §3.2)。
+            // 失敗時 (= 不正 packet) はそのまま `decode` に渡してエラーを得る:
+            // ここで早期失敗してもエラーメッセージが二重化するだけのため、
+            // 最大バッファでデコードを試みて libopus 経由のエラーに任せる。
+            match self.decoder.get_nb_samples(packet) {
+                Ok(n) if n > 0 && n <= OPUS_MAX_FRAME_SAMPLES => n,
+                _ => OPUS_MAX_FRAME_SAMPLES,
+            }
+        };
+        let mut samples = vec![0i16; buf_len];
         let n = self
             .decoder
             .decode(packet, &mut samples, false)
@@ -264,6 +340,86 @@ mod tests {
             tail < head * 0.5 || tail < 1.0e6,
             "PLC が長時間で fade out していない: head={head} tail={tail}"
         );
+    }
+
+    /// RFC 7587 §4.1 (Opus Frame Sizes): "Opus supports five different frame
+    /// sizes: 2.5, 5, 10, 20, 40, and 60 ms." — 受信側 (sabiden の Opus
+    /// デコーダ) は 20 ms 以外のフレーム長を **truncate せず** デコードでき
+    /// なければならない (RFC 7587 §4.2: "the receiver SHOULD NOT assume any
+    /// particular frame size")。
+    ///
+    /// Issue #89: 旧実装は出力バッファを `OPUS_FRAME_SAMPLES` (= 20 ms) で
+    /// 固定確保していたため、 40 ms / 60 ms フレームを受信すると後段で
+    /// silently drop されていた。 本テストは 40 ms と 60 ms フレームを
+    /// エンコードして、 デコード後のサンプル数が期待値 (1920 / 2880) に
+    /// 一致することを契約として固定する。
+    ///
+    /// `Encoder::set_expert_frame_duration` 経由でフレーム長を指定する API は
+    /// opus crate 0.3 では公開されていないため、 ここでは「N × 20ms 分の PCM を
+    /// 1 度に encode」して libopus に desired frame duration を推測させる経路を使う
+    /// (libopus は `frame_size = pcm_len` から内部で適切なフレームを選ぶ:
+    /// RFC 6716 §3.2.1)。
+    #[test]
+    fn rfc7587_4_1_decoder_handles_40ms_and_60ms_frame_sizes() {
+        for (ms, expected_samples) in [(40usize, 1920usize), (60, 2880)] {
+            let mut enc = OpusEncoder::new().unwrap();
+            let mut dec = OpusDecoder::new().unwrap();
+
+            // N×20ms 分の連続 sine wave を作る。 libopus encoder は PCM 長から
+            // frame size を選び、 N×20ms = 単体フレーム (40 / 60 ms) もしくは
+            // multi-frame concatenation を出力する。
+            let n_samples = (OPUS_SAMPLE_RATE as usize * ms) / 1000;
+            let mut pcm = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+                let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin();
+                pcm.push((v * 8000.0) as i16);
+            }
+            // `OpusEncoder::encode` は length チェックで 20ms 固定を要求するため、
+            // 40/60ms フレームを作るには `encode_test_variable_duration` を使う。
+            let af = AudioFrame::new(OPUS_SAMPLE_RATE, pcm);
+            let out = enc
+                .encode_test_variable_duration(&af)
+                .unwrap_or_else(|e| panic!("{} ms encode 失敗: {:?}", ms, e));
+            assert!(
+                !out.is_empty(),
+                "{} ms encode 結果が空 (libopus が duration を解釈できない可能性)",
+                ms
+            );
+
+            // デコード: silently truncate されたら 960 だが、 修正後は ms 相当
+            // のサンプル数が返るはず。
+            let decoded = dec
+                .decode(&out)
+                .unwrap_or_else(|e| panic!("{} ms decode 失敗: {:?}", ms, e));
+            assert_eq!(
+                decoded.sample_rate, OPUS_SAMPLE_RATE,
+                "{} ms decode 出力レートが 48kHz でない",
+                ms
+            );
+            assert_eq!(
+                decoded.samples.len(),
+                expected_samples,
+                "{} ms decode 出力長が期待値と不一致 (silently truncated): \
+                 expected {}, got {}",
+                ms,
+                expected_samples,
+                decoded.samples.len()
+            );
+            // 期待 frame 数 (= ms / 20) も chunks(960) で取れる
+            assert!(
+                decoded.samples.len().is_multiple_of(OPUS_FRAME_SAMPLES),
+                "{} ms decode 出力が 20ms (960 samples) の整数倍でない: {}",
+                ms,
+                decoded.samples.len()
+            );
+            assert_eq!(
+                decoded.samples.len() / OPUS_FRAME_SAMPLES,
+                ms / 20,
+                "{} ms decode 出力が ms/20 個の 20ms chunk に分割できない",
+                ms
+            );
+        }
     }
 
     /// RFC 7587 §7.1 (`a=rtpmap:<pt> opus/48000/2`): Opus の動的 PT は

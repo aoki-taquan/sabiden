@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
 use crate::observability::Metrics;
-use crate::rtp::codec::opus::{OpusDecoder, OpusEncoder, OPUS_FRAME_SAMPLES};
+use crate::rtp::codec::opus::{OpusDecoder, OpusEncoder, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE};
 use crate::rtp::codec::resample::{
     DownsamplerWbToNb, UpsamplerNbToWb, NARROW_BAND_RATE, NB_FRAME_SAMPLES, WB_FRAME_SAMPLES,
 };
@@ -572,7 +572,21 @@ async fn web_to_ngn_loop(
             _ = tick.tick() => {
                 let Some(pkt) = jitter.pull() else { continue };
 
-                // Opus decode → 48k PCM (mono, 960 samples 想定)
+                // Opus decode → 48k PCM。
+                // RFC 7587 §4.1 (Frame Sizes): Opus フレーム長は 2.5/5/10/20/40/60 ms
+                // (= 120/240/480/960/1920/2880 samples @ 48 kHz)。
+                // RFC 6716 §3.2 (code-3 multi-frame packet) では複数フレームを
+                // 1 packet にまとめて最大 120 ms (= 5760 samples) まで運べる。
+                // RFC 7587 §4.2: "the receiver SHOULD NOT assume any particular
+                // frame size" — 受信側は 20 ms 以外も処理する義務がある。
+                //
+                // Issue #89: 旧実装は 20 ms (960 samples) 固定で検査して
+                // それ以外を silently drop していた。 修正後は decode 出力を
+                // 20 ms chunk (= `WB_FRAME_SAMPLES`) ごとに分割し、 各 chunk を
+                // downsample → μ-law encode → RTP send する。
+                // `DownsamplerWbToNb` は `FastFixedIn` 固定入力長 960 で構築されて
+                // いる (`src/rtp/codec/resample.rs:81-90`) ため、 1920/2880 等を
+                // 一括投入できない。 必ず chunks(960) で分割処理する。
                 let wb = match decoder.decode(&pkt.payload) {
                     Ok(v) => v,
                     Err(e) => {
@@ -581,33 +595,21 @@ async fn web_to_ngn_loop(
                         continue;
                     }
                 };
-                // 20ms 以外のフレーム長はサポート外 (本実装は 20ms 固定)
-                if wb.samples.len() != WB_FRAME_SAMPLES {
+                if wb.samples.is_empty() || !wb.samples.len().is_multiple_of(WB_FRAME_SAMPLES) {
+                    // RFC 7587 §4.1 で許される frame size は全て 20ms の整数倍
+                    // (20/40/60 ms)。 2.5/5/10 ms はインタオペ実績が稀で、
+                    // sabiden の出力レッグ (NGN PCMU 20ms 固定) ともフレーム境界が
+                    // 一致しない。 これらは現時点で未サポートとして drop する。
+                    // TODO(本流対応): 2.5/5/10 ms 対応は内部で 20ms 単位に
+                    //   累積するバッファを別途設けて Issue #89 fix の続きで扱う。
                     trace!(
                         samples = wb.samples.len(),
-                        "WebRTC フレーム長異常 (20ms 期待) → drop"
+                        wb_frame = WB_FRAME_SAMPLES,
+                        "WebRTC フレーム長が 20ms (960) の整数倍でない → drop"
                     );
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-
-                // downsample 48k → 8k
-                let nb = match downsampler.process(&wb) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        trace!(error=%e, "ダウンサンプル失敗");
-                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                if nb.samples.len() != NB_FRAME_SAMPLES {
-                    trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
-                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // μ-law encode
-                let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
 
                 let dest = match *to_state.peer.lock().await {
                     Some(d) => d,
@@ -617,31 +619,68 @@ async fn web_to_ngn_loop(
                     }
                 };
 
-                // 共有 egress state から SSRC / seq / ts を払い出して 1 frame 分進める。
-                // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
-                // Issue #112: bridge lifetime 中 SSRC 不変 + flow 中の seq / ts 連番を保証。
-                let (seq, ts, ssrc) = {
-                    let mut eg = state.web_to_ngn_egress.lock().await;
-                    eg.next(SAMPLES_PER_FRAME as u32)
-                };
+                // 20ms chunk ごとに 1 RTP packet を生成して送出する。
+                // 各 chunk は同じ SSRC を共有しつつ seq +1 / ts +160 (RFC 3551
+                // §4.5.14: PCMU 8 kHz × 20 ms) ずつ進む。 RFC 3550 §5.1 の
+                // 「同一 SSRC 内 seq は monotonically increasing」 を満たす。
+                let mut chunk_failed = false;
+                for chunk in wb.samples.chunks(WB_FRAME_SAMPLES) {
+                    // chunks() の最後が短くなることは上の % 検査で排除済みだが、
+                    // 念のため defensive check。
+                    if chunk.len() != WB_FRAME_SAMPLES {
+                        trace!(samples = chunk.len(), "chunk 長異常 → drop");
+                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                        chunk_failed = true;
+                        break;
+                    }
+                    let frame = AudioFrame::new(OPUS_SAMPLE_RATE, chunk.to_vec());
+                    let nb = match downsampler.process(&frame) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            trace!(error=%e, "ダウンサンプル失敗");
+                            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                            chunk_failed = true;
+                            break;
+                        }
+                    };
+                    if nb.samples.len() != NB_FRAME_SAMPLES {
+                        trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
+                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                        chunk_failed = true;
+                        break;
+                    }
+                    let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
 
-                let out_pkt = RtpPacket {
-                    payload_type: PAYLOAD_TYPE_ULAW,
-                    marker: false,
-                    sequence: seq,
-                    timestamp: ts,
-                    ssrc,
-                    payload: ulaw,
-                };
+                    // 共有 egress state から SSRC / seq / ts を払い出して 1 chunk 分進める。
+                    // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
+                    // Issue #112: bridge lifetime 中 SSRC 不変 + flow 中の seq / ts 連番を保証。
+                    let (seq, ts, ssrc) = {
+                        let mut eg = state.web_to_ngn_egress.lock().await;
+                        eg.next(SAMPLES_PER_FRAME as u32)
+                    };
 
-                if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
-                    warn!(error=%e, "NGN へ RTP forward 失敗");
-                    continue;
+                    let out_pkt = RtpPacket {
+                        payload_type: PAYLOAD_TYPE_ULAW,
+                        marker: false,
+                        sequence: seq,
+                        timestamp: ts,
+                        ssrc,
+                        payload: ulaw,
+                    };
+
+                    if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
+                        warn!(error=%e, "NGN へ RTP forward 失敗");
+                        chunk_failed = true;
+                        break;
+                    }
+                    state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics.as_ref() {
+                        m.add_rtp_ext_to_ngn(1);
+                    }
                 }
-                state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
-                if let Some(m) = metrics.as_ref() {
-                    m.add_rtp_ext_to_ngn(1);
-                }
+                // chunk_failed の場合は途中で break しているだけで、 上位ループ
+                // (受信再開) は継続する。 明示的に変数を読んで warning 回避。
+                let _ = chunk_failed;
             }
         }
     }
@@ -1064,13 +1103,34 @@ async fn peer_to_ngn_loop(
             continue;
         }
 
-        let ulaw: Vec<u8> = if direct_pcmu_passthrough {
+        // 1 受信 MediaFrame からの出力 μ-law payload 列。
+        // - PCMU 直送モード: 1 chunk (= frame.payload そのまま)。
+        // - トランスコードモード: Opus decode 結果を 20ms ごとに分割して
+        //   N chunk (N = frame_size_ms / 20、 RFC 7587 §4.1 で許される
+        //   20/40/60 ms 単体フレーム、 もしくは RFC 6716 §3.2 multi-frame
+        //   packet で合算 120 ms まで)。
+        //
+        // Issue #89: 旧実装は 20 ms 固定 (`wb.samples.len() != WB_FRAME_SAMPLES`)
+        // で 40 ms / 60 ms フレームを silently drop していた。 修正後は
+        // chunks(WB_FRAME_SAMPLES) で分割して 各 chunk を個別に downsample →
+        // μ-law encode する。 `DownsamplerWbToNb` は `FastFixedIn` 固定入力長
+        // 960 で構築されている (`src/rtp/codec/resample.rs:81-90`) ため、
+        // 1920 / 2880 等を一括投入できない。
+        let ulaw_chunks: Vec<Vec<u8>> = if direct_pcmu_passthrough {
             // PCMU 直送: peer からの μ-law payload をそのまま NGN へ。
-            frame.payload.clone()
+            vec![frame.payload.clone()]
         } else {
-            let (downsampler, decoder) = down_dec
-                .as_mut()
-                .expect("down_dec must be Some when not in direct mode");
+            let (downsampler, decoder) = match down_dec.as_mut() {
+                Some(v) => v,
+                None => {
+                    // direct_pcmu_passthrough=false の初期化で必ず Some になるが、
+                    // production code で unreachable panic を避けるため defensive
+                    // に drop して継続する (CLAUDE.md §6.5)。
+                    trace!("down_dec 未初期化 (unreachable) → drop");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
             let wb = match decoder.decode(&frame.payload) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1079,25 +1139,49 @@ async fn peer_to_ngn_loop(
                     continue;
                 }
             };
-            if wb.samples.len() != WB_FRAME_SAMPLES {
-                trace!(samples = wb.samples.len(), "WebRTC フレーム長異常 → drop");
+            if wb.samples.is_empty() || !wb.samples.len().is_multiple_of(WB_FRAME_SAMPLES) {
+                // 2.5/5/10 ms 等の 20ms 倍数でないフレーム長は現時点で未サポート
+                // (TODO(本流対応): Issue #89 fix の続きで内部累積バッファを設ける)。
+                trace!(
+                    samples = wb.samples.len(),
+                    wb_frame = WB_FRAME_SAMPLES,
+                    "WebRTC フレーム長が 20ms (960) の整数倍でない → drop"
+                );
                 state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let nb = match downsampler.process(&wb) {
-                Ok(v) => v,
-                Err(e) => {
-                    trace!(error=%e, "ダウンサンプル失敗");
+
+            let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(wb.samples.len() / WB_FRAME_SAMPLES);
+            let mut chunk_err = false;
+            for chunk in wb.samples.chunks(WB_FRAME_SAMPLES) {
+                if chunk.len() != WB_FRAME_SAMPLES {
+                    trace!(samples = chunk.len(), "chunk 長異常 → drop");
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                    chunk_err = true;
+                    break;
                 }
-            };
-            if nb.samples.len() != NB_FRAME_SAMPLES {
-                trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
-                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                let wb_chunk = AudioFrame::new(OPUS_SAMPLE_RATE, chunk.to_vec());
+                let nb = match downsampler.process(&wb_chunk) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        trace!(error=%e, "ダウンサンプル失敗");
+                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                        chunk_err = true;
+                        break;
+                    }
+                };
+                if nb.samples.len() != NB_FRAME_SAMPLES {
+                    trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    chunk_err = true;
+                    break;
+                }
+                chunks.push(nb.samples.iter().map(|s| encode_ulaw(*s)).collect());
+            }
+            if chunk_err {
                 continue;
             }
-            nb.samples.iter().map(|s| encode_ulaw(*s)).collect()
+            chunks
         };
 
         let dest = match *to_state.peer.lock().await {
@@ -1107,28 +1191,32 @@ async fn peer_to_ngn_loop(
                 continue;
             }
         };
-        // 共有 egress state から SSRC / seq / ts を払い出す。
-        // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
-        let (seq, ts, ssrc) = {
-            let mut eg = state.web_to_ngn_egress.lock().await;
-            eg.next(SAMPLES_PER_FRAME as u32)
-        };
-        let out_pkt = RtpPacket {
-            payload_type: PAYLOAD_TYPE_ULAW,
-            marker: false,
-            sequence: seq,
-            timestamp: ts,
-            ssrc,
-            payload: ulaw,
-        };
 
-        if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
-            warn!(error=%e, "NGN へ RTP forward 失敗");
-            continue;
-        }
-        state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
-        if let Some(m) = metrics.as_ref() {
-            m.add_rtp_ext_to_ngn(1);
+        // 各 chunk を 1 RTP packet として送出。 RFC 3550 §5.1: 同一 SSRC 内では
+        // seq が monotonically increasing、 timestamp は sample 数だけ進む
+        // (RFC 3551 §4.5.14: PCMU 8 kHz × 20 ms = 160 samples)。
+        for ulaw in ulaw_chunks {
+            let (seq, ts, ssrc) = {
+                let mut eg = state.web_to_ngn_egress.lock().await;
+                eg.next(SAMPLES_PER_FRAME as u32)
+            };
+            let out_pkt = RtpPacket {
+                payload_type: PAYLOAD_TYPE_ULAW,
+                marker: false,
+                sequence: seq,
+                timestamp: ts,
+                ssrc,
+                payload: ulaw,
+            };
+
+            if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
+                warn!(error=%e, "NGN へ RTP forward 失敗");
+                break;
+            }
+            state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = metrics.as_ref() {
+                m.add_rtp_ext_to_ngn(1);
+            }
         }
     }
     debug!("peer_media_rx closed → peer→NGN 方向終了");
@@ -1519,6 +1607,288 @@ mod tests {
         let (_n2w, w2n, _err) = bridge.stats();
         assert!(w2n >= 1, "WebRTC→NGN カウンタが上がっていない: {}", w2n);
         bridge.stop().await;
+    }
+
+    /// Issue #89 / RFC 7587 §4.1: `TranscodingBridge::web_to_ngn_loop` は
+    /// 40ms / 60ms の Opus フレーム (= 1920 / 2880 samples @ 48 kHz) を受信した
+    /// 場合、 silently drop せず **20ms chunk に分割して N 個の PCMU RTP packet
+    /// を NGN へ送出する** ことを契約として固定する。
+    ///
+    /// RFC 7587 §4.1 (Frame Sizes): "Opus supports five different frame sizes:
+    /// 2.5, 5, 10, 20, 40, and 60 ms."
+    /// RFC 7587 §4.2: "the receiver SHOULD NOT assume any particular frame size."
+    ///
+    /// 旧実装は `wb.samples.len() != WB_FRAME_SAMPLES` で 20ms 以外を全て drop
+    /// していたため、 ブラウザが (DTX 復帰時等で) 40/60ms フレームを送るたびに
+    /// NGN レッグの音声が途切れていた。
+    ///
+    /// 本テストは:
+    /// 1. 40 ms Opus packet を 3 個投入 → NGN 側で 20ms PCMU を 6 個受信
+    /// 2. 60 ms Opus packet を 2 個投入 → NGN 側で 20ms PCMU を 6 個受信
+    /// を順次確認する。 各 PCMU は 160 bytes (20ms @ 8kHz)、 seq +1 連番、
+    /// timestamp +160 連番 (RFC 3551 §4.5.14)。
+    #[tokio::test]
+    async fn rfc7587_4_1_web_to_ngn_splits_40ms_and_60ms_opus_into_pcmu_frames() {
+        for (ms, n_input_packets) in [(40usize, 3usize), (60, 2)] {
+            let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let web_addr = web_sock.local_addr().unwrap();
+
+            let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+            let web_peer_addr = web_peer.local_addr().unwrap();
+
+            let bridge = TranscodingBridge::start(TranscodeConfig {
+                ngn_socket: ngn_sock,
+                web_socket: web_sock,
+                ngn_peer: Some(ngn_peer_addr),
+                web_peer: Some(web_peer_addr),
+                opus_payload_type: DEFAULT_OPUS_PT,
+                metrics: None,
+            })
+            .unwrap();
+
+            // N ms 分の 48 kHz 1 kHz sine wave を作る
+            let n_samples = (OPUS_SAMPLE_RATE as usize * ms) / 1000;
+            let mut samples = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+                let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+                samples.push(v as i16);
+            }
+            let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+            // jitter depth=4 を満たすため、 最低 5 packet 投入する。
+            // 40 ms × 3 = 120 ms 出力 (6 PCMU frame)、 60 ms × 2 = 120 ms 出力 (6
+            // PCMU frame) でも、 jitter pull は 5 個目以降で始まる。 そこで
+            // 入力 packet 数は depth + 1 を最低保証する。
+            let n_total = n_input_packets.max(JITTER_DEPTH + 1);
+            let mut enc = OpusEncoder::new().unwrap();
+            for i in 0..n_total {
+                let opus_payload = enc.encode_test_variable_duration(&frame).unwrap();
+                let pkt = RtpPacket {
+                    payload_type: DEFAULT_OPUS_PT,
+                    marker: false,
+                    sequence: (i as u16) + 1,
+                    timestamp: (i as u32) * (n_samples as u32),
+                    ssrc: 0xDEAD_BEEF,
+                    payload: opus_payload,
+                }
+                .to_bytes();
+                web_peer.send_to(&pkt, web_addr).await.unwrap();
+            }
+
+            // 各入力 packet は ms/20 個の PCMU を生成する。 全 packet で合計
+            // n_total × (ms/20) 個の PCMU が NGN 側に届く。
+            let expected_pcmu = n_total * (ms / 20);
+            let mut received: Vec<RtpPacket> = Vec::with_capacity(expected_pcmu);
+            for _ in 0..expected_pcmu {
+                let mut buf = vec![0u8; 1500];
+                let (n, _) = timeout(Duration::from_secs(3), ngn_peer.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{} ms: NGN 側で {} 個目の PCMU を受信できない (silently drop?)",
+                            ms,
+                            received.len() + 1
+                        )
+                    })
+                    .unwrap();
+                let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+                assert_eq!(
+                    recv.payload_type, PAYLOAD_TYPE_ULAW,
+                    "{} ms: PT が PCMU でない",
+                    ms
+                );
+                assert_eq!(
+                    recv.payload.len(),
+                    SAMPLES_PER_FRAME,
+                    "{} ms: PCMU payload が 160 bytes (RFC 3551 §4.5.14) でない: {}",
+                    ms,
+                    recv.payload.len()
+                );
+                received.push(recv);
+            }
+
+            // seq +1 / timestamp +160 連番 (RFC 3550 §5.1 / RFC 3551 §4.5.14)
+            for w in received.windows(2) {
+                assert_eq!(
+                    w[1].sequence.wrapping_sub(w[0].sequence),
+                    1,
+                    "{} ms: 分割 PCMU の seq が連番でない",
+                    ms
+                );
+                assert_eq!(
+                    w[1].timestamp.wrapping_sub(w[0].timestamp),
+                    SAMPLES_PER_FRAME as u32,
+                    "{} ms: 分割 PCMU の timestamp 増分が 160 でない",
+                    ms
+                );
+            }
+
+            // SSRC は全 packet で一致 (RFC 3550 §5.1)
+            let ssrc0 = received[0].ssrc;
+            for (i, pkt) in received.iter().enumerate() {
+                assert_eq!(
+                    pkt.ssrc, ssrc0,
+                    "{} ms: frame #{} で SSRC が変わっている",
+                    ms, i
+                );
+            }
+
+            // 統計上 transcode_errors は 0 のはず (silently drop が消えた契約)
+            let (_n2w, w2n, err) = bridge.stats();
+            assert_eq!(
+                err, 0,
+                "{} ms: transcode_errors が 0 でない (silently drop 残存): {}",
+                ms, err
+            );
+            assert!(
+                w2n >= expected_pcmu as u64,
+                "{} ms: PCMU 送信カウンタが {} 以上でない: {}",
+                ms,
+                expected_pcmu,
+                w2n
+            );
+
+            bridge.stop().await;
+        }
+    }
+
+    /// Issue #89 / RFC 7587 §4.1: `WebRtcAudioBridge::peer_to_ngn_loop`
+    /// (str0m 経由の Opus → NGN PCMU 経路) も 40ms / 60ms フレームを 20ms 単位の
+    /// PCMU RTP packet に分割して NGN へ流す。
+    ///
+    /// `direct_pcmu_passthrough = false` (= Opus → PCMU トランスコード経路) の
+    /// 分岐に対して RFC 7587 §4.1 契約を固定する。
+    #[tokio::test]
+    async fn rfc7587_4_1_peer_to_ngn_splits_40ms_and_60ms_opus_into_pcmu_frames() {
+        use std::sync::Arc as SArc;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, _: MediaFrame) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        for ms in [40usize, 60] {
+            let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+            let (peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(16);
+
+            let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+                ngn_socket: ngn_sock,
+                ngn_peer: Some(ngn_peer_addr),
+                peer: Arc::new(NoopPeer),
+                peer_media_rx: peer_rx,
+                opus_payload_type: DEFAULT_OPUS_PT,
+                // Opus → PCMU トランスコード経路 (Issue #89 修正対象)
+                direct_pcmu_passthrough: false,
+                metrics: None,
+            });
+
+            // N ms 分の 48 kHz 1 kHz sine wave をエンコード
+            let n_samples = (OPUS_SAMPLE_RATE as usize * ms) / 1000;
+            let mut samples = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+                let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+                samples.push(v as i16);
+            }
+            let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+            let mut enc = OpusEncoder::new().unwrap();
+            let opus_payload = enc.encode_test_variable_duration(&frame).unwrap();
+
+            // 1 個の長尺 Opus packet を送る (jitter buffer なしの直結 mpsc 経路)
+            peer_tx
+                .send(MediaFrame {
+                    pt: DEFAULT_OPUS_PT,
+                    rtp_time: 0,
+                    payload: opus_payload,
+                    network_time: std::time::Instant::now(),
+                })
+                .await
+                .unwrap();
+
+            // ms/20 個の PCMU が NGN 側に届く
+            let expected_pcmu = ms / 20;
+            let mut received: Vec<RtpPacket> = Vec::with_capacity(expected_pcmu);
+            for _ in 0..expected_pcmu {
+                let mut buf = vec![0u8; 1500];
+                let (n, _) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{} ms: NGN 側で {} 個目の PCMU を受信できない",
+                            ms,
+                            received.len() + 1
+                        )
+                    })
+                    .unwrap();
+                let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+                assert_eq!(recv.payload_type, PAYLOAD_TYPE_ULAW, "{} ms PT 不正", ms);
+                assert_eq!(
+                    recv.payload.len(),
+                    SAMPLES_PER_FRAME,
+                    "{} ms: PCMU payload が 160 bytes でない",
+                    ms
+                );
+                received.push(recv);
+            }
+
+            // 連続性 (seq +1, ts +160)
+            for w in received.windows(2) {
+                assert_eq!(
+                    w[1].sequence.wrapping_sub(w[0].sequence),
+                    1,
+                    "{} ms peer→NGN: seq 不連続",
+                    ms
+                );
+                assert_eq!(
+                    w[1].timestamp.wrapping_sub(w[0].timestamp),
+                    SAMPLES_PER_FRAME as u32,
+                    "{} ms peer→NGN: timestamp 増分不正",
+                    ms
+                );
+            }
+
+            let (_n2p, p2n, err) = bridge.stats();
+            assert_eq!(
+                err, 0,
+                "{} ms peer→NGN: transcode_errors が 0 でない (silently drop): {}",
+                ms, err
+            );
+            assert!(
+                p2n >= expected_pcmu as u64,
+                "{} ms peer→NGN: PCMU 送信カウンタが {} 以上でない: {}",
+                ms,
+                expected_pcmu,
+                p2n
+            );
+
+            bridge.stop().await;
+        }
     }
 
     /// Issue #87 / #121: NGN socket → WebRtcAudioBridge → peer.send_media

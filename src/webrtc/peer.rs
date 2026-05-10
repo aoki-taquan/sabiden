@@ -30,6 +30,7 @@
 //! 経路 (auth → register → offer/answer/ice → bye) は実装通りに動く。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -37,6 +38,29 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
 use crate::sdp::SessionDescription;
+
+/// PeerConnection から取り出す / 押し込む音声フレーム 1 個。
+///
+/// RFC 3550 §5.1 (RTP) の 1 packet に対応する depayload 済みフレーム。
+/// RFC 7587 (Opus payload format) で WebRTC は通常 20 ms = 960 samples@48kHz の
+/// Opus フレームを 1 RTP packet に乗せる。 本構造は RTP ヘッダを直接持たず、
+/// `pt` (payload type) と `rtp_time` (RTP timestamp / メディア時刻) と
+/// `payload` (codec が解釈するペイロード本体) のみを保持する。
+///
+/// [`PeerSession::send_media`] / [`PeerSession::take_media_rx`] で
+/// orchestrator ↔ str0m の間を流れる単位になる。
+#[derive(Debug, Clone)]
+pub struct MediaFrame {
+    /// SDP の `a=rtpmap:<pt>` で negotiate した payload type。
+    pub pt: u8,
+    /// RTP timestamp (sample count, codec のサンプリングレート単位)。
+    pub rtp_time: u32,
+    /// codec ペイロード本体 (Opus フレーム、 μ-law サンプル列等)。
+    pub payload: Vec<u8>,
+    /// 受信時の wall-clock。 送信側 (orchestrator → str0m) では
+    /// `Instant::now()` を入れる。 RFC 3550 §6.4.1 SR 算出に使う。
+    pub network_time: Instant,
+}
 
 /// WebRTC PeerConnection の最小インタフェース。
 ///
@@ -80,6 +104,34 @@ pub trait PeerSession: Send + Sync {
     /// 戻り値が `None` の場合、シグナリング層は trickle 配信をスキップする。
     async fn take_local_candidates(&self) -> Option<mpsc::Receiver<String>> {
         None
+    }
+
+    /// ブラウザから受信したメディアフレーム ([`MediaFrame`]) のストリームを
+    /// 1 度だけ取り出す (RFC 8835 §3: WebRTC media plane)。
+    ///
+    /// str0m バックエンドでは run_loop の `Event::MediaData` から 1 frame ずつ
+    /// 流れる。 本 receiver を取り出した orchestrator は通常
+    /// [`crate::call::bridge::MediaBridge::WebRtcAudio`] にパイプし、
+    /// Opus → PCMU トランスコードして NGN レッグへ転送する。
+    ///
+    /// stub バックエンドは `None` を返す (実 codec を持たない)。
+    /// 取り出しは **1 度だけ**。 2 度目以降は `None`。
+    async fn take_media_rx(&self) -> Option<mpsc::Receiver<MediaFrame>> {
+        None
+    }
+
+    /// orchestrator から peer に音声フレームを送り込む (NGN → ブラウザ方向)。
+    ///
+    /// str0m バックエンドでは run_loop に command として渡し、
+    /// `Rtc::writer(mid).write(pt, wallclock, rtp_time, payload)` 経由で
+    /// SRTP 化して UDP へ送出する (RFC 8827: WebRTC は SRTP 必須)。
+    /// 呼出側は Opus 化済みペイロードを渡す (PT は negotiate 済みの値)。
+    ///
+    /// stub バックエンドは即 `Ok(())` を返す (no-op、 テスト用)。
+    /// peer がまだ Connected していない場合 (DTLS 確立前) は drop されるが
+    /// `Ok(())` を返す (`Rtc::writer().write` の挙動に追従)。
+    async fn send_media(&self, _frame: MediaFrame) -> Result<()> {
+        Ok(())
     }
 
     /// セッションをクローズする。

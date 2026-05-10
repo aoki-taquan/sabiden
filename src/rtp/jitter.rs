@@ -26,13 +26,17 @@ const SEQ_REORDER_WINDOW: i32 = 3000;
 /// ジッタバッファ統計 (RFC 3550 RR で報告するために保持)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitterStats {
-    /// 受信した総パケット数 (重複・古すぎるものを含む)
+    /// 重複 / 古すぎを除いた実取り込みパケット数。 RFC 3550 §A.3 における
+    /// `received` (拡張 seq で初めて取り込んだ distinct packet 数) に対応する。
     pub received: u64,
-    /// 取り出し時に検出した期待 seq とのズレの累積 (= 推定ロス)
+    /// バッファ容量超過時の強制吐き出しで検出した「期待 seq との差」累積。
+    /// **これは RFC 3550 の cumulative_lost ではない**: あくまでバッファ枯渇時の
+    /// オーバフロー指標で、 RR 出力には `cumulative_lost()` を使うこと。
+    /// (Issue #93 経過: RR の cumulative_lost は §A.3 ベースに刷新済)
     pub lost: i64,
     /// 重複として破棄したパケット数
     pub duplicates: u64,
-    /// バッファ容量超過で破棄したパケット数
+    /// 既に pull 済みの古い seq を受信し破棄したパケット数 (= late packets)
     pub late_drops: u64,
     /// 推定ジッタ (RFC 3550 Appendix A.8 / 8000 Hz クロック単位)
     pub jitter: f64,
@@ -43,16 +47,58 @@ pub struct JitterStats {
 }
 
 impl JitterStats {
-    /// RFC 3550 §6.4.1 fraction lost: 直前の SR からのロス比 (0..=255)
-    /// 単純化のため累積値ベースで計算する。
-    pub fn fraction_lost(&self, last_reported_lost: i64, last_reported_recv: u64) -> u8 {
-        let recv_diff = self.received.saturating_sub(last_reported_recv);
-        let lost_diff = (self.lost - last_reported_lost).max(0) as u64;
-        let expected = recv_diff + lost_diff;
-        if expected == 0 {
+    /// RFC 3550 §6.4.1 / §A.3: cumulative number of packets lost.
+    ///
+    /// > the total number of RTP data packets from source SSRC_n that have
+    /// > been lost since the beginning of reception. This number is defined
+    /// > to be the number of packets expected less the number of packets
+    /// > actually received, where the number of packets received includes
+    /// > any which are late or duplicates.
+    ///
+    /// RFC 3550 §A.3 reference algorithm:
+    /// ```text
+    /// extended_max = s->cycles + s->max_seq;
+    /// expected     = extended_max - s->base_seq + 1;
+    /// lost         = expected - s->received;
+    /// ```
+    ///
+    /// 本実装では `max_seq_ext` / `base_seq_ext` を 16-bit ラップ補正済み
+    /// 拡張 seq として保持しているのでそのまま差分を取る。 `received` は
+    /// 重複 / 古すぎを除いた distinct packet count であり、 RFC §A.3 の
+    /// `s->received` と意味が一致する (late / dup は expected を増やさず、
+    /// received も増やさないので差し引きでロスに数えない)。
+    ///
+    /// 戻り値は **24-bit signed clamp 前** の生の i64。 負値は (重複や
+    /// late が多く push されて received が expected を超えた) 異常状態を
+    /// 表し、 RR 出力側で 0 にクランプする。
+    pub fn cumulative_lost(&self) -> i64 {
+        let Some(base) = self.base_seq_ext else {
+            return 0;
+        };
+        let expected = self.max_seq_ext - base + 1;
+        expected - self.received as i64
+    }
+
+    /// RFC 3550 §6.4.1 fraction lost: 直前の RR/SR 報告からのロス比 (0..=255)
+    ///
+    /// 算出は RFC 3550 §A.3 に従い、 累積 `expected` と累積 `received` を
+    /// 前回報告値と差し引いて差分の `expected_interval` / `received_interval`
+    /// から fraction を求める。 caller 側で前回値を渡すこと。
+    ///
+    /// - `last_reported_expected`: 前回 RR/SR 出力時の `expected` (= `cumulative_lost + received`)
+    /// - `last_reported_received`: 前回 RR/SR 出力時の `received`
+    pub fn fraction_lost(&self, last_reported_expected: i64, last_reported_received: u64) -> u8 {
+        let Some(base) = self.base_seq_ext else {
+            return 0;
+        };
+        let expected = self.max_seq_ext - base + 1;
+        let expected_interval = (expected - last_reported_expected).max(0) as u64;
+        let received_interval = self.received.saturating_sub(last_reported_received);
+        let lost_interval = expected_interval.saturating_sub(received_interval);
+        if expected_interval == 0 {
             return 0;
         }
-        let frac = (lost_diff * 256) / expected;
+        let frac = (lost_interval * 256) / expected_interval;
         frac.min(255) as u8
     }
 }
@@ -110,16 +156,22 @@ impl JitterBuffer {
     }
 
     /// パケットを投入する。受信時刻 `now` はテスト用に注入可能。
+    ///
+    /// RFC 3550 §A.3 とのマッピング:
+    /// - `received` は重複 / 古すぎを除く distinct packet 数として集計する。
+    ///   `cumulative_lost = expected - received` (§A.3) の `received` と意味を揃える。
+    /// - `max_seq_ext` / `base_seq_ext` は extended seq (16-bit wrap 補正済) で保持する。
+    /// - ジッタは Appendix A.8 の D(i,j) = (Rj-Ri)-(Sj-Si) に基づき指数平均する。
     pub fn push(&mut self, pkt: RtpPacket, now: Instant) {
-        self.stats.received += 1;
         let ext_seq = self.extend_seq(pkt.sequence);
 
         // 拡張 seq を更新
-        if ext_seq > self.stats.max_seq_ext {
-            self.stats.max_seq_ext = ext_seq;
-        }
         if self.stats.base_seq_ext.is_none() {
+            // 初パケット: base / max を初期化し、 received=1 (RFC §A.3 init_seq)
             self.stats.base_seq_ext = Some(ext_seq);
+            self.stats.max_seq_ext = ext_seq;
+        } else if ext_seq > self.stats.max_seq_ext {
+            self.stats.max_seq_ext = ext_seq;
         }
 
         // ジッタ更新 (RFC 3550 Appendix A.8)
@@ -133,7 +185,11 @@ impl JitterBuffer {
         }
         self.last_arrival = Some((pkt.timestamp, now));
 
-        // 既に pull 済みの古い seq は捨てる
+        // 既に pull 済みの古い seq は捨てる (late drop)。
+        // RFC §A.3 では late も `received` に含むが、 本実装ではバッファに
+        // 載らず再生されない packet なので playable count として除外する。
+        // RR の `cumulative_lost` はこの定義でも RFC §A.3 数式と整合する
+        // (late は expected を増やさず received も増やさない → 計算に影響しない)。
         if let Some(next) = self.next_pull_seq {
             if ext_seq < next {
                 self.stats.late_drops += 1;
@@ -141,12 +197,14 @@ impl JitterBuffer {
             }
         }
 
-        // 重複は捨てる
+        // 重複は捨てる (RFC §A.3 の `received` に二重計上しない)
         if self.queue.contains_key(&ext_seq) {
             self.stats.duplicates += 1;
             return;
         }
 
+        // ここまで来たら distinct packet を取り込む
+        self.stats.received += 1;
         self.queue.insert(ext_seq, pkt);
 
         // 容量を超えた場合は最古を強制的に取り出す代わりにフラグを立てる
@@ -349,5 +407,138 @@ mod tests {
         let _ = jb.pull();
         let rest = jb.drain();
         assert_eq!(rest.len(), 2);
+    }
+
+    /// RFC 3550 §A.3: cumulative_lost = expected - received。
+    /// 無損失で seq=1..=4 を受信した場合 expected=4, received=4, lost=0。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_zero_when_no_loss() {
+        let mut jb = JitterBuffer::new(2);
+        let now = Instant::now();
+        for s in 1..=4u16 {
+            jb.push(pkt(s, (s as u32) * 160), now);
+        }
+        let st = jb.stats();
+        assert_eq!(st.received, 4);
+        assert_eq!(st.base_seq_ext, Some(1));
+        assert_eq!(st.max_seq_ext, 4);
+        assert_eq!(st.cumulative_lost(), 0);
+    }
+
+    /// RFC 3550 §A.3: 「受信中に seq=10,11,13 と来た場合、 真のロス数 (=1) を計上する」。
+    /// 旧実装は pull で `lost` を増やすだけだったので、 seq=12 が落ちても
+    /// バッファが overflow しなければカウントされなかった。 新 API
+    /// `cumulative_lost()` は expected (=4) - received (=3) = 1 を即座に返す。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_single_gap() {
+        let mut jb = JitterBuffer::new(8);
+        let now = Instant::now();
+        jb.push(pkt(10, 0), now);
+        jb.push(pkt(11, 160), now);
+        // seq=12 はロス
+        jb.push(pkt(13, 480), now);
+        let st = jb.stats();
+        assert_eq!(st.received, 3);
+        assert_eq!(st.base_seq_ext, Some(10));
+        assert_eq!(st.max_seq_ext, 13);
+        // expected = 13 - 10 + 1 = 4, received = 3, lost = 1
+        assert_eq!(st.cumulative_lost(), 1);
+    }
+
+    /// RFC 3550 §A.3: 連続ロス (seq=20,21 が落ちる) も正しく差分でカウントする。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_consecutive_gap() {
+        let mut jb = JitterBuffer::new(8);
+        let now = Instant::now();
+        jb.push(pkt(19, 0), now);
+        // seq=20, 21 ロス
+        jb.push(pkt(22, 480), now);
+        jb.push(pkt(23, 640), now);
+        let st = jb.stats();
+        // expected = 23 - 19 + 1 = 5, received = 3, lost = 2
+        assert_eq!(st.cumulative_lost(), 2);
+    }
+
+    /// RFC 3550 §A.3 + §A.1: 16-bit seq wraparound 越境のロス計上。
+    /// seq=65534, 65535 (ロス), 0, 1 -> base=65534, max_ext=65537, expected=4,
+    /// received=3, lost=1。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_across_seq_wrap() {
+        let mut jb = JitterBuffer::new(8);
+        let now = Instant::now();
+        jb.push(pkt(65534, 0), now);
+        // seq=65535 ロス
+        jb.push(pkt(0, 320), now);
+        jb.push(pkt(1, 480), now);
+        let st = jb.stats();
+        // ラップ補正で max_seq_ext = 65536 + 1 = 65537, base = 65534
+        assert_eq!(st.base_seq_ext, Some(65534));
+        assert_eq!(st.max_seq_ext, 65537);
+        // expected = 65537 - 65534 + 1 = 4, received = 3, lost = 1
+        assert_eq!(st.cumulative_lost(), 1);
+    }
+
+    /// RFC 3550 §A.3: reorder (seq が一旦逆順に入る) は最終的にロス 0。
+    /// 旧 `lost` (bufferoverflow ベース) では検出できなかったケース。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_reorder_no_loss() {
+        let mut jb = JitterBuffer::new(8);
+        let now = Instant::now();
+        jb.push(pkt(5, 0), now);
+        jb.push(pkt(7, 320), now);
+        jb.push(pkt(6, 160), now); // 遅れて到着
+        jb.push(pkt(8, 480), now);
+        let st = jb.stats();
+        // expected = 8 - 5 + 1 = 4, received = 4, lost = 0
+        assert_eq!(st.received, 4);
+        assert_eq!(st.cumulative_lost(), 0);
+    }
+
+    /// RFC 3550 §A.3: 重複は `received` に二重計上しない (= cumulative_lost に影響しない)。
+    #[test]
+    fn rfc3550_a3_duplicate_does_not_count_as_received() {
+        let mut jb = JitterBuffer::new(4);
+        let now = Instant::now();
+        jb.push(pkt(1, 0), now);
+        jb.push(pkt(2, 160), now);
+        jb.push(pkt(2, 160), now); // 重複
+        jb.push(pkt(3, 320), now);
+        let st = jb.stats();
+        assert_eq!(st.duplicates, 1);
+        assert_eq!(st.received, 3);
+        assert_eq!(st.cumulative_lost(), 0);
+    }
+
+    /// RFC 3550 §A.3: 完全に空のバッファでは cumulative_lost = 0。
+    #[test]
+    fn rfc3550_a3_cumulative_lost_empty_is_zero() {
+        let jb = JitterBuffer::new(2);
+        assert_eq!(jb.stats().cumulative_lost(), 0);
+    }
+
+    /// RFC 3550 §6.4.1 fraction_lost: 直前 RR からの interval 比で算出。
+    /// 5 packet expected のうち 1 つロスなら fraction = 1 * 256 / 5 = 51。
+    #[test]
+    fn rfc3550_6_4_1_fraction_lost_interval() {
+        let mut jb = JitterBuffer::new(8);
+        let now = Instant::now();
+        // 最初の RR 報告地点: seq=1..=5 全部受信
+        for s in 1..=5u16 {
+            jb.push(pkt(s, (s as u32) * 160), now);
+        }
+        let first = jb.stats();
+        let last_expected = first.max_seq_ext - first.base_seq_ext.unwrap() + 1;
+        let last_received = first.received;
+        // 次の interval: seq=6,7,8,9,10 を期待するが 7 がロス
+        jb.push(pkt(6, 960), now);
+        // seq=7 ロス
+        jb.push(pkt(8, 1280), now);
+        jb.push(pkt(9, 1440), now);
+        jb.push(pkt(10, 1600), now);
+        let st = jb.stats();
+        // expected_interval = (10-1+1) - 5 = 5, received_interval = 9 - 5 = 4
+        // lost_interval = 1, frac = 1*256/5 = 51
+        let frac = st.fraction_lost(last_expected, last_received);
+        assert_eq!(frac, 51);
     }
 }

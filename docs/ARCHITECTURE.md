@@ -600,6 +600,7 @@ recv_from(UDP)  ─push─►  JitterBuffer  ─pull─►  codec pipeline  ─s
 | Pull 周期 | 20 ms (`JITTER_PULL_INTERVAL`) | RFC 3551 §4.5.14 (PCMU) / RFC 7587 §4.2 (Opus) |
 | MissedTickBehavior | `Delay` | tick lag 時の bursty 送出を避ける |
 | PLC | 未実装 (端末側に委ねる) | RFC 7587 §6.2 (将来拡張余地) |
+| RR cumulative_lost | `JitterStats::cumulative_lost()` = `max_seq_ext - base_seq_ext + 1 - received` (RFC 3550 §A.3) | Issue #93。 旧 `JitterStats.lost` (バッファ overflow 検出) は legacy 指標として残置 |
 
 `WebRtcAudioBridge` (`ngn_to_peer_loop` / `peer_to_ngn_loop`) は str0m 自体が
 ICE/SRTP 経路で再整列するため、 sabiden 側 jitter buffer は **挟まない**。

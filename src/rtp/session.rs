@@ -216,7 +216,9 @@ impl RtpSession {
             if s.jitter > combined.jitter {
                 combined.jitter = s.jitter;
             }
-            combined.lost += s.lost;
+            // RFC 3550 §A.3: cumulative_lost = expected - received。
+            // Issue #93 で旧 `s.lost` (バッファ overflow ベース) から差し替え。
+            combined.lost += s.cumulative_lost();
             if s.max_seq_ext > combined.max_seq_ext {
                 combined.max_seq_ext = s.max_seq_ext;
             }
@@ -268,10 +270,15 @@ impl RtpSession {
             .take(31)
             .map(|(ssrc, jb)| {
                 let s = jb.stats();
-                let cum = s.lost.max(0) as u32 & 0x00FF_FFFF;
+                // RFC 3550 §6.4.1 / §A.3: cumulative_lost = expected - received
+                // (24-bit signed, clamp to 0 for under-flow).
+                // 旧実装は `s.lost` (バッファ overflow 検出ベースの近似値) を
+                // 使っていたため真のロス数を反映しなかった (Issue #93)。
+                let cum_signed = s.cumulative_lost();
+                let cum = cum_signed.max(0) as u32 & 0x00FF_FFFF;
                 let frac = if let Some(base) = s.base_seq_ext {
                     let expected = (s.max_seq_ext - base + 1).max(0) as u64;
-                    let lost_total = s.lost.max(0) as u64;
+                    let lost_total = cum_signed.max(0) as u64;
                     (lost_total * 256)
                         .checked_div(expected)
                         .map(|v| v.min(255) as u8)

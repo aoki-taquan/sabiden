@@ -89,6 +89,20 @@ src/
 - トランザクション ID (branch + via-sent-by + cseq-method)
 - タイマー T1/T2/T4 管理
 - 再送制御
+- **INVITE 応答受信進捗 watch (RFC 3261 §9.1 / Issue #97)**:
+  `TransactionLayer::create_client` は INVITE 用クライアント transaction を
+  登録するとき、 同時に `watch::Sender<InviteResponseProgress>` を
+  `TransactionTable::provisional` に保持する。 状態は `Pending` 初期、
+  `dispatch_response` で 1xx → `Provisional` / 最終応答 → `Final` に
+  遷移する (monotonic、 Provisional → Final は許可、 Final → Provisional は不可)。
+  `Uac::cancel_pending` は `TransactionLayer::provisional_watch(id)` で
+  receiver を取り、 RFC 3261 §9.1 が要求する "CANCEL MUST NOT be sent
+  before any provisional response" を満たすためここで Provisional への遷移を
+  待機してから CANCEL を組み立てる。 最終応答が先に到達した場合は no-op
+  (`CancelOutcome::NotSent`) で返り、 §9.1 後半 "CANCEL SHOULD NOT be sent
+  if final response received" を満たす。 transaction 終了時 (`drop_client` /
+  Timer D 経過後の absorber) には provisional エントリも一緒に drop される
+  ため、 待機中の receiver は `changed()` で `Err` を受け取り NotSent で抜ける。
 - **応答 skeleton header echo の不変条件 (RFC 3261 §8.2.6.2 / §12.1.1 / §20.38, Issue #90)**:
   `src/sip/transaction.rs::build_response_skeleton` は受信 request から
   応答に必須 / 推奨される ヘッダを **過不足なく** コピーする:

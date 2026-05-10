@@ -65,7 +65,7 @@ use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
 use crate::sip::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
 };
-use crate::sip::uac::{EstablishedCall, InviteOutcome, InvitePlan, Uac, UacDialog};
+use crate::sip::uac::{CancelOutcome, EstablishedCall, InviteOutcome, InvitePlan, Uac, UacDialog};
 use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
 use crate::webrtc::signaling::{
@@ -2012,13 +2012,17 @@ impl UasEventHandler {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         pending.cancelled.notify_waiters();
 
-        // RFC 3261 §9.1: 元 INVITE と同じ branch / CSeq で CANCEL を送る。
-        // CANCEL の応答 (200) は ngn_uac の transaction layer がディスパッチするが、
-        // ここでは応答を待たず単発で send する (Uac::cancel_pending は応答待ちする
-        // 実装になっているのでそれを使う)。
+        // RFC 3261 §9.1: 1xx 受信前に CANCEL を送ってはならない (MUST NOT)。
+        // `Uac::cancel_pending` は内部で transaction layer の応答受信進捗を
+        // 待機し、 Provisional 後にだけ CANCEL を送出する (Issue #97)。
+        // 最終応答が先に到達 / transaction 終了済の場合は `NotSent` を返す:
+        // 後段の `cancelled_flag` 経路 (200 OK 受領 → BYE) が引き取る。
         match self.ngn_uac.cancel_pending(&pending.invite_plan).await {
-            Ok(resp) => {
+            Ok(CancelOutcome::Sent(resp)) => {
                 debug!(code = resp.status_code, "NGN CANCEL 応答");
+            }
+            Ok(CancelOutcome::NotSent) => {
+                debug!("NGN CANCEL skip (RFC 3261 §9.1): 最終応答既到達 or transaction 終了済");
             }
             Err(e) => {
                 warn!(error=%e, "NGN CANCEL 送出失敗");

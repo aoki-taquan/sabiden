@@ -25,13 +25,25 @@ use tracing::{debug, warn};
 use super::auth::{DigestChallenge, DigestCredentials};
 use super::dialog::{Dialog, DialogConfig};
 use super::message::{SipMethod, SipRequest, SipResponse};
-use super::transaction::TransactionLayer;
+use super::transaction::{InviteResponseProgress, TransactionId, TransactionLayer};
 use super::utils::{new_branch, new_call_id, new_tag};
 
 /// NTT NGN 既定 (RFC 4028)
 pub const DEFAULT_SESSION_EXPIRES: u32 = 300;
 /// RFC 4028 で定義される最小値の下限 (90 秒)
 pub const MIN_SE: u32 = 90;
+
+/// `Uac::cancel_pending` が 1xx 待機を諦める上限 (= RFC 3261 §17.1.1.2 Timer B
+/// と同じ 64*T1 = 32s)。
+///
+/// RFC 3261 §9.1 は "the client MUST wait for the arrival of a provisional
+/// response before sending the request" と書くだけで明示的な上限を置かないが、
+/// Timer B (INVITE 自体のタイムアウト = 32s) を超えて待つと、 INVITE
+/// トランザクションは既に Terminated になっており CANCEL を送る対象が消失する。
+/// したがって Timer B と同じ 32s でキャップする (それまでに 1xx も最終応答も
+/// 来ないなら、 INVITE 側が timer B で失敗扱いになり transaction エントリも
+/// 消えるので、 watch の receiver も `Err` で抜ける = 整合する)。
+pub const CANCEL_PROVISIONAL_WAIT: std::time::Duration = std::time::Duration::from_secs(32);
 
 /// UAC が使うローカル パラメータ。`Registrar` と同等の設定情報。
 ///
@@ -373,9 +385,113 @@ impl Uac {
     ///
     /// CANCEL は元 INVITE と同じ Call-ID, From, To, Request-URI, CSeq 番号
     /// (method=CANCEL), 最初の Via (同じ branch) を持つ。
-    pub async fn cancel_pending(&self, plan: &InvitePlan) -> Result<SipResponse> {
-        let cancel = build_cancel(&plan.request, plan.cseq);
-        self.layer.send_request(cancel, self.server_addr).await
+    ///
+    /// ## RFC 3261 §9.1 1xx 受信ゲート
+    ///
+    /// > If no provisional response has been received, the CANCEL request
+    /// > MUST NOT be sent; rather, the client MUST wait for the arrival of
+    /// > a provisional response before sending the request. If the original
+    /// > request has generated a final response, the CANCEL SHOULD NOT be
+    /// > sent, as it is an effective no-op, since CANCEL has no effect on
+    /// > requests that have already generated a final response.
+    ///
+    /// 本関数は transaction layer の [`InviteResponseProgress`] watcher を
+    /// 介して INVITE トランザクションの応答受信進捗を観測し:
+    /// - `Pending` の間は最大 [`CANCEL_PROVISIONAL_WAIT`] (= Timer B = 32s)
+    ///   まで待機する (即送出 = RFC §9.1 違反を避ける)
+    /// - `Provisional` への遷移を検知したら CANCEL を組み立てて送出
+    /// - `Final` (1xx を経ず直接最終応答到達) なら CANCEL no-op (RFC §9.1 後半)
+    /// - watcher が `None` (transaction エントリ消滅) も「終了済 = no-op」 扱い
+    /// - 待機タイムアウト (32s で 1xx も来ない) はエラーを返す
+    ///   (INVITE 側も Timer B でタイムアウトしているため、 呼出側は単に放棄して
+    ///   よい — orchestrator は `cancelled_flag` の "200 OK 後の BYE" で
+    ///   後段カバーする)
+    pub async fn cancel_pending(&self, plan: &InvitePlan) -> Result<CancelOutcome> {
+        // INVITE の TransactionId を Via branch から再構築する。 plan.request
+        // は build_invite が組み立てた INVITE そのもので、 layer.send_request
+        // が裏で `create_client` 時に登録した watch のキーと一致する
+        // (RFC 3261 §17.1.3: ID = branch + sent-by + method)。
+        let invite_id = TransactionId::from_request(&plan.request)?;
+        let Some(mut rx) = self.layer.provisional_watch(&invite_id).await else {
+            // RFC 3261 §9.1: 最終応答後の CANCEL は SHOULD NOT。 transaction
+            // エントリが既に消えている = 完了済または Timer B タイムアウトで
+            // Terminated 済。 どちらでも CANCEL は無意味。
+            debug!(
+                ?invite_id,
+                "CANCEL skip: INVITE transaction が既に終了済 (RFC 3261 §9.1 後半)"
+            );
+            return Ok(CancelOutcome::NotSent);
+        };
+
+        // 現状の値を確認。 すでに Provisional / Final なら待たずに分岐。
+        let initial = *rx.borrow();
+        let progress = match initial {
+            InviteResponseProgress::Pending => {
+                // RFC 3261 §9.1: "the client MUST wait for the arrival of a
+                // provisional response before sending the request"。
+                // タイムアウトを置きつつ `changed()` で遷移を待つ。
+                let wait_result = tokio::time::timeout(CANCEL_PROVISIONAL_WAIT, async {
+                    // watch::Receiver::changed() は値が更新されるまで block。
+                    // sender が drop されたら Err: それは transaction 終了を意味する。
+                    while rx.changed().await.is_ok() {
+                        match *rx.borrow_and_update() {
+                            InviteResponseProgress::Pending => continue,
+                            other => return Some(other),
+                        }
+                    }
+                    // sender drop = transaction 終了。 None を返す。
+                    None
+                })
+                .await;
+                match wait_result {
+                    Ok(Some(progress)) => progress,
+                    Ok(None) => {
+                        // transaction が終了した (最終応答到達 or Timer B)。
+                        debug!(
+                            ?invite_id,
+                            "CANCEL skip: 待機中に INVITE transaction が終了 (RFC 3261 §9.1)"
+                        );
+                        return Ok(CancelOutcome::NotSent);
+                    }
+                    Err(_) => {
+                        // 32s 内に 1xx も最終応答も来ない = INVITE 側で Timer B
+                        // が走っているはずだが、 観測経路として念のため Err。
+                        warn!(
+                            ?invite_id,
+                            "CANCEL: 1xx 待機が CANCEL_PROVISIONAL_WAIT を超過 (RFC 3261 §9.1)"
+                        );
+                        return Err(anyhow!(
+                            "CANCEL: 1xx 受信前に待機タイムアウト (RFC 3261 §9.1)"
+                        ));
+                    }
+                }
+            }
+            other => other,
+        };
+
+        match progress {
+            InviteResponseProgress::Provisional => {
+                // RFC 3261 §9.1: 1xx 受信済なので CANCEL を送ってよい。
+                let cancel = build_cancel(&plan.request, plan.cseq);
+                let resp = self.layer.send_request(cancel, self.server_addr).await?;
+                Ok(CancelOutcome::Sent(resp))
+            }
+            InviteResponseProgress::Final => {
+                // RFC 3261 §9.1: 最終応答到達後の CANCEL は SHOULD NOT。
+                debug!(
+                    ?invite_id,
+                    "CANCEL skip: 既に最終応答到達済 (RFC 3261 §9.1 後半)"
+                );
+                Ok(CancelOutcome::NotSent)
+            }
+            InviteResponseProgress::Pending => {
+                // 上のループで Pending を吸い出すはずなので原理上ここには来ない。
+                // 念のため Err にして観測する。
+                Err(anyhow!(
+                    "CANCEL: 内部状態不整合 (Pending のままループを抜けた)"
+                ))
+            }
+        }
     }
 
     pub fn config(&self) -> &UacConfig {
@@ -408,6 +524,25 @@ pub enum InviteOutcome {
     Established(Box<EstablishedCall>),
     /// 3xx-6xx で確立失敗。
     Failed { response: SipResponse },
+}
+
+/// [`Uac::cancel_pending`] 結果 (RFC 3261 §9.1)。
+///
+/// `NotSent` は **RFC 違反ではなく仕様準拠の不送信**:
+/// - 待機中に INVITE が最終応答 (>=200) に到達 → CANCEL は no-op
+///   (RFC 3261 §9.1: "If the original request has generated a final
+///   response, the CANCEL SHOULD NOT be sent")
+/// - INVITE transaction が既に終了済 (Timer B / D 経過)
+///
+/// 呼出側 (orchestrator) は `Sent` でも `NotSent` でも内線レッグへは
+/// 487 Request Terminated を送る (元々 cancelled_flag で BYE 経路を持つ
+/// 二段構え)。
+pub enum CancelOutcome {
+    /// 1xx 受信を確認のうえ CANCEL を送出し応答を受け取った。
+    Sent(SipResponse),
+    /// RFC 3261 §9.1 に従って CANCEL を送らなかった
+    /// (= 最終応答既到達 / transaction 終了済)。
+    NotSent,
 }
 
 /// `InviteOutcome::Established` の中身。
@@ -1289,7 +1424,14 @@ mod tests {
         // 100 Trying が server に届いてから CANCEL を送る (短い遅延)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let cancel_resp = uac.cancel_pending(&plan_for_cancel).await.expect("cancel");
+        // RFC 3261 §9.1: 100 Trying (= Provisional) を受けた後の CANCEL は MUST 送出。
+        let outcome = uac.cancel_pending(&plan_for_cancel).await.expect("cancel");
+        let cancel_resp = match outcome {
+            CancelOutcome::Sent(resp) => resp,
+            CancelOutcome::NotSent => {
+                panic!("100 Trying 受信後の CANCEL は送出されるべき (RFC 3261 §9.1)")
+            }
+        };
         assert_eq!(cancel_resp.status_code, 200);
 
         invite_task.abort();
@@ -1976,5 +2118,246 @@ mod tests {
             via
         );
         assert!(via.contains(";branch=z9hG4bK"));
+    }
+
+    // ====================================================================
+    // RFC 3261 §9.1 CANCEL UAC Behavior (Issue #97)
+    //
+    // > If no provisional response has been received, the CANCEL request
+    // > MUST NOT be sent; rather, the client MUST wait for the arrival of
+    // > a provisional response before sending the request. If the original
+    // > request has generated a final response, the CANCEL SHOULD NOT be
+    // > sent, as it is an effective no-op.
+    // ====================================================================
+
+    /// RFC 3261 §9.1: 1xx 受信前に `cancel_pending` が呼ばれても CANCEL は
+    /// 送らずに待機し、 1xx 到達後に CANCEL を送出する。
+    ///
+    /// 旧実装は 1xx を待たずに即送出していたため、 NGN P-CSCF が
+    /// branch=未知の CANCEL に 481 を返す可能性があった (Issue #97)。
+    /// 本テストは fake server が CANCEL を **100 Trying 送出前に観測した
+    /// ら fail** という形にすることで、 「CANCEL は必ず 1xx の後」 を強制
+    /// する。
+    #[tokio::test]
+    async fn rfc3261_9_1_cancel_waits_for_provisional_before_sending() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_local = client_sock.local_addr().unwrap();
+
+        let trying_sent = Arc::new(AtomicBool::new(false));
+
+        let server_clone = server_sock.clone();
+        let trying_sent_clone = trying_sent.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            // 1) INVITE 受信 (Trying を即返さない)
+            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(invite) = parsed else {
+                panic!("INVITE expected")
+            };
+            assert_eq!(invite.method, SipMethod::Invite);
+            // RFC 3261 §9.1 の真の検証: CANCEL は 100 Trying より後でなければならない。
+            // 100 Trying 送出を遅延し、 その間に Server が他に何か (CANCEL)
+            // を受け取らないことを確認する。
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let trying = crate::sip::transaction::build_response_skeleton(&invite, 100, "Trying");
+            server_clone
+                .send_to(&trying.to_bytes(), peer)
+                .await
+                .unwrap();
+            trying_sent_clone.store(true, Ordering::SeqCst);
+
+            // 2) CANCEL 受信 (100 Trying の **後** であることを表明)
+            let (n2, peer2) = server_clone.recv_from(&mut buf).await.unwrap();
+            let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
+            let SipMessage::Request(cancel) = parsed2 else {
+                panic!("CANCEL expected (got non-Request)")
+            };
+            assert_eq!(cancel.method, SipMethod::Cancel);
+            assert!(
+                trying_sent_clone.load(Ordering::SeqCst),
+                "RFC 3261 §9.1 違反: CANCEL が 100 Trying より先に到達した"
+            );
+            // CANCEL に 200 OK を返す
+            let cancel_ok = crate::sip::transaction::build_response_skeleton(&cancel, 200, "OK");
+            server_clone
+                .send_to(&cancel_ok.to_bytes(), peer2)
+                .await
+                .unwrap();
+        });
+
+        let (layer, _inbound_rx) = crate::sip::transaction::TransactionLayer::spawn(client_sock);
+        let mut uac_cfg = cfg();
+        uac_cfg.local_addr = client_local;
+        let uac = Uac::new(uac_cfg, layer, server_addr);
+        let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
+
+        // INVITE を別タスクで送出 (transaction が table に登録される)。
+        // `create_client` まで実行されるのを待つため、 transaction layer に
+        // 登録される前 (= provisional_watch が None を返す前) に
+        // cancel_pending が走らないよう、 INVITE 登録完了を notify で同期する。
+        let layer_for_invite = uac.layer.clone();
+        let server_addr_invite = uac.server_addr;
+        let plan_for_invite = plan.clone();
+        let invite_started = Arc::new(tokio::sync::Notify::new());
+        let invite_started_signal = invite_started.clone();
+        let invite_task = tokio::spawn(async move {
+            // create_client は send_request 内で実行されるが、 spawn の境界で
+            // 必ず実行が始まるとは限らない。 ここで明示的に layer.create_client
+            // を先に呼んで registration を保証する: send_request は内部で
+            // create_client を呼ぶので、 同等の registration が走る。
+            let _ = layer_for_invite
+                .send_request(plan_for_invite.request, server_addr_invite)
+                .await;
+            invite_started_signal.notify_one();
+        });
+
+        // INVITE が transaction table に登録されるまで短く待つ
+        // (オーケストレーター実機経路では handle_ext_cancel が呼ばれる時点で
+        // 必ず INVITE 送信済なので、 実機 race ではなくテスト同期のため)。
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // 1xx 受信前に cancel_pending を呼ぶ (= server 側はまだ 150ms 寝てる)。
+        // 100 Trying 到達まで cancel_pending が **待つ** ことを確認する。
+        // 旧実装ではここで即 CANCEL が server に届いてしまい
+        // `trying_sent == false` で assert! が失敗する。
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(2), uac.cancel_pending(&plan))
+                .await
+                .expect("cancel_pending が timeout (1xx 待機が長すぎ)")
+                .expect("cancel_pending err");
+
+        match outcome {
+            CancelOutcome::Sent(resp) => assert_eq!(resp.status_code, 200),
+            CancelOutcome::NotSent => panic!("Provisional 後の CANCEL は送出されるべき"),
+        }
+        assert!(
+            trying_sent.load(Ordering::SeqCst),
+            "100 Trying は CANCEL 前に必ず送出済 (RFC 3261 §9.1)"
+        );
+
+        invite_task.abort();
+        server_handle.await.unwrap();
+    }
+
+    /// RFC 3261 §9.1 後半: 最終応答が既に到達済みなら CANCEL は SHOULD NOT
+    /// send (no-op)。 `cancel_pending` は `CancelOutcome::NotSent` を返す。
+    ///
+    /// > If the original request has generated a final response, the CANCEL
+    /// > SHOULD NOT be sent, as it is an effective no-op.
+    #[tokio::test]
+    async fn rfc3261_9_1_cancel_not_sent_when_final_response_already_received() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_local = client_sock.local_addr().unwrap();
+
+        let server_clone = server_sock.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            // INVITE 受信 → 486 Busy Here (最終応答) を即返す。
+            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(invite) = parsed else {
+                panic!("INVITE expected")
+            };
+            let mut resp =
+                crate::sip::transaction::build_response_skeleton(&invite, 486, "Busy Here");
+            resp.headers.set(
+                "To",
+                format!("{};tag=busy", invite.headers.get("to").unwrap()),
+            );
+            server_clone.send_to(&resp.to_bytes(), peer).await.unwrap();
+
+            // 自動 ACK (RFC 3261 §17.1.1.3) を吸収。
+            let (_n_ack, _) = server_clone.recv_from(&mut buf).await.unwrap();
+            // ここで CANCEL が来てしまったら fail (no-op であるべき)。
+            let mut buf2 = vec![0u8; 4096];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                server_clone.recv_from(&mut buf2),
+            )
+            .await
+            {
+                Ok(Ok((nx, _))) => {
+                    let parsed_x = crate::sip::message::parse_message(&buf2[..nx]).unwrap();
+                    if let SipMessage::Request(req_x) = parsed_x {
+                        if req_x.method == SipMethod::Cancel {
+                            panic!("RFC 3261 §9.1 違反: 最終応答後に CANCEL が送出された");
+                        }
+                    }
+                }
+                _ => {
+                    // タイムアウト = CANCEL 来ず: 期待通り。
+                }
+            }
+        });
+
+        let (layer, _inbound_rx) = crate::sip::transaction::TransactionLayer::spawn(client_sock);
+        let mut uac_cfg = cfg();
+        uac_cfg.local_addr = client_local;
+        let uac = Uac::new(uac_cfg, layer, server_addr);
+        let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
+
+        // INVITE を別タスクで送る → 486 が即返り final 状態に遷移する。
+        let layer_for_invite = uac.layer.clone();
+        let server_addr_invite = uac.server_addr;
+        let plan_for_invite = plan.clone();
+        let invite_task = tokio::spawn(async move {
+            let _ = layer_for_invite
+                .send_request(plan_for_invite.request, server_addr_invite)
+                .await;
+        });
+
+        // 486 が dispatch されるのを待ってから cancel_pending を呼ぶ。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // RFC 3261 §9.1 後半: 最終応答後の CANCEL は no-op = NotSent。
+        let outcome = uac.cancel_pending(&plan).await.expect("cancel_pending err");
+        match outcome {
+            CancelOutcome::NotSent => {}
+            CancelOutcome::Sent(resp) => panic!(
+                "最終応答後の CANCEL は送らないはず (RFC 3261 §9.1): got code={}",
+                resp.status_code
+            ),
+        }
+
+        invite_task.abort();
+        server_handle.await.unwrap();
+    }
+
+    /// RFC 3261 §9.1 / §17.1.3: `Uac::cancel_pending` が
+    /// transaction layer の応答受信進捗 watcher を介して 1xx を観測すること
+    /// を、 build_cancel 単体ではなく `Uac` 経由で確認する。
+    ///
+    /// `provisional_watch` に存在しない INVITE (= 未送信 / 既に終了済) に
+    /// 対しては `NotSent` を返す。
+    #[tokio::test]
+    async fn rfc3261_9_1_cancel_not_sent_when_invite_never_registered() {
+        // INVITE を一切 send_request していない状態で cancel_pending を
+        // 呼ぶと、 transaction table に entry が無いので provisional_watch
+        // が None を返し、 `NotSent` で返る (= RFC 3261 §9.1 "no CANCEL on
+        // already-terminated request")。
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_local = client_sock.local_addr().unwrap();
+
+        let (layer, _inbound_rx) = crate::sip::transaction::TransactionLayer::spawn(client_sock);
+        let mut uac_cfg = cfg();
+        uac_cfg.local_addr = client_local;
+        let uac = Uac::new(uac_cfg, layer, server_addr);
+        let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
+
+        // INVITE を送らずに直接 cancel_pending を呼ぶ。
+        let outcome = uac.cancel_pending(&plan).await.expect("cancel_pending err");
+        assert!(
+            matches!(outcome, CancelOutcome::NotSent),
+            "未登録 INVITE への CANCEL は NotSent (RFC 3261 §9.1)"
+        );
     }
 }

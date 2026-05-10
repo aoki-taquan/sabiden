@@ -153,7 +153,9 @@ impl OutboundDialogForwarder for UasEventHandler {
 /// 終了をもう片側へ伝搬する責務を負う。
 pub struct WebRtcOutboundEntry {
     /// NGN レッグの確立済み UAC dialog。 PWA→NGN BYE は `send_bye()` で投げる。
-    /// `Mutex` は `send_bye` が `&mut self` を要求するため必要 (Arc 内可変)。
+    /// `tokio::sync::Mutex` (本ファイル冒頭の `use tokio::sync::Mutex;`) を使う
+    /// 理由: `send_bye` 内で I/O await するので、 `std::sync::Mutex` だと async
+    /// boundary 越しに guard を保持できない。 短期ロックで競合は無視可能。
     pub ngn_dialog: Mutex<UacDialog>,
     /// 該当 PWA WS セッションへの送信ハンドル。 NGN→PWA BYE 時は
     /// `ServerMessage::Bye` を enqueue する。
@@ -632,17 +634,26 @@ impl NgnInboundHandler {
     ///
     /// 1. **NGN へ 200 OK 即返** (RFC 3261 §15.1.2 第 1 段): BYE は新規
     ///    transaction で受け取り、 直ちに 200 OK を返す。
-    /// 2. **outbound forwarder へ伝搬を試みる**: 内線→NGN 発信通話の BYE で
+    /// 2. **PWA outbound BYE 判定** (Issue #147): NGN レッグ Call-ID が
+    ///    `webrtc_outbound_active` にあれば PWA→NGN 発信通話の終了通知。
+    ///    エントリを `remove` (= idempotent gate) → bridge を `terminate` →
+    ///    `dec_call_active` → WS に `ServerMessage::Bye` を push → NGN
+    ///    レッグ dialog を Terminated に遷移させ、 ここで return。 SIP 内線
+    ///    BYE 経路 (3, 4) は走らせない (PWA outbound に内線レッグは無いため)。
+    /// 3. **outbound forwarder へ伝搬を試みる**: 内線→NGN 発信通話の BYE で
     ///    あれば内線レッグへ転送する経路 (Phase R4 で `B2buaCall::handle_ngn_bye`
-    ///    に統合予定)。
-    /// 3. **NGN→内線 着信通話の cleanup**: `pending` / `active` から該当
+    ///    に統合予定)。 forwarder が引き受けた (`true` を返した) 場合は
+    ///    ここで return。
+    /// 4. **NGN→内線 着信通話の cleanup**: `pending` / `active` から該当
     ///    Call-ID を除去、 RTP ブリッジを stop、 メトリクスから call_active を
     ///    -1 する。
-    /// 4. **WebRTC peer 伝搬** (Issue #81): WebRTC 内線レッグだった場合は
-    ///    `webrtc_active` から WS を引いて `ServerMessage::Bye` を push し、
-    ///    PWA 側 `App.tsx::case "bye"` ハンドラが UI teardown を行う
+    /// 5. **WebRTC 内線レッグ peer 伝搬** (Issue #81): WebRTC 内線レッグだった
+    ///    場合は `webrtc_active` から WS を引いて `ServerMessage::Bye` を
+    ///    push し、 PWA 側 `App.tsx::case "bye"` ハンドラが UI teardown を行う
     ///    (RFC 5853 §3.2.2 SBC framework: 片側 dialog 終了をもう片側へ伝搬
-    ///    するのは B2BUA の責務)。
+    ///    するのは B2BUA の責務)。 NGN→内線 着信時の WebRTC peer 経路で、
+    ///    ステップ 2 (PWA outbound) とは別テーブル (`webrtc_active` vs
+    ///    `webrtc_outbound_active`) を使うので衝突しない。
     async fn handle_bye(&self, request: SipRequest, remote: SocketAddr) -> Result<()> {
         // BYE は新しい transaction で 200 OK を返す。
         let mut tx = ServerTransaction::new(request.clone(), remote, self.socket.clone())?;
@@ -2478,20 +2489,15 @@ impl PwaOutboundHandler for UasEventHandler {
 #[async_trait::async_trait]
 impl PwaOutboundCloser for UasEventHandler {
     async fn close_pwa_outbound_for_ws(&self, ws: &WsSink) -> usize {
-        // (1) WS が一致するエントリを全て一気に remove する。 ロックを保持した
-        //     まま send_bye を await するとシグナリング層が他の Call-ID で
-        //     操作するときにブロックするので、 remove と外部 IO は分離する。
+        // (1) WS が一致するエントリを 1 段スキャンで一気に取り出す。
+        //     ロックを保持したまま send_bye を await するとシグナリング層が
+        //     他の Call-ID で操作するときにブロックするので、 remove と外部 IO は
+        //     分離する。 2 段イテレーション (filter→collect→remove) は冗長
+        //     なので `HashMap::extract_if` を使って 1 段で remove する
+        //     (review #2 🟡#3)。
         let entries: Vec<(String, Arc<WebRtcOutboundEntry>)> = {
             let mut tbl = self.webrtc_outbound_active.lock().await;
-            let matching_keys: Vec<String> = tbl
-                .iter()
-                .filter(|(_, e)| e.ws.same_channel(ws))
-                .map(|(k, _)| k.clone())
-                .collect();
-            matching_keys
-                .into_iter()
-                .filter_map(|k| tbl.remove(&k).map(|v| (k, v)))
-                .collect()
+            tbl.extract_if(|_, e| e.ws.same_channel(ws)).collect()
         };
 
         let count = entries.len();
@@ -8063,12 +8069,13 @@ mod tests {
     //    無関係 WS で呼んでもテーブルは触らない (誤掃き防止)。
 
     /// PWA outbound 発信フロー全体を立ち上げ、 共有 outbound テーブルに
-    /// エントリが挿入されるまで完了するヘルパ。
+    /// エントリが挿入されるまで完了するヘルパ (production layout =
+    /// `CallManager` を outbound/inbound で共有)。
     ///
     /// 戻り値:
     /// - `webrtc_outbound_active` Arc (NGN/UAS 両ハンドラと共有済)
     /// - `metrics` Arc
-    /// - `mgr` `CallManager`
+    /// - `mgr` outbound 側 `CallManager` (= 本 layout では inbound と同一 Arc)
     /// - `ws_sink` PWA セッションの WS 送信ハンドル
     /// - `ws_rx` 同 WS 受信側 (テストで `ServerMessage::Bye` を観測する)
     /// - `ngn_handler` 必要に応じて NGN→PWA BYE を駆動するため返す
@@ -8089,6 +8096,54 @@ mod tests {
         SocketAddr,
         String,
     ) {
+        let r = issue147_setup_pwa_outbound_call_with_layout(false).await;
+        // production layout は outbound_mgr == inbound_mgr の同一 Arc。
+        // 既存呼び出し元向けに 1 個だけ返す。
+        (
+            r.webrtc_outbound_active,
+            r.metrics,
+            r.outbound_mgr,
+            r.ws_sink,
+            r.ws_rx,
+            r.ngn_handler,
+            r.uas_handler,
+            r.fake_ngn,
+            r.fake_ngn_addr,
+            r.ngn_call_id,
+        )
+    }
+
+    /// `issue147_setup_pwa_outbound_call` の検証用 layout 切替版。
+    ///
+    /// `separate_mgrs = true` で PR #154 修正前の production layout (outbound と
+    /// inbound で別々の `CallManager` Arc を持つ) を再現する。 NGN→PWA BYE で
+    /// `terminate` が silent no-op になり RTP bridge が leak することを直接
+    /// 観測するための regression test に使う (review #2 🔴)。
+    /// `separate_mgrs = false` は本流 (= PR #154 修正後の挙動) で `outbound_mgr ==
+    /// inbound_mgr`。
+    struct Issue147SetupResult {
+        webrtc_outbound_active: WebRtcOutboundActive,
+        metrics: Arc<Metrics>,
+        /// `UasEventHandler` に注入した `CallManager`。
+        outbound_mgr: Arc<CallManager>,
+        /// `NgnInboundHandler` に注入した `CallManager`。 production layout では
+        /// `outbound_mgr` と同一 Arc。
+        inbound_mgr: Arc<CallManager>,
+        ws_sink: WsSink,
+        ws_rx: mpsc::UnboundedReceiver<ServerMessage>,
+        ngn_handler: Arc<NgnInboundHandler>,
+        uas_handler: Arc<UasEventHandler>,
+        fake_ngn: Arc<UdpSocket>,
+        fake_ngn_addr: SocketAddr,
+        ngn_call_id: String,
+        /// fake NGN に到達した BYE の数 (review #2 🟡#2: PWA→NGN BYE 経路で
+        /// 実 BYE 到達を直接検証するため)。
+        ngn_bye_seen: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    async fn issue147_setup_pwa_outbound_call_with_layout(
+        separate_mgrs: bool,
+    ) -> Issue147SetupResult {
         use crate::call::manager::CallManager;
         use crate::sip::uac::UacConfig;
         use crate::webrtc::peer::{MediaFrame, PeerSession};
@@ -8104,6 +8159,10 @@ mod tests {
         let ngn_peer_rtp_addr = ngn_peer_rtp.local_addr().unwrap();
 
         let fake_ngn_clone = fake_ngn.clone();
+        // BYE 到達カウンタ (review #2 🟡#2: PWA→NGN BYE が実 socket に到達した
+        // ことを test 側で `assert` できるよう public に出す)。
+        let ngn_bye_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ngn_bye_seen_inner = ngn_bye_seen.clone();
         // INVITE 受信 → 200 OK 送信、 後続 ACK / BYE は受け取って 200 OK で
         // 返す (テスト中ずっと spawn しっぱなしにしておく)。
         tokio::spawn(async move {
@@ -8143,6 +8202,7 @@ mod tests {
                             let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
                         }
                         SipMethod::Bye => {
+                            ngn_bye_seen_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let resp = build_response_skeleton(&req, 200, "OK");
                             let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
                         }
@@ -8171,12 +8231,19 @@ mod tests {
         // ---- 共有 webrtc_outbound_active + metrics + CallManager ----
         let webrtc_outbound_active: WebRtcOutboundActive = Arc::new(Mutex::new(HashMap::new()));
         let metrics = Metrics::new();
-        let mgr = CallManager::new(ExtensionRegistrar::new());
+        // production layout: outbound と inbound は同一 Arc を共有 (PR #154 fix)。
+        // separate_mgrs=true (regression test 用) では別 Arc を作って旧バグを再現。
+        let outbound_mgr = CallManager::new(ExtensionRegistrar::new());
+        let inbound_mgr = if separate_mgrs {
+            CallManager::new(ExtensionRegistrar::new())
+        } else {
+            outbound_mgr.clone()
+        };
 
         // ---- UasEventHandler (共有テーブル付き) ----
         let uas_handler = UasEventHandler::with_call_manager_metrics_and_outbound_table(
             ngn_uac.clone(),
-            mgr.clone(),
+            outbound_mgr.clone(),
             Some("127.0.0.1".parse().unwrap()),
             Some("127.0.0.1".parse().unwrap()),
             metrics.clone(),
@@ -8195,7 +8262,7 @@ mod tests {
             inviter,
             ExtensionRegistrar::new(),
             NgnInboundConfig::default(),
-            mgr.clone(),
+            inbound_mgr.clone(),
             metrics.clone(),
             webrtc_outbound_active.clone(),
         );
@@ -8280,10 +8347,11 @@ mod tests {
             tbl.keys().next().unwrap().clone()
         };
 
-        (
+        Issue147SetupResult {
             webrtc_outbound_active,
             metrics,
-            mgr,
+            outbound_mgr,
+            inbound_mgr,
             ws_sink,
             ws_rx,
             ngn_handler,
@@ -8291,7 +8359,8 @@ mod tests {
             fake_ngn,
             fake_ngn_addr,
             ngn_call_id,
-        )
+            ngn_bye_seen,
+        }
     }
 
     /// Issue #147 (1): PWA outbound 成立時に共有テーブルに insert される。
@@ -8389,10 +8458,15 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        // CallManager::terminate は dialog を Terminated state にしてエントリを残すか
-        // 削除するかの仕様差異がある (manager.rs::terminate 参照)。 ここでは
-        // `len()` ではなく state_of で Terminated を確認する。 len 0 でも OK。
-        let _ = mgr.len().await;
+        // (e) review #2 🔴 fix 検証: outbound 側で create_call した bridge が
+        //     inbound 側の terminate でちゃんと回収されていることを確認する。
+        //     production layout (= 共有 CallManager) では `mgr.len()` は 0 に戻る。
+        //     PR #154 修正前は 2 個別 Arc 構成で silent no-op になり 1 件残った。
+        assert_eq!(
+            mgr.len().await,
+            0,
+            "NGN→PWA BYE で outbound bridge が回収されている (CallManager 共有 layout)"
+        );
     }
 
     /// RFC 3261 §15.1.1 (Issue #147 (3)):
@@ -8402,38 +8476,59 @@ mod tests {
     async fn rfc3261_15_1_1_pwa_close_sends_ngn_bye_and_dec_call_active() {
         use crate::webrtc::signaling::PwaOutboundCloser;
 
-        let (tbl, metrics, mgr, ws, _ws_rx, _ngnh, uash, fngn, _fngn_addr, ngn_cid) =
-            issue147_setup_pwa_outbound_call().await;
+        // review #2 🟡#2: NGN BYE 到達を直接 assert するため layout 版を使う
+        // (`ngn_bye_seen` カウンタを参照)。
+        let r = issue147_setup_pwa_outbound_call_with_layout(false).await;
         assert_eq!(
-            metrics
+            r.metrics
                 .call_active
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+        assert_eq!(
+            r.ngn_bye_seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "発信完了時点で NGN への BYE はまだ届いていない"
+        );
 
-        // フェイク NGN は INVITE / BYE を共通 spawn ループで返答する。
-        // PWA WS close 経由で NGN BYE が出ることを、 NGN 側受信を独立 spawn
-        // で待ち受けて検証 — のではなく、 ロジックとしては `send_bye()` が
-        // 200 OK を取れたら成功を返すので closer の戻り値を見るのが一番固い。
-        let closer: Arc<dyn PwaOutboundCloser> = uash.clone();
-        let closed = closer.close_pwa_outbound_for_ws(&ws).await;
+        let closer: Arc<dyn PwaOutboundCloser> = r.uas_handler.clone();
+        let closed = closer.close_pwa_outbound_for_ws(&r.ws_sink).await;
         assert_eq!(closed, 1, "PWA WS と一致するエントリ 1 件が閉じられた");
 
         // 副作用: メトリクス -1、 テーブルから削除
         assert_eq!(
-            metrics
+            r.metrics
                 .call_active
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        assert!(!tbl.lock().await.contains_key(&ngn_cid));
+        assert!(!r
+            .webrtc_outbound_active
+            .lock()
+            .await
+            .contains_key(&r.ngn_call_id));
 
-        // フェイク NGN への BYE 到達を確認 (spawn ループが 200 OK 返答するので
-        // 送出経路が成立していることは戻り値 closed=1 + send_bye が Result Ok を
-        // 返した = 200 OK を NGN から受け取った、 で確認できている)。
-        // CallManager::terminate も走った (idempotent: state_of で確認は省略)。
-        let _ = mgr.len().await;
-        let _ = fngn;
+        // review #2 🟡#2: フェイク NGN への BYE 到達を直接観測する。
+        // `close_pwa_outbound_for_ws` は `send_bye` のエラーを握り潰すので、
+        // closed=1 だけでは BYE socket 出力を保証しない。 fake NGN spawn ループの
+        // BYE counter が 1 以上になることを assert することで「NGN レッグ
+        // socket に SIP BYE が届いた」を直接検証する (RFC 3261 §15.1.1)。
+        let mut waited = 0u32;
+        while r.ngn_bye_seen.load(std::sync::atomic::Ordering::SeqCst) == 0 && waited < 30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 1;
+        }
+        assert!(
+            r.ngn_bye_seen.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "PWA→NGN BYE が fake NGN socket に到達していない"
+        );
+
+        // bridge も outbound_mgr (= 共有 layout なので inbound_mgr と同一) から消えている
+        assert_eq!(
+            r.outbound_mgr.len().await,
+            0,
+            "PWA→NGN BYE 後は outbound_mgr の bridge は解放される"
+        );
     }
 
     /// Issue #147 (4): NGN BYE → close_pwa_outbound_for_ws の二重実行で
@@ -8634,5 +8729,94 @@ mod tests {
             "take_media_rx None で NGN INVITE は飛ばない"
         );
         assert_eq!(mgr.len().await, 0);
+    }
+
+    /// Issue #147 review #2 🔴 (regression test): 旧 layout (outbound と
+    /// inbound で **別々の** `CallManager` Arc) では NGN→PWA BYE 経路で
+    /// `terminate` が silent no-op になり、 outbound 側の RTP bridge が
+    /// 回収されない (= `outbound_mgr.len()` が 1 のまま残る) ことを直接
+    /// 観測する。 PR #154 の修正 (main.rs で `shared_call_manager` を共有)
+    /// が将来 regression したら本テストが落ちる。
+    ///
+    /// 対比して `rfc3261_15_1_2_ngn_bye_terminates_pwa_outbound_and_pushes_ws_bye`
+    /// (production layout = 共有 Arc) では `mgr.len() == 0` になる。
+    ///
+    /// RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog
+    /// 終了をもう片側へ伝搬する責務を負う。 共有 CallManager はその責務を
+    /// 成立させるための実装契約。
+    #[tokio::test]
+    async fn issue147_separate_call_managers_leak_outbound_bridge_on_ngn_bye() {
+        let r = issue147_setup_pwa_outbound_call_with_layout(true).await;
+        assert_eq!(
+            r.metrics
+                .call_active
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        // 旧 layout: outbound 側 CallManager に 1 件、 inbound 側は空。
+        assert_eq!(
+            r.outbound_mgr.len().await,
+            1,
+            "PWA outbound 成立時は outbound_mgr に 1 件登録される"
+        );
+        assert_eq!(
+            r.inbound_mgr.len().await,
+            0,
+            "inbound_mgr は別 Arc なので空"
+        );
+
+        // mock NGN から sabiden の inbound socket に BYE を送る
+        let sabiden_inbound_addr = r.ngn_handler.socket.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let mut bye = SipRequest::new(
+            SipMethod::Bye,
+            format!("sip:sabiden@{}", sabiden_inbound_addr),
+        );
+        bye.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKngnbyeleak147", ngn_addr),
+        );
+        bye.headers
+            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngnsidetagleak");
+        bye.headers.set(
+            "To",
+            format!("<sip:sabiden@{}>;tag=sabsidetagleak", sabiden_inbound_addr),
+        );
+        bye.headers.set("Call-ID", &r.ngn_call_id);
+        bye.headers.set("CSeq", "2 BYE");
+        ngn_sock
+            .send_to(&bye.to_bytes(), sabiden_inbound_addr)
+            .await
+            .unwrap();
+
+        // BYE 200 OK が返るのを待つ (= handle_bye 完了)
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(3), ngn_sock.recv_from(&mut buf))
+            .await
+            .expect("BYE 200 OK が返るべき")
+            .unwrap();
+
+        // テーブルからは消える (handle_bye の冒頭で remove するため)
+        assert!(!r
+            .webrtc_outbound_active
+            .lock()
+            .await
+            .contains_key(&r.ngn_call_id));
+
+        // 🔴 観測される leak: NgnInboundHandler は inbound_mgr.terminate を呼ぶが、
+        // bridge_call_id は outbound_mgr で create_call された ID なので
+        // inbound_mgr 側には entry が無く、 silent Ok(()) が返る。
+        // 結果 outbound_mgr 側の entry は永続。
+        assert_eq!(
+            r.outbound_mgr.len().await,
+            1,
+            "🔴 separate_mgrs layout: NGN→PWA BYE 経路で outbound bridge が回収されない (= leak)"
+        );
+        assert_eq!(
+            r.inbound_mgr.len().await,
+            0,
+            "inbound_mgr 側には何も登録されていない (= terminate は silent no-op)"
+        );
     }
 }

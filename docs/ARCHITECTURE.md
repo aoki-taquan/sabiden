@@ -180,21 +180,25 @@ RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework の片側 dialog 終了を
 | `bridge_call_id: CallId` | BYE 時に `CallManager::terminate` で RTP ブリッジ停止 |
 
 ```
-[NGN→PWA BYE flow]                       [PWA→NGN BYE flow]
-NGN ──BYE──► sabiden                     PWA ──ClientMessage::Bye / WS close──► sabiden
-              │                                                                    │
-              │ (1) NGN へ 200 OK 即返答                                          │ (1) PwaOutboundCloser::close_pwa_outbound_for_ws
-              │ (2) webrtc_outbound_active.remove(call_id)                        │ (2) webrtc_outbound_active から WS 一致エントリ remove
-              │ (3) CallManager::terminate(bridge_call_id)                        │ (3) ngn_dialog.send_bye() (RFC 3261 §15.1.1)
-              │ (4) metrics.dec_call_active                                       │ (4) CallManager::terminate(bridge_call_id)
-              │ (5) ngn_dialog.terminate (state)                                  │ (5) metrics.dec_call_active
-              │ (6) ws.send(ServerMessage::Bye)                                   │ (6) PWA に ServerMessage::Bye を返却
-              ▼                                                                    │
-PWA ◄──ServerMessage::Bye── sabiden                                                ▼
-                                                                  sabiden(UAC) ──BYE──► NGN
-                                                                                       │
-                                                                  sabiden ◄──200 OK── NGN
+[NGN→PWA BYE flow]                                  [PWA→NGN BYE flow]
+NGN ──BYE──► sabiden                                PWA ──ClientMessage::Bye / WS close──► sabiden
+              │                                                                              │
+              │ (1) NGN へ 200 OK 即返答                                                    │ (1) PwaOutboundCloser::close_pwa_outbound_for_ws
+              │ (2) webrtc_outbound_active.remove(call_id)                                  │ (2) webrtc_outbound_active から WS 一致エントリ remove
+              │ (3) CallManager::terminate(bridge_call_id)                                  │ (3) ngn_dialog.send_bye() (RFC 3261 §15.1.1)
+              │ (4) metrics.dec_call_active                                                 │ (4) CallManager::terminate(bridge_call_id)
+              │ (5) ngn_dialog.terminate (state)                                            │ (5) metrics.dec_call_active
+              │ (6) ws.send(ServerMessage::Bye)                                             │
+              ▼                                                                              ▼
+PWA ◄──ServerMessage::Bye── sabiden                 sabiden(UAC) ──BYE──► NGN
+                                                    sabiden          ◄──200 OK── NGN
 ```
+
+両 flow とも同じ手順 (テーブル先 `remove` → bridge `terminate` → `dec_call_active`) を踏み、
+最後に dialog 終了通知を反対側 (PWA / NGN) に出して完了する。 `CallManager` Arc を outbound と
+inbound で共有することで `bridge_call_id` の `terminate` がどちら経路から来ても確実に効く
+(PR #154 review #2 🔴: 別 Arc 構成だと NGN→PWA BYE 経路の `terminate` が silent no-op に
+なり RTP bridge socket / spawn task が leak する)。
 
 **leak 防止 (Issue #147)**:
 

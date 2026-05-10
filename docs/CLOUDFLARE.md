@@ -153,5 +153,25 @@ Permissions-Policy: microphone=(self)
 | --- | --- |
 | WS が 502 | `cloudflared tunnel info sabiden` で接続確認、`SIGNAL_ORIGIN` 値 |
 | WS が 401 | HMAC トークンの `expiry` 過去 / `secret` 不一致 |
+| WS が 100 秒で切れる | Cloudflare Tunnel の **idle timeout = 100 秒** で切断される (cloudflared 既定動作)。 sabiden は 30 秒周期で WebSocket Ping (RFC 6455 §5.5.2) を送り続けて経路上の idle timer をリセットしている。 PWA 側 `SignalingClient` は close code 別に再接続するため通話継続は維持される (Issue #98 / #127)。 周期の調整は `[webrtc] keepalive_interval_secs` / `idle_timeout_secs` (Issue #131) |
 | 音が出ない | iOS Safari は user gesture 後でないと `audio.play()` できない (本 PWA は応答ボタンで起動) |
 | PWA インストール不可 | HTTPS と manifest が必須。Workers/Pages なら自動 HTTPS |
+
+### 6.1 WebSocket keepalive 設計 (Issue #98 / #131)
+
+Cloudflare Tunnel は **idle 100 秒で WebSocket を切断する**。 sabiden は経路上の
+idle timer を確実にリセットするため、 サーバ → クライアント方向に WebSocket
+Ping (RFC 6455 §5.5.2) を周期的に送る:
+
+| パラメータ | 既定値 | 用途 |
+| --- | --- | --- |
+| `keepalive_interval_secs` | 30 | Ping 送出周期 (RFC 6455 §5.5.2、 経路 idle timer リセット) |
+| `idle_timeout_secs` | 60 | 受信フレーム不在で WS 撤収する閾値 (Pong 不在検知、 RFC 6455 §7.4.1 status 1011 Close で撤収) |
+
+両者とも Cloudflare の 100 秒 timeout より十分短い。 通常は既定で十分だが、
+他の idle timer (別 LB / SBC / NAT) が経路に挟まる場合のみ短縮する。 環境変数
+`SABIDEN_WEBRTC_KEEPALIVE_INTERVAL_SECS` / `SABIDEN_WEBRTC_IDLE_TIMEOUT_SECS`
+でも上書き可能 (K8s Secret マウント等)。
+
+ブラウザ側は Pong を自動で返す (RFC 6455 §5.5.3 SHOULD、 axum WebSocket は
+受信 Ping 自動応答)。 PWA は能動的な keepalive を持たない。

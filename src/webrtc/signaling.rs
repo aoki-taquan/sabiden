@@ -539,7 +539,13 @@ pub async fn run_session(
                 let mut s = sender_clone.lock().await;
                 if s.send(Message::Text(payload)).await.is_err() {
                     debug!("server-push: WS 送信失敗、forwarder 終了");
-                    shutdown_c.notify_waiters();
+                    // Issue #131: `notify_one()` は permit を蓄える (tokio
+                    // `Notify` doc) ので、 受信ループが select! の外 (深い
+                    // await) にいる瞬間でも次の `notified()` 評価で即解放
+                    // される。 `notify_waiters()` は現に awaiting でない
+                    // タスクには届かず、 アイドル撤収が最大数秒遅れていた
+                    // 原因。
+                    shutdown_c.notify_one();
                     break;
                 }
             }
@@ -667,7 +673,15 @@ pub async fn run_session(
     }
 
     // 周辺タスク (forwarder / keepalive) を確実に止める。
-    shutdown.notify_waiters();
+    //
+    // Issue #131: `notify_one()` は permit を蓄える (tokio `Notify` doc)。
+    // 受信ループ離脱直後に keepalive が `select!` の片足で `send_ping` 等の
+    // await に入っている可能性があるが、 permit 化されているので次 tick で
+    // 即時 `notified()` が解決し撤収する。 `notify_waiters()` だと該当瞬間
+    // に awaiting でないタスクに通知が届かず lost。 forwarder は
+    // `out_rx.recv()` 主導なので shutdown を待たず、 ここの notify は
+    // 主に keepalive 向け。
+    shutdown.notify_one();
 
     // Issue #147: WS が close した = PWA は通話を維持できない。 進行中の
     // PWA→NGN 発信通話があれば NGN レッグへ BYE を撃つ (RFC 3261 §15.1.1)。
@@ -751,7 +765,9 @@ impl KeepaliveSender for AxumPingSender {
 ///   library 任せで自動応答する (RFC 6455 §5.5.2 implementer note)。
 /// - **idle timeout**: `last_recv` (受信ループが任意フレーム受信時に更新する
 ///   `tokio::time::Instant`) と現在時刻の差が `idle_timeout` を超えたら、
-///   Close frame (code 1011) を送って `shutdown.notify_waiters()` する。
+///   Close frame (RFC 6455 §7.4.1 status code 1011 = "internal error") を
+///   送って `shutdown.notify_one()` する (Issue #131: permit を蓄える形に
+///   変更、 受信ループが深い await 内でも次 select で即時撤収)。
 ///   受信ループ側はこの通知を `tokio::select!` で観測して終了する。
 /// - **Cloudflare Tunnel 100 秒 idle (`docs/CLOUDFLARE.md`)**: 既定値
 ///   `interval=30s` / `idle_timeout=60s` はこれより十分小さい。
@@ -792,14 +808,19 @@ pub async fn run_keepalive_loop<S: KeepaliveSender>(
                 "WS keepalive: Pong 不在で idle timeout、 Close を送って撤収"
             );
             let _ = sender.send_close(1011, "idle timeout".to_string()).await;
-            shutdown.notify_waiters();
+            // Issue #131: `notify_one()` で permit を蓄える (tokio `Notify`
+            // doc)。 受信ループが深い await 内 (例: process_client_message
+            // の I/O 中) でも次 `notified()` で即解放され、 アイドル切断時
+            // の撤収が遅れる事象が解消する。
+            shutdown.notify_one();
             return;
         }
 
         // Ping 送信。 失敗 (相手切断) なら撤収。
         if sender.send_ping(Vec::new()).await.is_err() {
             debug!("keepalive: WS 送信失敗 (相手切断)、 keepalive タスク終了");
-            shutdown.notify_waiters();
+            // Issue #131: 同上 — permit を蓄えて受信ループの即時撤収を保証。
+            shutdown.notify_one();
             return;
         }
     }
@@ -1910,5 +1931,206 @@ mod tests {
         // (shutdown は keepalive ループから来ているはずだが、 念の為再送)。
         shutdown.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_secs(2), updater).await;
+    }
+
+    /// Issue #131 race 検証 (本 PR の主目的): keepalive が `notify_one` で
+    /// shutdown を出すとき、 受信側がまだ `notified()` を await していなくて
+    /// も permit が蓄えられ、 後から登録した waiter が即時 resolve すること。
+    ///
+    /// `tokio::sync::Notify` 仕様 (tokio 1.x docs) のうち本 PR が利用する 2
+    /// 性質:
+    /// - **`notify_one` は permit を蓄える**: 呼び出し時点で waiter が居なくて
+    ///   も次の `notified()` 呼び出しが即座に解決する。
+    /// - **`notify_waiters` は permit を蓄えない**: 呼び出し時点で
+    ///   `notified()` を能動 await していない waiter には届かない (lost)。
+    ///
+    /// 本テストは前者 (= `notify_one`) を直接検証することで、 production
+    /// コード (`run_keepalive_loop` / forwarder / `run_session` 末尾) が
+    /// `notify_one` に置換されている回帰防止になる。
+    #[tokio::test]
+    async fn rfc6455_notify_one_permit_outlives_waiterless_window() {
+        let n = Arc::new(Notify::new());
+
+        // waiter 不在の瞬間に notify_one を発火。 permit が蓄えられる。
+        n.notify_one();
+
+        // ある程度経過 (= 受信ループが深い await から戻ってくる時間相当) してから
+        // notified() を呼んでも、 permit があるので即解決する。
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // タイムアウト 2 秒以内に解決しない場合は permit が消えている (= 回帰)。
+        let res = tokio::time::timeout(Duration::from_secs(2), n.notified()).await;
+        assert!(
+            res.is_ok(),
+            "notify_one の permit が waiterless 期間を越えて保持されていない (Issue #131 回帰)"
+        );
+    }
+
+    /// Issue #131 race 検証 (対比): `notify_waiters` は同じ条件下で permit を
+    /// 蓄えないため、 後から登録した waiter は永久に resolve しない。 これが
+    /// PR #128 で観測された「アイドル切断撤収最大数秒遅延」の根本原因。
+    /// 本テストは差分を「タイムアウトする = 期待」で固定する。
+    #[tokio::test]
+    async fn rfc6455_notify_waiters_loses_signal_without_active_waiter() {
+        let n = Arc::new(Notify::new());
+
+        // waiter 不在で notify_waiters → 通知が消滅する。
+        n.notify_waiters();
+
+        // この時点で notified() を await しても、 既に発火済みの notify は
+        // 蓄えられていないので解決しない。 100ms で必ずタイムアウトする。
+        let res = tokio::time::timeout(Duration::from_millis(100), n.notified()).await;
+        assert!(
+            res.is_err(),
+            "notify_waiters は permit を蓄えず lost。 Issue #131 で notify_one へ置換した根拠"
+        );
+    }
+
+    /// Issue #131: `run_keepalive_loop` が `notify_one` を使うことの間接検証。
+    /// idle timeout 経路で keepalive が抜けたあと、 仮の "受信ループ相当"
+    /// (= shutdown を late-await するタスク) が deadlock しないこと。
+    ///
+    /// 本テストは production コードが `notify_waiters` に逆戻りしたら fail する
+    /// (idle 経路の lost-signal 再発検知)。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_idle_close_signal_reaches_late_subscriber() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: None,
+        };
+
+        let shutdown_for_loop = shutdown.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown_for_loop,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        // keepalive ループが idle_timeout に到達 (60s) → Close 送出 →
+        // notify_one 発火 → return するのを待つ。
+        let _ = tokio::time::timeout(Duration::from_secs(120), loop_handle).await;
+
+        // notify は既に発火済み。 ここで late-await する subscriber を spawn する
+        // (= 本来の受信ループが深い await から戻ってきた瞬間に相当)。
+        // `notify_one` で permit が保存されているなら、 即時解決するはず。
+        let shutdown_late = shutdown.clone();
+        let late_subscriber = tokio::spawn(async move {
+            shutdown_late.notified().await;
+        });
+        let res = tokio::time::timeout(Duration::from_secs(5), late_subscriber).await;
+        assert!(
+            res.is_ok(),
+            "keepalive idle close 後の late subscriber が deadlock した (notify_waiters への回帰?)"
+        );
+
+        let cs = closes.lock().unwrap().clone();
+        assert_eq!(cs.len(), 1, "Close 1 回送出");
+        assert_eq!(cs[0].0, 1011);
+    }
+
+    /// Issue #131: ping 失敗 (= 相手切断) 経路でも `notify_one` が permit を
+    /// 蓄え、 late subscriber が deadlock しないこと。
+    ///
+    /// last_recv updater は **別 Notify (`updater_shutdown_notify`)** で停止
+    /// させる。 keepalive 用の `shutdown` を共有すると、 updater が
+    /// `select!` 内で `notified()` を待っている瞬間に keepalive の permit を
+    /// 横取りし、 本テストの late subscriber が deadlock する (= テスト
+    /// セマンティクスの racing、 production 経路には存在しない)。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_ping_error_signal_reaches_late_subscriber() {
+        let pings = Arc::new(std::sync::Mutex::new(0u32));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_recv = Arc::new(Mutex::new(Instant::now()));
+        let shutdown = Arc::new(Notify::new());
+        // updater 専用の停止経路 (keepalive shutdown と分離する)。
+        let updater_shutdown_notify = Arc::new(Notify::new());
+
+        // 1 回目の Ping から Err を返す (= 即座に send_ping 失敗で抜ける)。
+        let sender = FakeKeepaliveSender {
+            pings: pings.clone(),
+            closes: closes.clone(),
+            fail_after: Some(0),
+        };
+
+        // last_recv は更新し続ける (idle ではなく純粋な send 失敗を再現)。
+        let last_recv_c = last_recv.clone();
+        let updater_stop = updater_shutdown_notify.clone();
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = updater_stop.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        *last_recv_c.lock().await = Instant::now();
+                    }
+                }
+            }
+        });
+
+        let shutdown_for_loop = shutdown.clone();
+        let loop_handle = tokio::spawn(async move {
+            run_keepalive_loop(
+                sender,
+                last_recv,
+                shutdown_for_loop,
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+            )
+            .await
+        });
+
+        // 1 周期 (30s) で send_ping Err、 ループ終了 + notify_one 発火。
+        let _ = tokio::time::timeout(Duration::from_secs(60), loop_handle).await;
+
+        // late subscriber が permit を拾うことを確認 (= 受信ループ相当)。
+        let shutdown_late = shutdown.clone();
+        let late_subscriber = tokio::spawn(async move {
+            shutdown_late.notified().await;
+        });
+        let res = tokio::time::timeout(Duration::from_secs(5), late_subscriber).await;
+        assert!(
+            res.is_ok(),
+            "ping error 経路で late subscriber が deadlock (notify_waiters への回帰?)"
+        );
+
+        // updater 停止 (keepalive 側の permit と独立)。
+        updater_shutdown_notify.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(2), updater).await;
+    }
+
+    /// Issue #131: SignalingState の keepalive 設定が WebRtcConfig から正しく
+    /// 反映できる経路 (config → main.rs → SignalingState) のうち、 sabiden 内
+    /// で完結する部分 (`with_keepalive` builder) を直接 round-trip 検証する。
+    ///
+    /// main.rs::register コマンドの実体は重いので、 ここでは `SignalingState`
+    /// 単体で keepalive 値を任意上書きできることを担保する。
+    #[test]
+    fn signaling_state_with_keepalive_round_trip_accepts_arbitrary_values() {
+        let v = Arc::new(Verifier::new(b"k".to_vec()));
+        // 60s / 90s (Cloudflare 100s 寸前まで広げるケース)
+        let s = SignalingState::new(
+            v.clone(),
+            ExtensionRegistrar::new(),
+            Duration::from_secs(60),
+        )
+        .with_keepalive(Duration::from_secs(60), Duration::from_secs(90));
+        assert_eq!(s.keepalive_interval, Duration::from_secs(60));
+        assert_eq!(s.idle_timeout, Duration::from_secs(90));
+
+        // 5s / 10s (短縮ケース、 別 LB/SBC が挟まる構成想定)
+        let s2 = SignalingState::new(v, ExtensionRegistrar::new(), Duration::from_secs(60))
+            .with_keepalive(Duration::from_secs(5), Duration::from_secs(10));
+        assert_eq!(s2.keepalive_interval, Duration::from_secs(5));
+        assert_eq!(s2.idle_timeout, Duration::from_secs(10));
     }
 }

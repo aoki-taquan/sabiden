@@ -176,6 +176,24 @@ pub struct WebRtcConfig {
     /// 本 PR では設定値の取り込みのみ行い、実際の TURN allocate は TODO。
     #[serde(default)]
     pub ice_servers: Vec<String>,
+    /// WebSocket keepalive Ping 送出周期 (秒)。
+    ///
+    /// Cloudflare Tunnel は idle 100 秒で WS を切断する (`docs/CLOUDFLARE.md`
+    /// §6 トラブルシュート、 Issue #98)。 既定 30 秒は経路上の idle timer を
+    /// 確実にリセットする値 (RFC 6455 §5.5.2 Ping は keepalive 用途として MAY、
+    /// `docs/refactor-plan.md` 経由で根拠付け)。
+    ///
+    /// 通常は既定で十分。 経路に他の idle timeout (LB / SBC / NAT) が挟まる
+    /// 場合のみ短縮する (Issue #131)。
+    #[serde(default = "default_webrtc_keepalive_interval")]
+    pub keepalive_interval_secs: u64,
+    /// 受信フレーム不在で WS 接続をアイドル切断する閾値 (秒)。
+    ///
+    /// 既定 60 秒 = `keepalive_interval_secs` の 2 倍 (RFC 6455 §5.5.3 の
+    /// Pong 即応 SHOULD を踏まえ、 1 周期分のトレラントを許容)。
+    /// Cloudflare の 100 秒 timeout より十分小さい (Issue #98 / #131)。
+    #[serde(default = "default_webrtc_idle_timeout")]
+    pub idle_timeout_secs: u64,
 }
 
 /// NGN 直収モード関連の設定 (Issue #37)。
@@ -250,6 +268,18 @@ fn default_webrtc_register_ttl() -> u64 {
 
 fn default_webrtc_backend() -> String {
     "stub".to_string()
+}
+
+/// Issue #98 / #131: Cloudflare Tunnel 100 秒 idle 切断より十分短い既定。
+/// 経路上の idle timer を確実にリセットする (RFC 6455 §5.5.2)。
+fn default_webrtc_keepalive_interval() -> u64 {
+    30
+}
+
+/// Issue #98 / #131: keepalive_interval の 2 倍 = Pong 不在 1 周期分許容。
+/// Cloudflare の 100 秒 timeout より十分小さい。
+fn default_webrtc_idle_timeout() -> u64 {
+    60
 }
 
 /// 1 つの内線アカウント。
@@ -356,6 +386,10 @@ impl Config {
             trace: TraceConfig::default(),
             webrtc: WebRtcConfig {
                 backend: default_webrtc_backend(),
+                // Issue #131: env-only 起動でも keepalive 既定が反映される
+                // よう明示する (Default::default() は 0 を返すため)。
+                keepalive_interval_secs: default_webrtc_keepalive_interval(),
+                idle_timeout_secs: default_webrtc_idle_timeout(),
                 ..WebRtcConfig::default()
             },
             ngn: NgnConfig::default(),
@@ -439,6 +473,18 @@ impl Config {
             } else {
                 v.split(',').map(|s| s.trim().to_string()).collect()
             };
+        }
+        // Issue #131: WebRTC シグナリング keepalive の運用調整窓口
+        // (RFC 6455 §5.5.2 Ping、 Cloudflare Tunnel 100 秒 idle 切断対策)。
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_KEEPALIVE_INTERVAL_SECS") {
+            if let Ok(n) = v.parse() {
+                self.webrtc.keepalive_interval_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_WEBRTC_IDLE_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() {
+                self.webrtc.idle_timeout_secs = n;
+            }
         }
         // [ngn] セクション (Issue #37)
         if let Ok(v) = std::env::var("SABIDEN_NGN_DIRECT_MODE") {
@@ -529,6 +575,11 @@ max_expires = 3600
 # udp_port_range = "40000-40999"
 # # STUN/TURN URL (現状は SDP に乗せるのみ、relay allocate は将来実装)
 # ice_servers = ["turn:turn.example.com:3478"]
+# # WS keepalive (Issue #98 / #131)。 既定 30s / 60s は Cloudflare Tunnel 100s
+# # idle 切断対策の安全側 (RFC 6455 §5.5.2 Ping は keepalive として MAY)。
+# # 通常は変更不要。 経路上に他の idle timer (LB / SBC / NAT) がある場合のみ短縮。
+# keepalive_interval_secs = 30
+# idle_timeout_secs = 60
 
 # RTP ブリッジ用 bind IP (任意, Issue #66)
 # 内線 UA (Linphone 等) が NGN 側 NIC とは別 NIC (eth0 LAN 等) にいる場合、
@@ -736,5 +787,42 @@ vendor_class = "PR-500KI"
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.ngn.vendor_class, "PR-500KI");
+    }
+
+    /// Issue #131: WebRTC keepalive の既定値 (Cloudflare Tunnel 100 秒 idle
+    /// 切断対策、 RFC 6455 §5.5.2 Ping)。 TOML 省略時に 30s / 60s が反映される。
+    #[test]
+    fn toml_default_webrtc_keepalive_is_30s_idle_60s() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[webrtc]
+secret_hex = "00"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.webrtc.keepalive_interval_secs, 30);
+        assert_eq!(cfg.webrtc.idle_timeout_secs, 60);
+    }
+
+    /// Issue #131: TOML で keepalive を上書きできる (経路追加 idle timer 対策)。
+    #[test]
+    fn toml_webrtc_keepalive_can_be_overridden() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[webrtc]
+secret_hex = "00"
+keepalive_interval_secs = 5
+idle_timeout_secs = 12
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.webrtc.keepalive_interval_secs, 5);
+        assert_eq!(cfg.webrtc.idle_timeout_secs, 12);
     }
 }

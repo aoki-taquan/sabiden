@@ -65,6 +65,11 @@ max_expires = 3600
 # udp_port_range = "40000-40999"
 # # 任意の TURN/STUN URL (本 PR では SDP 提示のみ、relay allocate は TODO)
 # ice_servers = ["turn:turn.example.com:3478"]
+# # WS keepalive (Issue #98 / #131)。 既定 30s / 60s は Cloudflare Tunnel
+# # 100s idle 切断より十分短い (RFC 6455 §5.5.2 Ping は keepalive として MAY)。
+# # 経路上に他の idle timer (LB / SBC / NAT) がある場合のみ調整。
+# keepalive_interval_secs = 30
+# idle_timeout_secs = 60
 
 # RTP ブリッジ用 bind IP (Issue #66)
 # B2BUA media anchoring 用に NGN レッグと内線レッグの 2 つの UDP socket を

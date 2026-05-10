@@ -427,7 +427,17 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         backend,
                         ttl.as_secs()
                     );
+                    // Issue #131: keepalive_interval / idle_timeout を config
+                    // から渡す。 既定 30s/60s は Cloudflare Tunnel 100s idle に
+                    // 対する余裕。 経路上に他の idle timer が挟まる場合のみ
+                    // 設定で短縮する想定 (RFC 6455 §5.5.2 Ping は keepalive
+                    // 用途として MAY)。
+                    let keepalive_interval =
+                        std::time::Duration::from_secs(full_config.webrtc.keepalive_interval_secs);
+                    let idle_timeout =
+                        std::time::Duration::from_secs(full_config.webrtc.idle_timeout_secs);
                     let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl)
+                        .with_keepalive(keepalive_interval, idle_timeout)
                         .with_pwa_outbound(uas_handler_for_pwa_outbound.clone())
                         .with_pwa_outbound_closer(uas_handler_for_pwa_closer.clone());
                     if backend == "str0m" {

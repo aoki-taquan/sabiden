@@ -310,7 +310,11 @@ fn title_case_dashed(s: &str) -> String {
 ///
 /// - `scheme`: "sip" / "sips" / その他 (lower-case で保持)
 /// - `user`: `@` の左側 (パスワード `:` は削除しユーザ名のみ)
-/// - `host`: ホスト or `[v6]`
+/// - `host`: ホスト名 / IPv4 リテラル / **IPv6 リテラルは `[..]` brackets 込み**
+///   (例: `"[2001:db8::1]"`)。 これは `parse_sip_uri` が IPv6 を識別する
+///   `[..]:port` 構文を round-trip 可能な形で保持する契約 (Issue #133)。
+///   `IpAddr` を作る側は `host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))`
+///   で剥がしてから `parse::<IpAddr>()` する (例: `src/sip/uac.rs::resolve_next_hop_addr`)。
 /// - `port`: 数値 (省略時 None)
 /// - `params`: `;k=v` ペア (順序維持、値が無い `lr` は空文字列)
 /// - `headers`: `?k=v&k=v` ペア

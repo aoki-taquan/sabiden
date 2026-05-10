@@ -36,9 +36,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use call::manager::{CallManager, UacForker};
-use call::orchestrator::{
-    wire_ngn_inbound_with_manager_and_metrics, NgnInboundConfig, UasEventHandler,
-};
+use call::orchestrator::{NgnInboundConfig, UasEventHandler};
 use config::Config;
 use observability::{Metrics, SipTraceWriter};
 use sip::register::Registrar;
@@ -274,14 +272,35 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         bridge_ext_ip = %bridge_ext_ip,
         "RTP ブリッジ bind IP を決定 (Issue #66)"
     );
-    let uas_handler = if let Some(ext_registrar) = ext_registrar.clone() {
-        let call_manager = CallManager::new(ext_registrar);
-        let mut h = UasEventHandler::with_call_manager_and_metrics(
+    // Issue #147: PWA→NGN 発信通話の双方向 BYE 連動テーブルを 1 個構築し、
+    // `UasEventHandler` (PWA outbound 成立時に insert) と `NgnInboundHandler`
+    // (NGN→PWA BYE 受信時に lookup) で共有する。
+    let webrtc_outbound_active: call::orchestrator::WebRtcOutboundActive =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Issue #147 (review #2 🔴): `CallManager` は **両ハンドラで 1 個共有** する。
+    // outbound (`UasEventHandler::handle_pwa_outbound_offer`) で `create_call`
+    // した CallId を、 NGN→PWA BYE 経路 (`NgnInboundHandler::handle_bye`) で
+    // `terminate` する必要があり、 別インスタンスを持たせると `terminate` が
+    // entry 無しで silent no-op になり RTP bridge socket / spawn task が
+    // leak する (= NGN 側は 200 OK が返って dialog terminate されているのに
+    // sabiden 側 bridge は永続)。 inbound 経路の `start_bridge_for_inbound` も
+    // 同じ Arc を使うので NGN→内線 着信 / PWA outbound のどちらからの
+    // BYE でも一貫して bridge を閉じられる。
+    // RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog
+    // 終了をもう片側へ伝搬する責務を負う。
+    let shared_call_manager: Option<Arc<CallManager>> = ext_registrar
+        .as_ref()
+        .map(|er| CallManager::new(er.clone()));
+
+    let uas_handler = if let Some(call_manager) = shared_call_manager.clone() {
+        let mut h = UasEventHandler::with_call_manager_metrics_and_outbound_table(
             ngn_uac.clone(),
             call_manager,
             Some(bridge_ngn_ip),
             Some(bridge_ext_ip),
             metrics.clone(),
+            webrtc_outbound_active.clone(),
         );
         if let (Some(uas_layer), uas_addr) = (uas_layer_for_b2bua.clone(), uas_local_addr) {
             // 内線レッグへ in-dialog (BYE 等) を送るため UAS の TransactionLayer を借用。
@@ -301,10 +320,16 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // 設定を再利用できる。
     let uas_handler_for_pwa_outbound: Arc<dyn webrtc::signaling::PwaOutboundHandler> =
         uas_handler.clone();
+    // Issue #147: PWA WS close / `ClientMessage::Bye` 経路で NGN レッグへ
+    // BYE を撃つ cleanup ハンドラ (= 同じ `UasEventHandler`)。
+    let uas_handler_for_pwa_closer: Arc<dyn webrtc::signaling::PwaOutboundCloser> =
+        uas_handler.clone();
 
-    if let (Some(ext_registrar), Some(ext_send_sock)) =
-        (ext_registrar.clone(), ext_socket_for_forker)
-    {
+    if let (Some(ext_registrar), Some(ext_send_sock), Some(inbound_call_manager)) = (
+        ext_registrar.clone(),
+        ext_socket_for_forker,
+        shared_call_manager.clone(),
+    ) {
         // 内線レッグ送信ソケットもトレース対応 (NGN→内線 着信フォーク用)
         let (ext_layer, _ext_inbound_rx) =
             TransactionLayer::spawn_with_tracer(ext_send_sock.clone(), tracer.clone());
@@ -344,19 +369,23 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // そのまま使うと NGN が ACK 不能で 10 秒後 CANCEL してくる。
             ngn_local_addr: Some(local_addr_for_hdr),
         };
-        // 着信 NGN→内線 用にも CallManager を渡す。outbound 側と同じ
-        // `ext_registrar` を共有することで、登録テーブルを 1 つに保つ。
-        let inbound_call_manager = CallManager::new(ext_registrar.clone());
-        let ngn_handler = wire_ngn_inbound_with_manager_and_metrics(
-            ngn_layer.clone(),
-            ngn_socket.clone(),
-            ngn_inbound_rx,
-            forker,
-            ext_registrar,
-            cfg,
-            inbound_call_manager,
-            metrics.clone(),
-        );
+        // 着信 NGN→内線 用 CallManager は **outbound 側と同じ Arc**
+        // (`shared_call_manager`) を再利用する (Issue #147 review #2 🔴 fix)。
+        // 別 Arc を作ると PWA outbound で create_call した CallId を inbound
+        // 側で terminate しても entry 無しの silent no-op になり、 RTP bridge
+        // socket / spawn task が leak する。
+        let ngn_handler =
+            call::orchestrator::wire_ngn_inbound_with_manager_metrics_and_outbound_table(
+                ngn_layer.clone(),
+                ngn_socket.clone(),
+                ngn_inbound_rx,
+                forker,
+                ext_registrar,
+                cfg,
+                inbound_call_manager,
+                metrics.clone(),
+                webrtc_outbound_active.clone(),
+            );
         // NGN→内線 BYE 伝搬の経路を結線する (B2BUA 双方向 BYE)。
         ngn_handler
             .set_outbound_forwarder(uas_handler_for_forwarder)
@@ -399,7 +428,8 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         ttl.as_secs()
                     );
                     let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl)
-                        .with_pwa_outbound(uas_handler_for_pwa_outbound.clone());
+                        .with_pwa_outbound(uas_handler_for_pwa_outbound.clone())
+                        .with_pwa_outbound_closer(uas_handler_for_pwa_closer.clone());
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {
                             Ok(s_cfg) => {

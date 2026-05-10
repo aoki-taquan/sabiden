@@ -35,7 +35,7 @@
 //! - UDP ポート範囲は最低限の挙動 (範囲内でランダム選択) のみ。複数同時
 //!   セッションでのポート再利用回避は将来課題。
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -191,10 +191,11 @@ impl Str0mPeerSession {
             .build(Instant::now());
 
         let socket = Arc::new(socket);
-        // str0m の Receive::new に渡す destination 用。socket は 0.0.0.0 で
-        // bind しているが、 str0m は host_candidate (= 公開アドレス) と一致
-        // する destination でないと「自分宛ではない」と判定して STUN を drop
-        // する。 そのため広告した host_advert (192.168.20.239:port) を渡す。
+        // str0m の Receive::new に渡す destination 用。 socket はファミリ別
+        // ANY (`0.0.0.0` または `::`) で bind しているが、 str0m は
+        // host_candidate (= 公開アドレス) と一致する destination でないと
+        // 「自分宛ではない」と判定して STUN を drop する (Issue #103: IPv6
+        // でも同様に host_advert を渡す)。
         let local_bind = host_advert;
 
         tokio::spawn(run_loop(RunCtx {
@@ -671,11 +672,21 @@ fn write_media(rtc: &mut Rtc, audio_mid: Option<Mid>, frame: &MediaFrame) {
 /// 範囲が小さい場合は数十回程度のリトライで諦めてエラーを返す。
 async fn bind_udp_in_range(cfg: &Str0mConfig) -> Result<UdpSocket> {
     let (lo, hi) = cfg.port_range;
-    // ホスト側は IPv4 ANY で listen し、advertise だけ public_ip に置き換える。
-    // (Cloudflare Tunnel / NAT 構成での一般的なパターン)
+    // ホスト側は public_ip のアドレスファミリに合わせた ANY で listen し、
+    // ICE host candidate (RFC 8839 §5.1 / RFC 5245 §4.1.1.2) だけは公開
+    // アドレス (cfg.public_ip) に置き換える (Cloudflare Tunnel / NAT 構成)。
+    //
+    // Issue #103: IPv6 public_ip でも bind を成功させる。 Linux の
+    // `IPV6_V6ONLY` 既定は ON なので、 IPv6 UNSPECIFIED bind は IPv6 のみ
+    // listen する (IPv4-mapped で混ぜない)。 IPv4/IPv6 dual-stack は str0m
+    // が複数 host candidate を許す (`Rtc::add_local_candidate`) が、 ソケットも
+    // ファミリ別に必要になる。 本 PR では「public_ip 1 つ ↔ ソケット 1 つ」
+    // の現行構造を維持し、 ファミリだけ揃える最小修正に留める (RFC 8835 §4.1.1
+    // の ICE candidate ペアリングは各候補単位で機能するため、 単一ファミリでも
+    // ブラウザ側 dual-stack 候補と問題なく通る)。
     let bind_ip: IpAddr = match cfg.public_ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => return Err(anyhow!("IPv6 public_ip は未対応 (TODO)")),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
 
     // ThreadRng は !Send のため、ports を先に集めて await を含むループ外で生成する。
@@ -751,6 +762,87 @@ mod tests {
         };
         let s = Str0mConfig::from_webrtc(&cfg).unwrap();
         assert_eq!(s.port_range, (40000, 40999));
+    }
+
+    /// Issue #103: `public_ip` に IPv6 アドレス文字列を渡しても
+    /// `Str0mConfig::from_webrtc` がパースできること。
+    ///
+    /// RFC 8839 §5.1 (ICE candidate address) は IPv4 / IPv6 双方を許可する。
+    /// 旧実装は parse 自体は通っていたが下流の bind で失敗していた。
+    #[test]
+    fn rfc8839_5_1_str0m_config_parses_ipv6_public_ip() {
+        let cfg = WebRtcConfig {
+            backend: "str0m".into(),
+            public_ip: Some("2001:db8::1".into()),
+            udp_port_range: Some("49000-49099".into()),
+            ..WebRtcConfig::default()
+        };
+        let s = Str0mConfig::from_webrtc(&cfg).expect("IPv6 public_ip も受理する");
+        assert!(s.public_ip.is_ipv6(), "IPv6 として保持される");
+        assert_eq!(s.public_ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    /// Issue #103: IPv6 loopback (`::1`) を `public_ip` に指定した場合、
+    /// `Str0mPeerSession::new` が UDP bind で `Ipv6Addr::UNSPECIFIED` を
+    /// 使って成功し、 host candidate も IPv6 で広告されること。
+    ///
+    /// RFC 5245 §4.1.1.2 (host candidate) / RFC 8839 §5.1: host candidate は
+    /// ローカルにバインドされた IP/port を直接広告する。 公開 IP がブラウザに
+    /// 到達するルートで決まる以上、 IPv6 を選ぶ運用 (NGN 直収 + IPv6 backbone)
+    /// は禁止せず通す必要がある。
+    #[tokio::test]
+    async fn rfc5245_4_1_1_2_str0m_session_binds_with_ipv6_public_ip() {
+        let cfg = Str0mConfig {
+            public_ip: "::1".parse().unwrap(),
+            port_range: (50000, 50999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg)
+            .await
+            .expect("IPv6 loopback public_ip での起動が成功する");
+        // close まで進めば run_loop が無事 spawn された証拠。
+        let _ = session.close().await;
+    }
+
+    /// Issue #103: IPv6 host candidate が `take_local_candidates` から
+    /// IPv6 アドレスで送出されること (RFC 8839 §5.1: candidate 行の
+    /// connection-address は IP リテラル)。
+    #[tokio::test]
+    async fn rfc8839_5_1_str0m_session_advertises_ipv6_host_candidate() {
+        let cfg = Str0mConfig {
+            public_ip: "::1".parse().unwrap(),
+            port_range: (51000, 51999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg)
+            .await
+            .expect("IPv6 public_ip での起動が成功する");
+
+        // offer を渡して ICE 連携を始動させる (Event::IceConnectionStateChange を
+        // 引き出すため)。 firefox_offer.sdp は IPv4 候補を含むが、 ICE-Lite の
+        // controlled 側として local candidate は public_ip に従う。
+        let offer = include_str!("testdata/firefox_offer.sdp");
+        let _answer = session.handle_offer(offer).await.expect("answer 生成");
+
+        // local candidate 行を受信する。 タイムアウトを付けて hung しないようにする。
+        let mut rx = session
+            .take_local_candidates()
+            .await
+            .expect("1 度目は取れる");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("local candidate を 2 秒以内に受信")
+            .expect("送信側が close せずに 1 件流す");
+        // RFC 8839 §5.1: `candidate:<foundation> <component> <transport>
+        // <priority> <connection-address> <port> typ host`。
+        // IPv6 リテラルは括弧無しの素アドレスで載る。
+        assert!(
+            line.contains("::1"),
+            "IPv6 host candidate に loopback IP が含まれない: {}",
+            line
+        );
+        assert!(line.contains("typ host"), "host candidate でない: {}", line);
+        let _ = session.close().await;
     }
 
     /// 実 UDP socket をバインドして run_loop を起動。

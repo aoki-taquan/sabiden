@@ -160,9 +160,17 @@ pub struct WebRtcConfig {
     /// - `"str0m"`: 実 ICE/DTLS-SRTP/RTP 終端 (Issue #28)
     #[serde(default = "default_webrtc_backend")]
     pub backend: String,
-    /// ICE host candidate に載せる「外部から到達可能な IPv4」。
-    /// Cloudflare Tunnel 経由なら LAN 側でも可。未設定なら全インタフェースで
-    /// listen するが ICE candidate は配信できない (str0m バックエンドでは必須)。
+    /// ICE host candidate (RFC 8839 §5.1 / RFC 5245 §4.1.1.2) に載せる
+    /// 「外部から到達可能な IP アドレス」。 IPv4 / IPv6 どちらも受理する
+    /// (Issue #103)。 Cloudflare Tunnel 経由なら LAN 側 IP でも可。
+    /// 未設定なら全インタフェースで listen するが ICE candidate は配信
+    /// できない (str0m バックエンドでは必須)。
+    ///
+    /// IPv6 を指定した場合、 UDP socket は `::` (IPv6 UNSPECIFIED) に bind
+    /// される (Linux 既定の `IPV6_V6ONLY=1` により IPv6 only listen)。
+    /// IPv4 / IPv6 同時 advertisement (dual-stack host candidate) は将来課題
+    /// (ソケットがファミリ別に必要で str0m 側設計が変わるため、 本 PR では
+    /// 単一ファミリのみ対応)。
     #[serde(default)]
     pub public_ip: Option<String>,
     /// UDP メディアポートの範囲 ("40000-40999" 形式)。

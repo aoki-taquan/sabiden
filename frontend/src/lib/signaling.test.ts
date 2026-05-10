@@ -431,7 +431,7 @@ describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
     // バックグラウンド) 時に 1011 を送る。 これは「token 失効」ではなく
     // 「無線の眠り」 なので、 permanent にすると Issue #119 の auto-reconnect が
     // keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
-    // `maxReconnectAttempts` (10 分上限) で達成済み。
+    // `maxReconnectAttempts` (約 8 分上限) で達成済み。
     expect(isPermanentCloseCode(1011)).toBe(false);
   });
 
@@ -799,5 +799,110 @@ describe("App.tsx connect() catch-race against onClosedReason (Issue #127 round-
     expect(view).toBe("dialer");
     expect(signaling).not.toBeNull();
     expect(signaling!.state).toBe("reconnecting");
+  });
+});
+
+describe("onClosedReason API contract (Issue #142)", () => {
+  // PR #141 follow-up: 「onClosedReason は onStateChange('closed') の直前に
+  // 同期発火、 1 度だけ」 を future refactor で壊さないため、 契約を test
+  // で固定化する (signaling.ts::SignalingHandlers.onClosedReason docstring)。
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  function setup(overrides: Partial<ReconnectOptions> = {}) {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+    const events: string[] = [];
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onStateChange: (s) => events.push(`state:${s}`),
+        onClosedReason: (r) => events.push(`reason:${r}`),
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+        ...overrides,
+      },
+    );
+    return { client, sockets, timer, events };
+  }
+
+  it("fires onClosedReason exactly once even on double close()", () => {
+    const { client, sockets, events } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    client.close();
+    client.close(); // 2 度目は no-op
+    client.close();
+
+    // reason:normal は 1 回だけ
+    const reasonCount = events.filter((e) => e.startsWith("reason:")).length;
+    expect(reasonCount).toBe(1);
+    expect(events).toContain("reason:normal");
+  });
+
+  it("emits reason:<r> immediately before state:closed (auth)", () => {
+    const { client, sockets, events } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    sockets[0].fireClose(1008);
+
+    // state は connecting → open → closed 順に流れているはず。
+    // 重要なのは reason:auth が state:closed の直前に並ぶこと。
+    const reasonIdx = events.indexOf("reason:auth");
+    const closedIdx = events.indexOf("state:closed");
+    expect(reasonIdx).toBeGreaterThanOrEqual(0);
+    expect(closedIdx).toBeGreaterThan(reasonIdx);
+    expect(closedIdx - reasonIdx).toBe(1);
+    expect(client.state).toBe("closed");
+  });
+
+  it("emits reason:<r> immediately before state:closed (exhausted)", () => {
+    // maxReconnectAttempts=1 で即上限到達させる。
+    const { client, sockets, timer, events } = setup({
+      initialDelayMs: 1000,
+      maxDelayMs: 1000,
+      maxReconnectAttempts: 1,
+    });
+    void client.connect();
+    sockets[0].fireOpen();
+    sockets[0].fireClose(1006); // 1 回目: schedule reconnect (attempts=0→1)
+    timer.advance(1000); // attempt 1 を発射 (reconnectAttempts++ → 1)
+    sockets[1].fireClose(1006); // 2 回目の close: attempts==1 で上限到達 → exhausted
+
+    const reasonIdx = events.indexOf("reason:exhausted");
+    const closedIdx = events.indexOf("state:closed");
+    expect(reasonIdx).toBeGreaterThanOrEqual(0);
+    expect(closedIdx - reasonIdx).toBe(1);
+    expect(client.state).toBe("closed");
+  });
+
+  it("cumulative delay budget at default maxReconnectAttempts ≈ 8 minutes (not 10)", () => {
+    // ReconnectOptions.maxReconnectAttempts docstring の主張を test 化:
+    //   1+2+4+8+16+30×15 ≈ 481 秒 (≈ 8 分)。
+    // backoff 計算式: base = min(maxDelayMs, initialDelayMs * 2^attempts)
+    // attempts=0..5 が exponential、 attempts>=6 で cap=30s に張り付く。
+    // 既定 maxReconnectAttempts=20 なら attempts=0..19 まで試行 (20 回)。
+    const initialDelayMs = 1000;
+    const maxDelayMs = 30000;
+    const maxAttempts = 20;
+    let total = 0;
+    for (let a = 0; a < maxAttempts; a++) {
+      total += Math.min(maxDelayMs, initialDelayMs * 2 ** a);
+    }
+    // 1+2+4+8+16+32 が exp 区間の予定だが、 32 は 30 で cap される。
+    // 実際: 1+2+4+8+16+30+30*14 = 61 + 420 = 481 秒
+    expect(total).toBe(481_000);
+    // 「30s × 20 = 600s = 10 分」 という直感計算とは ~120s ズレている事の証拠。
+    expect(total).toBeLessThan(maxDelayMs * maxAttempts);
   });
 });

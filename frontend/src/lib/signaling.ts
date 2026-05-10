@@ -36,8 +36,10 @@
 //       abnormal closure / message too big / internal server error / service
 //       restart」 RFC 6455 §7.4.1。 既存の指数バックオフで再接続を継続。
 //
-//   ただし transient であっても `maxReconnectAttempts` (既定 20、 30s × 20 ≈
-//   10 分) に達したら停止する (closed + reason="exhausted")。
+//   ただし transient であっても `maxReconnectAttempts` (既定 20 回) に
+//   達したら停止する (closed + reason="exhausted")。 累積遅延は backoff
+//   `1+2+4+8+16+30×15 ≈ 481s ≈ 約 8 分` (per-attempt delay の単純積では
+//   ない: 序盤は exponential、 7 回目以降は cap=30s)。
 //
 //   1011 (Internal Server Error) は **transient** 扱い (Issue #127 review #1):
 //   sabiden サーバ (`src/webrtc/signaling.rs`) は WS keepalive Pong 不着 (=
@@ -45,7 +47,7 @@
 //   時に 1011 で close してくる。 これは「token 失効」ではなく「無線の眠り」
 //   なので、 1011 を permanent にすると Issue #119 の auto-reconnect が
 //   keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
-//   `maxReconnectAttempts` (10 分上限) で達成済みなので、 1011 を permanent に
+//   `maxReconnectAttempts` (約 8 分上限) で達成済みなので、 1011 を permanent に
 //   入れる利得がない。
 //
 //   1006 は token 失効でも瞬断でも区別が付かないため transient 扱い (再接続は
@@ -132,7 +134,26 @@ export type SignalingHandlers = {
   /**
    * 永続的に閉じた (= 自動再接続を諦めた) ときに、 理由付きで 1 度だけ発火する
    * (Issue #127)。 UI で 「認証失敗、 token を入れ直してください」 等を出すため。
-   * `onStateChange("closed")` と一緒に呼ばれる。
+   *
+   * **API 契約 (この順序を future refactor で壊さないこと):**
+   * 1. **同一 client インスタンスで生涯ちょうど 1 回だけ呼ばれる**
+   *    (二重 close() / 二重 finalize() でも再発火しない、 `finalize` が
+   *    `disposed` 既セット時に早期 return することで保証)。
+   * 2. **`onStateChange("closed")` の直前に同期発火する** (call site:
+   *    `finalize()` 内で `onClosedReason → setState("closed")` の順で呼ぶ)。
+   *    UI 側で `closed` 状態を見たときに reason を取り損ねることが無いよう、
+   *    state 遷移より前に通知する。
+   * 3. **`connect()` Promise の reject よりも同期的に先に発火する**
+   *    (永続 close 受信時、 ws.onclose ハンドラ内で `finalize()` →
+   *    `onClosedReason()` を呼んでから、 同じハンドラで Promise を reject
+   *    するため)。 これにより呼び出し側は catch ブロックで signaling 参照
+   *    の null 化等から「reason 既処理かどうか」 を判定できる
+   *    (App.tsx::connect の race fix も この保証に依存)。
+   *
+   * 呼ばれるトリガ:
+   * - `client.close()` の明示呼び出し (reason=`normal`)
+   * - 永続 close code 受信: 1000 (`normal`) / 1008 / 4xxx (`auth`)
+   * - transient close code が `maxReconnectAttempts` を使い切る (`exhausted`)
    */
   onClosedReason?: (reason: SignalingCloseReason) => void;
 };
@@ -146,7 +167,13 @@ export type ReconnectOptions = {
   /** 加算する jitter の上限 (0..maxJitterMs の uniform 乱数)。 既定 250ms。 */
   maxJitterMs: number;
   /**
-   * 連続失敗の上限 (Issue #127)。 既定 20 (≒ 30s × 20 = 10 分でギブアップ)。
+   * 連続失敗の上限 (Issue #127)。 既定 20 回でギブアップ。
+   *
+   * 累積遅延の目安: backoff は `1s, 2s, 4s, 8s, 16s, 30s, 30s, ...` (cap=30s)
+   * なので `1+2+4+8+16+30×15 ≈ 481 秒 ≈ 約 8 分` でやっと諦める計算。
+   * 「30s × 20 = 10 分」 という直感的計算は per-attempt delay の単純積で
+   * あって正しくない (序盤 6 回が exponential 区間で短いため)。
+   *
    * 0 以下を渡すと 「無制限」 として扱う (テスト用)。 既存の Issue #119 テスト
    * との互換のため optional。
    */
@@ -353,7 +380,9 @@ export class SignalingClient {
    *
    * Issue #127: `maxReconnectAttempts` 到達で諦める (closed + reason="exhausted")。
    * これにより token 失効が close code 1006 (= 再接続継続) に化けるブラウザでも
-   * 永久ループを回避できる。
+   * 永久ループを回避できる。 既定 20 回での累積遅延は約 8 分
+   * (`1+2+4+8+16+30×15 ≈ 481s`、 ReconnectOptions.maxReconnectAttempts の
+   *  docstring 参照)。
    */
   private scheduleReconnect(): void {
     if (this.disposed) return;
@@ -386,6 +415,13 @@ export class SignalingClient {
    * 再接続を諦めて closed 状態に移行する (Issue #127)。 `disposed=true` を立て、
    * pending timer を片付け、 onClosedReason / onStateChange を発火する。
    * 以後 `connect()` 等は no-op (Promise.reject) になる。
+   *
+   * 順序契約 (SignalingHandlers.onClosedReason の docstring と対):
+   *   `disposed=true` 早期 return → 1 回限定発火を保証
+   *   `onClosedReason(reason)` → 同期発火 (state は依然 reconnecting/connecting)
+   *   `setState("closed")` → onStateChange("closed") を発火
+   * future refactor でこの順序を変えると 「UI が reason を取り損ねる」
+   * 「二重発火する」 等の回帰が出るため触らない。
    */
   private finalize(reason: SignalingCloseReason): void {
     if (this.disposed) return;

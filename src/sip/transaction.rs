@@ -1347,8 +1347,39 @@ fn reason_text(err: &ParseError) -> &'static str {
 }
 
 /// レスポンス送信用ヘルパ。
-/// Via/From/To/Call-ID/CSeq/(timestamp) を request からコピーし、
-/// To に tag を付ける (RFC 3261 §8.2.6.2)。
+///
+/// 受信 request から応答で必須 / 推奨される ヘッダを最小限コピーする。
+///
+/// # コピー対象
+///
+/// - **Via / From / To / Call-ID / CSeq** (RFC 3261 §8.2.6.2):
+///   UAS が応答を生成する際の **必須** copy 対象。 To には呼出側が後段で
+///   tag を付与する (本関数では付けない: ステータスコードによっては付与禁止)。
+/// - **Record-Route** (RFC 3261 §12.1.1):
+///   > The UAS then constructs the state of the dialog. ... The route set
+///   > MUST be set to the list of URIs in the Record-Route header field
+///   > from the request, taken in order and preserving all URI parameters.
+///   > ... **The 2xx response MUST contain a Record-Route header field
+///   > obtained by copying the Record-Route header field from the request
+///   > without modification.**
+///
+///   2xx 応答に限らず Record-Route を全 final/provisional 応答で echo して
+///   問題ない (UAC 側は dialog 確立時 = 2xx でのみ使う)。 ここでは全応答で
+///   一律 echo する形にして、 呼出側の漏れを防ぐ。 複数 Record-Route ヘッダ
+///   (multi-hop proxy) の **順序と多重度** を維持するため、 `get_all`
+///   経由で per-entry `add` する。
+/// - **Timestamp** (RFC 3261 §20.38):
+///   > A response to a request containing a Timestamp header field SHOULD
+///   > echo the Timestamp value without modification (in the response).
+///
+///   RTT 計測に使われる SHOULD 規定。 単一値なので `set` でコピー。
+///
+/// # 非コピー対象 (意図的)
+///
+/// - **Contact**: 応答の Contact は UAS の連絡先であり request からコピーしない
+///   (RFC 3261 §8.2.6.2 / §20.10)。 呼出側が `set` する。
+/// - **Route**: request 側のヘッダで応答では使わない (§16.4 と §12.2.1.1)。
+/// - **Max-Forwards / Allow / Supported 等**: 応答固有の値を呼出側で組み立てる。
 pub fn build_response_skeleton(request: &SipRequest, status: u16, reason: &str) -> SipResponse {
     let mut headers = SipHeaders::new();
     if let Some(via) = request.headers.get("via") {
@@ -1365,6 +1396,21 @@ pub fn build_response_skeleton(request: &SipRequest, status: u16, reason: &str) 
     }
     if let Some(cseq) = request.headers.get("cseq") {
         headers.set("CSeq", cseq);
+    }
+    // RFC 3261 §12.1.1: UAS は 2xx 応答に Record-Route を **そのまま** echo する。
+    // multi-proxy 経路では Record-Route が複数値で乗ってくるため、 順序と
+    // 多重度を保ったまま `add` で per-entry コピーする。 `get_all` は
+    // 受信順に Vec を返す (`SipHeaders::fields` の挿入順)。
+    // 結果として UAC 側 dialog で route set (RFC 3261 §12.1.2 で逆順を取る)
+    // が正しく構築でき、 in-dialog request (BYE / Re-INVITE / UPDATE) が
+    // loose routing で経路解決できる。
+    for rr in request.headers.get_all("record-route") {
+        headers.add("Record-Route", rr);
+    }
+    // RFC 3261 §20.38: Timestamp は応答で SHOULD echo (RTT 計測用途)。
+    // 単一値ヘッダ。 値そのまま (delay の追加は呼出側の責任)。
+    if let Some(ts) = request.headers.get("timestamp") {
+        headers.set("Timestamp", ts);
     }
     SipResponse {
         status_code: status,
@@ -1469,6 +1515,95 @@ mod tests {
         );
         assert_eq!(resp.headers.get("call-id").unwrap(), "callid@host");
         assert_eq!(resp.headers.get("cseq").unwrap(), "1 REGISTER");
+    }
+
+    /// RFC 3261 §12.1.1: UAS が組み立てる 2xx 応答は、 受信 INVITE の
+    /// Record-Route を **そのまま、 順序と多重度を保って** echo しなければ
+    /// ならない。 これが欠落すると UAC 側 dialog の route set が空になり、
+    /// in-dialog BYE / Re-INVITE が loose routing 経路を辿れず、 proxy
+    /// 多段経路で宛先解決に失敗する。
+    #[test]
+    fn rfc3261_12_1_1_response_skeleton_echoes_record_route_in_order() {
+        let mut req = make_invite_request("z9hG4bKrr");
+        // multi-hop proxy 想定: edge → core の 2 段で Record-Route が積まれる。
+        // 受信順 = 上流に近い側から、 という SIP の Record-Route 規約に従う
+        // (RFC 3261 §16.6 step 4)。
+        req.headers.add("Record-Route", "<sip:edge.example.net;lr>");
+        req.headers.add("Record-Route", "<sip:core.example.net;lr>");
+        let resp = build_response_skeleton(&req, 200, "OK");
+
+        let rrs = resp.headers.get_all("record-route");
+        assert_eq!(
+            rrs,
+            vec!["<sip:edge.example.net;lr>", "<sip:core.example.net;lr>"],
+            "Record-Route は受信順を保ったまま全件 echo されるべき"
+        );
+    }
+
+    /// RFC 3261 §12.1.1: Record-Route が request に **無い** 場合は、
+    /// 応答にも追加してはならない (空 echo)。 NGN 直収のように proxy が 1 段
+    /// しか挟まらない構成では、 内線 → sabiden (UAS) レッグで Record-Route
+    /// が乗らない通常運用のケース。
+    #[test]
+    fn rfc3261_12_1_1_response_skeleton_no_record_route_when_absent() {
+        let req = make_invite_request("z9hG4bKnorr");
+        let resp = build_response_skeleton(&req, 200, "OK");
+        assert!(
+            resp.headers.get_all("record-route").is_empty(),
+            "request に Record-Route が無いなら応答にも入れない"
+        );
+    }
+
+    /// RFC 3261 §20.38: Timestamp ヘッダが request に乗っているなら、
+    /// 応答は SHOULD でそれを **そのまま** echo する (RTT 計測用途)。
+    #[test]
+    fn rfc3261_20_38_response_skeleton_echoes_timestamp() {
+        let mut req = make_invite_request("z9hG4bKts");
+        req.headers.set("Timestamp", "54.3");
+        let resp = build_response_skeleton(&req, 200, "OK");
+        assert_eq!(
+            resp.headers.get("timestamp"),
+            Some("54.3"),
+            "Timestamp は値そのままに echo する"
+        );
+    }
+
+    /// RFC 3261 §20.38: request に Timestamp が無いなら応答にも入れない。
+    #[test]
+    fn rfc3261_20_38_response_skeleton_no_timestamp_when_absent() {
+        let req = make_invite_request("z9hG4bKnots");
+        let resp = build_response_skeleton(&req, 200, "OK");
+        assert!(
+            resp.headers.get("timestamp").is_none(),
+            "request に Timestamp が無いなら応答にも入れない"
+        );
+    }
+
+    /// RFC 3261 §12.1.1 / §20.38: Record-Route と Timestamp は INVITE
+    /// 以外の request (例: BYE / Re-INVITE) でも同様に echo されるべき。
+    /// in-dialog BYE は UAC 側 route set 由来で Record-Route を改めて
+    /// 載せないのが普通だが、 proxy が再度 Record-Route を載せて UAS 側で
+    /// route set を更新する RFC 5658 拡張ケースに備える。
+    #[test]
+    fn rfc3261_12_1_1_response_skeleton_echoes_record_route_for_non_invite() {
+        let mut req = SipRequest::new(SipMethod::Bye, "sip:bob@ntt-east.ne.jp");
+        req.headers
+            .set("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKbye");
+        req.headers
+            .set("From", "<sip:0312345678@ntt-east.ne.jp>;tag=alice");
+        req.headers.set("To", "<sip:bob@ntt-east.ne.jp>;tag=bob");
+        req.headers.set("Call-ID", "callid@host");
+        req.headers.set("CSeq", "2 BYE");
+        req.headers
+            .add("Record-Route", "<sip:proxy.example.net;lr>");
+        req.headers.set("Timestamp", "100.5");
+
+        let resp = build_response_skeleton(&req, 200, "OK");
+        assert_eq!(
+            resp.headers.get_all("record-route"),
+            vec!["<sip:proxy.example.net;lr>"]
+        );
+        assert_eq!(resp.headers.get("timestamp"), Some("100.5"));
     }
 
     /// Timer B (64*T1 = 32s) 相当のタイムアウト確認 (INVITE)。

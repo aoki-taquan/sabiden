@@ -17,8 +17,14 @@ use std::fmt;
 /// SIP method (RFC 3261 §7.1 + 拡張)。
 ///
 /// RFC 3261 で定義される基本メソッドに加え、よく使われる拡張メソッド
-/// (PUBLISH/NOTIFY/SUBSCRIBE/PRACK) は専用バリアントを持ち、未知の
-/// メソッドは [`SipMethod::Other`] にフォールバックする。
+/// (PUBLISH/NOTIFY/SUBSCRIBE/PRACK/UPDATE/MESSAGE/REFER) は専用バリアントを持ち、
+/// 未知のメソッドは [`SipMethod::Other`] にフォールバックする。
+///
+/// 個別 variant 化の動機 (Issue #110): 上位ルータが
+/// `Other(String)` を一律 405 で拒否すると、 IMS 経由の NOTIFY (reg-event) や
+/// MESSAGE (SMS) が UA 側の再送ストームを引き起こす。 RFC ごとに
+/// 適切な default 応答 (NOTIFY → 481、 MESSAGE → 200 OK 等) を返せるよう
+/// パース側で区別しておく。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SipMethod {
     Register,
@@ -27,6 +33,7 @@ pub enum SipMethod {
     Bye,
     Cancel,
     Options,
+    /// RFC 6086 (旧 RFC 2976)
     Info,
     /// RFC 3265
     Notify,
@@ -36,6 +43,12 @@ pub enum SipMethod {
     Prack,
     /// RFC 3903 (Event State Publication)
     Publish,
+    /// RFC 3311 (UPDATE Method)
+    Update,
+    /// RFC 3428 (Instant Messaging)
+    Message,
+    /// RFC 3515 (Refer Method)
+    Refer,
     /// 未知のメソッド名 (パース時に保持しておくが、ルータは 405 等で返す想定)。
     Other(String),
 }
@@ -55,6 +68,9 @@ impl SipMethod {
             SipMethod::Subscribe => "SUBSCRIBE",
             SipMethod::Prack => "PRACK",
             SipMethod::Publish => "PUBLISH",
+            SipMethod::Update => "UPDATE",
+            SipMethod::Message => "MESSAGE",
+            SipMethod::Refer => "REFER",
             SipMethod::Other(s) => s.as_str(),
         }
     }
@@ -86,6 +102,9 @@ impl std::str::FromStr for SipMethod {
             "SUBSCRIBE" => SipMethod::Subscribe,
             "PRACK" => SipMethod::Prack,
             "PUBLISH" => SipMethod::Publish,
+            "UPDATE" => SipMethod::Update,
+            "MESSAGE" => SipMethod::Message,
+            "REFER" => SipMethod::Refer,
             other => SipMethod::Other(other.to_string()),
         })
     }
@@ -845,11 +864,12 @@ mod tests {
 
     #[test]
     fn test_method_other_for_unknown() {
-        // RFC 3428 (MESSAGE) など未対応メソッドは Other に入る
-        let m: SipMethod = "MESSAGE".parse().unwrap();
-        assert_eq!(m, SipMethod::Other("MESSAGE".to_string()));
-        assert_eq!(m.as_str(), "MESSAGE");
-        assert_eq!(format!("{}", m), "MESSAGE");
+        // 既知の RFC 拡張 (REFER/MESSAGE/UPDATE/NOTIFY 等) は Issue #110 で
+        // 専用バリアント化済み。 真に未知のメソッドのみ `Other` に入る。
+        let m: SipMethod = "FOOBAR".parse().unwrap();
+        assert_eq!(m, SipMethod::Other("FOOBAR".to_string()));
+        assert_eq!(m.as_str(), "FOOBAR");
+        assert_eq!(format!("{}", m), "FOOBAR");
     }
 
     #[test]
@@ -859,6 +879,24 @@ mod tests {
         let pub_: SipMethod = "PUBLISH".parse().unwrap();
         assert_eq!(p, SipMethod::Prack);
         assert_eq!(pub_, SipMethod::Publish);
+    }
+
+    /// Issue #110 / RFC 3311 / RFC 3428 / RFC 3515: UPDATE / MESSAGE / REFER は
+    /// 上位ルータが個別 default 応答 (UPDATE → 481、 MESSAGE → 200 OK、
+    /// REFER → 405 等) を返せるよう専用バリアントを持つ。
+    /// `Other(String)` に落ちると一律 405 になり IMS 経由の MESSAGE 再送
+    /// ストーム等を引き起こすため、 パース時に区別しておく。
+    #[test]
+    fn rfc3311_3428_3515_method_update_message_refer_have_explicit_variants() {
+        let u: SipMethod = "UPDATE".parse().unwrap();
+        let msg: SipMethod = "MESSAGE".parse().unwrap();
+        let r: SipMethod = "REFER".parse().unwrap();
+        assert_eq!(u, SipMethod::Update);
+        assert_eq!(msg, SipMethod::Message);
+        assert_eq!(r, SipMethod::Refer);
+        assert_eq!(u.as_str(), "UPDATE");
+        assert_eq!(msg.as_str(), "MESSAGE");
+        assert_eq!(r.as_str(), "REFER");
     }
 
     #[test]

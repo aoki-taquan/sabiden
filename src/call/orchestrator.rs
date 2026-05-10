@@ -72,6 +72,19 @@ use crate::webrtc::signaling::{
     WsSink,
 };
 
+/// RFC 3261 §8.2.1 / §20.5: 405 / 489 / 481 等の拒否応答に必ず添える
+/// `Allow` ヘッダ値。 sabiden の NGN UAS が **実際に処理経路を持つ** method 列。
+///
+/// - `INVITE` / `ACK` / `BYE` / `CANCEL`: 通話の基本 (RFC 3261)
+/// - `OPTIONS`: keep-alive / capabilities probe (RFC 3261 §11)
+///
+/// `UPDATE` / `INFO` / `MESSAGE` / `NOTIFY` / `SUBSCRIBE` / `PRACK` /
+/// `PUBLISH` / `REFER` は意図的に列挙から除外。 これらは per-method
+/// handler が 481 / 489 / 405 等で拒否する (Issue #110): Allow に
+/// 載せるのは「実装が実用的に処理する」method に限る (RFC 3261 §20.5
+/// 「a list of methods that the UA implementing this header supports」)。
+const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
+
 /// NGN 着信処理の動作パラメータ。
 #[derive(Debug, Clone)]
 pub struct NgnInboundConfig {
@@ -396,22 +409,158 @@ impl NgnInboundHandler {
             }
             SipMethod::Options => {
                 let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
-                tx.respond(build_response_skeleton(tx.request(), 200, "OK"))
-                    .await?;
+                let mut resp = build_response_skeleton(tx.request(), 200, "OK");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
                 Ok(())
             }
-            ref other => {
-                warn!(?other, "NGN 側で未対応メソッド → 405");
+            // RFC 3265 §3.2: UAS が `NOTIFY` を受け、 該当する subscription
+            // が無い場合は 481 (Subscription Does Not Exist) を返すべき。
+            // sabiden は B2BUA であり SUBSCRIBE 受信機能 (presence / reg-event 等)
+            // を持たないため、 NGN→sabiden の NOTIFY は常に「subscription なし」
+            // 扱いで 481 を返す。 これにより IMS の reg-event NOTIFY が
+            // 405 で拒否されて REGISTER binding 期限が短縮される問題
+            // (Issue #110) を回避する。
+            SipMethod::Notify => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 NOTIFY: 該当 subscription なし → 481 (RFC 3265 §3.2)"
+                );
                 let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
-                tx.respond(build_response_skeleton(
-                    tx.request(),
-                    405,
-                    "Method Not Allowed",
-                ))
-                .await?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Subscription Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
                 Ok(())
+            }
+            // RFC 3265 §7.2.4 / §3.1.4: 未対応 event package に対する
+            // SUBSCRIBE には 489 (Bad Event) を返し、 `Allow-Events` ヘッダで
+            // サポート済 package を列挙する (sabiden は何も提供しないので空)。
+            SipMethod::Subscribe => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 SUBSCRIBE: 未対応 event package → 489 (RFC 3265 §7.2.4)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp = build_response_skeleton(tx.request(), 489, "Bad Event");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 3262 §4: PRACK は UAS が `Require: 100rel` 付きの 1xx を
+            // 出した場合のみ正規に届く。 sabiden は 100rel を発行しないので、
+            // PRACK 受信は対応する PRACK-able 状態が無い = 481 で返す
+            // (RFC 3262 §4 / §7.1: 該当 transaction なし扱い)。
+            SipMethod::Prack => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 PRACK: 100rel 未送信 → 481 (RFC 3262 §4)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 3903 §6: PUBLISH も event package ベース。 sabiden は
+            // event state 受信機能を持たないので 489 (Bad Event) で返す。
+            SipMethod::Publish => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 PUBLISH: 未対応 event package → 489 (RFC 3903 §11.1)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp = build_response_skeleton(tx.request(), 489, "Bad Event");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 3311 §5.2: UPDATE はダイアログ前 (early) / 確立後どちらでも
+            // 来うる。 NgnInboundHandler は INVITE/BYE の Call-ID 管理のみ持ち、
+            // ダイアログ状態を直接保持しないため、 UPDATE は対応するダイアログ
+            // 不在として 481 を返す (RFC 3261 §12.2.2)。 上位 B2BUA で
+            // 動的 SDP 更新が必要になった段階で per-dialog ハンドラを生やす。
+            SipMethod::Update => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 UPDATE: 対応ダイアログ無し → 481 (RFC 3311 §5.2)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 6086 §3 / §4: NgnInboundHandler は INFO の上位ルーティング
+            // (DTMF 等) を持たないため、 NGN 側からの中間 INFO は対応ダイアログ
+            // 不在扱いで 481 を返す (内線側 INFO は `UasEvent::Info` 経由で
+            // CallManager にルートされる; orchestrator.rs:1798 `handle_ext_info`)。
+            SipMethod::Info => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 INFO: 該当ダイアログ無し → 481 (RFC 6086 §4)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 3428 §7: UAS が MESSAGE をサポートしないと判断した場合でも、
+            // 200 OK で受け流すのが推奨される (UA が再送し続けるのを止める)。
+            // sabiden は MESSAGE の dispatch 経路を持たないが、 NGN 側で
+            // IMS 由来の即時メッセージが来た場合に再送ストームを避けるため
+            // 200 OK で素直に応答する (本文は破棄)。
+            SipMethod::Message => {
+                debug!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 MESSAGE: 200 OK で受け流し (RFC 3428 §7、 本文は破棄)"
+                );
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp = build_response_skeleton(tx.request(), 200, "OK");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                Ok(())
+            }
+            // RFC 3515 §2.4.6: REFER は転送 (call transfer) を要求する。
+            // sabiden は B2BUA で REFER 受信処理 (NOTIFY refer event 発行 +
+            // 新 INVITE) を実装していないため、 RFC 3261 §8.2.1 に従い
+            // 405 + Allow ヘッダで明示的に拒否する。
+            SipMethod::Refer => {
+                warn!(
+                    call_id = ?request.headers.get("call-id"),
+                    "NGN 側 REFER: 転送未対応 → 405 + Allow (RFC 3261 §8.2.1)"
+                );
+                self.respond_method_not_allowed(request, remote).await
+            }
+            // RFC 3261 §8.2.1: 未知メソッドには **必ず** Allow ヘッダ付きの 405
+            // で応答する義務がある (Allow 欠落自体が RFC 違反)。
+            ref other => {
+                warn!(
+                    ?other,
+                    "NGN 側で未対応メソッド → 405 + Allow (RFC 3261 §8.2.1)"
+                );
+                self.respond_method_not_allowed(request, remote).await
             }
         }
+    }
+
+    /// RFC 3261 §8.2.1: 未対応メソッドに対する 405 Method Not Allowed の
+    /// 共通実装。 `Allow` ヘッダ列挙は MUST であり、 これを欠くと UA 側
+    /// 実装によっては再送し続ける。
+    async fn respond_method_not_allowed(
+        &self,
+        request: SipRequest,
+        remote: SocketAddr,
+    ) -> Result<()> {
+        let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+        let mut resp = build_response_skeleton(tx.request(), 405, "Method Not Allowed");
+        resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+        tx.respond(resp).await?;
+        Ok(())
     }
 
     async fn handle_invite(&self, request: SipRequest, remote: SocketAddr) -> Result<()> {
@@ -3662,6 +3811,170 @@ mod tests {
             0,
             "内線が無ければ inviter は呼ばれない"
         );
+    }
+
+    /// Issue #110 共通ハーネス: NGN→sabiden に method 指定の SIP リクエストを
+    /// 投げて、 期待するステータスコードと `Allow` ヘッダの有無を検証する。
+    ///
+    /// セットアップ: 100 Trying 等を返さない non-INVITE 経路を見るために
+    /// 登録内線 0 件で十分 (handle_invite に到達しないため)。
+    async fn assert_ngn_method_response(
+        method: SipMethod,
+        expected_status: u16,
+        expect_allow_header: bool,
+    ) {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter.clone(),
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let method_str = method.as_str().to_string();
+        let req = builders::request_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            method,
+            "sip:sabiden@127.0.0.1",
+            &format!("ngn-{}-cid", method_str.to_lowercase()),
+            &format!("z9hG4bKngn-{}", method_str.to_lowercase()),
+        );
+        let method_str = method_str.as_str();
+        ngn_sock
+            .send_to(&req.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let mut got_response = None;
+        for _ in 0..3 {
+            match tokio::time::timeout(Duration::from_secs(2), ngn_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                        // 100 Trying は INVITE 系のみ。 非 INVITE 経路には来ない想定。
+                        if r.status_code != 100 {
+                            got_response = Some(r);
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let resp = got_response.unwrap_or_else(|| {
+            panic!(
+                "{} に対する応答が NGN 側に届くべき (期待 status={})",
+                method_str, expected_status
+            )
+        });
+        assert_eq!(
+            resp.status_code, expected_status,
+            "{} には status={} を返すべき (実際: {} {})",
+            method_str, expected_status, resp.status_code, resp.reason,
+        );
+        let allow = resp.headers.get("allow");
+        if expect_allow_header {
+            let allow_val = allow.unwrap_or_else(|| {
+                panic!(
+                    "{} 応答には `Allow` ヘッダが必須 (RFC 3261 §8.2.1 / §20.5)",
+                    method_str
+                )
+            });
+            assert!(
+                allow_val.contains("INVITE") && allow_val.contains("BYE"),
+                "{} 応答の Allow に INVITE / BYE が含まれること: {}",
+                method_str,
+                allow_val
+            );
+        }
+    }
+
+    /// RFC 3265 §3.2: NGN 側から届いた NOTIFY は該当 subscription が
+    /// 無いため `481 Subscription Does Not Exist` で応答する。
+    /// IMS の reg-event NOTIFY を 405 で返すと P-CSCF が
+    /// 「reg-event を扱えない端末」と判断し binding 期限を短縮する
+    /// (Issue #110)。
+    #[tokio::test]
+    async fn rfc3265_3_2_ngn_notify_returns_481_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Notify, 481, true).await;
+    }
+
+    /// RFC 3265 §7.2.4: 未対応 event package に対する SUBSCRIBE には
+    /// `489 Bad Event` で返す。 sabiden は SUBSCRIBE 受信機能を持たない。
+    #[tokio::test]
+    async fn rfc3265_7_2_4_ngn_subscribe_returns_489_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Subscribe, 489, true).await;
+    }
+
+    /// RFC 3262 §4: PRACK は UAS が `Require: 100rel` 付き 1xx を出した
+    /// ときのみ正規に届く。 sabiden は 100rel を発行しないので、
+    /// PRACK は対応 transaction なし扱いで `481` を返す。
+    #[tokio::test]
+    async fn rfc3262_4_ngn_prack_returns_481_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Prack, 481, true).await;
+    }
+
+    /// RFC 3903 §11.1: 未対応 event package に対する PUBLISH には
+    /// `489 Bad Event` で返す。
+    #[tokio::test]
+    async fn rfc3903_11_1_ngn_publish_returns_489_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Publish, 489, true).await;
+    }
+
+    /// RFC 3311 §5.2: UPDATE はダイアログ既存判定で 200 OK / 481。
+    /// `NgnInboundHandler` はダイアログ状態を直接保持しないため、 UPDATE は
+    /// 対応ダイアログ無しとして `481` を返す。
+    #[tokio::test]
+    async fn rfc3311_5_2_ngn_update_returns_481_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Update, 481, true).await;
+    }
+
+    /// RFC 6086 §4: orchestrator が NGN 側で INFO 受信時の上位
+    /// ルーティング (DTMF 等) を持たないため、 該当ダイアログ無し扱いで
+    /// `481` を返す (内線側 INFO は `UasEvent::Info` 経由でルートされる)。
+    #[tokio::test]
+    async fn rfc6086_4_ngn_info_returns_481_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Info, 481, true).await;
+    }
+
+    /// RFC 3428 §7: UAS が MESSAGE をサポートしない場合でも `200 OK` で
+    /// 受け流し、 UA 側の再送ストームを防ぐ (CLAUDE.md §9 既知方針)。
+    #[tokio::test]
+    async fn rfc3428_7_ngn_message_returns_200_ok() {
+        assert_ngn_method_response(SipMethod::Message, 200, true).await;
+    }
+
+    /// RFC 3261 §8.2.1: REFER は転送実装が無いため `405 Method Not Allowed`
+    /// + `Allow` ヘッダで明示的に拒否する。
+    #[tokio::test]
+    async fn rfc3261_8_2_1_ngn_refer_returns_405_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Refer, 405, true).await;
+    }
+
+    /// RFC 3261 §8.2.1: 未知メソッド (`Other(_)`) には必ず `Allow` ヘッダ
+    /// 付きの `405` で応答する。 Allow 欠落自体が RFC 違反 (Issue #110)。
+    #[tokio::test]
+    async fn rfc3261_8_2_1_ngn_unknown_method_returns_405_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Other("FOO".to_string()), 405, true).await;
+    }
+
+    /// RFC 3261 §11 / §20.5: OPTIONS への 200 OK にも `Allow` を載せて
+    /// capability 広告できる (keep-alive を兼ねる)。 既存 OPTIONS 経路の
+    /// regression check を兼ねる (Issue #110 同 PR で Allow 付与した)。
+    #[tokio::test]
+    async fn rfc3261_11_ngn_options_returns_200_with_allow_header() {
+        assert_ngn_method_response(SipMethod::Options, 200, true).await;
     }
 
     /// `make_forker` は与えられた Uac を内包する forker を生成する。

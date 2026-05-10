@@ -401,6 +401,29 @@ describe("parseServerMessage", () => {
   it("rejects offer missing call_id", () => {
     expect(parseServerMessage(JSON.stringify({ type: "offer", sdp: "v=0..." }))).toBeNull();
   });
+
+  // Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) /
+  // W3C WebRTC §4.4.1.6: 空文字列の `candidate` は end-of-candidates marker。
+  // sabiden server-side (str0m_session.rs::handle_event) は host candidate 直後に
+  // empty string を流すため、 parser は **空文字列を有効な値として保持** する
+  // (skip / null 化してはならない)。 PWA 側 `addIce("")` は別途これを
+  // `pc.addIceCandidate(null)` に翻訳する。
+  it("rfc8840_4_parses_ice_with_empty_candidate_as_end_of_candidates_marker", () => {
+    expect(parseServerMessage(JSON.stringify({ type: "ice", candidate: "" }))).toEqual({
+      type: "ice",
+      candidate: "",
+    });
+  });
+
+  // RFC 8839 §4.2 / W3C: 実 candidate と end-of-candidates marker は同じ
+  // `ice` メッセージで届く。 両者が parser から識別可能であることを確認する。
+  it("rfc8839_4_2_parses_ice_with_real_candidate", () => {
+    const cand = "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host";
+    expect(parseServerMessage(JSON.stringify({ type: "ice", candidate: cand }))).toEqual({
+      type: "ice",
+      candidate: cand,
+    });
+  });
 });
 
 describe("parseExtIdFromToken", () => {

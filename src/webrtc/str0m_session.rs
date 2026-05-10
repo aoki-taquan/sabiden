@@ -571,10 +571,32 @@ async fn handle_event(
             // ブラウザに送るべきローカル候補は host_candidate 1 つ
             // (ICE-Lite なので reflexive/relay は本ノードでは生成しない)。
             // 接続が動き始めたタイミングで 1 度だけ trickle 送出する。
+            //
+            // Issue #92 / RFC 8840 §4 (Trickle ICE): host candidate を 1 件
+            // 送出した直後に、 同じく **空文字列を end-of-candidates marker** と
+            // して送出する (RFC 8839 §4.2 / W3C WebRTC §4.4.1.6: end-of-candidates
+            // は null candidate / empty string で表す)。 ICE-Lite (RFC 8445 §2.4)
+            // は STUN/TURN による reflexive / relay 候補を生成しないため、
+            // host 1 件で全候補列挙が完了したことを ICE state Checking 遷移と
+            // 同時刻に確定できる。
+            //
+            // 効果: ブラウザは end-of-candidates 受信後 RFC 8838 §10 の
+            // consent freshness / RFC 8845 §3.4 の ICE failure timer を即時に
+            // 起動できる。 これがないとブラウザは「まだ候補が来るかもしれない」
+            // と推測待ちし、 ICE failed 検知が iceTransportPolicy の既定
+            // (chromium で 30 秒程度) まで遅延する (Issue #92 の根本要因)。
             if !*sent_local_cand {
                 let line = host_candidate.to_sdp_string();
                 if let Err(e) = local_cand_tx.try_send(line) {
                     debug!(error = %e, "str0m: local candidate 送出に失敗 (受信側未接続)");
+                }
+                // RFC 8840 §4: end-of-candidates marker は空文字列で表す
+                // (sabiden の signaling 層 / PWA は両方向で empty/`end-of-candidates`
+                // を end-of-candidates として既に解釈している、 signaling.rs:1075)。
+                // try_send 失敗 (受信側未接続 / 満杯) は ICE failed 検知の早期化が
+                // 効かないだけで通話自体には影響しない (退行ではないので debug ログ)。
+                if let Err(e) = local_cand_tx.try_send(String::new()) {
+                    debug!(error = %e, "str0m: end-of-candidates marker 送出に失敗 (受信側未接続)");
                 }
                 *sent_local_cand = true;
             }
@@ -842,6 +864,64 @@ mod tests {
             line
         );
         assert!(line.contains("typ host"), "host candidate でない: {}", line);
+        let _ = session.close().await;
+    }
+
+    /// Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) /
+    /// W3C WebRTC §4.4.1.6 (`addIceCandidate(null)` / empty candidate):
+    /// host candidate を 1 件送出した直後に、 同じく empty 文字列を
+    /// end-of-candidates marker として送出する。
+    ///
+    /// ICE-Lite (RFC 8445 §2.4) は STUN/TURN 反射 / 中継候補を生成しないため、
+    /// host 1 件で候補列挙が確定する。 この設計を遵守し、 ブラウザ側 ICE
+    /// failure timer が即時起動できるよう、 sabiden run_loop は host 直後に
+    /// empty marker を流す。
+    #[tokio::test]
+    async fn rfc8840_4_str0m_session_emits_end_of_candidates_after_host() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (45500, 45599),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.expect("session 起動");
+
+        // ICE state 遷移を駆動するため offer を投入する (Event::IceConnectionStateChange
+        // が host candidate / end-of-candidates 送出の trigger 経路)。
+        let offer = include_str!("testdata/firefox_offer.sdp");
+        let _answer = session.handle_offer(offer).await.expect("answer 生成");
+
+        let mut rx = session
+            .take_local_candidates()
+            .await
+            .expect("local candidate receiver 取得");
+
+        // 1 件目: 実 host candidate
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("host candidate を 2 秒以内に受信")
+            .expect("送信側が close せずに 1 件流す");
+        assert!(
+            first.contains("typ host"),
+            "1 件目は host candidate であるべき: {:?}",
+            first
+        );
+        assert!(
+            !first.is_empty(),
+            "host candidate 行は非空であるべき: {:?}",
+            first
+        );
+
+        // 2 件目: RFC 8840 §4 end-of-candidates marker (= 空文字列)
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("end-of-candidates marker を 2 秒以内に受信")
+            .expect("送信側が close せずに 2 件目を流す");
+        assert_eq!(
+            second, "",
+            "2 件目は end-of-candidates marker (空文字列) であるべき: {:?}",
+            second
+        );
+
         let _ = session.close().await;
     }
 

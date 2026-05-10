@@ -1,5 +1,5 @@
 import { createSignal, Match, onMount, Switch, type Component } from "solid-js";
-import { Login } from "./components/Login";
+import { Login, type LoginReason } from "./components/Login";
 import { Dialer } from "./components/Dialer";
 import { CallScreen } from "./components/CallScreen";
 import {
@@ -17,8 +17,14 @@ import {
   saveSignalUrl,
 } from "./lib/storage";
 
+/**
+ * View 状態 (Issue #142): `login` は再ログイン理由 `reason` を optional で
+ * 持てる discriminated union。 `auth`/`exhausted` 時に SignalingClient
+ * `onClosedReason` で受け取った値をそのまま流す
+ * (`./components/Login::LoginReason` を参照)。
+ */
 type View =
-  | { kind: "login" }
+  | { kind: "login"; reason?: LoginReason }
   | { kind: "dialer" }
   | {
       kind: "call";
@@ -207,7 +213,8 @@ export const App: Component = () => {
             signaling = null;
             teardownCall();
             clearToken();
-            setView({ kind: "login" });
+            // Issue #142: Login コンポーネントに理由を伝えて画面に表示する。
+            setView({ kind: "login", reason: "auth" });
             break;
           case "exhausted":
             setStatus("接続不可 (再ログインしてください)");
@@ -217,7 +224,8 @@ export const App: Component = () => {
             // 後にユーザが明示的にログインし直す方が安全 (古い token で
             // 即再接続して 401 ループを再発させるリスク回避)。
             clearToken();
-            setView({ kind: "login" });
+            // Issue #142: Login コンポーネントに理由を伝えて画面に表示する。
+            setView({ kind: "login", reason: "exhausted" });
             break;
         }
         setStatusOk(false);
@@ -360,7 +368,10 @@ export const App: Component = () => {
   return (
     <Switch>
       <Match when={view().kind === "login"}>
-        <Login onSubmit={handleLogin} />
+        {(() => {
+          const v = view() as Extract<View, { kind: "login" }>;
+          return <Login onSubmit={handleLogin} reason={v.reason} />;
+        })()}
       </Match>
       <Match when={view().kind === "dialer"}>
         <Dialer

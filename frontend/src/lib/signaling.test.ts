@@ -929,3 +929,49 @@ describe("onClosedReason API contract (Issue #142)", () => {
     expect(total).toBeLessThan(maxDelayMs * maxAttempts);
   });
 });
+
+describe("ClientMessage decline schema (Issue #107)", () => {
+  // Issue #107: PWA「拒否」ボタンが `{type:"decline", call_id}` を送って
+  // sabiden 側 fork レッグを 603 Decline (RFC 3261 §21.6.2) で集約させる。
+  // wire format は sabiden の `src/webrtc/signaling.rs::ClientMessage::Decline`
+  // と完全一致する必要がある (snake_case `call_id`, lowercase `type`)。
+
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  it("send {type:'decline', call_id} serialises with call_id field", () => {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      { onMessage: vi.fn() },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    void client.connect();
+    sockets[0].fireOpen();
+    client.send({ type: "decline", call_id: "ngn-call-xyz" });
+
+    expect(sockets[0].sent.length).toBe(1);
+    const obj = JSON.parse(sockets[0].sent[0]);
+    expect(obj).toEqual({ type: "decline", call_id: "ngn-call-xyz" });
+  });
+
+  it("decline wire format matches sabiden ClientMessage::Decline (snake_case call_id)", () => {
+    // 直接 JSON.stringify を確認する (SignalingClient 経由ではない unit test):
+    // - `type: "decline"` (lowercase, serde rename_all = "lowercase")
+    // - `call_id` (snake_case, serde default for struct fields)
+    const msg = { type: "decline", call_id: "abc-123" } as const;
+    expect(JSON.stringify(msg)).toBe('{"type":"decline","call_id":"abc-123"}');
+  });
+});

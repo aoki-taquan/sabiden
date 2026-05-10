@@ -351,14 +351,36 @@ export const App: Component = () => {
   };
 
   /**
-   * 着信を応答前に拒否する。
+   * 着信を応答前に拒否する (Issue #107)。
    *
-   * `bye` は WS セッション (= 内線登録) ごと閉じる意味なので、
-   * ringing 中に押されても送らない。ローカル UI をクリアするのみで、
-   * サーバ側は browser 応答が来ないことを CANCEL タイムアウトで検出する。
-   * (将来サーバが `reject` C→S に対応したらここで送信を追加する)
+   * `bye` は WS セッション (= 内線登録) ごと閉じる別物なので押さない。
+   * 個別の進行中着信のみ `decline{call_id}` で sabiden に通知する (RFC 3261
+   * §21.6.2 603 Decline 相当)。 sabiden は対応する fork レッグを
+   * `LegResult::Failed { status: 603 }` に倒し、 他フォーク先 (SIP 内線端末)
+   * が居なければ NGN へ 603 Decline を即時返す。
+   *
+   * 旧挙動 (Issue #107 修正前) はここで何も送らず、 サーバ側は browser
+   * 応答が来ないことを fork timeout (30 秒程度) で検出していた。 これにより
+   * 「拒否したのに NGN 側で 30 秒鳴り続ける」 という UX 不具合が起きていた。
+   *
+   * call_id が無い (= NGN 着信ではない / pendingOfferSdp なし) ケースでは
+   * 何も送らない。 ローカル UI のクリーンアップだけ行う。
+   *
+   * 送信失敗 (WS 切断中) は silent ignore: サーバ側の `cancel_all` (WS 切断
+   * ハンドラ、 Issue #117) が waiter を起こすので、 fork は遅延なく Errored
+   * で抜ける。 UI は teardownCall + setView で確実に閉じる。
    */
   const rejectIncoming = () => {
+    const v = view();
+    if (v.kind === "call" && v.incoming && v.callId && signaling) {
+      try {
+        signaling.send({ type: "decline", call_id: v.callId });
+      } catch (e) {
+        // WS 切断中等は送れないが、 サーバ側 `cancel_all` で代替されるので
+        // UI を閉じる方を優先する (silent warn のみ)。
+        console.warn("rejectIncoming: decline send failed (WS closed?)", e);
+      }
+    }
     teardownCall();
     setView({ kind: "dialer" });
   };

@@ -550,6 +550,12 @@ pub struct WebRtcAudioConfig {
     /// SDP `a=rtpmap:<pt> opus/48000[/<ch>]` で negotiate した PT。
     /// 不明なら [`DEFAULT_OPUS_PT`]。
     pub opus_payload_type: u8,
+    /// PCMU 直送モード (両側 PCMU 構成、 transcode 不要)。
+    /// sabiden の str0m は `enable_pcmu` 1 codec 構成 (`webrtc/str0m_session.rs:190`)
+    /// なので NGN(μ-law)↔PWA(μ-law) を素通しできる。 true の場合 Opus 経路を
+    /// 完全に bypass し、 NGN 受信 RTP の payload をそのまま `MediaFrame { pt:0 }`
+    /// として peer に流す (RFC 3551 §4.5.14: PCMU PT 0、 8kHz)。
+    pub direct_pcmu_passthrough: bool,
     /// 観測カウンタ。
     pub metrics: Option<Arc<Metrics>>,
 }
@@ -563,6 +569,7 @@ impl WebRtcAudioBridge {
             peer,
             peer_media_rx,
             opus_payload_type,
+            direct_pcmu_passthrough,
             metrics,
         } = cfg;
 
@@ -576,22 +583,26 @@ impl WebRtcAudioBridge {
         let state = Arc::new(BridgeState::default());
 
         // NGN → peer: μ-law → 8k PCM → 48k PCM → Opus → peer.send_media
+        // (direct_pcmu_passthrough = true なら μ-law をそのまま PT 0 で peer へ素通し)
         let ngn_to_peer = tokio::spawn(ngn_to_peer_loop(
             ngn_socket.clone(),
             ngn_state.clone(),
             peer.clone(),
             state.clone(),
             opus_payload_type,
+            direct_pcmu_passthrough,
             metrics.clone(),
         ));
 
         // peer → NGN: peer.take_media_rx (Opus) → 48k PCM → 8k PCM → μ-law → NGN UDP
+        // (direct_pcmu_passthrough = true なら受信した PT 0 PCMU をそのまま μ-law として NGN へ)
         let peer_to_ngn = tokio::spawn(peer_to_ngn_loop(
             peer_media_rx,
             ngn_socket.clone(),
             ngn_state.clone(),
             state.clone(),
             opus_payload_type,
+            direct_pcmu_passthrough,
             metrics,
         ));
 
@@ -656,28 +667,38 @@ async fn ngn_to_peer_loop(
     peer: Arc<dyn PeerSession>,
     state: Arc<BridgeState>,
     opus_pt: u8,
+    direct_pcmu_passthrough: bool,
     metrics: Option<Arc<Metrics>>,
 ) {
     use std::sync::atomic::Ordering;
     let span = tracing::trace_span!("transcode_ngn_to_peer");
     let _enter = span.enter();
 
-    let mut upsampler = match UpsamplerNbToWb::new() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error=%e, "Upsampler 初期化失敗 → NGN→peer 方向停止");
-            return;
-        }
-    };
-    let mut encoder = match OpusEncoder::new() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error=%e, "Opus エンコーダ初期化失敗 → NGN→peer 方向停止");
-            return;
-        }
+    debug!(direct_pcmu_passthrough, "ngn_to_peer_loop START");
+
+    // 直送モード時は upsampler / encoder を初期化しない (使わない)。
+    let mut upsampler_enc: Option<(UpsamplerNbToWb, OpusEncoder)> = if direct_pcmu_passthrough {
+        None
+    } else {
+        let up = match UpsamplerNbToWb::new() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error=%e, "Upsampler 初期化失敗 → NGN→peer 方向停止");
+                return;
+            }
+        };
+        let enc = match OpusEncoder::new() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error=%e, "Opus エンコーダ初期化失敗 → NGN→peer 方向停止");
+                return;
+            }
+        };
+        Some((up, enc))
     };
 
-    // RTP timestamp は 48 kHz 単位の単調増加 (RFC 7587 §4.1)。
+    // RTP timestamp 単調増加 (RFC 7587 §4.1: Opus は 48kHz、 RFC 3551 §4.5.14:
+    // PCMU は 8kHz)。 直送モードでは frame ごとに 160 サンプル進める。
     let mut rtp_ts: u32 = rand::random();
 
     let mut buf = vec![0u8; 1500];
@@ -716,35 +737,52 @@ async fn ngn_to_peer_loop(
             continue;
         }
 
-        let pcm8: Vec<i16> = pkt.payload.iter().map(|b| decode_ulaw(*b)).collect();
-        let nb = AudioFrame::new(NARROW_BAND_RATE, pcm8);
-        let wb = match upsampler.process(&nb) {
-            Ok(v) => v,
-            Err(e) => {
-                trace!(error=%e, "アップサンプル失敗");
-                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+        let frame = if direct_pcmu_passthrough {
+            // PCMU 直送: μ-law payload をそのまま PT 0 で peer に渡す。
+            // RTP timestamp は 8kHz 単位 (RFC 3551 §4.5.14: PCMU clock=8000)、
+            // 1 frame = SAMPLES_PER_FRAME (= 160) 進める。
+            let f = MediaFrame {
+                pt: PAYLOAD_TYPE_ULAW,
+                rtp_time: rtp_ts,
+                payload: pkt.payload.clone(),
+                network_time: std::time::Instant::now(),
+            };
+            rtp_ts = rtp_ts.wrapping_add(SAMPLES_PER_FRAME as u32);
+            f
+        } else {
+            let (upsampler, encoder) = upsampler_enc
+                .as_mut()
+                .expect("upsampler_enc must be Some when not in direct mode");
+            let pcm8: Vec<i16> = pkt.payload.iter().map(|b| decode_ulaw(*b)).collect();
+            let nb = AudioFrame::new(NARROW_BAND_RATE, pcm8);
+            let wb = match upsampler.process(&nb) {
+                Ok(v) => v,
+                Err(e) => {
+                    trace!(error=%e, "アップサンプル失敗");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let opus_payload = match encoder.encode(&wb) {
+                Ok(v) => v,
+                Err(e) => {
+                    trace!(error=%e, "Opus エンコード失敗");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let f = MediaFrame {
+                pt: opus_pt,
+                rtp_time: rtp_ts,
+                payload: opus_payload,
+                network_time: std::time::Instant::now(),
+            };
+            rtp_ts = rtp_ts.wrapping_add(OPUS_FRAME_SAMPLES as u32);
+            f
         };
-        let opus_payload = match encoder.encode(&wb) {
-            Ok(v) => v,
-            Err(e) => {
-                trace!(error=%e, "Opus エンコード失敗");
-                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        let frame = MediaFrame {
-            pt: opus_pt,
-            rtp_time: rtp_ts,
-            payload: opus_payload,
-            network_time: std::time::Instant::now(),
-        };
-        rtp_ts = rtp_ts.wrapping_add(OPUS_FRAME_SAMPLES as u32);
 
         if let Err(e) = peer.send_media(frame).await {
-            trace!(error=%e, "peer.send_media 失敗 → NGN→peer 方向終了");
+            debug!(error=%e, "peer.send_media 失敗 → NGN→peer 方向終了");
             return;
         }
         state.ngn_to_web_packets.fetch_add(1, Ordering::Relaxed);
@@ -764,70 +802,91 @@ async fn peer_to_ngn_loop(
     to_state: Arc<LegState>,
     state: Arc<BridgeState>,
     opus_pt: u8,
+    direct_pcmu_passthrough: bool,
     metrics: Option<Arc<Metrics>>,
 ) {
     use std::sync::atomic::Ordering;
     let span = tracing::trace_span!("transcode_peer_to_ngn");
     let _enter = span.enter();
 
-    let mut downsampler = match DownsamplerWbToNb::new() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error=%e, "Downsampler 初期化失敗 → peer→NGN 方向停止");
-            return;
-        }
-    };
-    let mut decoder = match OpusDecoder::new() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error=%e, "Opus デコーダ初期化失敗 → peer→NGN 方向停止");
-            return;
-        }
+    debug!(direct_pcmu_passthrough, "peer_to_ngn_loop START");
+
+    // 直送モードでは decoder / downsampler は使わない。
+    let mut down_dec: Option<(DownsamplerWbToNb, OpusDecoder)> = if direct_pcmu_passthrough {
+        None
+    } else {
+        let down = match DownsamplerWbToNb::new() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error=%e, "Downsampler 初期化失敗 → peer→NGN 方向停止");
+                return;
+            }
+        };
+        let dec = match OpusDecoder::new() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error=%e, "Opus デコーダ初期化失敗 → peer→NGN 方向停止");
+                return;
+            }
+        };
+        Some((down, dec))
     };
 
     let ssrc: u32 = rand::random();
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
+    let expected_pt = if direct_pcmu_passthrough {
+        PAYLOAD_TYPE_ULAW
+    } else {
+        opus_pt
+    };
 
     while let Some(frame) = peer_media_rx.recv().await {
-        if frame.pt != opus_pt {
-            // 同じ peer 上の異 codec (DTMF telephone-event 等) は本実装の
-            // スコープ外 (PCMU only NGN レッグへ流せない)。
+        if frame.pt != expected_pt {
             trace!(
                 pt = frame.pt,
-                expected = opus_pt,
+                expected = expected_pt,
                 "peer 側 PT 不一致 → drop"
             );
             state.transcode_errors.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let wb = match decoder.decode(&frame.payload) {
-            Ok(v) => v,
-            Err(e) => {
-                trace!(error=%e, "Opus デコード失敗");
+
+        let ulaw: Vec<u8> = if direct_pcmu_passthrough {
+            // PCMU 直送: peer からの μ-law payload をそのまま NGN へ。
+            frame.payload.clone()
+        } else {
+            let (downsampler, decoder) = down_dec
+                .as_mut()
+                .expect("down_dec must be Some when not in direct mode");
+            let wb = match decoder.decode(&frame.payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    trace!(error=%e, "Opus デコード失敗");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            if wb.samples.len() != WB_FRAME_SAMPLES {
+                trace!(samples = wb.samples.len(), "WebRTC フレーム長異常 → drop");
                 state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-        };
-        if wb.samples.len() != WB_FRAME_SAMPLES {
-            trace!(samples = wb.samples.len(), "WebRTC フレーム長異常 → drop");
-            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        let nb = match downsampler.process(&wb) {
-            Ok(v) => v,
-            Err(e) => {
-                trace!(error=%e, "ダウンサンプル失敗");
+            let nb = match downsampler.process(&wb) {
+                Ok(v) => v,
+                Err(e) => {
+                    trace!(error=%e, "ダウンサンプル失敗");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            if nb.samples.len() != NB_FRAME_SAMPLES {
+                trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
                 state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            nb.samples.iter().map(|s| encode_ulaw(*s)).collect()
         };
-        if nb.samples.len() != NB_FRAME_SAMPLES {
-            trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
-            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
 
         let dest = match *to_state.peer.lock().await {
             Some(d) => d,
@@ -1089,6 +1148,7 @@ mod tests {
             peer: mock_peer,
             peer_media_rx: dummy_rx,
             opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: false,
             metrics: None,
         })
         .unwrap();
@@ -1162,6 +1222,7 @@ mod tests {
             peer: Arc::new(NoopPeer),
             peer_media_rx: peer_rx,
             opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: false,
             metrics: None,
         })
         .unwrap();

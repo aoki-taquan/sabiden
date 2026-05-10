@@ -191,7 +191,11 @@ impl Str0mPeerSession {
             .build(Instant::now());
 
         let socket = Arc::new(socket);
-        let local_bind = local_addr;
+        // str0m の Receive::new に渡す destination 用。socket は 0.0.0.0 で
+        // bind しているが、 str0m は host_candidate (= 公開アドレス) と一致
+        // する destination でないと「自分宛ではない」と判定して STUN を drop
+        // する。 そのため広告した host_advert (192.168.20.239:port) を渡す。
+        let local_bind = host_advert;
 
         tokio::spawn(run_loop(RunCtx {
             rtc,

@@ -876,10 +876,22 @@ pub async fn process_client_message(
                 ))
             }
         }
-        ClientMessage::Ice { candidate } => match peer.add_ice_candidate(&candidate).await {
-            Ok(_) => SessionAction::Continue,
-            Err(e) => SessionAction::Reply(ServerMessage::error("ice_failed", e.to_string())),
-        },
+        ClientMessage::Ice { candidate } => {
+            // RFC 8839 §4.2 / W3C WebRTC §4.4.1: 空文字 / `end-of-candidates` は
+            // trickle ICE の終端マーカで candidate ではない。 silent OK で受理する。
+            if candidate.trim().is_empty() || candidate.contains("end-of-candidates") {
+                tracing::info!("ICE: end-of-candidates / empty");
+                return SessionAction::Continue;
+            }
+            tracing::info!(candidate = %candidate, "ICE candidate received from browser");
+            match peer.add_ice_candidate(&candidate).await {
+                Ok(_) => SessionAction::Continue,
+                Err(e) => {
+                    tracing::warn!(error=%e, candidate=%candidate, "ICE add_candidate failed");
+                    SessionAction::Reply(ServerMessage::error("ice_failed", e.to_string()))
+                }
+            }
+        }
         ClientMessage::Bye => {
             if let Some(aor) = aor_guard.take() {
                 state.extensions.unregister(&aor).await;

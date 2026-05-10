@@ -1542,24 +1542,37 @@ impl UasEventHandler {
             // 早期拒否する (RFC 3261 §21.5.4 / §20.33)。 NGN P-CSCF に流す前に
             // 端末側で抑制することで、 NGN 側 cooldown (= 連鎖 5xx の原因) を
             // 起こさない。
-            let rate_decision = self.outbound_rate_limiter.check_and_record(&from_aor);
-            if let RateLimitDecision::Deny { retry_after } = rate_decision {
-                let secs = retry_after.as_secs();
-                warn!(
-                    aor = %from_aor,
-                    retry_after_secs = %secs,
-                    "内線 INVITE を rate limiter で 503 拒否 (TTC JJ-90.24 §5.7.1)"
-                );
-                self.metrics
-                    .record_invite_blocked_by_rate_limit(OutboundDirection::Extension);
-                self.metrics
-                    .record_invite_extension(InviteResult::Error);
-                // RFC 3261 §21.5.4: 503 + Retry-After で内線へ通知。
-                let resp = build_503_with_retry_after(&request, secs);
-                if let Err(e) = responder.respond(resp).await {
-                    warn!(error=%e, "503 Service Unavailable 送出失敗");
+            match self.outbound_rate_limiter.check_and_record(&from_aor) {
+                RateLimitDecision::Deny { retry_after } => {
+                    let secs = retry_after.as_secs();
+                    warn!(
+                        aor = %from_aor,
+                        retry_after_secs = %secs,
+                        "内線 INVITE を rate limiter で 503 拒否 (TTC JJ-90.24 §5.7.1)"
+                    );
+                    self.metrics
+                        .record_invite_blocked_by_rate_limit(OutboundDirection::Extension);
+                    self.metrics
+                        .record_invite_extension(InviteResult::Error);
+                    // RFC 3261 §21.5.4: 503 + Retry-After で内線へ通知。
+                    let resp = build_503_with_retry_after(&request, secs);
+                    if let Err(e) = responder.respond(resp).await {
+                        warn!(error=%e, "503 Service Unavailable 送出失敗");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                RateLimitDecision::Allow { previous_interval } => {
+                    // Issue #157 観測点: 連続発信間隔 (= 直前 Allow から今回 Allow
+                    // までの経過時間) を `sabiden_sip_invite_interval_seconds_{sum,count}`
+                    // に記録する。 初回 (`None`) は記録しない (= count は 2 本目以降の
+                    // サンプル数になる、 標本平均が「連投間隔」 として意味を持つ)。
+                    if let Some(d) = previous_interval {
+                        // u128 → u64 飽和: ms オーダで Duration がオーバーフローする
+                        // ことは現実的にないが、 panic を避けるために飽和変換。
+                        let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                        self.metrics.record_invite_interval_ms(ms);
+                    }
+                }
             }
 
             // Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.1):
@@ -1749,9 +1762,26 @@ impl UasEventHandler {
                         response.status_code,
                         retry_after_secs,
                     );
-                    responder
-                        .quick(response.status_code, response.reason.as_str())
-                        .await
+                    // PR #193 review #2 🟡#1: NGN が `Retry-After` を返した場合は
+                    // 内線レッグの 5xx にも転載する (RFC 3261 §20.33)。 これにより
+                    // 内線端末側でも自前の retry 抑制が効く (TTC JJ-90.24 §5.7.3:
+                    // 5xx + Retry-After で示された時間内は同一 Request-URI への
+                    // INVITE 再送禁止)。 Retry-After 無しの 4xx/5xx は従来通り
+                    // `responder.quick` で素通し。
+                    if let Some(secs) = retry_after_secs {
+                        let mut resp = build_response_skeleton(
+                            &request,
+                            response.status_code,
+                            response.reason.as_str(),
+                        );
+                        resp.headers.set("Retry-After", format!("{}", secs));
+                        ensure_to_tag(&mut resp);
+                        responder.respond(resp).await
+                    } else {
+                        responder
+                            .quick(response.status_code, response.reason.as_str())
+                            .await
+                    }
                 }
                 Err(e) => {
                     if was_cancelled {
@@ -2451,29 +2481,39 @@ impl PwaOutboundHandler for UasEventHandler {
         //      を返し、 PWA UI 側で「○秒お待ちください」を出す手掛かりにする
         //      (frontend UI 連発抑止は別 issue、 本 PR の scope 外)。
         let rate_aor = ngn_aor_from_uac(&self.ngn_uac);
-        if let RateLimitDecision::Deny { retry_after } =
-            self.outbound_rate_limiter.check_and_record(&rate_aor)
-        {
-            let secs = retry_after.as_secs();
-            warn!(
-                aor = %rate_aor,
-                retry_after_secs = %secs,
-                "PWA outbound INVITE を rate limiter で拒否 (TTC JJ-90.24 §5.7.1)"
-            );
-            self.metrics
-                .record_invite_blocked_by_rate_limit(OutboundDirection::PwaOutbound);
-            self.metrics.record_invite_pwa_outbound(InviteResult::Error);
-            let _ = ws_sink.send(ServerMessage::error(
-                "rate_limited",
-                format!(
-                    "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after {} sec",
+        match self.outbound_rate_limiter.check_and_record(&rate_aor) {
+            RateLimitDecision::Deny { retry_after } => {
+                let secs = retry_after.as_secs();
+                warn!(
+                    aor = %rate_aor,
+                    retry_after_secs = %secs,
+                    "PWA outbound INVITE を rate limiter で拒否 (TTC JJ-90.24 §5.7.1)"
+                );
+                self.metrics
+                    .record_invite_blocked_by_rate_limit(OutboundDirection::PwaOutbound);
+                self.metrics.record_invite_pwa_outbound(InviteResult::Error);
+                let _ = ws_sink.send(ServerMessage::error(
+                    "rate_limited",
+                    format!(
+                        "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after {} sec",
+                        secs
+                    ),
+                ));
+                return Err(anyhow!(
+                    "PWA outbound rate-limited: retry after {} sec",
                     secs
-                ),
-            ));
-            return Err(anyhow!(
-                "PWA outbound rate-limited: retry after {} sec",
-                secs
-            ));
+                ));
+            }
+            RateLimitDecision::Allow { previous_interval } => {
+                // Issue #157 観測点: 内線レッグと同じく PWA 経路でも連続発信間隔を
+                // `sabiden_sip_invite_interval_seconds` に記録する。 PWA は AOR が
+                // sabiden 自身の REGISTER 番号に集約されるため、 複数 WS タブからの
+                // 発射タイミングも全部この bucket で観測される。
+                if let Some(d) = previous_interval {
+                    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                    self.metrics.record_invite_interval_ms(ms);
+                }
+            }
         }
 
         // (b) browser SAVPF offer を str0m に渡し、 SAVPF answer を取得
@@ -2697,18 +2737,24 @@ impl PwaOutboundHandler for UasEventHandler {
                             response.status_code,
                             retry_after_secs,
                         );
-                        let _ = ws_sink_clone.send(ServerMessage::error(
-                            "outbound_failed",
-                            format!(
+                        // PR #193 review #2 🟡#1: NGN が Retry-After を返した場合は
+                        // PWA UI が retry 抑制できるよう文字列に転載する。 SIP レッグ
+                        // を持たない PWA は `ServerMessage::error` 経由でしか
+                        // フィードバックを受けないため、 メッセージ本文に
+                        // `retry_after=<sec>` を埋め込んで PWA 側で parse する。
+                        let detail = match retry_after_secs {
+                            Some(secs) => format!(
+                                "NGN INVITE 失敗: {} {} (retry_after={}s)",
+                                response.status_code, response.reason, secs
+                            ),
+                            None => format!(
                                 "NGN INVITE 失敗: {} {}",
                                 response.status_code, response.reason
                             ),
-                        ));
-                        Err(anyhow!(
-                            "NGN INVITE 失敗: {} {}",
-                            response.status_code,
-                            response.reason
-                        ))
+                        };
+                        let _ = ws_sink_clone
+                            .send(ServerMessage::error("outbound_failed", detail.clone()));
+                        Err(anyhow!(detail))
                     }
                     Err(e) => {
                         warn!(error=%e, "NGN INVITE トランスポート失敗");
@@ -3632,6 +3678,114 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
     use tokio::net::UdpSocket;
+
+    /// PR #193 review #2 🟡#3: PWA→NGN 経路の rate-limit bucket key 抽出
+    /// (`extract_user_from_sip_uri`) の境界条件。 sabiden の `local_uri` は
+    /// `sip:0312345678@ntt-east.ne.jp` 形式が標準 (RFC 3261 §19.1.1) だが、
+    /// 設定ミスや config 経路の柔軟性で別形式が混入する余地があるため、
+    /// 全形式で panic しないことと、 不正形式は `None` を返すことを保証する。
+    #[test]
+    fn extract_user_from_sip_uri_parses_canonical_form() {
+        // RFC 3261 §19.1.1 標準形式
+        assert_eq!(
+            extract_user_from_sip_uri("sip:0312345678@ntt-east.ne.jp"),
+            Some("0312345678".to_string())
+        );
+    }
+
+    /// `sips:` スキーム (RFC 3261 §19.1) も `sip:` と同じく user 部を返す。
+    #[test]
+    fn extract_user_from_sip_uri_handles_sips_scheme() {
+        assert_eq!(
+            extract_user_from_sip_uri("sips:alice@example.com"),
+            Some("alice".to_string())
+        );
+    }
+
+    /// user 部が無い URI (`sip:host[:port]`) は `None`。
+    /// 呼出側 (`ngn_aor_from_uac`) はこの場合 URI 全体を fallback key にする
+    /// (= 動作はそのまま、 ただ bucket key が長いだけ)。
+    #[test]
+    fn extract_user_from_sip_uri_returns_none_for_userless_uri() {
+        assert_eq!(extract_user_from_sip_uri("sip:example.com"), None);
+        assert_eq!(extract_user_from_sip_uri("sip:example.com:5060"), None);
+    }
+
+    /// 空文字列は `None` (panic しない)。
+    #[test]
+    fn extract_user_from_sip_uri_returns_none_for_empty_input() {
+        assert_eq!(extract_user_from_sip_uri(""), None);
+    }
+
+    /// `@` 前の user-part が空 (`sip:@host`) は `None`。 ロジック上は
+    /// `Some("")` で返さない (= bucket key として空文字列は使わない)。
+    #[test]
+    fn extract_user_from_sip_uri_rejects_empty_user_part() {
+        assert_eq!(extract_user_from_sip_uri("sip:@example.com"), None);
+    }
+
+    /// `;params` / `:port` 付きの host は user 抽出に影響しない。
+    /// `sip:user;param=val@host` のような不正形式 (params は URI 末尾の hostname
+    /// 以降に置くのが RFC 3261 §19.1.1 標準) は最初の `@` で割るため、
+    /// `user;param=val` を返す。 既存呼出側 (`ngn_aor_from_uac`) の用途では
+    /// この string がそのまま bucket key になる = 多少奇妙でも誤動作はしない。
+    #[test]
+    fn extract_user_from_sip_uri_keeps_userpart_verbatim() {
+        // 標準形式: host に :port が付いていても user 抽出には影響しない
+        assert_eq!(
+            extract_user_from_sip_uri("sip:0312345678@ntt-east.ne.jp:5060"),
+            Some("0312345678".to_string())
+        );
+        // user 部に `:password` (RFC 3261 §19.1.1: userinfo) が混入した場合は
+        // そのまま返す。 sabiden の用途では password を含む URI は使わない
+        // (`auth_password` は別フィールド) ので、 ここはベストエフォート。
+        assert_eq!(
+            extract_user_from_sip_uri("sip:user:pw@example.com"),
+            Some("user:pw".to_string())
+        );
+    }
+
+    /// PR #193 review #2 🟡#3: `ngn_aor_from_uac` は `Uac::config().local_addr_of_record()`
+    /// から user 部を取り出して bucket key とする。 user 抽出に成功すれば短い
+    /// key (`0312345678`)、 失敗すれば URI 全体 fallback (`sip:example.com`) を
+    /// 返すことを統合的に確認する。
+    #[tokio::test]
+    async fn ngn_aor_from_uac_falls_back_to_full_uri_when_no_user_part() {
+        use crate::sip::uac::UacConfig;
+        // (1) 正常: user 抽出成功
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(sock.clone());
+        let uac_ok = Uac::new(
+            UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            layer,
+            sock.local_addr().unwrap(),
+        );
+        assert_eq!(ngn_aor_from_uac(&uac_ok), "0312345678");
+
+        // (2) fallback: user 部無し URI → URI 全体が key になる
+        let sock2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer2, _rx2) = TransactionLayer::spawn(sock2.clone());
+        let uac_userless = Uac::new(
+            UacConfig {
+                local_uri: "sip:ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: sock2.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            layer2,
+            sock2.local_addr().unwrap(),
+        );
+        assert_eq!(ngn_aor_from_uac(&uac_userless), "sip:ntt-east.ne.jp");
+    }
 
     /// RFC 3261 §8.2.6.2 / §7.3.1 / §25.1 / §12.2.2 / PR #136 review fix:
     /// orchestrator 側の `ensure_to_tag` も既存 To-tag 有無判定を

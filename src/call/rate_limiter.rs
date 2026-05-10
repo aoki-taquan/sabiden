@@ -58,15 +58,22 @@ use std::time::{Duration, Instant};
 
 /// `OutboundRateLimiter` の判定結果。
 ///
-/// - `Allow { recorded_at }`: 発信を許可。 呼び出し側はこれを受け取って即座に
-///   INVITE を構築する。 `recorded_at` は内部で記録された時刻 (テスト用、
-///   通常は無視して良い)。
+/// - `Allow { previous_interval }`: 発信を許可。 呼び出し側はこれを受け取って
+///   即座に INVITE を構築する。 `previous_interval` は同 AOR の **直前の許可**
+///   から今回までの経過時間。 初回発信 (= 初許可) では `None`。 呼び出し側は
+///   この値を `Metrics::record_invite_interval_ms` に流して
+///   `sabiden_sip_invite_interval_seconds` の sum/count に集計する (Issue #157
+///   観測点)。
 /// - `Deny { retry_after }`: 発信を拒否。 内線/PWA には 503 + `Retry-After:
 ///   <retry_after.as_secs()>` を返す (RFC 3261 §21.5.4, §20.33)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RateLimitDecision {
     /// 発信を許可する。
-    Allow,
+    Allow {
+        /// 同 AOR の直前許可からの経過時間。 初回は `None`。 メトリクス
+        /// (`sabiden_sip_invite_interval_seconds`) への記録に使う。
+        previous_interval: Option<Duration>,
+    },
     /// 発信を拒否する。 呼び出し側は 503 Service Unavailable + Retry-After を返す。
     Deny {
         /// 次回発信までに待つべき秒数 (`Retry-After` ヘッダ用)。
@@ -238,13 +245,23 @@ impl OutboundRateLimiter {
             .and_then(|s| s.retry_after_until)
             .filter(|ra| *ra > now);
 
+        // 直前許可からの経過時間を `previous_interval` で返す。 初回 (= entry None)
+        // では None。 これを呼出側が
+        // `Metrics::record_invite_interval_ms` に流して
+        // `sabiden_sip_invite_interval_seconds_{sum,count}` を更新する。
+        // 単調時計 (`Instant`) で計測しているため負値や巻き戻りはない (RFC 3550
+        // §6.3.1 が NTP 時計を避けるのと同じ理由)。
+        let previous_interval = entry
+            .as_ref()
+            .map(|s| now.saturating_duration_since(s.last_allowed_at));
+
         let updated = AorState {
             last_allowed_at: now,
             failure_streak: entry.as_ref().map(|s| s.failure_streak).unwrap_or(0),
             retry_after_until: cleared_retry_after_until,
         };
         state.insert(aor.to_string(), updated);
-        RateLimitDecision::Allow
+        RateLimitDecision::Allow { previous_interval }
     }
 
     /// 直前の INVITE が 5xx で失敗した場合に呼ぶ。 `failure_streak` を 1 増やす。
@@ -373,12 +390,18 @@ pub fn parse_retry_after(value: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// TTC JJ-90.24 §5.7.1: 初回発信は必ず Allow される。
+    /// TTC JJ-90.24 §5.7.1: 初回発信は必ず Allow される。 初回 `previous_interval`
+    /// は `None` (直前許可が存在しないため)。
     #[test]
     fn ttc_5_7_1_first_invite_is_allowed() {
         let limiter = OutboundRateLimiter::new();
         let decision = limiter.check_and_record("0312345678");
-        assert_eq!(decision, RateLimitDecision::Allow);
+        assert_eq!(
+            decision,
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        );
     }
 
     /// TTC JJ-90.24 §5.7.1: min_interval 内の 2 回目発信は Deny される。
@@ -390,10 +413,12 @@ mod tests {
             failure_backoff_steps: vec![],
         });
         let t0 = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             limiter.check_and_record_at("0312345678", t0),
-            RateLimitDecision::Allow
-        );
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
         // 1 秒後は Deny (min_interval=3s なので 2 秒 retry-after)。
         let t1 = t0 + Duration::from_secs(1);
         let decision = limiter.check_and_record_at("0312345678", t1);
@@ -405,7 +430,9 @@ mod tests {
         }
     }
 
-    /// TTC JJ-90.24 §5.7.1: min_interval 経過後は Allow に戻る。
+    /// TTC JJ-90.24 §5.7.1: min_interval 経過後は Allow に戻る。 2 本目の Allow
+    /// では `previous_interval = Some(3s)` (1 本目発信からの経過時間) が返り、
+    /// 呼出側が metrics に流す。
     #[test]
     fn ttc_5_7_1_invite_after_min_interval_is_allowed() {
         let limiter = OutboundRateLimiter::with_config(RateLimiterConfig {
@@ -413,16 +440,22 @@ mod tests {
             failure_backoff_steps: vec![],
         });
         let t0 = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             limiter.check_and_record_at("0312345678", t0),
-            RateLimitDecision::Allow
-        );
-        // 3 秒経過後は再度 Allow。
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
+        // 3 秒経過後は再度 Allow。 2 本目は previous_interval=Some(3s)。
         let t1 = t0 + Duration::from_secs(3);
-        assert_eq!(
-            limiter.check_and_record_at("0312345678", t1),
-            RateLimitDecision::Allow
-        );
+        match limiter.check_and_record_at("0312345678", t1) {
+            RateLimitDecision::Allow {
+                previous_interval: Some(d),
+            } => {
+                assert_eq!(d, Duration::from_secs(3));
+            }
+            other => panic!("expected Allow with previous_interval, got {:?}", other),
+        }
     }
 
     /// per-AOR: 別 AOR からの発信は互いに干渉しない。
@@ -433,15 +466,19 @@ mod tests {
             failure_backoff_steps: vec![],
         });
         let t0 = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             limiter.check_and_record_at("alice", t0),
-            RateLimitDecision::Allow
-        );
-        // 別 AOR (bob) は影響を受けない。
-        assert_eq!(
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
+        // 別 AOR (bob) は影響を受けない (初回 Allow)。
+        assert!(matches!(
             limiter.check_and_record_at("bob", t0 + Duration::from_millis(100)),
-            RateLimitDecision::Allow
-        );
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
     }
 
     /// TTC JJ-90.24 §5.7.1 連続抑制: 5xx 後は backoff が effective interval を伸ばす。
@@ -453,10 +490,12 @@ mod tests {
             failure_backoff_steps: vec![Duration::from_secs(5), Duration::from_secs(10)],
         });
         let t0 = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             limiter.check_and_record_at("0312345678", t0),
-            RateLimitDecision::Allow
-        );
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
         // 500 で失敗を記録。
         limiter.record_failure_at("0312345678", 500, None, t0 + Duration::from_secs(1));
         // 4 秒後 (min_interval=3 は超えるが backoff=5 未満) は Deny。
@@ -468,11 +507,15 @@ mod tests {
             }
             other => panic!("expected Deny, got {:?}", other),
         }
-        // 6 秒後 (backoff=5 を超える) は Allow。
-        assert_eq!(
-            limiter.check_and_record_at("0312345678", t0 + Duration::from_secs(6)),
-            RateLimitDecision::Allow
-        );
+        // 6 秒後 (backoff=5 を超える) は Allow。 previous_interval=Some(6s)。
+        match limiter.check_and_record_at("0312345678", t0 + Duration::from_secs(6)) {
+            RateLimitDecision::Allow {
+                previous_interval: Some(d),
+            } => {
+                assert_eq!(d, Duration::from_secs(6));
+            }
+            other => panic!("expected Allow, got {:?}", other),
+        }
     }
 
     /// TTC JJ-90.24 §5.7.3 / RFC 3261 §20.33: NGN が Retry-After: N を返した場合、
@@ -484,10 +527,12 @@ mod tests {
             failure_backoff_steps: vec![Duration::from_secs(5)],
         });
         let t0 = Instant::now();
-        assert_eq!(
+        assert!(matches!(
             limiter.check_and_record_at("0312345678", t0),
-            RateLimitDecision::Allow
-        );
+            RateLimitDecision::Allow {
+                previous_interval: None
+            }
+        ));
         // 500 + Retry-After: 60 を記録。
         limiter.record_failure_at("0312345678", 500, Some(60), t0 + Duration::from_secs(1));
         // backoff=5 を超えたが、 Retry-After 60 が effective。
@@ -576,6 +621,54 @@ mod tests {
         assert_eq!(parse_retry_after("-5"), None);
     }
 
+    /// Issue #157 観測点: 連続発信間隔 (`previous_interval`) は同 AOR の
+    /// 直前 Allow からの経過時間として正しく返る。 初回は `None`。
+    /// `Metrics::record_invite_interval_ms` に流して
+    /// `sabiden_sip_invite_interval_seconds_{sum,count}` を埋める呼出側契約。
+    #[test]
+    fn allow_carries_previous_interval_for_metrics() {
+        let limiter = OutboundRateLimiter::with_config(RateLimiterConfig {
+            min_interval: Duration::from_secs(1),
+            failure_backoff_steps: vec![],
+        });
+        let t0 = Instant::now();
+        // 1 本目: 初回なので None。
+        match limiter.check_and_record_at("0312345678", t0) {
+            RateLimitDecision::Allow { previous_interval } => {
+                assert!(previous_interval.is_none());
+            }
+            other => panic!("expected Allow, got {:?}", other),
+        }
+        // 2 本目: t0+5s → previous_interval = 5s。
+        match limiter.check_and_record_at("0312345678", t0 + Duration::from_secs(5)) {
+            RateLimitDecision::Allow {
+                previous_interval: Some(d),
+            } => {
+                assert_eq!(d, Duration::from_secs(5));
+            }
+            other => panic!("expected Allow with 5s, got {:?}", other),
+        }
+        // 3 本目: t0+10s → previous_interval = 5s (2 本目からの差分)。
+        match limiter.check_and_record_at("0312345678", t0 + Duration::from_secs(10)) {
+            RateLimitDecision::Allow {
+                previous_interval: Some(d),
+            } => {
+                assert_eq!(d, Duration::from_secs(5));
+            }
+            other => panic!("expected Allow with 5s, got {:?}", other),
+        }
+        // 別 AOR は独立 (初回 = None)。
+        match limiter.check_and_record_at("alice", t0 + Duration::from_secs(11)) {
+            RateLimitDecision::Allow { previous_interval } => {
+                assert!(
+                    previous_interval.is_none(),
+                    "別 AOR の初回は previous_interval が None でなければならない"
+                );
+            }
+            other => panic!("expected Allow for alice, got {:?}", other),
+        }
+    }
+
     /// failure_streak が backoff_steps の長さを超えても最後の step が使われる
     /// (saturating index)。
     #[test]
@@ -586,7 +679,7 @@ mod tests {
         });
         let t0 = Instant::now();
         let _ = limiter.check_and_record_at("0312345678", t0);
-        // 3 回失敗 (streak=3、 配列 index は最後の 30s に飽和)。
+        // 3 回失敗 (streak=3, 配列 index は最後の 30s に飽和)。
         limiter.record_failure_at("0312345678", 500, None, t0);
         limiter.record_failure_at("0312345678", 500, None, t0);
         limiter.record_failure_at("0312345678", 500, None, t0);

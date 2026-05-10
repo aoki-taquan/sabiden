@@ -364,9 +364,14 @@ describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
     expect(permanentCloseReason(1008)).toBe("auth");
   });
 
-  it("treats 1011 (Internal Server Error) as permanent auth failure", () => {
-    expect(isPermanentCloseCode(1011)).toBe(true);
-    expect(permanentCloseReason(1011)).toBe("auth");
+  it("treats 1011 (Internal Server Error) as transient (Issue #127 review #1)", () => {
+    // sabiden サーバ (`src/webrtc/signaling.rs`) は WS keepalive Pong 不着
+    // (= モバイル WiFi スリープ / Cloudflare Tunnel 100s idle / 端末
+    // バックグラウンド) 時に 1011 を送る。 これは「token 失効」ではなく
+    // 「無線の眠り」 なので、 permanent にすると Issue #119 の auto-reconnect が
+    // keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
+    // `maxReconnectAttempts` (10 分上限) で達成済み。
+    expect(isPermanentCloseCode(1011)).toBe(false);
   });
 
   it("treats 4xxx (private use) as permanent auth failure", () => {
@@ -376,10 +381,11 @@ describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
     expect(permanentCloseReason(4401)).toBe("auth");
   });
 
-  it("treats transient codes (1001 / 1006 / 1009 / 1012) as non-permanent", () => {
+  it("treats transient codes (1001 / 1006 / 1009 / 1011 / 1012) as non-permanent", () => {
     expect(isPermanentCloseCode(1001)).toBe(false);
     expect(isPermanentCloseCode(1006)).toBe(false);
     expect(isPermanentCloseCode(1009)).toBe(false);
+    expect(isPermanentCloseCode(1011)).toBe(false);
     expect(isPermanentCloseCode(1012)).toBe(false);
     // 5000+ もまだ未割当なので non-permanent。
     expect(isPermanentCloseCode(5000)).toBe(false);
@@ -449,18 +455,23 @@ describe("SignalingClient close-code handling (Issue #127)", () => {
     expect(sockets.length).toBe(1);
   });
 
-  it("does NOT reconnect after close code 1011 (Internal Server Error)", () => {
+  it("DOES reconnect after close code 1011 (Issue #127 review #1)", () => {
+    // sabiden サーバの WS keepalive idle timeout (= モバイル WiFi スリープ /
+    // Cloudflare Tunnel 100s idle / 端末バックグラウンド) で送られてくる
+    // 1011 は transient 扱い。 1 発で permanent 停止すると Issue #119 の
+    // 「無線復帰時に自動再接続」 が壊れる。
     const { client, sockets, timer, reasons } = setup();
     void client.connect();
     sockets[0].fireOpen();
+    expect(client.state).toBe("open");
 
     sockets[0].fireClose(1011);
-    expect(client.state).toBe("closed");
-    expect(reasons).toEqual(["auth"]);
-    expect(timer.pendingCount()).toBe(0);
+    expect(client.state).toBe("reconnecting");
+    expect(reasons).toEqual([]); // permanent な諦めはしていない
+    expect(timer.pendingCount()).toBe(1);
 
-    timer.advance(60000);
-    expect(sockets.length).toBe(1);
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
   });
 
   it("does NOT reconnect after close code 4401 (application auth close)", () => {

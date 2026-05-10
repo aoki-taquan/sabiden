@@ -193,17 +193,31 @@ export const App: Component = () => {
       },
       onClosedReason: (reason) => {
         // Issue #127: 自動再接続を諦めた理由を UI に表示する。
-        // `auth` の場合 token を入れ直さない限り復旧できないため、
-        // ユーザにログアウト → token 再投入を促す。
+        // `auth` / `exhausted` の場合 token を入れ直さない限り復旧できないため、
+        // signaling 参照を破棄 + token を invalidate + login view に自動遷移
+        // させる (review #2)。 そうしないと dialer view に居続けて
+        // 「disposed な signaling instance を握ったまま」 race の温床になる。
         switch (reason) {
           case "normal":
             setStatus("切断");
             break;
           case "auth":
             setStatus("認証失敗 (token を入れ直してください)");
+            // disposed instance race を防ぐため参照を切る。
+            signaling = null;
+            teardownCall();
+            clearToken();
+            setView({ kind: "login" });
             break;
           case "exhausted":
             setStatus("接続不可 (再ログインしてください)");
+            signaling = null;
+            teardownCall();
+            // exhausted は token 自体は有効かもしれないが、 ネットワーク復旧
+            // 後にユーザが明示的にログインし直す方が安全 (古い token で
+            // 即再接続して 401 ループを再発させるリスク回避)。
+            clearToken();
+            setView({ kind: "login" });
             break;
         }
         setStatusOk(false);

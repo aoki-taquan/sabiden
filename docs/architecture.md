@@ -928,10 +928,11 @@ stateDiagram-v2
 ### 5.8 PWA SignalingClient 接続状態 (Issue #119, #127)
 
 ブラウザ PWA (`frontend/src/lib/signaling.ts::SignalingClient`) の WS 接続状態
-機械。 W3C WebSocket API §10.7 では「open 後の close からの再接続は application
-責務」と明記されており、 sabiden PWA は「自宅電話受話器の代替」 として常時待機が
-前提なので、 WiFi 電源管理 / モバイルデータ切替 / Cloudflare Tunnel idle timeout
-で WS が落ちても自動で復旧する必要がある。
+機械。 W3C WebSocket Standard §7.1.5 (close handshake) / §11.7 (close events)
+では close からの再接続は application 責務と整理されており、 sabiden PWA は
+「自宅電話受話器の代替」 として常時待機が前提なので、 WiFi 電源管理 /
+モバイルデータ切替 / Cloudflare Tunnel idle timeout で WS が落ちても自動で復旧
+する必要がある。
 
 ただし token 失効等の **永続的エラー** を瞬断と同じ backoff で再試行すると、
 30 秒周期で 401 を撃ち続けて Cloudflare Access の rate-limit に当たる。 そのため
@@ -943,9 +944,9 @@ stateDiagram-v2
   [*] --> idle
   idle --> connecting: connect()
   connecting --> open: ws.onopen
-  connecting --> reconnecting: ws.onclose<br/>(transient: 1006 等) → backoff schedule
-  connecting --> closed: ws.onclose (permanent: 1000/1008/1011/4xxx)<br/>または client.close()
-  open --> reconnecting: ws.onclose<br/>(transient: 瞬断) → backoff schedule
+  connecting --> reconnecting: ws.onclose<br/>(transient: 1006 / 1011 等) → backoff schedule
+  connecting --> closed: ws.onclose (permanent: 1000/1008/4xxx)<br/>または client.close()
+  open --> reconnecting: ws.onclose<br/>(transient: 瞬断 / keepalive idle) → backoff schedule
   open --> closed: ws.onclose (permanent) または client.close()
   reconnecting --> reconnecting: backoff timer 満了 → 新 WS 試行<br/>(1s, 2s, 4s, 8s, ..., cap 30s + jitter)
   reconnecting --> open: ws.onopen<br/>(再接続成功 / attempts=0 リセット)
@@ -963,21 +964,35 @@ stateDiagram-v2
   に再追従する。 トークンは `localStorage` に保管されているため、 ブラウザを
   reload しても保持される (`frontend/src/lib/storage.ts`)。
 - `client.close()` を呼ぶと以後の自動再接続は停止する (ログアウト時)。
-- close code → 永続性の判定 (RFC 6455 §7.4, Issue #127):
+- close code → 永続性の判定 (RFC 6455 §7.4, W3C WebSocket §11.7, Issue #127):
   - **permanent (再接続せず closed)**:
     - `1000` Normal Closure → reason=`normal`
     - `1008` Policy Violation (token invalid 等) → reason=`auth`
-    - `1011` Internal Server Error → reason=`auth`
     - `4000-4999` 私的使用域 (アプリ独自 close) → reason=`auth`
   - **transient (backoff で再接続)**:
     - `1001` Going Away, `1006` Abnormal Closure, `1009` Message Too Big,
-      `1012` Service Restart, その他未割当 1xxx
-    - 1006 は token 失効でも瞬断でも区別が付かないため transient 扱いだが、
-      `maxReconnectAttempts` (既定 20、 約 10 分) で必ず止まる。
+      `1011` Internal Server Error, `1012` Service Restart, その他未割当 1xxx
+    - **1011 は transient** (Issue #127 review #1 改訂): sabiden サーバ
+      (`src/webrtc/signaling.rs::ws_loop`) は WS keepalive Pong 不着 (=
+      モバイル WiFi スリープ / Cloudflare Tunnel 100s idle / 端末
+      バックグラウンド) 時に 1011 を送る。 これは「token 失効」ではなく
+      「無線の眠り」 なので、 permanent にすると Issue #119 の auto-reconnect が
+      keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
+      `maxReconnectAttempts` で達成済み。
+    - 1006 / 1011 は token 失効でも瞬断でも区別が付かないため transient 扱い
+      だが、 `maxReconnectAttempts` (既定 20、 約 10 分) で必ず止まる。
 - 上限到達時は `closed` (reason=`exhausted`) に遷移し、 UI に 「接続不可」 を
   表示してユーザに再ログインを促す。
 - `onClosedReason(reason)` は永続 closed への遷移時に 1 度だけ発火する
   (`normal` / `auth` / `exhausted` の 3 値)。 `App.tsx` で UI 文言を出し分ける。
+- **UI 復旧フロー** (Issue #127 review #2): `onClosedReason` で `auth` /
+  `exhausted` を受けたら、 `App.tsx` は以下を行う:
+  1. `signaling = null` で disposed instance への参照を切る (race 防止)
+  2. `teardownCall()` で進行中の通話を破棄
+  3. `clearToken()` で localStorage の token を invalidate
+  4. `setView({ kind: "login" })` で login view に強制遷移
+  これにより 「dialer view に居続けて disposed な signaling を握ったまま発信
+  ボタンが押せる」 race を防ぎ、 ユーザに再ログインを促す。
 
 ---
 

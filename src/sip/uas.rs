@@ -31,7 +31,7 @@ use super::registrar::ExtensionRegistrar;
 use super::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
 };
-use super::utils::{new_call_id, new_tag};
+use super::utils::{has_to_tag, new_call_id, new_tag};
 use crate::config::{ExtensionConfig, UasConfig};
 use crate::observability::Metrics;
 
@@ -41,7 +41,12 @@ use crate::observability::Metrics;
 /// そのまま上位に流し、上位が応答とブリッジを組み立てる。
 #[derive(Debug)]
 pub enum UasEvent {
-    /// 認証済みの内線からの INVITE。`responder` 経由で 1xx/2xx/4xx 等を返す。
+    /// 認証済みの内線からの新規 INVITE (To-tag 無し = dialog-creating)。
+    ///
+    /// RFC 3261 §12.1.1 / §13.3.1: 新規 INVITE は To-tag を持たず、UAS が
+    /// 応答に新しい To-tag を付けて dialog を確立する。本イベントはその
+    /// 経路を上位 (Call Manager) に通知する。
+    /// `responder` 経由で 1xx/2xx/4xx 等を返す。
     Invite {
         /// 認証された AOR (内線ユーザ名)。
         from_aor: String,
@@ -50,6 +55,32 @@ pub enum UasEvent {
         /// 送信元 (応答送信先)。
         remote: SocketAddr,
         /// レスポンスを送るためのハンドル。
+        responder: ResponderHandle,
+    },
+    /// 既存ダイアログ内の Re-INVITE (To-tag 付き = mid-dialog).
+    ///
+    /// RFC 3261 §14.2 (UAS Behavior on Re-INVITE) / §12.2.2 に従い、To-tag が
+    /// 付いた INVITE は **既存 dialog 内の SDP renegotiation 要求** であり、
+    /// 新規 dialog として扱ってはならない。Linphone 等は session-timer
+    /// (RFC 4028) や hold/un-hold で Re-INVITE を投げてくるため、これを
+    /// 新規 INVITE として処理すると dialog が破綻する (Issue #94)。
+    ///
+    /// 上位 (B2BUA) は本イベント受信時に:
+    /// - 既存 dialog (Call-ID + From-tag + To-tag で同定) を lookup する
+    ///   - 見つからない、 かつ進行中 INVITE もない: 481 Call/Transaction
+    ///     Does Not Exist (RFC 3261 §12.2.2)
+    ///   - 見つからないが **進行中 INVITE がある** (初回 INVITE 完了前の
+    ///     Re-INVITE 競合): 491 Request Pending (RFC 3261 §14.2)
+    /// - 見つかれば NGN レッグへ Re-INVITE を伝搬し、200 OK を内線へ返す。
+    ///   200 OK の To-tag は **既存 dialog の local-tag を保持** する
+    ///   (= 受信 INVITE の To-tag をそのままエコーする)
+    ///   (RFC 3261 §12.2.2)。
+    Reinvite {
+        /// SIP リクエスト本体 (新 SDP offer 含む)。
+        request: SipRequest,
+        /// 送信元。
+        remote: SocketAddr,
+        /// レスポンス送出ハンドル。
         responder: ResponderHandle,
     },
     /// 既存ダイアログに対する BYE。`responder` で 200 OK を返す。
@@ -499,12 +530,58 @@ impl ExtensionUas {
     /// - binding 有り: `UasEvent::Invite` を上位 (Call Manager) に流す
     /// - binding 無し: **403 Forbidden** で蹴る (401 challenge は意図的に出さない)
     /// - Authorization ヘッダ付きの INVITE: 検証せず無視する
+    ///
+    /// # Re-INVITE 分岐 (RFC 3261 §14.2 / §12.2.2 / Issue #94)
+    ///
+    /// 受信 INVITE の **To ヘッダに tag が付いている** 場合は in-dialog Re-INVITE
+    /// (= 既存 dialog 内の SDP renegotiation / Session-Timer 更新) であり、
+    /// 新規 INVITE と扱いが異なる:
+    ///
+    /// - 認証 (binding lookup) 済み dialog の継続なので REGISTER binding 検証を
+    ///   再度行わない (in-dialog request は既存 dialog state で認可される)
+    /// - From-AOR の取り出し / 未登録チェックを skip
+    /// - `UasEvent::Reinvite` を上位 (B2BUA) に流す。 上位は既存 dialog を引いて
+    ///   NGN レッグへ Re-INVITE を伝搬し、200 OK で答える責務を負う
+    ///
+    /// 100 Trying は新規 INVITE / Re-INVITE どちらも RFC 3261 §17.2.1 に従って
+    /// 即時に返す。
     async fn handle_invite(
         &self,
         request: &SipRequest,
         remote: SocketAddr,
         responder: ResponderHandle,
     ) -> Result<()> {
+        // RFC 3261 §14.2 / §12.2.2: To-tag 付きは in-dialog Re-INVITE。
+        // 新規 INVITE 経路の binding 検証を skip し、上位 (B2BUA) に既存 dialog
+        // 内 renegotiation として扱わせる。
+        let is_reinvite = request.headers.get("to").map(has_to_tag).unwrap_or(false);
+
+        if is_reinvite {
+            debug!(
+                "To-tag 付き INVITE = Re-INVITE → 上位へ既存 dialog 内 renegotiation として転送"
+            );
+            // 100 Trying を即返す (RFC 3261 §17.2.1, Re-INVITE も同様)
+            responder.quick(100, "Trying").await?;
+            if let Some(tx) = &self.event_tx {
+                let event = UasEvent::Reinvite {
+                    request: request.clone(),
+                    remote,
+                    responder,
+                };
+                if tx.send(event).is_err() {
+                    warn!("Call Manager 受信側が閉じている → Re-INVITE は dropped");
+                }
+                return Ok(());
+            } else {
+                // 上位未接続 → RFC 3261 §12.2.2: 既存 dialog が引けないので
+                // 481 Call/Transaction Does Not Exist で返す。
+                warn!("Call Manager 未接続 → Re-INVITE 481");
+                return responder
+                    .quick(481, "Call/Transaction Does Not Exist")
+                    .await;
+            }
+        }
+
         // From URI のユーザ部 = AOR を取り出す。取れない (壊れた From) なら
         // 4xx で蹴るしかない。RFC 3261 §8.1.1.3 で From は必須ヘッダ。
         let Some(from_aor) = request.headers.get("from").and_then(extract_user_from_addr) else {
@@ -628,9 +705,19 @@ fn extract_uri_from_contact(contact: &str) -> String {
 }
 
 /// レスポンスの To に tag が無ければ付与する (RFC 3261 §8.2.6.2)。
+///
+/// 既存 tag の有無判定は [`has_to_tag`] (RFC 3261 §7.3.1 / §25.1 で
+/// parameter name は case-insensitive) と同じヘルパに委ねる。 ナイーブに
+/// `to.contains("tag=")` で判定すると、 `;TAG=existing` のような大文字
+/// パラメータを「無し」と誤判定して `;tag=<new>` を末尾追加し、
+/// `To: <sip:dest>;TAG=existing;tag=new` の **二重 tag** で 200 OK を返す
+/// (RFC 3261 §12.2.2 違反; 内線 UA は ACK を送らず切断する) 罠がある。
+/// 共通ヘルパ経由にすることで `has_to_tag` (in-dialog Re-INVITE 判定) と
+/// `ensure_to_tag` (既存 tag 二重付与防止) の case-sensitivity を強制的に
+/// 揃える。
 fn ensure_to_tag(resp: &mut SipResponse) {
     if let Some(to) = resp.headers.get("to") {
-        if !to.contains("tag=") {
+        if !has_to_tag(to) {
             let new = format!("{};tag={}", to, new_tag());
             resp.headers.set("To", new);
         }
@@ -1056,6 +1143,119 @@ mod tests {
         assert_eq!(parse_register_expires(&req), 240);
     }
 
+    /// RFC 3261 §14.2 / §12.2.2 / Issue #94:
+    /// 既存 dialog 内 Re-INVITE (To-tag 付き INVITE) は新規 INVITE 経路
+    /// (= From-AOR 検証 + UasEvent::Invite) には流さず、`UasEvent::Reinvite`
+    /// として上位へ転送する。 binding 検証も skip する (in-dialog request は
+    /// 既存 dialog state で認可されるため、 REGISTER 抹消後でも Re-INVITE は
+    /// 通る経路にする)。
+    #[tokio::test]
+    async fn rfc3261_14_2_invite_with_to_tag_dispatches_as_reinvite() {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let uas = uas.with_handler(event_tx);
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        // 「未登録」 AOR の Re-INVITE を流す。 既存 dialog 内 in-dialog request は
+        // REGISTER binding に依らず通るのが正解 (RFC 3261 §12.2: dialog state で
+        // 認可される)。 本テストでは「To-tag 付きなら from binding 検証を skip
+        // する」ことを 403 が返らないことで確認する。
+        let mut req =
+            builders::invite_from_phone(&local, "ghost", "sip:dest@sabiden", "z9hG4bKreinv", None);
+        // 既存 dialog の To-tag を付与 (mid-dialog Re-INVITE と等価)
+        req.headers
+            .set("To", "<sip:dest@sabiden>;tag=existing-uas-tag");
+
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let event = time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("event present");
+        match event {
+            UasEvent::Reinvite { request, .. } => {
+                let to = request.headers.get("to").unwrap();
+                assert!(
+                    to.contains("tag=existing-uas-tag"),
+                    "To-tag が保持されている"
+                );
+            }
+            other => panic!("Re-INVITE であるべき: {:?}", other),
+        }
+
+        // 100 Trying は来る (RFC 3261 §17.2.1)。 401 / 403 は来てはいけない。
+        let mut buf = vec![0u8; 4096];
+        match time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                    assert_eq!(
+                        r.status_code, 100,
+                        "Re-INVITE への最初の応答は 100 Trying (RFC 3261 §17.2.1)"
+                    );
+                }
+            }
+            _ => panic!("100 Trying が来るべき"),
+        }
+    }
+
+    /// 上位 (Call Manager) 未接続時の Re-INVITE は 481 Call/Transaction
+    /// Does Not Exist で返す (RFC 3261 §12.2.2: 既存 dialog が引けない場合)。
+    #[tokio::test]
+    async fn rfc3261_12_2_2_reinvite_without_handler_returns_481() {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        // event_tx を結線せずに run (= Call Manager 未接続)
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        let mut req = builders::invite_from_phone(
+            &local,
+            "iphone",
+            "sip:dest@sabiden",
+            "z9hG4bKreinv2",
+            None,
+        );
+        req.headers
+            .set("To", "<sip:dest@sabiden>;tag=stale-uas-tag");
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let mut saw_481 = false;
+        for _ in 0..3 {
+            match time::timeout(Duration::from_secs(1), client.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        if r.status_code == 481 {
+                            saw_481 = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            saw_481,
+            "Call Manager 未接続時の Re-INVITE は 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)"
+        );
+    }
+
     #[test]
     fn extract_uri_brackets() {
         assert_eq!(
@@ -1069,6 +1269,72 @@ mod tests {
         assert_eq!(
             extract_uri_from_contact("sip:iphone@host"),
             "sip:iphone@host"
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 / §7.3.1 / §25.1 / §12.2.2 / PR #136 review fix:
+    /// `ensure_to_tag` は既存 To-tag の有無判定を **case-insensitive** で
+    /// 行わなければならない。 さもなくば内線が `;TAG=existing` 大文字で
+    /// 送ってきた Re-INVITE に対し sabiden が「tag 無し」と誤判定し
+    /// `;tag=<新規>` を末尾追加して `To: <sip:dest>;TAG=existing;tag=new`
+    /// の二重 tag を返す → 内線 UA は RFC 3261 §12.2.2 違反として ACK を
+    /// 送らず切断する。
+    #[test]
+    fn rfc3261_8_2_6_2_ensure_to_tag_is_case_insensitive_for_existing_tag() {
+        // 大文字 `;TAG=existing` (既存 dialog から内線が送ってきた Re-INVITE
+        // を sabiden が echo するケースを模擬)。 ensure_to_tag は既存 tag を
+        // 検出して **何もしない** べき。
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers
+            .set("To", "<sip:dest@sabiden>;TAG=existing-uas-tag");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;TAG=existing-uas-tag",
+            "case-insensitive に既存 tag を検出して二重付与してはならない: To={}",
+            to
+        );
+
+        // mixed case `;tAg=` も同様
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>;tAg=mixed");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;tAg=mixed",
+            "mixed case の既存 tag を保持: To={}",
+            to
+        );
+
+        // tag が本当に無いケース: ensure_to_tag が新規生成して付与するべき
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            to.contains(";tag="),
+            "tag 無しなら付与する (RFC 3261 §8.2.6.2): To={}",
+            to
+        );
+        assert!(
+            !to.contains(";tag=;") && !to.ends_with(";tag="),
+            "値が空でない tag が付くべき: To={}",
+            to
         );
     }
 }

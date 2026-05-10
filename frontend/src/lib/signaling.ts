@@ -24,9 +24,13 @@
 //     - normal (1000): 「正常終了」 RFC 6455 §7.4.1 / W3C WebSocket §7.1.5。
 //       再接続しない (closed)。
 //     - auth (1008 / 4xxx): 「ポリシー違反 / アプリ独自 close」
-//       RFC 6455 §7.4.1, §7.4.2。 token 失効 (HTTP 401 → WS handshake 失敗 →
-//       ブラウザは多くの場合 1006 で fire するが、 sabiden Worker は明示的に
-//       1008 を送るパスもあるため両対応) 等の永続的エラーとして扱い、
+//       RFC 6455 §7.4.1, §7.4.2。 token 失効時の現状サーバ挙動は HTTP 401 で
+//       WS upgrade させない (`src/webrtc/signaling.rs::ws_handler` →
+//       `StatusCode::UNAUTHORIZED`) ため、 ブラウザは 1006 (Abnormal Closure) で
+//       onclose を発火する。 1008 は **現サーバが emit しない** が、 将来
+//       ハンドシェイク後に policy 違反で close するパスを追加した場合や、
+//       Cloudflare Access 経由で WS Worker が独自に 1008 を返す構成でも止まる
+//       ように、 防御的に permanent 分類に入れている。 永続的エラーとして扱い、
 //       再接続しない (closed + reason="auth")。
 //     - transient (1001 / 1006 / 1009 / 1011 / 1012 / その他): 「going away /
 //       abnormal closure / message too big / internal server error / service
@@ -166,10 +170,13 @@ const DEFAULT_RECONNECT: Required<Omit<ReconnectOptions, "webSocketFactory">> = 
  * - RFC 6455 §7.4.1 1000 (Normal Closure): サーバ / クライアントが行儀よく
  *   閉じた。 再接続しない。
  * - RFC 6455 §7.4.1 1008 (Policy Violation): token が認証ポリシー上 invalid。
- *   再試行しても通らない。
+ *   再試行しても通らない。 **現サーバ (`src/webrtc/signaling.rs`) は emit しない**
+ *   (HTTP 401 で WS upgrade を拒否 → ブラウザは 1006 で onclose) が、 将来
+ *   ハンドシェイク完了後の policy 違反 close や Cloudflare Access Worker が
+ *   1008 を返す構成のために防御的に permanent 分類に入れている。
  * - RFC 6455 §7.4.2 4000-4999 (private use): アプリ独自 close。 sabiden Worker /
- *   sabiden 本体は token 失効を 4401 / 4403 等で送出する想定。 RFC 上もこの帯は
- *   アプリ仕様で定義してよい。
+ *   sabiden 本体は token 失効を 4401 / 4403 等で送出する想定 (現状未実装、 防御的
+ *   分類)。 RFC 上もこの帯はアプリ仕様で定義してよい。
  *
  * 注意: 1011 (Internal Server Error) は **transient** として扱う
  * (Issue #127 review #1)。 sabiden サーバの WS keepalive idle timeout が

@@ -573,3 +573,170 @@ describe("SignalingClient close-code handling (Issue #127)", () => {
     });
   });
 });
+
+describe("App.tsx connect() catch-race against onClosedReason (Issue #127 round-2 review #1)", () => {
+  // App.tsx は `await signaling.connect()` の catch で setView({kind:"dialer"})
+  // していたが、 永続 close (1008/4xxx) の場合は ws.onclose 内で finalize() →
+  // onClosedReason() が同期発火し、 そこで setView({kind:"login"}) +
+  // signaling=null が確定してから connect() Promise が reject される。
+  //
+  // catch が無条件に dialer view へ遷移すると login view を握り潰すため、
+  // catch では「onClosedReason が既に終端確定したか」 を signaling 参照の null
+  // 化で検出して setView をスキップする (App.tsx::connect 内 fix)。
+  //
+  // この describe では SignalingClient API の契約として
+  // 「onClosedReason は connect() Promise reject の **前** に同期発火する」
+  // ことと、 App.tsx と同形のコールバック構造で書いた client コードが
+  // 「auth/exhausted 時に login view を保持し、 transient 時に dialer view へ
+  // 進む」 ことを検証する。
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  it("fires onClosedReason synchronously before connect() Promise rejects (auth)", async () => {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+    const events: string[] = [];
+
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (r) => events.push(`closedReason:${r}`),
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    const promise = client.connect();
+    promise.catch(() => events.push("connectReject"));
+
+    // 永続 close (1008) → onClosedReason が同期発火、 connect() reject は
+    // microtask で後追い。
+    sockets[0].fireClose(1008);
+
+    // この時点で onClosedReason は同期的に発火済み、 reject はまだ enqueue 中。
+    expect(events).toEqual(["closedReason:auth"]);
+
+    // microtask を flush して reject を処理。
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(events).toEqual(["closedReason:auth", "connectReject"]);
+  });
+
+  it("App-shaped callback flow keeps `login` view on auth close (catch must not overwrite)", async () => {
+    // App.tsx の挙動を最小再現: view 状態 + signaling 参照 + try/catch を
+    // closure に書き、 auth close で login view が保たれることを assert する。
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    let view: "login" | "dialer" = "login";
+    let signaling: SignalingClient | null = null;
+
+    signaling = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (reason) => {
+          // App.tsx と同じ: auth/exhausted で login へ強制遷移 + 参照切断。
+          if (reason === "auth" || reason === "exhausted") {
+            signaling = null;
+            view = "login";
+          }
+        },
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    // App.tsx::connect の try/catch を最小再現。 catch で
+    // signaling===null なら setView をスキップする (round-2 review #1 fix)。
+    const runAppConnect = async () => {
+      try {
+        await signaling!.connect();
+        view = "dialer";
+      } catch {
+        if (signaling === null) return; // round-2 review #1 fix
+        view = "dialer";
+      }
+    };
+
+    const done = runAppConnect();
+    // open する前に auth close。
+    sockets[0].fireClose(1008);
+    await done;
+
+    // login view が保持されていること (= catch が握り潰していない)。
+    expect(view).toBe("login");
+    expect(signaling).toBeNull();
+  });
+
+  it("App-shaped callback flow advances to `dialer` view on transient close (regression guard)", async () => {
+    // 対偶ケース: transient (1006) ではユーザに「再接続中」 を見せて dialer に
+    // 進むのが Issue #119 以来の正しい挙動。 round-2 review #1 fix で
+    // この path が壊れていないことを確認する。
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    let view: "login" | "dialer" = "login";
+    let signaling: SignalingClient | null = null;
+
+    signaling = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (reason) => {
+          if (reason === "auth" || reason === "exhausted") {
+            signaling = null;
+            view = "login";
+          }
+        },
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    const runAppConnect = async () => {
+      try {
+        await signaling!.connect();
+        view = "dialer";
+      } catch {
+        if (signaling === null) return;
+        view = "dialer";
+      }
+    };
+
+    const done = runAppConnect();
+    sockets[0].fireClose(1006); // transient → schedule reconnect
+    await done;
+
+    // dialer に遷移、 signaling は生きていて次の backoff を待っている。
+    expect(view).toBe("dialer");
+    expect(signaling).not.toBeNull();
+    expect(signaling!.state).toBe("reconnecting");
+  });
+});

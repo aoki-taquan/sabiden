@@ -228,9 +228,20 @@ export const App: Component = () => {
       setView({ kind: "dialer" });
     } catch (e) {
       console.error(e);
+      // Issue #127 review #2 race fix:
+      //   onClosedReason は ws.onclose 内で同期的に発火し、 そこで signaling=null +
+      //   setView({kind:"login"}) を済ませている可能性がある (auth / exhausted)。
+      //   その後で connect() Promise が reject され、 ここの catch に入る。
+      //   何もチェックせず setView({kind:"dialer"}) に上書きすると、 onClosedReason
+      //   が決めた login view を握り潰してしまう (= ユーザが認証失敗時に dialer に
+      //   戻されて再ログインの導線を失う)。 onClosedReason 側が既に終端状態を確定
+      //   していたら (signaling 参照が null になっていたら) ここでは何もしない。
+      if (signaling === null) {
+        return;
+      }
       // 初回 connect の resolve は失敗したが、 SignalingClient は内部で
-      // backoff 再接続を継続している。 ユーザーには再接続中であることを
-      // 示し、 dialer view には移行する (発信ボタンは statusOk で disable)。
+      // backoff 再接続を継続している (transient close)。 ユーザーには再接続中で
+      // あることを示し、 dialer view には移行する (発信ボタンは statusOk で disable)。
       setStatus("再接続中...");
       setStatusOk(false);
       setView({ kind: "dialer" });

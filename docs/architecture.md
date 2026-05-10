@@ -993,6 +993,15 @@ stateDiagram-v2
   4. `setView({ kind: "login" })` で login view に強制遷移
   これにより 「dialer view に居続けて disposed な signaling を握ったまま発信
   ボタンが押せる」 race を防ぎ、 ユーザに再ログインを促す。
+- **`connect()` catch race 回避** (Issue #127 round-2 review #1): WS `onclose`
+  ハンドラ内で `finalize` が同期的に呼ばれ、 そこで発火する `onClosedReason`
+  コールバックが先に `signaling = null` + `setView({kind:"login"})` を確定する。
+  その直後に `connect()` の Promise が reject され `App.tsx` の catch が走る。
+  catch が無条件に `setView({kind:"dialer"})` で上書きすると login view が握り
+  潰される (= ユーザが認証失敗時に再ログインの導線を失う) ため、 catch では
+  `signaling === null` (= onClosedReason が既に終端確定) なら `setView` を
+  スキップする。 transient close (1006 / 1011 等) では `signaling` は非 null の
+  ままなので従来通り 「再接続中」 で dialer view に遷移する。
 
 ---
 

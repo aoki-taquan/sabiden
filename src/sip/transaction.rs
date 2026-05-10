@@ -103,7 +103,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time;
 use tracing::{debug, trace, warn};
 
@@ -366,6 +366,36 @@ pub fn response_destination_for(via: &str, remote: SocketAddr) -> SocketAddr {
     // (`docs/architecture.md` §11 NAT 越え参照)
     let _ = via;
     remote
+}
+
+/// INVITE クライアント トランザクションの応答受信進捗
+/// (RFC 3261 §9.1 "Once the CANCEL is constructed, the client SHOULD check
+/// whether it has received any response (provisional or final) for the
+/// request being cancelled" を CANCEL 送出前にチェックするための観測値)。
+///
+/// `cancel_pending` (UAC TU) はこの状態を `watch` で読み、 RFC 3261 §9.1
+/// が要求する **"If no provisional response has been received, the CANCEL
+/// request MUST NOT be sent"** を満たす:
+/// - `Pending` の間は CANCEL を送らずに待機。
+/// - `Provisional` に遷移したら CANCEL を送る。
+/// - `Final` に直行した (1xx を経ずに最終応答を受けた) 場合、 CANCEL は
+///   no-op (RFC 3261 §9.1: "If the original request has generated a final
+///   response, the CANCEL SHOULD NOT be sent") なので送らずに諦める。
+///
+/// `watch` の初期値は `Pending`。 transaction layer の `dispatch_response`
+/// が応答コードを見て遷移を駆動する (`Pending → Provisional` か
+/// `Pending → Final`)。 `Provisional → Final` も観測できるが、
+/// `cancel_pending` 側は Provisional 検出時点で待機を抜けるため後者の遷移は
+/// ロジックに影響しない (transaction 終了後の cleanup で `watch` 自体が
+/// drop され、 receiver の `changed()` は `Err` になる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteResponseProgress {
+    /// まだ応答 (1xx も最終応答も) を受信していない (RFC 3261 §9.1 待機条件)。
+    Pending,
+    /// 1xx を受信済み (CANCEL を送ってよい状態)。
+    Provisional,
+    /// 既に最終応答 (>=200) を受信済み (CANCEL は no-op、 送らない)。
+    Final,
 }
 
 /// クライアント トランザクションの状態 (RFC 3261 §17.1)。
@@ -669,9 +699,13 @@ impl ClientTransaction {
                 }
             }
             // 自身をテーブルから削除 (Terminated)。
+            // provisional watch も一緒に drop して、 待機中の `cancel_pending`
+            // 側の `changed()` を `Err` で抜けさせる (RFC 3261 §9.1: 最終応答
+            // 到達後の CANCEL は SHOULD NOT)。
             if let Some(table) = table {
                 let mut guard = table.lock().await;
                 guard.clients.remove(&id);
+                guard.provisional.remove(&id);
             }
         });
     }
@@ -980,6 +1014,21 @@ pub struct TransactionLayer {
 struct TransactionTable {
     /// branch+sent-by+method → クライアント トランザクションへの送信口。
     clients: HashMap<TransactionId, mpsc::UnboundedSender<ClientEvent>>,
+    /// INVITE クライアント トランザクション ID → 応答受信進捗の broadcast 元。
+    ///
+    /// RFC 3261 §9.1 (CANCEL は 1xx 受信後にのみ送出) を満たすため、 UAC TU
+    /// (`Uac::cancel_pending`) が CANCEL 送出前に 1xx 受信を待機できるよう
+    /// `watch::Sender` を保持する。 `dispatch_response` が応答コードに応じて
+    /// `Pending → Provisional` / `Pending → Final` を駆動し、
+    /// `Uac::cancel_pending` 側は `subscribe()` した receiver で待機する。
+    ///
+    /// INVITE 専用 (non-INVITE は CANCEL 対象外: RFC 3261 §9.1 "A CANCEL
+    /// request SHOULD NOT be sent to cancel a request other than INVITE")。
+    /// transaction 終了時 (`drop_client` / absorber Timer D 満了) に
+    /// 一緒に remove する。 `watch::Sender` が drop されると receiver の
+    /// `changed()` は `Err` を返すため、 `cancel_pending` 側はそれを
+    /// 「transaction 終了済 = CANCEL 不要」と解釈する。
+    provisional: HashMap<TransactionId, watch::Sender<InviteResponseProgress>>,
 }
 
 /// TU (上位層) へ届ける受信リクエスト。
@@ -1166,10 +1215,46 @@ impl TransactionLayer {
                 return;
             }
         };
-        let sender = {
+        let code = resp.status_code;
+        // RFC 3261 §9.1 の CANCEL 送出ゲート用に、 INVITE クライアント
+        // トランザクションの応答受信進捗を `Pending → Provisional` /
+        // `Pending → Final` に進める。 `Provisional → Final` も観測できるが、
+        // `cancel_pending` 側は Provisional 検出時点で待機を抜けるため動作影響なし。
+        // sender (mpsc) と同じ lock 内で読み取り、 watch の send は lock 外で行う
+        // (watch::Sender::send は同期 API、 send_replace で値を上書きするだけなので
+        // mpsc 側の lock を保持したまま呼んでも問題ないが、 単純化のため分離する)。
+        let (sender, provisional_sender) = {
             let table = self.inner.lock().await;
-            table.clients.get(&id).cloned()
+            (
+                table.clients.get(&id).cloned(),
+                table.provisional.get(&id).cloned(),
+            )
         };
+        if let Some(psend) = provisional_sender {
+            let new_state = if (100..200).contains(&code) {
+                InviteResponseProgress::Provisional
+            } else if code >= 200 {
+                InviteResponseProgress::Final
+            } else {
+                // 0..100 は SIP では非合法 (RFC 3261 §7.2: status-code は
+                // 100..699)。 transition せずに無視。
+                *psend.borrow()
+            };
+            // 既に Final なら Provisional に戻さない (monotonic 遷移)。
+            let cur = *psend.borrow();
+            let should_advance = matches!(
+                (cur, new_state),
+                (InviteResponseProgress::Pending, _)
+                    | (
+                        InviteResponseProgress::Provisional,
+                        InviteResponseProgress::Final
+                    )
+            );
+            if should_advance {
+                // send_replace は receiver が居なくても成功する。
+                let _ = psend.send_replace(new_state);
+            }
+        }
         if let Some(tx) = sender {
             let _ = tx.send(ClientEvent::Response(resp));
         } else {
@@ -1178,6 +1263,11 @@ impl TransactionLayer {
     }
 
     /// クライアント トランザクションを登録し、ハンドルを返す。
+    ///
+    /// INVITE のときは、 RFC 3261 §9.1 (CANCEL は 1xx 後にのみ送出) を満たすため
+    /// 応答受信進捗を発信する [`watch::Sender<InviteResponseProgress>`] も併設して
+    /// テーブルに登録する。 UAC TU 側は [`Self::provisional_watch`] で
+    /// receiver を取得し、 CANCEL 送出前に Provisional への遷移を待機する。
     pub async fn create_client(
         &self,
         request: SipRequest,
@@ -1185,9 +1275,15 @@ impl TransactionLayer {
     ) -> Result<ClientTransaction> {
         let id = TransactionId::from_request(&request)?;
         let (tx, rx) = mpsc::unbounded_channel();
+        let is_invite = matches!(id.method, SipMethod::Invite);
         {
             let mut table = self.inner.lock().await;
             table.clients.insert(id.clone(), tx);
+            if is_invite {
+                // RFC 3261 §9.1 用: 1xx 受信を CANCEL 送出側が待てるよう watch を作る。
+                let (psend, _) = watch::channel(InviteResponseProgress::Pending);
+                table.provisional.insert(id.clone(), psend);
+            }
         }
         Ok(ClientTransaction::new_with_table(
             id,
@@ -1200,11 +1296,34 @@ impl TransactionLayer {
         ))
     }
 
+    /// 進行中 INVITE トランザクションの応答受信進捗 watcher を返す。
+    ///
+    /// RFC 3261 §9.1: CANCEL は 1xx 受信後にのみ送出してよい。 UAC TU
+    /// (`Uac::cancel_pending`) は CANCEL 送出前にこの receiver を読み、
+    /// `Provisional` への遷移を待機する。 transaction が既に終了している
+    /// (= テーブルからエントリが消えた) 場合は `None` を返す:
+    /// 呼出側は「既に最終応答済 / Timer B タイムアウト済」 と解釈し、 RFC §9.1
+    /// 後半 "If the original request has generated a final response, the
+    /// CANCEL SHOULD NOT be sent" に従い CANCEL を送らない。
+    pub async fn provisional_watch(
+        &self,
+        id: &TransactionId,
+    ) -> Option<watch::Receiver<InviteResponseProgress>> {
+        let table = self.inner.lock().await;
+        table.provisional.get(id).map(|s| s.subscribe())
+    }
+
     /// トランザクション完了後にエントリを削除する。
     /// `ClientTransaction::run` 完了後に呼ぶ。
+    ///
+    /// INVITE の場合は、 紐づく provisional watch も同時に drop することで、
+    /// 待機中の `cancel_pending` 側の `changed()` を `Err` にして
+    /// 「transaction 終了済」 を通知する (RFC 3261 §9.1 後半: 最終応答到達後の
+    /// CANCEL は no-op)。
     pub async fn drop_client(&self, id: &TransactionId) {
         let mut table = self.inner.lock().await;
         table.clients.remove(id);
+        table.provisional.remove(id);
     }
 
     /// 応答を待たないリクエスト送信。
@@ -3549,5 +3668,134 @@ mod tests {
         //  が hang / panic / unwrap で失敗しないこと」。 unwrap が通った時点で
         //  境界条件は満たされている。)
         let _ = id; // suppress unused
+    }
+
+    // ====================================================================
+    // RFC 3261 §9.1 用 InviteResponseProgress watch のテスト群 (Issue #97)
+    //
+    // CANCEL UAC は 1xx 受信前に CANCEL を送ってはならない (MUST NOT)。
+    // transaction layer は INVITE クライアント transaction を `create_client`
+    // で登録する際に `watch::Sender<InviteResponseProgress>` を併設し、
+    // `dispatch_response` で応答コードに応じて Pending → Provisional /
+    // Pending → Final へ遷移させる。 UAC TU はこの watch を購読して
+    // CANCEL のゲートとして使う。
+    // ====================================================================
+
+    /// RFC 3261 §9.1: INVITE 登録直後の `provisional_watch` の初期値は
+    /// `Pending` でなければならない (まだ 1xx も最終応答も受け取っていない)。
+    #[tokio::test]
+    async fn rfc3261_9_1_provisional_watch_initial_state_is_pending() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
+        let local = socket.local_addr().unwrap();
+        let branch = "z9hG4bKprogressInit";
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@127.0.0.1");
+        invite
+            .headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        invite.headers.set("From", "<sip:alice@example>;tag=alice");
+        invite.headers.set("To", "<sip:bob@example>");
+        invite.headers.set("Call-ID", "progress-init@host");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Max-Forwards", "70");
+
+        let id = TransactionId::from_request(&invite).unwrap();
+        let _ct = layer.create_client(invite, dest).await.unwrap();
+        let rx = layer.provisional_watch(&id).await.expect("watch present");
+        assert_eq!(*rx.borrow(), InviteResponseProgress::Pending);
+    }
+
+    /// RFC 3261 §9.1: 1xx (100 Trying 等) を受信したら `provisional_watch` は
+    /// Pending → Provisional に遷移する。 UAC TU はこの遷移を観測してから
+    /// CANCEL を送出する。
+    #[tokio::test]
+    async fn rfc3261_9_1_provisional_watch_transitions_on_1xx() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
+        let local = socket.local_addr().unwrap();
+        let branch = "z9hG4bKprogress1xx";
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@127.0.0.1");
+        invite
+            .headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        invite.headers.set("From", "<sip:alice@example>;tag=alice");
+        invite.headers.set("To", "<sip:bob@example>");
+        invite.headers.set("Call-ID", "progress-1xx@host");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Max-Forwards", "70");
+
+        let id = TransactionId::from_request(&invite).unwrap();
+        let _ct = layer.create_client(invite, dest).await.unwrap();
+        let mut rx = layer.provisional_watch(&id).await.expect("watch present");
+        // 100 Trying を dispatch する
+        let mut trying = make_invite_response(branch, 100, "Trying");
+        trying
+            .headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        layer.dispatch_response(trying).await;
+        // changed() で遷移を観測。
+        rx.changed().await.expect("watch should change on 1xx");
+        assert_eq!(*rx.borrow_and_update(), InviteResponseProgress::Provisional);
+    }
+
+    /// RFC 3261 §9.1 後半: 1xx を経ずに最終応答 (>=200) を受信した場合、
+    /// `provisional_watch` は Pending → Final に直接遷移する
+    /// (CANCEL を送ってはならない状態)。
+    #[tokio::test]
+    async fn rfc3261_9_1_provisional_watch_transitions_directly_to_final_on_2xx() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
+        let local = socket.local_addr().unwrap();
+        let branch = "z9hG4bKprogressFinal";
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@127.0.0.1");
+        invite
+            .headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        invite.headers.set("From", "<sip:alice@example>;tag=alice");
+        invite.headers.set("To", "<sip:bob@example>");
+        invite.headers.set("Call-ID", "progress-final@host");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Max-Forwards", "70");
+
+        let id = TransactionId::from_request(&invite).unwrap();
+        let _ct = layer.create_client(invite, dest).await.unwrap();
+        let mut rx = layer.provisional_watch(&id).await.expect("watch present");
+        // 486 を直接 dispatch する
+        let mut busy = make_invite_response(branch, 486, "Busy Here");
+        busy.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        layer.dispatch_response(busy).await;
+        rx.changed().await.expect("watch should change on final");
+        assert_eq!(*rx.borrow_and_update(), InviteResponseProgress::Final);
+    }
+
+    /// RFC 3261 §9.1: non-INVITE には `provisional_watch` を作らない
+    /// (CANCEL は INVITE 専用、 §9.1 "A CANCEL request SHOULD NOT be sent to
+    /// cancel a request other than INVITE")。
+    #[tokio::test]
+    async fn rfc3261_9_1_provisional_watch_absent_for_non_invite() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
+        let local = socket.local_addr().unwrap();
+        let branch = "z9hG4bKnoninvite";
+        let mut reg = SipRequest::new(SipMethod::Register, "sip:registrar.example");
+        reg.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        reg.headers.set("From", "<sip:alice@example>;tag=alice");
+        reg.headers.set("To", "<sip:alice@example>");
+        reg.headers.set("Call-ID", "noninvite@host");
+        reg.headers.set("CSeq", "1 REGISTER");
+        reg.headers.set("Max-Forwards", "70");
+
+        let id = TransactionId::from_request(&reg).unwrap();
+        let _ct = layer.create_client(reg, dest).await.unwrap();
+        assert!(
+            layer.provisional_watch(&id).await.is_none(),
+            "non-INVITE には provisional_watch を作らない (RFC 3261 §9.1)"
+        );
     }
 }

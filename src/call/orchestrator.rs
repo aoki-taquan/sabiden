@@ -583,11 +583,8 @@ impl NgnInboundHandler {
             // NGN へ返す SDP は browser SDP 由来 (AVP に変換済) → PCMU only に
             // 絞り、 `c=`/`m= port` を sabiden の NGN 側 socket に書き換える。
             let pcmu_only = restrict_audio_to_pcmu_with_dtmf(ext_answer);
-            let rewritten = rewrite_rtp_endpoint(
-                &pcmu_only,
-                sabiden_ngn_addr.ip(),
-                sabiden_ngn_addr.port(),
-            )?;
+            let rewritten =
+                rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
             let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
                 super::transcoder::WebRtcAudioConfig {
                     ngn_socket: ngn_bridge_sock,

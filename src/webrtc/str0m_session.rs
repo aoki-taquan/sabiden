@@ -137,7 +137,9 @@ enum Command {
     /// (RFC 8835 §3 WebRTC media plane)。 run_loop が
     /// `Rtc::writer(mid).write(pt, wallclock, rtp_time, payload)` で
     /// SRTP 化して UDP に出す。
-    SendMedia { frame: MediaFrame },
+    SendMedia {
+        frame: MediaFrame,
+    },
     Close,
 }
 
@@ -594,7 +596,7 @@ async fn handle_event(
                 "str0m: 受信 media frame"
             );
             let frame = MediaFrame {
-                pt: u8::from(*d.pt),
+                pt: *d.pt,
                 rtp_time: d.time.numer() as u32,
                 payload: d.data.clone(),
                 network_time: d.network_time,

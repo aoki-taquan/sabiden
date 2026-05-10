@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
-use super::transcoder::TranscodingBridge;
+use super::transcoder::{TranscodingBridge, WebRtcAudioBridge};
 use crate::observability::Metrics;
 use crate::rtp::set_rtp_dscp;
 
@@ -47,7 +47,19 @@ pub enum MediaBridge {
     /// 純リレー (G.711 μ-law をそのまま転送)。
     Relay(RtpBridge),
     /// Opus ⇔ G.711 トランスコード (RFC 7587 ↔ RFC 3551)。
+    /// 内線レッグも UDP socket を持つ場合 (内線 SIP UA が Opus を要求した
+    /// パターン) に使う。
     Transcode(TranscodingBridge),
+    /// Issue #87 / #121: NGN レッグ (G.711 μ-law) ⇔ WebRTC peer (str0m)。
+    ///
+    /// WebRTC レッグは独自 UDP socket を str0m が ICE/DTLS 上で多重化して
+    /// 持っているため、 sabiden 側に追加の UDP socket を bind せず、
+    /// `PeerSession` の MediaFrame I/O (`take_media_rx` / `send_media`) を
+    /// 経由する。
+    ///
+    /// NGN ⇄ peer の双方向に Opus ⇔ μ-law トランスコードを噛ませる
+    /// (RFC 7587 ↔ RFC 3551)。
+    WebRtcAudio(WebRtcAudioBridge),
 }
 
 impl MediaBridge {
@@ -57,6 +69,7 @@ impl MediaBridge {
         match self {
             MediaBridge::Relay(b) => b.stop().await,
             MediaBridge::Transcode(b) => b.stop().await,
+            MediaBridge::WebRtcAudio(b) => b.stop().await,
         }
     }
 
@@ -70,6 +83,10 @@ impl MediaBridge {
                 let (n2w, w2n, _err) = b.stats();
                 (n2w, w2n)
             }
+            MediaBridge::WebRtcAudio(b) => {
+                let (n2w, w2n, _err) = b.stats();
+                (n2w, w2n)
+            }
         }
     }
 
@@ -79,20 +96,26 @@ impl MediaBridge {
     ///
     /// `MediaBridge::Relay` (両側 PCMU) でも `MediaBridge::Transcode` (Opus⇔PCMU)
     /// でも同じ NGN socket / NGN peer を使うので、変種に関わらず同一インタフェース
-    /// で扱える。
+    /// で扱える。 `WebRtcAudio` も NGN socket は持つ (peer 側のみ socket レス)。
     pub async fn send_to_ngn(&self, datagram: &[u8]) -> Result<()> {
         match self {
             MediaBridge::Relay(b) => b.send_to_ngn(datagram).await,
             MediaBridge::Transcode(b) => b.send_to_ngn(datagram).await,
+            MediaBridge::WebRtcAudio(b) => b.send_to_ngn(datagram).await,
         }
     }
 
     /// Issue #69: 内線レッグ socket から内線ピア宛に任意 RTP datagram を 1 つ
     /// 注入する (NGN→内線 INFO 経路の placeholder)。
+    /// `WebRtcAudio` は内線レッグが UDP socket を持たないため、 DTMF in-band 注入は
+    /// 未対応 (RFC 4733 telephone-event の WebRTC 適合は別 issue)。
     pub async fn send_to_ext(&self, datagram: &[u8]) -> Result<()> {
         match self {
             MediaBridge::Relay(b) => b.send_to_ext(datagram).await,
             MediaBridge::Transcode(b) => b.send_to_web(datagram).await,
+            MediaBridge::WebRtcAudio(_) => Err(anyhow::anyhow!(
+                "WebRtcAudio bridge では send_to_ext は未対応 (DTMF over WebRTC は別 issue)"
+            )),
         }
     }
 }
@@ -106,6 +129,12 @@ impl From<RtpBridge> for MediaBridge {
 impl From<TranscodingBridge> for MediaBridge {
     fn from(b: TranscodingBridge) -> Self {
         MediaBridge::Transcode(b)
+    }
+}
+
+impl From<WebRtcAudioBridge> for MediaBridge {
+    fn from(b: WebRtcAudioBridge) -> Self {
+        MediaBridge::WebRtcAudio(b)
     }
 }
 

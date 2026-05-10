@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
@@ -44,6 +44,7 @@ use crate::rtp::codec::resample::{
 use crate::rtp::codec::AudioFrame;
 use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME};
 use crate::rtp::{decode_ulaw, encode_ulaw, set_rtp_dscp};
+use crate::webrtc::peer::{MediaFrame, PeerSession};
 
 /// Opus ペイロード PT。WebRTC SDP では動的 PT (96-127) を使うのが一般的。
 /// SDP で受け取った値を渡せるようにし、デフォルトは 111 (Chromium 互換)。
@@ -501,6 +502,363 @@ pub fn sdp_uses_opus(sdp_bytes: &[u8]) -> bool {
     find_opus_payload_type(sdp_bytes).is_some()
 }
 
+/// Issue #87 / #121: NGN レッグ (UDP socket) ⇔ WebRTC peer (str0m) を結ぶ
+/// 双方向ブリッジ。
+///
+/// `TranscodingBridge` と違い、 PWA レッグは UDP socket を直接持たず、
+/// [`PeerSession::take_media_rx`] / [`PeerSession::send_media`] の
+/// MediaFrame mpsc を使う (str0m が ICE/DTLS 上で SRTP 多重化するため)。
+///
+/// # 経路
+///
+/// ```text
+/// NGN UDP socket (PCMU PT 0)  →  μ-law decode → 8k PCM
+///   → upsample 48k PCM → Opus encode → MediaFrame → peer.send_media
+///
+/// peer.take_media_rx (Opus)
+///   → Opus decode → 48k PCM → downsample 8k PCM
+///   → μ-law encode → RtpPacket → NGN UDP socket
+/// ```
+///
+/// # RFC 引用
+///
+/// - **RFC 3550 §5.1** (RTP frame): NGN レッグの 1 RTP パケットは 1 frame。
+/// - **RFC 3551 §4.5.14** (PCMU PT 0, 8 kHz, 20 ms = 160 samples / packet)。
+/// - **RFC 7587 §4.2** (Opus payload format): WebRTC は通常 20 ms = 960
+///   samples@48 kHz の Opus フレームを 1 RTP packet に乗せる。
+/// - **RFC 8835** (WebRTC overview): 媒体経路は SRTP/AVPF の上 Opus を運ぶ。
+pub struct WebRtcAudioBridge {
+    ngn_to_peer: Option<JoinHandle<()>>,
+    peer_to_ngn: Option<JoinHandle<()>>,
+    state: Arc<BridgeState>,
+    /// NGN 側 socket / 学習済 peer。 DTMF 注入 (Issue #69) で使う。
+    ngn_socket: Arc<UdpSocket>,
+    ngn_state: Arc<LegState>,
+}
+
+/// [`WebRtcAudioBridge`] の起動パラメータ。
+pub struct WebRtcAudioConfig {
+    /// NGN 側 RTP ソケット (G.711 μ-law PT=0)。
+    pub ngn_socket: Arc<UdpSocket>,
+    /// SDP から既知の NGN 側ピア (Option: late-binding)。
+    pub ngn_peer: Option<SocketAddr>,
+    /// WebRTC peer。 双方向の MediaFrame mpsc にアクセスする。
+    pub peer: Arc<dyn PeerSession>,
+    /// `take_media_rx` で取り出した PWA → orchestrator 方向の receiver。
+    /// `peer.take_media_rx().await` の結果をそのまま渡す。
+    pub peer_media_rx: mpsc::Receiver<MediaFrame>,
+    /// SDP `a=rtpmap:<pt> opus/48000[/<ch>]` で negotiate した PT。
+    /// 不明なら [`DEFAULT_OPUS_PT`]。
+    pub opus_payload_type: u8,
+    /// 観測カウンタ。
+    pub metrics: Option<Arc<Metrics>>,
+}
+
+impl WebRtcAudioBridge {
+    /// ブリッジを起動する。両方向のループを spawn する。
+    pub fn start(cfg: WebRtcAudioConfig) -> Result<Self> {
+        let WebRtcAudioConfig {
+            ngn_socket,
+            ngn_peer,
+            peer,
+            peer_media_rx,
+            opus_payload_type,
+            metrics,
+        } = cfg;
+
+        if let Err(e) = set_rtp_dscp(&ngn_socket, 32) {
+            warn!("NGN RTP socket DSCP 設定失敗 (続行): {}", e);
+        }
+
+        let ngn_state = Arc::new(LegState {
+            peer: Mutex::new(ngn_peer),
+        });
+        let state = Arc::new(BridgeState::default());
+
+        // NGN → peer: μ-law → 8k PCM → 48k PCM → Opus → peer.send_media
+        let ngn_to_peer = tokio::spawn(ngn_to_peer_loop(
+            ngn_socket.clone(),
+            ngn_state.clone(),
+            peer.clone(),
+            state.clone(),
+            opus_payload_type,
+            metrics.clone(),
+        ));
+
+        // peer → NGN: peer.take_media_rx (Opus) → 48k PCM → 8k PCM → μ-law → NGN UDP
+        let peer_to_ngn = tokio::spawn(peer_to_ngn_loop(
+            peer_media_rx,
+            ngn_socket.clone(),
+            ngn_state.clone(),
+            state.clone(),
+            opus_payload_type,
+            metrics,
+        ));
+
+        Ok(Self {
+            ngn_to_peer: Some(ngn_to_peer),
+            peer_to_ngn: Some(peer_to_ngn),
+            state,
+            ngn_socket,
+            ngn_state,
+        })
+    }
+
+    /// Issue #69: NGN 側 socket から NGN ピア宛に任意 RTP datagram を 1 つ送る。
+    pub async fn send_to_ngn(&self, datagram: &[u8]) -> Result<()> {
+        let dest = { *self.ngn_state.peer.lock().await };
+        let dest = dest.ok_or_else(|| anyhow::anyhow!("NGN peer 未確定"))?;
+        self.ngn_socket.send_to(datagram, dest).await?;
+        Ok(())
+    }
+
+    /// 両ループを停止する。
+    pub async fn stop(mut self) {
+        if let Some(h) = self.ngn_to_peer.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = self.peer_to_ngn.take() {
+            h.abort();
+            let _ = h.await;
+        }
+    }
+
+    /// 統計: (NGN→peer 成功数, peer→NGN 成功数, トランスコード失敗数)
+    pub fn stats(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.state.ngn_to_web_packets.load(Ordering::Relaxed),
+            self.state.web_to_ngn_packets.load(Ordering::Relaxed),
+            self.state.transcode_errors.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Drop for WebRtcAudioBridge {
+    fn drop(&mut self) {
+        if let Some(h) = self.ngn_to_peer.take() {
+            h.abort();
+        }
+        if let Some(h) = self.peer_to_ngn.take() {
+            h.abort();
+        }
+    }
+}
+
+/// NGN (μ-law 8k) → WebRTC peer (Opus 48k) 方向。
+///
+/// 1 RTP 受信 → 1 MediaFrame 送信。 `peer.send_media` は run_loop に
+/// command で渡すだけなので背圧は実質 mpsc バッファ容量で吸収される。
+async fn ngn_to_peer_loop(
+    from_socket: Arc<UdpSocket>,
+    from_state: Arc<LegState>,
+    peer: Arc<dyn PeerSession>,
+    state: Arc<BridgeState>,
+    opus_pt: u8,
+    metrics: Option<Arc<Metrics>>,
+) {
+    use std::sync::atomic::Ordering;
+    let span = tracing::trace_span!("transcode_ngn_to_peer");
+    let _enter = span.enter();
+
+    let mut upsampler = match UpsamplerNbToWb::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error=%e, "Upsampler 初期化失敗 → NGN→peer 方向停止");
+            return;
+        }
+    };
+    let mut encoder = match OpusEncoder::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error=%e, "Opus エンコーダ初期化失敗 → NGN→peer 方向停止");
+            return;
+        }
+    };
+
+    // RTP timestamp は 48 kHz 単位の単調増加 (RFC 7587 §4.1)。
+    let mut rtp_ts: u32 = rand::random();
+
+    let mut buf = vec![0u8; 1500];
+    loop {
+        let (n, src) = match from_socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error=%e, "NGN recv エラー → NGN→peer 方向終了");
+                return;
+            }
+        };
+        {
+            let mut p = from_state.peer.lock().await;
+            if p.as_ref() != Some(&src) {
+                trace!(?src, "NGN 側 RTP 送信元学習");
+                *p = Some(src);
+            }
+        }
+
+        let pkt = match RtpPacket::from_bytes(&buf[..n]) {
+            Ok(p) => p,
+            Err(e) => {
+                trace!(error=%e, "NGN RTP パース失敗 → drop");
+                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        if pkt.payload_type != PAYLOAD_TYPE_ULAW {
+            trace!(pt = pkt.payload_type, "NGN 側 PT≠0 → drop");
+            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if pkt.payload.len() != SAMPLES_PER_FRAME {
+            trace!(len = pkt.payload.len(), "NGN payload 長異常 → drop");
+            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let pcm8: Vec<i16> = pkt.payload.iter().map(|b| decode_ulaw(*b)).collect();
+        let nb = AudioFrame::new(NARROW_BAND_RATE, pcm8);
+        let wb = match upsampler.process(&nb) {
+            Ok(v) => v,
+            Err(e) => {
+                trace!(error=%e, "アップサンプル失敗");
+                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let opus_payload = match encoder.encode(&wb) {
+            Ok(v) => v,
+            Err(e) => {
+                trace!(error=%e, "Opus エンコード失敗");
+                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        let frame = MediaFrame {
+            pt: opus_pt,
+            rtp_time: rtp_ts,
+            payload: opus_payload,
+            network_time: std::time::Instant::now(),
+        };
+        rtp_ts = rtp_ts.wrapping_add(OPUS_FRAME_SAMPLES as u32);
+
+        if let Err(e) = peer.send_media(frame).await {
+            trace!(error=%e, "peer.send_media 失敗 → NGN→peer 方向終了");
+            return;
+        }
+        state.ngn_to_web_packets.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = metrics.as_ref() {
+            m.add_rtp_ngn_to_ext(1);
+        }
+    }
+}
+
+/// WebRTC peer (Opus 48k) → NGN (μ-law 8k) 方向。
+///
+/// `peer_media_rx` から MediaFrame を 1 個受け取り、 Opus decode → resample →
+/// μ-law encode → RTP packet 構築 → NGN UDP socket へ送信する。
+async fn peer_to_ngn_loop(
+    mut peer_media_rx: mpsc::Receiver<MediaFrame>,
+    to_socket: Arc<UdpSocket>,
+    to_state: Arc<LegState>,
+    state: Arc<BridgeState>,
+    opus_pt: u8,
+    metrics: Option<Arc<Metrics>>,
+) {
+    use std::sync::atomic::Ordering;
+    let span = tracing::trace_span!("transcode_peer_to_ngn");
+    let _enter = span.enter();
+
+    let mut downsampler = match DownsamplerWbToNb::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error=%e, "Downsampler 初期化失敗 → peer→NGN 方向停止");
+            return;
+        }
+    };
+    let mut decoder = match OpusDecoder::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error=%e, "Opus デコーダ初期化失敗 → peer→NGN 方向停止");
+            return;
+        }
+    };
+
+    let ssrc: u32 = rand::random();
+    let mut seq: u16 = rand::random();
+    let mut ts: u32 = rand::random();
+
+    while let Some(frame) = peer_media_rx.recv().await {
+        if frame.pt != opus_pt {
+            // 同じ peer 上の異 codec (DTMF telephone-event 等) は本実装の
+            // スコープ外 (PCMU only NGN レッグへ流せない)。
+            trace!(
+                pt = frame.pt,
+                expected = opus_pt,
+                "peer 側 PT 不一致 → drop"
+            );
+            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let wb = match decoder.decode(&frame.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                trace!(error=%e, "Opus デコード失敗");
+                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        if wb.samples.len() != WB_FRAME_SAMPLES {
+            trace!(samples = wb.samples.len(), "WebRTC フレーム長異常 → drop");
+            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let nb = match downsampler.process(&wb) {
+            Ok(v) => v,
+            Err(e) => {
+                trace!(error=%e, "ダウンサンプル失敗");
+                state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        if nb.samples.len() != NB_FRAME_SAMPLES {
+            trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
+            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
+
+        let dest = match *to_state.peer.lock().await {
+            Some(d) => d,
+            None => {
+                trace!("NGN 側 peer 未確定 → drop");
+                continue;
+            }
+        };
+        let out_pkt = RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: false,
+            sequence: seq,
+            timestamp: ts,
+            ssrc,
+            payload: ulaw,
+        };
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(SAMPLES_PER_FRAME as u32);
+
+        if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
+            warn!(error=%e, "NGN へ RTP forward 失敗");
+            continue;
+        }
+        state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = metrics.as_ref() {
+            m.add_rtp_ext_to_ngn(1);
+        }
+    }
+    debug!("peer_media_rx closed → peer→NGN 方向終了");
+}
+
 /// テスト用ヘルパ: 1 NGN RTP パケット (μ-law 20ms 無音) を作る。
 #[cfg(test)]
 pub(crate) fn build_ulaw_rtp_packet(seq: u16, ts: u32, ssrc: u32, samples: &[i16]) -> Vec<u8> {
@@ -667,6 +1025,179 @@ mod tests {
 
         let (_n2w, w2n, _err) = bridge.stats();
         assert!(w2n >= 1, "WebRTC→NGN カウンタが上がっていない: {}", w2n);
+        bridge.stop().await;
+    }
+
+    /// Issue #87 / #121: NGN socket → WebRtcAudioBridge → peer.send_media
+    /// 経路が PCMU 1 packet で起動し、 peer に Opus MediaFrame が届く。
+    #[tokio::test]
+    async fn webrtc_audio_bridge_ngn_to_peer_emits_opus_media_frame() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as SArc;
+        use tokio::sync::Mutex as TMutex;
+
+        // sabiden 内 mock peer: send_media を回数カウントして observed に積む。
+        struct MockPeer {
+            received: SArc<TMutex<Vec<MediaFrame>>>,
+            counter: SArc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl PeerSession for MockPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, frame: MediaFrame) -> anyhow::Result<()> {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                self.received.lock().await.push(frame);
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // 1 RTP datagram を投入できる NGN socket
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        // peer_media_rx は使用しない (peer→NGN 方向はテストしない) ので空チャネル
+        let (_dummy_tx, dummy_rx) = mpsc::channel::<MediaFrame>(1);
+
+        let received: SArc<TMutex<Vec<MediaFrame>>> = SArc::new(TMutex::new(Vec::new()));
+        let counter = SArc::new(AtomicU32::new(0));
+        let mock_peer: Arc<dyn PeerSession> = Arc::new(MockPeer {
+            received: received.clone(),
+            counter: counter.clone(),
+        });
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: mock_peer,
+            peer_media_rx: dummy_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 8 kHz 1 kHz トーン (160 samples) を μ-law 化して NGN socket に投入
+        let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
+        for i in 0..NB_FRAME_SAMPLES {
+            let t = i as f32 / NARROW_BAND_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let pkt = build_ulaw_rtp_packet(1, 0, 0xCAFE_BEEF, &samples);
+        ngn_peer_sock.send_to(&pkt, ngn_addr).await.unwrap();
+
+        // peer.send_media が呼ばれるまで最大 2 秒待つ
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while counter.load(Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("WebRtcAudioBridge: NGN→peer 方向で peer.send_media が呼ばれない");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let frames = received.lock().await;
+        assert_eq!(frames.len(), 1, "1 frame 受信されているはず");
+        assert_eq!(frames[0].pt, DEFAULT_OPUS_PT, "Opus PT で push されている");
+        assert!(!frames[0].payload.is_empty(), "Opus payload が空");
+
+        let (n2p, _p2n, _err) = bridge.stats();
+        assert!(n2p >= 1, "stats 反映されていない: {}", n2p);
+        bridge.stop().await;
+    }
+
+    /// Issue #87: peer_media_rx (Opus) → NGN socket (μ-law) 方向。
+    /// テストフレームを peer_media_rx に push し、 NGN socket で μ-law が
+    /// 受信できることを確認する。
+    #[tokio::test]
+    async fn webrtc_audio_bridge_peer_to_ngn_emits_pcmu_to_ngn_socket() {
+        use std::sync::Arc as SArc;
+
+        // dummy peer: send_media は呼ばれない (NGN→peer は流さないので)
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        let (peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(8);
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: Arc::new(NoopPeer),
+            peer_media_rx: peer_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 48 kHz 1 kHz トーンを Opus encode し、 MediaFrame として peer_tx に push
+        let mut enc = OpusEncoder::new().unwrap();
+        let mut samples = Vec::with_capacity(OPUS_FRAME_SAMPLES);
+        for i in 0..OPUS_FRAME_SAMPLES {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+        let opus_payload = enc.encode(&frame).unwrap();
+        let media = MediaFrame {
+            pt: DEFAULT_OPUS_PT,
+            rtp_time: 0,
+            payload: opus_payload,
+            network_time: std::time::Instant::now(),
+        };
+        peer_tx.send(media).await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let (n, _src) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("NGN socket で μ-law が受信できない")
+            .unwrap();
+        let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(
+            recv.payload_type, PAYLOAD_TYPE_ULAW,
+            "PCMU PT=0 で送られているはず"
+        );
+        assert_eq!(recv.payload.len(), SAMPLES_PER_FRAME);
+
+        let (_n2p, p2n, _err) = bridge.stats();
+        assert!(p2n >= 1, "peer→NGN stats 反映されていない: {}", p2n);
         bridge.stop().await;
     }
 

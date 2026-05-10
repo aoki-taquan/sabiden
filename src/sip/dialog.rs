@@ -13,12 +13,14 @@
 //!
 //! NTT NGN 制約: Via ヘッダに `rport` を付けない (拒否される)。
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use tracing::{debug, warn};
 
-use super::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
+use super::message::{parse_sip_uri, SipHeaders, SipMethod, SipRequest, SipResponse};
 use super::utils::new_branch;
 
 /// ダイアログ状態 (RFC 3261 §12)。
@@ -357,11 +359,16 @@ impl Dialog {
 
     /// in-dialog リクエストの **次ホップ URI** を返す (RFC 3261 §12.2.1.1)。
     ///
+    /// **strict / loose のどちらでも `route_set[0]` の URI を返す** (空なら
+    /// `remote_target`)。 Request-URI と Route ヘッダの組み立てだけが
+    /// strict / loose で違い、 次ホップ host:port は同一の値を採用する。
+    ///
     /// RFC 3261 §12.2.1.1 / §8.1.2 に従い、 UAC は in-dialog リクエストを
     /// **「Request-URI が指す host」ではなく** 「next-hop」 = topmost Route が
     /// あればその URI、 なければ Request-URI (= remote target) の host:port へ
     /// 送らねばならない。 戻り値は次ホップを示す SIP URI (`sip:host[:port][;params]`)
-    /// であり、 呼び出し側が host:port を取り出して SocketAddr に解決する。
+    /// であり、 呼び出し側が host:port を取り出して SocketAddr に解決する
+    /// ([`Dialog::next_hop_socket`] 参照)。
     ///
     /// 分岐 (RFC 3261 §12.2.1.1 末尾の「The UAC SHOULD send the request to ...」):
     /// - route_set が空: remote_target を返す (Request-URI = remote_target)
@@ -379,6 +386,65 @@ impl Dialog {
         }
         // loose / strict のいずれでも次ホップは先頭 Route の URI。
         extract_uri(&self.route_set[0])
+    }
+
+    /// in-dialog リクエストの宛先 SocketAddr を返す (RFC 3261 §12.2.1.1)。
+    ///
+    /// [`Dialog::next_hop_uri`] が返す URI を `parse_sip_uri` でパースし、
+    /// host が IP リテラル + 明示 port のときに限り `SocketAddr` を確定で
+    /// 返す。 それ以外 (FQDN / port 省略 / URI パース失敗) は `fallback`
+    /// を返す。 これは **(RFC 3263 §4.1 SRV / NAPTR ベースの完全な next-hop
+    /// 解決は未実装、 別 Issue で対応予定)** の縮退実装である。
+    ///
+    /// `fallback` には呼び出し側が「最終手段」として使うべき SocketAddr
+    /// (典型的には INVITE 送信先 = NGN P-CSCF) を渡す。
+    ///
+    /// NGN 直収では P-CSCF が Record-Route で `118.177.125.1:5060` を返すため
+    /// 確定経路で動く (`docs/asterisk-real-invite.md` §3 / §5.1 / Contact 例 §5.6)。
+    ///
+    /// Issue #133: uac.rs に重複していた `resolve_next_hop_addr` を dialog 層に
+    /// push し、 in-dialog リクエスト宛先解決の単一情報源にした。
+    pub fn next_hop_socket(&self, fallback: SocketAddr) -> SocketAddr {
+        let uri = self.next_hop_uri();
+        let parts = match parse_sip_uri(&uri) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(
+                    target_uri = %uri,
+                    ?err,
+                    "dialog next-hop URI のパースに失敗、 fallback (= server_addr) を使う"
+                );
+                return fallback;
+            }
+        };
+        let Some(port) = parts.port else {
+            // port 省略時は SRV / NAPTR が必要 (RFC 3263 §4.1)。 未実装のため fallback。
+            debug!(
+                target_uri = %uri,
+                "dialog next-hop URI に port 指定なし (RFC 3263 §4.1 SRV 未実装)、 fallback を使う"
+            );
+            return fallback;
+        };
+        // SipUriParts::host は IPv6 のとき "[v6]" 形式 (同 struct docstring 契約)。
+        // strip して parse、 それ以外は IPv4 リテラルを試す。
+        let host = parts.host.as_str();
+        let parsed_ip =
+            if let Some(stripped) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                stripped.parse::<IpAddr>().ok()
+            } else {
+                host.parse::<IpAddr>().ok()
+            };
+        match parsed_ip {
+            Some(ip) => SocketAddr::new(ip, port),
+            None => {
+                // FQDN: 名前解決は別 Issue (RFC 3263 §4.1)。 fallback を使う。
+                debug!(
+                    host = %host,
+                    "dialog next-hop の host が IP リテラルでない (FQDN)、 fallback を使う"
+                );
+                fallback
+            }
+        }
     }
 
     /// Route set の先頭 URI が `lr` (loose router) を含むかで Request-URI と
@@ -827,6 +893,115 @@ mod tests {
         resp.headers = new_headers;
         let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
         assert_eq!(dlg.next_hop_uri(), "sip:strict.example.com");
+    }
+
+    /// RFC 3261 §12.2.1.1: route_set 空 + remote_target が IPv4 リテラル +
+    /// 明示 port のとき、 next_hop_socket は確定で SocketAddr を返す。
+    /// fallback は使われない (= 異なる値を渡しても採用されない)。
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_socket_resolves_ipv4_literal_with_port() {
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        // Record-Route 削除 + Contact を IPv4 リテラルに置換
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" && k != "contact" {
+                new_headers.add(k, v);
+            }
+        }
+        new_headers.add("Contact", "<sip:remote@198.51.100.5:5070>");
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = dlg.next_hop_socket(fallback);
+        assert_eq!(addr, "198.51.100.5:5070".parse::<SocketAddr>().unwrap());
+        assert_ne!(addr, fallback, "fallback が誤って採用されていないこと");
+    }
+
+    /// RFC 3261 §12.2.1.1 + IPv6 brackets contract (Issue #133):
+    /// `SipUriParts::host` は IPv6 のとき `[..]` brackets 込みで返るので、
+    /// next_hop_socket は brackets を剥がして IpAddr に解決できる。
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_socket_resolves_ipv6_literal_with_port() {
+        let inv = invite_request();
+        let resp = ok_response_with_route();
+        // Default fixture の Contact が `<sip:0312345678@[2001:db8::99]:5060>`。
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" {
+                new_headers.add(k, v);
+            }
+        }
+        let mut resp = resp;
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = dlg.next_hop_socket(fallback);
+        assert_eq!(addr, "[2001:db8::99]:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    /// RFC 3263 §4.1: FQDN host は SRV / NAPTR 解決が必要。 sabiden は未実装
+    /// なので next_hop_socket は fallback を返す。 (Issue #133 docstring 契約)
+    #[test]
+    fn rfc3263_4_1_next_hop_socket_falls_back_for_fqdn() {
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" && k != "contact" {
+                new_headers.add(k, v);
+            }
+        }
+        // FQDN + 明示 port でも host 部が IP リテラルでないので fallback。
+        new_headers.add("Contact", "<sip:remote@proxy.example.com:5060>");
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = dlg.next_hop_socket(fallback);
+        assert_eq!(addr, fallback);
+    }
+
+    /// RFC 3263 §4.1: port 省略時は SRV lookup が必要。 未実装なので fallback。
+    #[test]
+    fn rfc3263_4_1_next_hop_socket_falls_back_when_port_omitted() {
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" && k != "contact" {
+                new_headers.add(k, v);
+            }
+        }
+        new_headers.add("Contact", "<sip:remote@198.51.100.5>");
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = dlg.next_hop_socket(fallback);
+        assert_eq!(addr, fallback);
+    }
+
+    /// RFC 3261 §12.2.1.1: route_set 非空 (loose) のとき、 next_hop_socket は
+    /// route_set[0] (= topmost Route) を採用し、 remote_target は使わない。
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_socket_uses_topmost_route_when_loose_routing() {
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        // Record-Route を確定 IP+port に置き換え (parse 可能にする)
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" {
+                new_headers.add(k, v);
+            }
+        }
+        // 受信順 [proxy_a, proxy_b] → UAC route_set 逆順 [proxy_b, proxy_a]
+        new_headers.add("Record-Route", "<sip:198.51.100.10:5060;lr>");
+        new_headers.add("Record-Route", "<sip:198.51.100.11:5061;lr>");
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let fallback: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let addr = dlg.next_hop_socket(fallback);
+        // route_set[0] は受信順 2 番目 = proxy_b = 198.51.100.11:5061
+        assert_eq!(addr, "198.51.100.11:5061".parse::<SocketAddr>().unwrap());
     }
 
     #[test]

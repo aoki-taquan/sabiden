@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use super::auth::{DigestChallenge, DigestCredentials};
 use super::dialog::{Dialog, DialogConfig};
-use super::message::{parse_sip_uri, SipMethod, SipRequest, SipResponse};
+use super::message::{SipMethod, SipRequest, SipResponse};
 use super::transaction::TransactionLayer;
 use super::utils::{new_branch, new_call_id, new_tag};
 
@@ -458,11 +458,11 @@ impl UacDialog {
 
     /// in-dialog リクエストの宛先 SocketAddr (RFC 3261 §12.2.1.1)。
     ///
-    /// dialog の next-hop URI (= topmost Route または remote target) から
-    /// host:port を取り出し SocketAddr に解決する。 解決不能 (FQDN /
+    /// 単一情報源は [`Dialog::next_hop_socket`] にあり、 ここはハンドル側の
+    /// 都合で `fallback_peer` を渡すだけのアダプタ。 解決不能 (FQDN /
     /// port 省略 / 不正 URI) のときは `fallback_peer` を返す。
     fn next_hop_socket(&self) -> SocketAddr {
-        resolve_next_hop_addr(&self.inner, self.fallback_peer)
+        self.inner.next_hop_socket(self.fallback_peer)
     }
 
     /// BYE を送信してダイアログを終了する (RFC 3261 §15.1.1)。
@@ -554,51 +554,21 @@ pub fn build_cancel(invite: &SipRequest, invite_cseq: u32) -> SipRequest {
 
 /// dialog の next-hop URI (RFC 3261 §12.2.1.1) を SocketAddr に解決する。
 ///
-/// 次ホップ host:port が **IP リテラル + 明示 port** の場合のみ確定。
-/// FQDN / port 省略の場合は `fallback` を返す (RFC 3263 SRV / NAPTR 解決は
-/// 未実装、 別 Issue 扱い)。 NGN 直収では P-CSCF が Record-Route で
-/// `118.177.125.1:5060` を返すため確定経路で動く (`docs/asterisk-real-invite.md`
-/// §3 / §5.1 / `docs/asterisk-real-invite.md` Contact 例 §5.6)。
+/// **(RFC 3263 §4.1 SRV / NAPTR ベースの完全な next-hop 解決は未実装、
+/// 別 Issue で対応予定。)** 本関数は [`Dialog::next_hop_socket`] への
+/// 薄いラッパであり、 単一情報源は dialog 層側にある。 縮退ルール:
+///
+/// - 次ホップ host:port が **IP リテラル + 明示 port** の場合のみ
+///   `SocketAddr` を確定で返す (`SipUriParts::host` は IPv6 のとき
+///   `[..]` brackets 込み、 同 struct docstring 参照)
+/// - FQDN / port 省略 / URI パース失敗の場合は `fallback` を返す
+///   (RFC 3263 §4.1 の `_sip._udp.<host>` SRV lookup → port を引く本来の
+///   解決は別 Issue)
+///
+/// NGN 直収では P-CSCF が Record-Route で `118.177.125.1:5060` を返すため
+/// 確定経路で動く (`docs/asterisk-real-invite.md` §3 / §5.1 / Contact 例 §5.6)。
 fn resolve_next_hop_addr(dialog: &Dialog, fallback: SocketAddr) -> SocketAddr {
-    let uri = dialog.next_hop_uri();
-    let parts = match parse_sip_uri(&uri) {
-        Ok(p) => p,
-        Err(err) => {
-            warn!(
-                target_uri = %uri,
-                ?err,
-                "dialog next-hop URI のパースに失敗、 fallback (= server_addr) を使う"
-            );
-            return fallback;
-        }
-    };
-    let Some(port) = parts.port else {
-        // port 省略時は SRV / NAPTR が必要 (RFC 3263 §4)。 未実装のため fallback。
-        debug!(
-            target_uri = %uri,
-            "dialog next-hop URI に port 指定なし (RFC 3263 SRV 未実装)、 fallback を使う"
-        );
-        return fallback;
-    };
-    // host が "[v6]" 形式なら strip して parse、 それ以外は IPv4 リテラルを試す。
-    let host = parts.host.as_str();
-    let parsed_ip = if let Some(stripped) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-    {
-        stripped.parse::<std::net::IpAddr>().ok()
-    } else {
-        host.parse::<std::net::IpAddr>().ok()
-    };
-    match parsed_ip {
-        Some(ip) => SocketAddr::new(ip, port),
-        None => {
-            // FQDN: 名前解決は別 Issue。 fallback を使う。
-            debug!(
-                host = %host,
-                "dialog next-hop の host が IP リテラルでない (FQDN)、 fallback を使う"
-            );
-            fallback
-        }
-    }
+    dialog.next_hop_socket(fallback)
 }
 
 /// 元の INVITE と同じ Via 構造を保ちつつ branch だけ新規生成する。
@@ -1039,6 +1009,174 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), bye_received.notified())
             .await
             .expect("BYE が server_b に届かなかった (server_addr に飛んでいる可能性)");
+        server_b_handle.await.unwrap();
+    }
+
+    /// RFC 3261 §12.2.1.1 / §13.2.2.4 / RFC 4028 §7:
+    ///
+    /// Re-INVITE (Session Timer 更新含む) と続く 2xx ACK は **dialog の
+    /// next-hop** に送らなければならない。 旧実装 (#79 修正前) は INVITE
+    /// 送信先 `server_addr` (= NGN P-CSCF 固定) に流していた。 Issue #133
+    /// は #132 で BYE 用 dual-server harness を追加したのを受けて、 同等の
+    /// regression 防止を Re-INVITE 経路にも入れる。
+    ///
+    /// Shape (BYE テストと同形):
+    ///   - INVITE 受け口: server_a (= server_addr 役、 P-CSCF 役)
+    ///   - Re-INVITE / 2xx ACK 受け口: server_b (= 200 OK Contact 側、 真の対向)
+    ///   200 OK で Contact = server_b、 Record-Route 無し → route_set 空、
+    ///   次ホップ = remote target = server_b。 Re-INVITE が server_b に届けば
+    ///   PASS、 server_a に届けば FAIL (旧バグ再発)。
+    #[tokio::test]
+    async fn rfc3261_12_2_1_1_reinvite_goes_to_dialog_remote_target_not_server_addr() {
+        let server_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_a_addr = server_a.local_addr().unwrap();
+        let server_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_b_addr = server_b.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_local = client_sock.local_addr().unwrap();
+
+        let server_a_clone = server_a.clone();
+        let server_b_clone = server_b.clone();
+        let server_b_addr_for_resp = server_b_addr;
+        let server_a_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // INVITE 受信 → 200 OK with Contact = server_b、 Record-Route 無し
+            let (n, peer) = server_a_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(invite) = parsed else {
+                panic!("INVITE expected on server_a");
+            };
+            assert_eq!(invite.method, SipMethod::Invite);
+            let mut resp = crate::sip::transaction::build_response_skeleton(&invite, 200, "OK");
+            resp.headers.set(
+                "To",
+                format!("{};tag=server-tag", invite.headers.get("to").unwrap()),
+            );
+            resp.headers.set(
+                "Contact",
+                format!("<sip:remote@{}>", server_b_addr_for_resp),
+            );
+            server_a_clone
+                .send_to(&resp.to_bytes(), peer)
+                .await
+                .unwrap();
+            // Re-INVITE / 2xx ACK は dialog next-hop = server_b に飛ぶので、
+            // server_a にはこれ以上届かない。
+        });
+
+        let reinvite_received = Arc::new(tokio::sync::Notify::new());
+        let reinvite_received_for_task = reinvite_received.clone();
+        let server_b_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 1) 初回 INVITE の 2xx ACK 受信 (Issue #79 で server_b に届く既知挙動)
+            let (n, _peer) = server_b_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(ack) = parsed else {
+                panic!("ACK expected on server_b");
+            };
+            assert_eq!(
+                ack.method,
+                SipMethod::Ack,
+                "初回 INVITE の 2xx ACK は server_b (dialog next-hop) に届くべき"
+            );
+
+            // 2) Re-INVITE 受信 → 200 OK
+            let (n2, peer2) = server_b_clone.recv_from(&mut buf).await.unwrap();
+            let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
+            let SipMessage::Request(reinv) = parsed2 else {
+                panic!("Re-INVITE expected on server_b");
+            };
+            assert_eq!(
+                reinv.method,
+                SipMethod::Invite,
+                "Re-INVITE が dialog remote target (= server_b) に届くべき"
+            );
+            // RFC 3261 §12.2.1.1: Request-URI = remote target = Contact URI。
+            assert!(
+                reinv.uri.contains(&format!("@{}", server_b_addr_for_resp)),
+                "Re-INVITE の Request-URI は Contact (server_b) を指すべき: {}",
+                reinv.uri
+            );
+            // RFC 4028 §7.4: Re-INVITE は Session-Expires を持つ。
+            assert!(
+                reinv.headers.get("session-expires").is_some(),
+                "Re-INVITE に Session-Expires が必要 (RFC 4028 §7.4)"
+            );
+
+            let mut reinv_resp =
+                crate::sip::transaction::build_response_skeleton(&reinv, 200, "OK");
+            // 200 OK にも Contact / To-tag を載せる (元 dialog と同じ tag を維持)。
+            reinv_resp.headers.set(
+                "Contact",
+                format!("<sip:remote@{}>", server_b_addr_for_resp),
+            );
+            server_b_clone
+                .send_to(&reinv_resp.to_bytes(), peer2)
+                .await
+                .unwrap();
+
+            // 3) Re-INVITE 2xx ACK 受信 (RFC 3261 §13.2.2.4)
+            let (n3, _peer3) = server_b_clone.recv_from(&mut buf).await.unwrap();
+            let parsed3 = crate::sip::message::parse_message(&buf[..n3]).unwrap();
+            let SipMessage::Request(reinv_ack) = parsed3 else {
+                panic!("Re-INVITE 2xx ACK expected on server_b");
+            };
+            assert_eq!(
+                reinv_ack.method,
+                SipMethod::Ack,
+                "Re-INVITE 2xx ACK が dialog next-hop (= server_b) に届くべき"
+            );
+            // 2xx ACK CSeq number = Re-INVITE と同番号 (RFC 3261 §13.2.2.4)
+            let reinv_cseq = reinv
+                .headers
+                .get("cseq")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            let ack_cseq = reinv_ack
+                .headers
+                .get("cseq")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert_eq!(
+                ack_cseq, reinv_cseq,
+                "RFC 3261 §13.2.2.4: 2xx ACK CSeq 番号は Re-INVITE と同じ"
+            );
+            reinvite_received_for_task.notify_one();
+        });
+
+        let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
+        let mut uac_cfg = cfg();
+        uac_cfg.local_addr = client_local;
+        // server_addr は server_a (= P-CSCF 役)。 Re-INVITE は dialog 次ホップ
+        // (= server_b) に向かわなければバグ。
+        let uac = Uac::new(uac_cfg, layer, server_a_addr);
+
+        let target_uri = format!("sip:remote@{}", server_a_addr);
+        let plan = uac.build_invite(&target_uri, None, Some(300));
+        let outcome = uac.invite(plan, None).await.expect("invite");
+        let mut dlg = match outcome {
+            InviteOutcome::Established(call) => call.dialog,
+            InviteOutcome::Failed { response } => {
+                panic!("expected established, got {}", response.status_code)
+            }
+        };
+
+        // SDP 無しの Session Timer 更新専用 Re-INVITE を発射。
+        let reinv_resp = dlg.send_reinvite(None).await.expect("re-invite");
+        assert_eq!(reinv_resp.status_code, 200);
+
+        server_a_handle.await.unwrap();
+        // タイムアウト保護で notify を待つ。 server_a に飛ぶバグなら timeout する。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reinvite_received.notified(),
+        )
+        .await
+        .expect("Re-INVITE が server_b に届かなかった (server_addr に飛んでいる可能性)");
         server_b_handle.await.unwrap();
     }
 

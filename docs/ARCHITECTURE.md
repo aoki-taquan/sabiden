@@ -430,6 +430,33 @@ passthrough モードでの **frame fast path**:
    現状では同じ `ngn_to_peer_loop` / `peer_to_ngn_loop` 関数に 2 モードを
    `if direct_pcmu_passthrough { ... } else { ... }` で同居させる方が安い。
 
+#### `TranscodingBridge` のジッタバッファ (Issue #105)
+
+`TranscodingBridge::{ngn_to_web_loop, web_to_ngn_loop}` は **両方向とも
+`JitterBuffer` (`src/rtp/jitter.rs`) を経由する**。 受信タスクと
+エンコード送信タスクは 1 つの async 関数内 `tokio::select!` で同居し、
+[`JitterBuffer`] への排他アクセスを Mutex なしで実現する。
+
+```text
+recv_from(UDP)  ─push─►  JitterBuffer  ─pull─►  codec pipeline  ─send_to(UDP)
+                          (depth=4)              (transcode)
+                          ▲       ▲
+                          │       └ tokio::time::interval (20 ms tick)
+                          └ select! arm: 受信時即 push
+```
+
+| 項目 | 値 | 根拠 |
+|---|---|---|
+| バッファ深度 | 4 packet ≒ 80 ms | `src/rtp/jitter.rs::DEFAULT_DEPTH`、 RFC 3550 §6.4.1/§6.4.2 |
+| Pull 周期 | 20 ms (`JITTER_PULL_INTERVAL`) | RFC 3551 §4.5.14 (PCMU) / RFC 7587 §4.2 (Opus) |
+| MissedTickBehavior | `Delay` | tick lag 時の bursty 送出を避ける |
+| PLC | 未実装 (端末側に委ねる) | RFC 7587 §6.2 (将来拡張余地) |
+
+`WebRtcAudioBridge` (`ngn_to_peer_loop` / `peer_to_ngn_loop`) は str0m 自体が
+ICE/SRTP 経路で再整列するため、 sabiden 側 jitter buffer は **挟まない**。
+NGN ↔ UDP socket の `TranscodingBridge` のみが reorder 緩和の責務を負う
+(SIP-only 内線が UDP で symmetric RTP を流す前提)。
+
 #### orchestrator 配線
 
 ```text

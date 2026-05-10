@@ -139,6 +139,84 @@ sabiden ◄──200 OK── NGN
 [RTPブリッジ確立]
 ```
 
+### 発信 (PWA → NGN、 Issue #145 / #147)
+
+PWA (WebRTC ブラウザ) は SIP dialog を持たず、 専用 WS シグナリングと
+str0m (ICE/DTLS-SRTP) で sabiden に接続する。 NGN レッグは sabiden が
+UAC として通常の SIP INVITE で発呼する。 B2BUA SDP anchoring (RFC 5853 §3.2)
+で 2 つの SDP 交渉は完全に独立: PWA 側は SAVPF/Opus、 NGN 側は AVP/PCMU。
+
+```
+PWA ──ClientMessage::Offer{target,sdp(SAVPF)}──► sabiden(WS シグナリング)
+                                                       │
+                                                       │ peer.handle_offer → SAVPF answer
+                                                       ▼
+PWA ◄──ServerMessage::Answer{sdp(SAVPF)}── sabiden  (RFC 8829 / RFC 3264 §6)
+        ▲
+        │  (背景タスク化、 RFC 8839 §4 trickle ICE 詰まり対策)
+        │
+sabiden(UAC) ──INVITE (AVP/PCMU)──► NGN
+                                       │
+sabiden ◄──200 OK── NGN              (`docs/asterisk-real-invite.md` §5)
+                                       │
+sabiden ──ACK──► NGN                  (RFC 3261 §17.1.1.3 ACK for 2xx)
+                                       │
+[MediaBridge::WebRtcAudio 起動: NGN UDP ⇄ Opus⇔PCMU ⇄ str0m peer]
+```
+
+**双方向 BYE 連動 (Issue #147)**:
+
+PWA は SIP dialog を持たないため、 既存の `OutboundCallRegistry`
+(内線→NGN 発信用 = `ext_dialog` 必須) は使えない。 専用テーブル
+`webrtc_outbound_active: HashMap<NGN_Call_ID, WebRtcOutboundEntry>` を
+`UasEventHandler` と `NgnInboundHandler` で **同じ Arc を共有** することで、
+RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework の片側 dialog 終了を
+もう片側に伝搬する責務を満たす:
+
+| エントリ要素 | 用途 |
+|---|---|
+| `ngn_dialog: Mutex<UacDialog>` | PWA 切断時に NGN へ BYE を撃つ (RFC 3261 §15.1.1) |
+| `ws: WsSink` | NGN 切断時に PWA へ `ServerMessage::Bye` を push |
+| `bridge_call_id: CallId` | BYE 時に `CallManager::terminate` で RTP ブリッジ停止 |
+
+```
+[NGN→PWA BYE flow]                       [PWA→NGN BYE flow]
+NGN ──BYE──► sabiden                     PWA ──ClientMessage::Bye / WS close──► sabiden
+              │                                                                    │
+              │ (1) NGN へ 200 OK 即返答                                          │ (1) PwaOutboundCloser::close_pwa_outbound_for_ws
+              │ (2) webrtc_outbound_active.remove(call_id)                        │ (2) webrtc_outbound_active から WS 一致エントリ remove
+              │ (3) CallManager::terminate(bridge_call_id)                        │ (3) ngn_dialog.send_bye() (RFC 3261 §15.1.1)
+              │ (4) metrics.dec_call_active                                       │ (4) CallManager::terminate(bridge_call_id)
+              │ (5) ngn_dialog.terminate (state)                                  │ (5) metrics.dec_call_active
+              │ (6) ws.send(ServerMessage::Bye)                                   │ (6) PWA に ServerMessage::Bye を返却
+              ▼                                                                    │
+PWA ◄──ServerMessage::Bye── sabiden                                                ▼
+                                                                  sabiden(UAC) ──BYE──► NGN
+                                                                                       │
+                                                                  sabiden ◄──200 OK── NGN
+```
+
+**leak 防止 (Issue #147)**:
+
+PWA outbound 成立 branch (`UasEventHandler::handle_pwa_outbound_offer` の
+`Established(call)` arm 内、 bridge attach 完了後) のみテーブルに insert する。
+途中失敗 (NGN SDP 解析失敗 / `WebRtcAudioBridge::start` 失敗 / `CallManager`
+未注入 / `attach_media_bridge` 失敗) では:
+
+1. テーブルには insert しない (leak しない)
+2. **best-effort で NGN BYE を撃つ** (`ngn_dialog.send_bye()`) — NGN は
+   既に 200 OK を返して dialog confirmed だが、 sabiden 側で通話を保持
+   できないので即座に閉じる。 これを怠ると NGN が 5 分タイムアウトまで
+   dialog を残し、 同番号への再発信が 486 Busy Here で弾かれる
+   (Issue #147 の根本要因)。
+
+**idempotency**:
+
+NGN→PWA BYE と PWA→NGN BYE が同時に発火しても (例: PWA 切断中に NGN が
+タイムアウト BYE を送る)、 テーブルから先に `remove` してから処理する
+設計のため、 後勝ちは 0 件 = no-op で `dec_call_active` の二重減算は
+起きない (`Metrics::dec_call_active` 自体も saturating-zero なので二重防御)。
+
 ### Re-INVITE (内線 → sabiden、 RFC 3261 §14.2 / Issue #94)
 
 確立済み dialog 内で内線 UA が SDP renegotiation (hold/un-hold) や

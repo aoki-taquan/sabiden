@@ -188,6 +188,27 @@ pub struct PwaOutboundOutcome {
     pub completion: tokio::task::JoinHandle<Result<()>>,
 }
 
+/// PWA→NGN 発信通話の cleanup ハンドラ (Issue #147)。
+///
+/// 本トレイトは WS セッション終了側から呼び出される:
+/// - `ClientMessage::Bye` を受信した直後 (PWA UI で「切る」ボタン)
+/// - WS 接続が close した直後 (タブ閉じ / ネットワーク断 / Cloudflare idle)
+///
+/// 実装 ([`crate::call::orchestrator::UasEventHandler`]) は WS と紐づく
+/// `webrtc_outbound_active` エントリを全て NGN BYE で閉じ、 RTP ブリッジ /
+/// `call_active` メトリクスを cleanup する責務を負う (RFC 3261 §15.1.1
+/// `BYE`、 RFC 5853 §3.2.2 SBC framework: 片側 dialog 終了をもう片側へ伝搬)。
+///
+/// `WebRtcOutboundActive` テーブル本体は orchestrator 内部に閉じ、 シグナ
+/// リング層からは本 trait 経由でしか触らない (依存方向: signaling → orchestrator)。
+#[async_trait::async_trait]
+pub trait PwaOutboundCloser: Send + Sync {
+    /// 指定 WS と紐づく PWA→NGN outbound 通話を全て NGN BYE で閉じる。
+    /// 戻り値は閉じたエントリ数 (テスト / 観測用、 production code は
+    /// 戻り値を読まなくて良い)。 該当無し = 0 (idempotent: 二重 close 安全)。
+    async fn close_pwa_outbound_for_ws(&self, ws: &WsSink) -> usize;
+}
+
 /// PWA→NGN 発信ハンドラ (Issue #145)。
 ///
 /// `ClientMessage::Offer { target, sdp }` を受けたとき、 sabiden が
@@ -289,6 +310,12 @@ pub struct SignalingState {
     /// Offer は `ServerMessage::Error{code:"outbound_unavailable"}` で拒否
     /// する (sabiden が NGN UAC を持っていない構成 = 内線無し設定など)。
     pub pwa_outbound: Option<Arc<dyn PwaOutboundHandler>>,
+    /// PWA→NGN 発信通話の cleanup ハンドラ (Issue #147)。 `ClientMessage::Bye`
+    /// 受信時 / WS close 時に該当 WS の outbound 通話を NGN へ BYE で伝搬する。
+    /// `None` のときは PWA outbound が無い構成 (= `pwa_outbound = None`) と
+    /// 同義。 通常 `pwa_outbound` と同じ `UasEventHandler` を `Arc::clone`
+    /// で渡す (`PwaOutboundHandler` と `PwaOutboundCloser` の両方を実装)。
+    pub pwa_outbound_closer: Option<Arc<dyn PwaOutboundCloser>>,
 }
 
 impl SignalingState {
@@ -306,6 +333,7 @@ impl SignalingState {
             keepalive_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
             pwa_outbound: None,
+            pwa_outbound_closer: None,
         }
     }
 
@@ -325,6 +353,13 @@ impl SignalingState {
     /// PWA→NGN 発信ハンドラを差し込む (Issue #145)。
     pub fn with_pwa_outbound(mut self, h: Arc<dyn PwaOutboundHandler>) -> Self {
         self.pwa_outbound = Some(h);
+        self
+    }
+
+    /// PWA→NGN 発信通話の cleanup ハンドラを差し込む (Issue #147)。
+    /// 通常 `with_pwa_outbound` と同じ `UasEventHandler` を渡す。
+    pub fn with_pwa_outbound_closer(mut self, h: Arc<dyn PwaOutboundCloser>) -> Self {
+        self.pwa_outbound_closer = Some(h);
         self
     }
 }
@@ -634,6 +669,22 @@ pub async fn run_session(
     // 周辺タスク (forwarder / keepalive) を確実に止める。
     shutdown.notify_waiters();
 
+    // Issue #147: WS が close した = PWA は通話を維持できない。 進行中の
+    // PWA→NGN 発信通話があれば NGN レッグへ BYE を撃つ (RFC 3261 §15.1.1)。
+    // タブ閉じ / ネットワーク断 / Cloudflare Tunnel idle 切断のいずれの
+    // 経路で WS が落ちても、 NGN dialog が 5 分残って 486 を返す事象
+    // (Issue #147 の根本要因) を防ぐ。 `ClientMessage::Bye` 経路で既に
+    // cleanup 済みなら本呼び出しは 0 件 = no-op (idempotent)。
+    if let Some(closer) = state.pwa_outbound_closer.as_ref() {
+        let n = closer.close_pwa_outbound_for_ws(&ws_sink).await;
+        if n > 0 {
+            info!(
+                closed = n,
+                "PWA→NGN BYE: WS close 経路で cleanup (Issue #147)"
+            );
+        }
+    }
+
     // クリーンアップ: AOR 失効 + PeerSession close
     if let Some(aor) = registered_aor.lock().await.take() {
         state.extensions.unregister(&aor).await;
@@ -893,6 +944,18 @@ pub async fn process_client_message(
             }
         }
         ClientMessage::Bye => {
+            // Issue #147: PWA→NGN 発信通話があれば NGN レッグを BYE で閉じる。
+            // RFC 3261 §15.1.1 / RFC 5853 §3.2.2 SBC framework: B2BUA 片側
+            // dialog 終了をもう片側に伝搬する責務。 `unregister` / `peer.close`
+            // より先に呼ぶことで、 NGN BYE 送出の起点 (`UacDialog`) は手元の
+            // `webrtc_outbound_active` テーブルが保持しているため、 PWA 側の
+            // teardown 順序に影響しない。
+            if let Some(closer) = state.pwa_outbound_closer.as_ref() {
+                let n = closer.close_pwa_outbound_for_ws(ws_sink).await;
+                if n > 0 {
+                    debug!(closed = n, "PWA→NGN BYE: ClientMessage::Bye 経路で cleanup");
+                }
+            }
             if let Some(aor) = aor_guard.take() {
                 state.extensions.unregister(&aor).await;
             }

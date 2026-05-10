@@ -79,12 +79,27 @@ export const Login: Component<{
           <span class="muted">アクセストークン (HMAC)</span>
           <input
             type="password"
-            autocomplete="off"
+            // Issue #109: ブラウザ password manager の autofill / 候補提示で
+            // HMAC token が UI に残るのを抑制する (`new-password` は WHATWG
+            // HTML §autocomplete-detail で「password manager に保存させない /
+            // 既存提案を出さない」 セマンティクス)。 完全には封じられない
+            // が、 主要ブラウザの候補表示は止まる。
+            autocomplete="new-password"
+            // ARIA: パスワード入力 input に明示ラベル付け (WAI-ARIA 1.2 §6.7
+            // labelling-by relation)。 同 label の <span> は visual で文字を
+            // 出しているが「ext.expiry.signature 形式」という入力指示を
+            // 補助テキストとして screen reader に届けるため aria-describedby
+            // を併用する。
+            aria-label="アクセストークン"
+            aria-describedby="token-help"
             placeholder="ext.expiry.signature"
             value={token()}
             onInput={(e) => setToken(e.currentTarget.value)}
             required
           />
+          <span id="token-help" class="muted" style={{ "font-size": "11px" }}>
+            HMAC 形式: ext.expiry.signature
+          </span>
         </label>
         <label class="stack" style={{ gap: "6px" }}>
           <span class="muted">シグナリング URL (任意)</span>

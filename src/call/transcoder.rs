@@ -1262,6 +1262,285 @@ mod tests {
         bridge.stop().await;
     }
 
+    /// Issue #150 / RFC 3551 §4.5.14: `direct_pcmu_passthrough = true` 経路で
+    /// NGN UDP socket 受信の μ-law payload が `MediaFrame { pt: 0 }` として
+    /// **不変**で peer に渡ることを確認する。
+    ///
+    /// 既存テスト `webrtc_audio_bridge_ngn_to_peer_emits_opus_media_frame` は
+    /// `false` で transcode 経路 (μ-law → Opus) のみを検証していたため、
+    /// production で唯一使われる直送経路に test gap があった (PR #149 review)。
+    ///
+    /// 期待:
+    /// - peer.send_media に届く `MediaFrame.pt == PAYLOAD_TYPE_ULAW (0)`
+    /// - `MediaFrame.payload` は受信 RTP の payload と完全一致 (encode/decode しない)
+    /// - RTP timestamp は 8 kHz クロック (RFC 3551 §4.5.14: PCMU clock=8000)
+    ///   なので、 1 frame で `SAMPLES_PER_FRAME (= 160)` 進む。
+    #[tokio::test]
+    async fn rfc3551_4_5_14_pcmu_passthrough_ngn_to_peer_preserves_payload() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as SArc;
+        use tokio::sync::Mutex as TMutex;
+
+        struct CapturePeer {
+            received: SArc<TMutex<Vec<MediaFrame>>>,
+            counter: SArc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl PeerSession for CapturePeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, frame: MediaFrame) -> anyhow::Result<()> {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                self.received.lock().await.push(frame);
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        // peer→NGN 方向は使わない
+        let (_dummy_tx, dummy_rx) = mpsc::channel::<MediaFrame>(1);
+
+        let received: SArc<TMutex<Vec<MediaFrame>>> = SArc::new(TMutex::new(Vec::new()));
+        let counter = SArc::new(AtomicU32::new(0));
+        let mock_peer: Arc<dyn PeerSession> = Arc::new(CapturePeer {
+            received: received.clone(),
+            counter: counter.clone(),
+        });
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: mock_peer,
+            peer_media_rx: dummy_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: true,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 8 kHz 1 kHz トーン (160 samples) を μ-law 化
+        let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
+        for i in 0..NB_FRAME_SAMPLES {
+            let t = i as f32 / NARROW_BAND_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        // 期待 payload: build_ulaw_rtp_packet と同じ μ-law エンコード結果
+        let expected_payload: Vec<u8> = samples.iter().map(|s| encode_ulaw(*s)).collect();
+        let pkt = build_ulaw_rtp_packet(1, 0, 0xDEAD_BEEF, &samples);
+        ngn_peer_sock.send_to(&pkt, ngn_addr).await.unwrap();
+
+        // 1 frame 目を投入: peer.send_media が呼ばれるまで待つ
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while counter.load(Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("direct_pcmu_passthrough: NGN→peer 方向で peer.send_media が呼ばれない");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 連続性確認のため 2 frame 目も投入 (rtp_time が 160 進むことを検証)
+        let pkt2 = build_ulaw_rtp_packet(2, 160, 0xDEAD_BEEF, &samples);
+        ngn_peer_sock.send_to(&pkt2, ngn_addr).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while counter.load(Ordering::SeqCst) < 2 {
+            if std::time::Instant::now() > deadline {
+                panic!("2 frame 目が peer に届かない");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let frames = received.lock().await;
+        assert_eq!(frames.len(), 2, "2 frame 受信されているはず");
+
+        // PT 不変 (RFC 3551 §4.5.14: PCMU PT=0)
+        assert_eq!(
+            frames[0].pt, PAYLOAD_TYPE_ULAW,
+            "passthrough は PCMU PT=0 で渡すべき"
+        );
+        assert_eq!(
+            frames[1].pt, PAYLOAD_TYPE_ULAW,
+            "passthrough は 2 frame 目も PCMU PT=0"
+        );
+
+        // payload 不変 (encode/decode を経由していない)
+        assert_eq!(
+            frames[0].payload, expected_payload,
+            "μ-law payload が不変で peer に渡るべき (encode/decode しない)"
+        );
+        assert_eq!(
+            frames[1].payload, expected_payload,
+            "2 frame 目も同じ payload が不変で渡るべき"
+        );
+
+        // RTP timestamp は 8 kHz クロックで SAMPLES_PER_FRAME 単位に進む
+        // (RFC 3551 §4.5.14: PCMU clock = 8000 Hz)
+        let dt = frames[1].rtp_time.wrapping_sub(frames[0].rtp_time);
+        assert_eq!(
+            dt as usize, SAMPLES_PER_FRAME,
+            "passthrough の RTP timestamp 増分は 160 (8kHz × 20ms)"
+        );
+
+        let (n2p, _p2n, err) = bridge.stats();
+        assert!(n2p >= 2, "stats が 2 frame 反映されていない: {}", n2p);
+        assert_eq!(err, 0, "passthrough 経路でエラーが出ている: {}", err);
+        bridge.stop().await;
+    }
+
+    /// Issue #150 / RFC 3551 §4.5.14: `direct_pcmu_passthrough = true` 経路で
+    /// peer から流れる `MediaFrame { pt: 0 }` の μ-law payload が NGN UDP socket
+    /// に **不変**で出ることを確認する。
+    ///
+    /// 既存テスト `webrtc_audio_bridge_peer_to_ngn_emits_pcmu_to_ngn_socket` は
+    /// `false` で Opus → μ-law transcode 経路のみを検証していたため、
+    /// 直送経路に test gap があった (PR #149 review 🟡#1)。
+    ///
+    /// 期待:
+    /// - NGN socket で受信した RTP の `payload_type == PAYLOAD_TYPE_ULAW (0)`
+    /// - 受信 RTP の payload は peer 側で push した μ-law payload と完全一致
+    ///   (Opus decode / resample / μ-law encode を経由しない)
+    /// - PT が opus_pt (=111) で来た frame は drop される (passthrough 時の
+    ///   expected_pt は 0)
+    #[tokio::test]
+    async fn rfc3551_4_5_14_pcmu_passthrough_peer_to_ngn_preserves_payload() {
+        use std::sync::Arc as SArc;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, _: MediaFrame) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        let (peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(8);
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: Arc::new(NoopPeer),
+            peer_media_rx: peer_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: true,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 8 kHz 1 kHz トーン → μ-law 化 (160 byte payload)
+        let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
+        for i in 0..NB_FRAME_SAMPLES {
+            let t = i as f32 / NARROW_BAND_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let ulaw_payload: Vec<u8> = samples.iter().map(|s| encode_ulaw(*s)).collect();
+        assert_eq!(ulaw_payload.len(), SAMPLES_PER_FRAME);
+
+        // direct_pcmu_passthrough なので peer 側の MediaFrame も PT=0 で来る前提
+        let media = MediaFrame {
+            pt: PAYLOAD_TYPE_ULAW,
+            rtp_time: 0,
+            payload: ulaw_payload.clone(),
+            network_time: std::time::Instant::now(),
+        };
+        peer_tx.send(media).await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let (n, _src) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("NGN socket で μ-law が受信できない")
+            .unwrap();
+        let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(
+            recv.payload_type, PAYLOAD_TYPE_ULAW,
+            "PCMU PT=0 で送られているはず (RFC 3551 §4.5.14)"
+        );
+        assert_eq!(
+            recv.payload.len(),
+            SAMPLES_PER_FRAME,
+            "20 ms = 160 samples (RFC 3551 §4.5.14)"
+        );
+        assert_eq!(
+            recv.payload, ulaw_payload,
+            "μ-law payload が不変で NGN に出るべき (decode/resample/encode しない)"
+        );
+
+        // PT 不一致 (opus_pt = 111) の frame は drop されることを確認
+        // (expected_pt は passthrough 時 PCMU=0)
+        let bad = MediaFrame {
+            pt: DEFAULT_OPUS_PT,
+            rtp_time: SAMPLES_PER_FRAME as u32,
+            payload: ulaw_payload.clone(),
+            network_time: std::time::Instant::now(),
+        };
+        peer_tx.send(bad).await.unwrap();
+
+        // 続いて正規 PT の 2 frame 目を流し、 NGN socket には bad ではなく
+        // この frame だけが届くことを確認 (drop されたら 1 個しか届かない)。
+        let media2 = MediaFrame {
+            pt: PAYLOAD_TYPE_ULAW,
+            rtp_time: SAMPLES_PER_FRAME as u32,
+            payload: ulaw_payload.clone(),
+            network_time: std::time::Instant::now(),
+        };
+        peer_tx.send(media2).await.unwrap();
+
+        let (n2, _) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("2 frame 目が NGN socket に届かない")
+            .unwrap();
+        let recv2 = RtpPacket::from_bytes(&buf[..n2]).unwrap();
+        assert_eq!(recv2.payload_type, PAYLOAD_TYPE_ULAW);
+        assert_eq!(recv2.payload, ulaw_payload, "2 frame 目も payload 不変");
+
+        let (_n2p, p2n, err) = bridge.stats();
+        assert!(p2n >= 2, "passthrough p2n stats 不足: {}", p2n);
+        assert!(
+            err >= 1,
+            "PT=111 の bad frame が drop された記録が無い: {}",
+            err
+        );
+        bridge.stop().await;
+    }
+
     /// ループバック (NGN→WebRTC→NGN相当) で品質劣化が一定以下か。
     /// 直接ブリッジ往復ではなくコーデックチェーン単体での確認 (端末役のソケット
     /// セットアップを 2 つ立てるよりシンプル)。

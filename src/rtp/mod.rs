@@ -17,6 +17,21 @@ pub use session::{RtpSession, RtpSessionStats};
 /// G.711 1 フレームのミリ秒長 (RFC 3551)
 pub const FRAME_MS: u32 = 20;
 
+/// UDP 受信バッファサイズ (RTP/RTCP 共通)
+///
+/// RFC 3550 §5.1 (RTP fixed header 12 byte + CSRC 最大 60 byte + extension)、
+/// RFC 3550 §6.4 (compound RTCP は 1 datagram に SR + SDES + BYE 等が連結) と、
+/// RFC 5285/8285 (RTP header extension) の合算で 1500 byte (一般 IP MTU) を
+/// 超え得るため、 jumbo frame 上限 9000 byte を採用する。 PCMU 20ms = 172 byte
+/// (RFC 3551) や 117 通話の通常 datagram には影響しない。
+///
+/// `tokio::net::UdpSocket::recv_from` は Linux `MSG_TRUNC` を expose せず、
+/// `recvmsg` の trailing byte を捨てた値 (= `min(len, buf.len())`) を返すため、
+/// 上位で `n == RECV_BUF_SIZE` を見て truncation を疑うことしかできない
+/// (Issue #96)。 そのためバッファを十分大きく取り、 切り詰めをそもそも起こさない
+/// 設計に倒す。
+pub const RECV_BUF_SIZE: usize = 9000;
+
 /// G.711 μ-law エンコード (linear16 PCM → ulaw)
 pub fn encode_ulaw(sample: i16) -> u8 {
     const BIAS: i32 = 0x84;
@@ -268,5 +283,82 @@ mod tests {
         // PCMU 判別子 (静的 PT 0) が他と確実に違うこと
         assert_ne!(PAYLOAD_TYPE_ULAW, 96);
         assert_ne!(PAYLOAD_TYPE_ULAW, 111);
+    }
+
+    /// RFC 3550 §5.1 (RTP fixed header 12 byte + CSRC 最大 60 byte +
+    /// optional extension) と §6.4 (compound RTCP: 複数 RTCP packet を 1
+    /// datagram に連結) を踏まえ、 受信バッファは 1500 byte (一般 IP MTU) を
+    /// 超え得る datagram を取りこぼさないサイズでなければならない。
+    ///
+    /// 加えて RFC 5285/8285 (RTP header extension) を多用する WebRTC RTP は
+    /// extension だけで 100+ byte 載るため、 1500 byte 固定では危険。
+    /// ここでは
+    /// 一般 IP MTU 1500 を上回ること、 および jumbo frame 上限 (9000 byte,
+    /// RFC 4638 PPPoE jumbo / 一般 Ethernet jumbo 慣行) と整合することを
+    /// 回帰検査する (Issue #96)。
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn rfc3550_5_1_recv_buf_exceeds_eth_mtu_and_matches_jumbo_ceiling() {
+        // const 値の回帰検査: 将来 RECV_BUF_SIZE が 1500 まで戻されたら CI が落ちる。
+        assert!(
+            RECV_BUF_SIZE > 1500,
+            "受信バッファ {RECV_BUF_SIZE} は一般 IP MTU 1500 byte を超えていない \
+             (RFC 3550 §5.1 拡張 + §6.4 compound RTCP で 1500 超過があり得る)"
+        );
+        assert_eq!(
+            RECV_BUF_SIZE, 9000,
+            "受信バッファは jumbo frame 上限 9000 byte (Issue #96) と一致するべき"
+        );
+    }
+
+    /// RFC 3550 §6.4 (compound RTCP) で SR + 大型 SDES + BYE を 1 datagram に
+    /// 詰め、 RFC 5285 §4.2 で RTP header extension を載せたケースを想定し、
+    /// 1500 byte より大きい合成 datagram が受信バッファ内に丸ごと収まることを
+    /// 検査する。 旧 1500 byte 固定だと末尾 byte が欠落して上位
+    /// (RtpPacket::from_bytes / RTCP parser) で誤検出が起こり得た (Issue #96)。
+    #[test]
+    fn rfc3550_6_4_compound_rtcp_with_extensions_fits_in_recv_buf() {
+        // RFC 5285 §4.2 拡張 (profile+length 4-byte) + extmap 群で 200 byte
+        // の拡張ブロックがあり得ると仮定。 + RTP 12 byte + CSRC 最大 60 byte。
+        let rtp_header_with_extensions = 12 + 60 + 4 + 200; // = 276
+                                                            // RFC 3550 §6.5: SDES 1 chunk = SSRC (4) + items (CNAME/NAME/EMAIL/
+                                                            // PHONE/LOC/TOOL/NOTE/PRIV)。 各 item は最大 255 byte。 全部詰めれば
+                                                            // 8 * (2 + 255) + 4 ≒ 2060 byte。
+        let sdes_chunk = 4 + 8 * (2 + 255);
+        // compound: SR (28) + SDES (2060) + BYE (8) + 余地 ≒ 2200 byte。
+        let compound_rtcp = 28 + sdes_chunk + 8;
+        // さらに RTP 拡張入りの大型 payload (G.722, Opus FEC 等) が 1024 byte
+        // 程度載ることもある (RFC 3551 §4.4 frame size 制約は緩い)。
+        let large_rtp = rtp_header_with_extensions + 1024;
+        // 一番大きい想定ケースが受信バッファに収まること。
+        assert!(
+            compound_rtcp <= RECV_BUF_SIZE,
+            "compound RTCP {compound_rtcp} byte が受信バッファ {RECV_BUF_SIZE} に収まらない \
+             (RFC 3550 §6.4 / §6.5)"
+        );
+        assert!(
+            large_rtp <= RECV_BUF_SIZE,
+            "拡張入り RTP {large_rtp} byte が受信バッファ {RECV_BUF_SIZE} に収まらない \
+             (RFC 3550 §5.1 / RFC 5285)"
+        );
+    }
+
+    /// RFC 3550 §5.1 PCMU 20ms (172 byte = 12 byte header + 160 byte payload)
+    /// の常用 datagram は新バッファでも当然収まる。 117 通話の regression が
+    /// 起きないことを明示する (Issue #96)。
+    #[test]
+    fn rfc3551_pcmu_20ms_packet_fits_in_recv_buf() {
+        let pcmu_packet = 12 + 160; // 172 byte
+        assert!(
+            pcmu_packet < RECV_BUF_SIZE,
+            "PCMU 20ms ({pcmu_packet} byte) が受信バッファ {RECV_BUF_SIZE} に収まらない \
+             (CLAUDE.md §5 NGN PCMU only)"
+        );
+        // 1500 byte の旧上限を残しても PCMU は通っていた事実の回帰確認:
+        assert!(
+            pcmu_packet < 1500,
+            "PCMU 20ms ({pcmu_packet} byte) は IP MTU 1500 にも収まる \
+             (NGN 117 通話 regression 防止)"
+        );
     }
 }

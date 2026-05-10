@@ -45,7 +45,7 @@ use crate::rtp::codec::resample::{
 use crate::rtp::codec::AudioFrame;
 use crate::rtp::jitter::{JitterBuffer, DEFAULT_DEPTH};
 use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME};
-use crate::rtp::{decode_ulaw, encode_ulaw, set_rtp_dscp};
+use crate::rtp::{decode_ulaw, encode_ulaw, set_rtp_dscp, RECV_BUF_SIZE};
 use crate::webrtc::peer::{MediaFrame, PeerSession};
 
 /// `TranscodingBridge` のジッタバッファ pull 周期。
@@ -374,7 +374,10 @@ async fn ngn_to_web_loop(
     let mut tick = tokio::time::interval(JITTER_PULL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut buf = vec![0u8; 1500];
+    // RFC 3550 §5.1 / §6.4: RTP/RTCP 1 datagram は 1500 byte (IP MTU) を超え得る
+    // (compound SR/SDES や RFC 5285 拡張)。 jumbo frame 上限 9000 byte で受ける
+    // (Issue #96)。 PCMU 20ms = 172 byte の常用パスには影響なし。
+    let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         tokio::select! {
             // RTP 受信 → jitter buffer へ push (RFC 3550 §6.4.1)
@@ -386,6 +389,16 @@ async fn ngn_to_web_loop(
                         return;
                     }
                 };
+                // tokio は Linux `MSG_TRUNC` を expose しないため上限張り付きを
+                // truncate 疑いとして警告する (RFC 3550 §5.1 / §6.4, Issue #96)。
+                if n == RECV_BUF_SIZE {
+                    warn!(
+                        bytes = n,
+                        "NGN→Web: RTP datagram が受信バッファ上限 ({} byte) に達 — \
+                         truncate の可能性",
+                        RECV_BUF_SIZE
+                    );
+                }
                 // 送信元学習 (NGN 側の peer)
                 {
                     let mut peer = from_state.peer.lock().await;
@@ -531,7 +544,10 @@ async fn web_to_ngn_loop(
     let mut tick = tokio::time::interval(JITTER_PULL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut buf = vec![0u8; 1500];
+    // RFC 3550 §5.1 / §6.4 + RFC 5285 拡張で 1500 byte 超過があり得るため
+    // jumbo frame 上限 9000 byte で受ける (Issue #96)。 WebRTC からの RTP は
+    // extension が多く積まれる傾向があり、 旧 1500 byte 固定では特に危険だった。
+    let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         tokio::select! {
             recv_res = from_socket.recv_from(&mut buf) => {
@@ -542,6 +558,14 @@ async fn web_to_ngn_loop(
                         return;
                     }
                 };
+                if n == RECV_BUF_SIZE {
+                    warn!(
+                        bytes = n,
+                        "Web→NGN: RTP datagram が受信バッファ上限 ({} byte) に達 — \
+                         truncate の可能性 (RFC 3550 §5.1 / §6.4, Issue #96)",
+                        RECV_BUF_SIZE
+                    );
+                }
                 {
                     let mut peer = from_state.peer.lock().await;
                     if peer.as_ref() != Some(&src) {
@@ -945,7 +969,9 @@ async fn ngn_to_peer_loop(
         OPUS_FRAME_SAMPLES as u32
     };
 
-    let mut buf = vec![0u8; 1500];
+    // RFC 3550 §5.1 / §6.4 で 1500 byte 超過があり得るため jumbo frame 上限
+    // 9000 byte で受ける (Issue #96)。 PCMU 20ms = 172 byte の常用パスには影響なし。
+    let mut buf = vec![0u8; RECV_BUF_SIZE];
     loop {
         let (n, src) = match from_socket.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -954,6 +980,14 @@ async fn ngn_to_peer_loop(
                 return;
             }
         };
+        if n == RECV_BUF_SIZE {
+            warn!(
+                bytes = n,
+                "NGN→peer: RTP datagram が受信バッファ上限 ({} byte) に達 — \
+                 truncate の可能性 (RFC 3550 §5.1 / §6.4, Issue #96)",
+                RECV_BUF_SIZE
+            );
+        }
         {
             let mut p = from_state.peer.lock().await;
             if p.as_ref() != Some(&src) {

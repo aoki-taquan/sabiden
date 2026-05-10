@@ -21,7 +21,7 @@ use tracing::{debug, trace, warn};
 use crate::rtp::jitter::{JitterBuffer, JitterStats, DEFAULT_DEPTH};
 use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME};
 use crate::rtp::rtcp::{NtpTimestamp, ReceiverReport, ReportBlock, SenderReport};
-use crate::rtp::set_rtp_dscp;
+use crate::rtp::{set_rtp_dscp, RECV_BUF_SIZE};
 
 /// RTP セッションの統計値スナップショット
 #[derive(Debug, Clone, Copy, Default)]
@@ -190,9 +190,23 @@ impl RtpSession {
 
     /// UDP ソケットから 1 パケット受信して、RTP としてジッタバッファに投入する。
     /// 上位ループ用ヘルパ。
+    ///
+    /// バッファサイズは [`RECV_BUF_SIZE`] (9000 byte, jumbo frame 上限) を用いる。
+    /// RFC 3550 §5.1 RTP ヘッダ (12 byte + 任意 CSRC 60 byte + RFC 5285 拡張) と
+    /// §6.4 compound RTCP (SR/SDES/BYE 連結) が 1500 byte を超える場合に備える。
+    /// `n == RECV_BUF_SIZE` の場合は MSG_TRUNC 相当 (Linux 上の tokio は expose しない)
+    /// と推定して警告ログを残す (Issue #96)。
     pub async fn recv_once(&self) -> Result<()> {
-        let mut buf = vec![0u8; 1500];
+        let mut buf = vec![0u8; RECV_BUF_SIZE];
         let (n, _src) = self.socket.recv_from(&mut buf).await?;
+        if n == RECV_BUF_SIZE {
+            warn!(
+                bytes = n,
+                "RTP/RTCP datagram が受信バッファ上限 ({} byte) に達しました — \
+                 truncate の可能性 (RFC 3550 §5.1 / §6.4, Issue #96)",
+                RECV_BUF_SIZE
+            );
+        }
         if let Err(e) = self.ingest_raw(&buf[..n]) {
             warn!("RTP パース失敗 ({} bytes): {}", n, e);
         }
@@ -444,5 +458,66 @@ mod tests {
         assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
         assert_eq!(pkt.payload.len(), 160);
         assert_eq!(pkt.ssrc, s.ssrc());
+    }
+
+    /// RFC 3550 §5.1 (extension 含む RTP packet) と §6.4 (compound RTCP) で
+    /// 1500 byte を超える datagram が到来した場合に、 `recv_once` が
+    /// **末尾を切り詰めない** ことを検証する。 旧 1500 byte 固定では
+    /// 受信側 socket が `MSG_TRUNC` 相当で trailing byte を捨て、 上位の
+    /// `RtpPacket::from_bytes` が「短いペイロード」を観測する不具合があった
+    /// (Issue #96)。
+    ///
+    /// 本テストは PCMU PT=0 で 2000 byte の payload (合計 12 + 2000 = 2012
+    /// byte) を loopback 送信し、 受信統計 `recv_octets` に **payload 全長
+    /// 2000 byte が記録される** ことを確認する。 もし 1500 byte で truncate
+    /// されていれば 2000 ではなく ~1488 (= 1500 - 12 byte header) になる。
+    /// ローカル loopback は MTU 65535 (Linux `lo`) のため datagram は分割
+    /// されず、 truncate は受信バッファ要因のみとなる。
+    #[tokio::test]
+    async fn rfc3550_5_1_large_rtp_packet_not_truncated_on_recv() {
+        // 受信側 socket = RtpSession の入口
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let send_addr = send_sock.local_addr().unwrap();
+        let s = Arc::new(RtpSession::new(Arc::new(recv_sock), send_addr).unwrap());
+
+        // 2000 byte payload (1500 byte IP MTU を超えるサイズ)
+        let payload = vec![0xAAu8; 2000];
+        let pkt = RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: false,
+            sequence: 42,
+            timestamp: 12_345,
+            ssrc: 0xDEAD_BEEF,
+            payload: payload.clone(),
+        };
+        let bytes = pkt.to_bytes();
+        assert!(
+            bytes.len() > 1500,
+            "事前条件: 検査対象 datagram は 1500 byte より大きいこと (got {})",
+            bytes.len(),
+        );
+
+        // 送信 → recv_once でジッタバッファに入る
+        send_sock.send_to(&bytes, recv_addr).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), s.recv_once())
+            .await
+            .expect("recv_once timeout")
+            .expect("recv_once error");
+
+        // 受信 payload 長が記録された octet 数と一致する (truncate 無し)
+        // RFC 3550 §6.4.1: octet_count は payload のみカウント、 header 含まず。
+        let stats = s.stats();
+        assert_eq!(
+            stats.recv_packets, 1,
+            "1 datagram を受信したはず (recv_packets が増えていない)"
+        );
+        assert_eq!(
+            stats.recv_octets, 2000,
+            "受信 payload が truncate されている: 期待 2000 / 実 {} \
+             (RFC 3550 §5.1 / §6.4.1 / Issue #96)",
+            stats.recv_octets,
+        );
     }
 }

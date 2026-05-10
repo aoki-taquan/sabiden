@@ -658,6 +658,20 @@ mod tests {
         c
     }
 
+    /// CSeq ヘッダから数値部だけを取り出すテスト用ヘルパ
+    /// (RFC 3261 §20.16: `CSeq = 1*DIGIT LWS Method`)。
+    /// Issue #143 で 401/407 retry テストの ACK / BYE CSeq 検証に使う。
+    fn parse_cseq_num(headers: &crate::sip::message::SipHeaders) -> u32 {
+        headers
+            .get("cseq")
+            .expect("CSeq ヘッダが必須 (RFC 3261 §20.16)")
+            .split_whitespace()
+            .next()
+            .expect("CSeq の数値部分")
+            .parse::<u32>()
+            .expect("CSeq 数値が u32 でパースできる")
+    }
+
     fn make_dialog_with(remote_target: &str, record_routes: &[&str]) -> Dialog {
         // INVITE 風 SipRequest と 200 OK 風 SipResponse をでっち上げて
         // Dialog::from_uac_response を経由する。 production に test hook は出さない。
@@ -1145,232 +1159,343 @@ mod tests {
         received.await.unwrap();
     }
 
-    /// RFC 3261 §22.2 / RFC 2617 §3.2: 401 Unauthorized challenge を受けた
-    /// UAC は WWW-Authenticate を読み Authorization 付きで INVITE を再送する。
-    /// 再送 2xx でダイアログ確立。 Issue #113 の核となる shape。
-    // TODO(本流対応): #143 — 統合テスト hang を修正後 #[ignore] 撤去。
-    // production retry ロジック (Uac::invite + retry_invite_with_auth) は
-    // 実装済だが、 fake server との同期 (transaction layer 自動 ACK 経路と
-    // 受信 order) が race を起こして hang する。 unit ベース (DigestChallenge
-    // / DigestCredentials) は別テストでカバー済。
-    #[ignore = "Issue #143 follow-up: integration test race"]
+    /// RFC 3261 §22.2 / RFC 2617 §3.2 / §13.2.2.4 / §12.2.1.1: 401
+    /// Unauthorized challenge を受けた UAC は WWW-Authenticate を読み
+    /// Authorization 付きで INVITE を再送する。 再送 2xx でダイアログ確立し、
+    /// 2xx ACK CSeq は **retry INVITE の CSeq と一致** (§13.2.2.4)、 後続
+    /// BYE CSeq は retry INVITE CSeq + 1 (§12.2.1.1 strictly increasing) に
+    /// なることまで Issue #143 で要求された end-to-end shape を確認する。
+    ///
+    /// ## Issue #143 race 修正の要点
+    ///
+    /// 旧テストは 200 OK Contact を `sip:remote@127.0.0.1:9999` (テスト
+    /// サーバではない bogus port) に置いており、 `resolve_next_hop_addr`
+    /// (RFC 3261 §12.2.1.1) が IP リテラル + port 指定を採用して 2xx ACK を
+    /// `127.0.0.1:9999` 宛に送ってしまい、 テストサーバの `recv_from` が
+    /// 永遠に待つ hang を起こしていた。 修正案:
+    ///
+    /// - 200 OK に `Record-Route: <sip:proxy.example;lr>` を載せて loose
+    ///   routing を起動。 next-hop が FQDN (= `proxy.example`) になり
+    ///   `resolve_next_hop_addr` の FQDN/SRV 未対応分岐で fallback (=
+    ///   `server_addr`) を採用する (passing test
+    ///   `rfc3261_13_2_2_4_ack_and_dialog_cseq_match_retry_invite_after_401`
+    ///   と同 shape)。
+    /// - test 全体を `tokio::time::timeout(30s, ...)` で囲み、 race 再発時
+    ///   に CI が永続 hang せず即 fail させる。
     #[tokio::test]
     async fn rfc3261_22_2_invite_401_retries_with_authorization_then_2xx() {
-        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server_sock.local_addr().unwrap();
-        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let client_local = client_sock.local_addr().unwrap();
+        // RFC 3261 §17.1.1.2 Timer B 32 s の倍以下に抑え、 race 再発を
+        // 早期検知する。 想定挙動下では 1 RTT 内 (< 100 ms) に終わる。
+        let test_body = async {
+            let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let server_addr = server_sock.local_addr().unwrap();
+            let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let client_local = client_sock.local_addr().unwrap();
 
-        let server_clone = server_sock.clone();
-        let server_handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            // 1) 1st INVITE (no Authorization) → 401 Unauthorized
-            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
-            let SipMessage::Request(invite1) = parsed else {
-                panic!("INVITE expected");
+            let server_clone = server_sock.clone();
+            let server_handle = tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                // 1) 1st INVITE (no Authorization) → 401 Unauthorized
+                let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+                let SipMessage::Request(invite1) = parsed else {
+                    panic!("INVITE expected");
+                };
+                assert_eq!(invite1.method, SipMethod::Invite);
+                assert!(
+                    invite1.headers.get("authorization").is_none(),
+                    "1 回目は Authorization 無しで来るはず"
+                );
+                let invite1_via = invite1.headers.get("via").unwrap().to_string();
+                let invite1_cseq_num = parse_cseq_num(&invite1.headers);
+                let mut resp401 =
+                    crate::sip::transaction::build_response_skeleton(&invite1, 401, "Unauthorized");
+                // RFC 3261 §22.4 の challenge ヘッダ
+                resp401.headers.set(
+                    "WWW-Authenticate",
+                    r#"Digest realm="ntt-east.ne.jp", nonce="abc123nonce", algorithm=MD5, qop="auth""#,
+                );
+                server_clone
+                    .send_to(&resp401.to_bytes(), peer)
+                    .await
+                    .unwrap();
+
+                // 2) RFC 3261 §17.1.1.3: non-2xx 最終応答に対し client
+                // transaction 層が自動 ACK を送ってくる (元 INVITE と
+                // 同 branch + 同 CSeq=N)。 strict order で吸収する。
+                let (n_ack, _) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed_ack = crate::sip::message::parse_message(&buf[..n_ack]).unwrap();
+                let SipMessage::Request(auto_ack) = parsed_ack else {
+                    panic!("auto-ACK expected after 401");
+                };
+                assert_eq!(auto_ack.method, SipMethod::Ack);
+                let auto_ack_cseq = parse_cseq_num(&auto_ack.headers);
+                assert_eq!(
+                    auto_ack_cseq, invite1_cseq_num,
+                    "non-2xx 自動 ACK CSeq は元 INVITE CSeq と一致 (RFC 3261 §17.1.1.3)"
+                );
+
+                // 3) 2nd INVITE (with Authorization) → 200 OK
+                let (n2, peer2) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
+                let SipMessage::Request(invite2) = parsed2 else {
+                    panic!("2nd INVITE expected");
+                };
+                assert_eq!(invite2.method, SipMethod::Invite);
+                // Authorization 付き
+                let auth = invite2
+                    .headers
+                    .get("authorization")
+                    .expect("Authorization が付くべき (RFC 3261 §22.2)");
+                assert!(auth.starts_with("Digest "), "Digest スキーム必須: {}", auth);
+                assert!(auth.contains(r#"username="0312345678""#));
+                assert!(auth.contains(r#"realm="ntt-east.ne.jp""#));
+                assert!(auth.contains(r#"nonce="abc123nonce""#));
+                // Call-ID は同じ (RFC 3261 §8.1.3.5: 同じ Call-ID で再送)
+                assert_eq!(
+                    invite2.headers.get("call-id").unwrap(),
+                    invite1.headers.get("call-id").unwrap()
+                );
+                // CSeq は +1 (RFC 3261 §8.1.3.5)
+                let invite2_cseq_num = parse_cseq_num(&invite2.headers);
+                assert_eq!(invite2_cseq_num, invite1_cseq_num + 1);
+                // 新 branch (RFC 3261 §17.1.1.3)
+                let invite2_via = invite2.headers.get("via").unwrap();
+                assert_ne!(
+                    invite2_via, &invite1_via,
+                    "branch は新規 (RFC 3261 §17.1.1.3)"
+                );
+                // 200 OK
+                let mut ok = crate::sip::transaction::build_response_skeleton(&invite2, 200, "OK");
+                ok.headers.set(
+                    "To",
+                    format!("{};tag=server-tag", invite2.headers.get("to").unwrap()),
+                );
+                ok.headers.set("Contact", "<sip:remote@127.0.0.1:9999>");
+                // RFC 3261 §16.4 / §12.1.1: Record-Route で loose routing を
+                // 起動 → next-hop URI が FQDN になり `resolve_next_hop_addr`
+                // の FQDN/SRV 未対応分岐で fallback (= server_addr) を採用。
+                // これで ACK / BYE が **このテストサーバ** に届く
+                // (Issue #143 race 解消の核)。
+                ok.headers.add("Record-Route", "<sip:proxy.example;lr>");
+                server_clone.send_to(&ok.to_bytes(), peer2).await.unwrap();
+
+                // 4) 2xx ACK (RFC 3261 §13.2.2.4): retry INVITE CSeq と一致。
+                let (n3, _) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed3 = crate::sip::message::parse_message(&buf[..n3]).unwrap();
+                let SipMessage::Request(ack) = parsed3 else {
+                    panic!("2xx ACK expected");
+                };
+                assert_eq!(ack.method, SipMethod::Ack);
+                let ack_cseq_num = parse_cseq_num(&ack.headers);
+                assert_eq!(
+                    ack_cseq_num, invite2_cseq_num,
+                    "2xx ACK CSeq must match retry INVITE CSeq (RFC 3261 §13.2.2.4)"
+                );
+
+                // 5) BYE (RFC 3261 §15) — Dialog local_cseq は retry INVITE
+                //    CSeq + 1 から始まる (RFC 3261 §12.2.1.1 strictly
+                //    increasing)。
+                let (n4, peer4) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed4 = crate::sip::message::parse_message(&buf[..n4]).unwrap();
+                let SipMessage::Request(bye) = parsed4 else {
+                    panic!("BYE expected");
+                };
+                assert_eq!(bye.method, SipMethod::Bye);
+                let bye_cseq_num = parse_cseq_num(&bye.headers);
+                assert_eq!(
+                    bye_cseq_num,
+                    invite2_cseq_num + 1,
+                    "BYE CSeq must be retry INVITE CSeq + 1 (RFC 3261 §12.2.1.1)"
+                );
+                let bye_resp = crate::sip::transaction::build_response_skeleton(&bye, 200, "OK");
+                server_clone
+                    .send_to(&bye_resp.to_bytes(), peer4)
+                    .await
+                    .unwrap();
+            });
+
+            let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
+            let mut uac_cfg = cfg_with_auth("0312345678", "p4ssw0rd");
+            uac_cfg.local_addr = client_local;
+            let uac = Uac::new(uac_cfg, layer, server_addr);
+            let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
+            let outcome = uac.invite(plan, None).await.expect("invite");
+            let mut dlg = match outcome {
+                InviteOutcome::Established(call) => {
+                    assert_eq!(call.dialog.dialog().id().remote_tag, "server-tag");
+                    // UacDialog::invite_cseq は retry INVITE の CSeq=2 を
+                    // 反映 (PR #144 review #1 Must-fix #1 regression guard)。
+                    assert_eq!(
+                        call.dialog.invite_cseq(),
+                        2,
+                        "UacDialog::invite_cseq は retry INVITE CSeq (RFC 3261 §13.2.2.4)"
+                    );
+                    call.dialog
+                }
+                InviteOutcome::Failed { response } => {
+                    panic!(
+                        "expected Established after 401 retry, got {}",
+                        response.status_code
+                    )
+                }
             };
-            assert_eq!(invite1.method, SipMethod::Invite);
-            assert!(
-                invite1.headers.get("authorization").is_none(),
-                "1 回目は Authorization 無しで来るはず"
-            );
-            let invite1_via = invite1.headers.get("via").unwrap().to_string();
-            let invite1_cseq_num = invite1
-                .headers
-                .get("cseq")
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            let mut resp401 =
-                crate::sip::transaction::build_response_skeleton(&invite1, 401, "Unauthorized");
-            // RFC 3261 §22.4 の challenge ヘッダ
-            resp401.headers.set(
-                "WWW-Authenticate",
-                r#"Digest realm="ntt-east.ne.jp", nonce="abc123nonce", algorithm=MD5, qop="auth""#,
-            );
-            server_clone
-                .send_to(&resp401.to_bytes(), peer)
-                .await
-                .unwrap();
-
-            // 2) RFC 3261 §17.1.1.3: non-2xx 最終応答に対し client transaction
-            // 層が自動 ACK を送ってくる (元 INVITE と同 branch)。 これを吸収。
-            let (n_ack, _) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed_ack = crate::sip::message::parse_message(&buf[..n_ack]).unwrap();
-            let SipMessage::Request(auto_ack) = parsed_ack else {
-                panic!("auto-ACK expected after 401");
-            };
-            assert_eq!(auto_ack.method, SipMethod::Ack);
-
-            // 3) 2nd INVITE (with Authorization) → 200 OK
-            let (n2, peer2) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
-            let SipMessage::Request(invite2) = parsed2 else {
-                panic!("2nd INVITE expected");
-            };
-            assert_eq!(invite2.method, SipMethod::Invite);
-            // Authorization 付き
-            let auth = invite2
-                .headers
-                .get("authorization")
-                .expect("Authorization が付くべき (RFC 3261 §22.2)");
-            assert!(auth.starts_with("Digest "), "Digest スキーム必須: {}", auth);
-            assert!(auth.contains(r#"username="0312345678""#));
-            assert!(auth.contains(r#"realm="ntt-east.ne.jp""#));
-            assert!(auth.contains(r#"nonce="abc123nonce""#));
-            // Call-ID は同じ (RFC 3261 §8.1.3.5: 同じ Call-ID で再送)
-            assert_eq!(
-                invite2.headers.get("call-id").unwrap(),
-                invite1.headers.get("call-id").unwrap()
-            );
-            // CSeq は +1 (RFC 3261 §8.1.3.5)
-            let invite2_cseq_num = invite2
-                .headers
-                .get("cseq")
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            assert_eq!(invite2_cseq_num, invite1_cseq_num + 1);
-            // 新 branch (RFC 3261 §17.1.1.3)
-            let invite2_via = invite2.headers.get("via").unwrap();
-            assert_ne!(
-                invite2_via, &invite1_via,
-                "branch は新規 (RFC 3261 §17.1.1.3)"
-            );
-            // 200 OK
-            let mut ok = crate::sip::transaction::build_response_skeleton(&invite2, 200, "OK");
-            ok.headers.set(
-                "To",
-                format!("{};tag=server-tag", invite2.headers.get("to").unwrap()),
-            );
-            ok.headers.set("Contact", "<sip:remote@127.0.0.1:9999>");
-            server_clone.send_to(&ok.to_bytes(), peer2).await.unwrap();
-
-            // 4) 2xx ACK (RFC 3261 §13.2.2.4)
-            let (n3, _) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed3 = crate::sip::message::parse_message(&buf[..n3]).unwrap();
-            let SipMessage::Request(ack) = parsed3 else {
-                panic!("2xx ACK expected");
-            };
-            assert_eq!(ack.method, SipMethod::Ack);
-        });
-
-        let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
-        let mut uac_cfg = cfg_with_auth("0312345678", "p4ssw0rd");
-        uac_cfg.local_addr = client_local;
-        let uac = Uac::new(uac_cfg, layer, server_addr);
-        let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
-        let outcome = uac.invite(plan, None).await.expect("invite");
-        match outcome {
-            InviteOutcome::Established(call) => {
-                assert_eq!(call.dialog.dialog().id().remote_tag, "server-tag");
-            }
-            InviteOutcome::Failed { response } => {
-                panic!(
-                    "expected Established after 401 retry, got {}",
-                    response.status_code
-                )
-            }
-        }
-        server_handle.await.unwrap();
+            // BYE を送って server 側の CSeq=3 assertion を駆動する。
+            let bye_resp = dlg.send_bye().await.expect("BYE 送信");
+            assert_eq!(bye_resp.status_code, 200);
+            server_handle.await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), test_body)
+            .await
+            .expect("Issue #143 race regression: test exceeded 30 s budget");
     }
 
-    /// RFC 3261 §22.3 / §8.1.3.5: 407 Proxy Authentication Required を
-    /// 受けた UAC は Proxy-Authenticate を読み Proxy-Authorization 付きで
-    /// INVITE を再送する。
-    // TODO(本流対応): #143 — 401 版と同じ統合テスト race。
-    #[ignore = "Issue #143 follow-up: integration test race"]
+    /// RFC 3261 §22.3 / §8.1.3.5 / §13.2.2.4 / §12.2.1.1: 407 Proxy
+    /// Authentication Required を受けた UAC は Proxy-Authenticate を読み
+    /// Proxy-Authorization 付きで INVITE を再送する。 401 版と同じ
+    /// end-to-end shape (ACK CSeq = retry INVITE CSeq、 BYE CSeq = +1) を
+    /// 検証する。 race 修正は 401 版と同じ Record-Route 経由 fallback。
     #[tokio::test]
     async fn rfc3261_22_3_invite_407_retries_with_proxy_authorization_then_2xx() {
-        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server_sock.local_addr().unwrap();
-        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let client_local = client_sock.local_addr().unwrap();
+        let test_body = async {
+            let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let server_addr = server_sock.local_addr().unwrap();
+            let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let client_local = client_sock.local_addr().unwrap();
 
-        let server_clone = server_sock.clone();
-        let server_handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            // 1) 1st INVITE (no Proxy-Authorization) → 407
-            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
-            let SipMessage::Request(invite1) = parsed else {
-                panic!("INVITE expected");
+            let server_clone = server_sock.clone();
+            let server_handle = tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                // 1) 1st INVITE (no Proxy-Authorization) → 407
+                let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+                let SipMessage::Request(invite1) = parsed else {
+                    panic!("INVITE expected");
+                };
+                assert!(invite1.headers.get("proxy-authorization").is_none());
+                let invite1_cseq_num = parse_cseq_num(&invite1.headers);
+                let mut resp407 = crate::sip::transaction::build_response_skeleton(
+                    &invite1,
+                    407,
+                    "Proxy Authentication Required",
+                );
+                resp407.headers.set(
+                    "Proxy-Authenticate",
+                    r#"Digest realm="proxy.example", nonce="proxynonce-xyz", algorithm=MD5, qop="auth""#,
+                );
+                server_clone
+                    .send_to(&resp407.to_bytes(), peer)
+                    .await
+                    .unwrap();
+
+                // 2) RFC 3261 §17.1.1.3 auto-ACK 吸収 (CSeq=N)。
+                let (n_ack, _) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed_ack = crate::sip::message::parse_message(&buf[..n_ack]).unwrap();
+                let SipMessage::Request(auto_ack) = parsed_ack else {
+                    panic!("auto-ACK expected after 407");
+                };
+                assert_eq!(auto_ack.method, SipMethod::Ack);
+                let auto_ack_cseq = parse_cseq_num(&auto_ack.headers);
+                assert_eq!(
+                    auto_ack_cseq, invite1_cseq_num,
+                    "non-2xx 自動 ACK CSeq は元 INVITE CSeq と一致 (RFC 3261 §17.1.1.3)"
+                );
+
+                // 3) 2nd INVITE (with Proxy-Authorization) → 200 OK
+                let (n2, peer2) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
+                let SipMessage::Request(invite2) = parsed2 else {
+                    panic!("2nd INVITE expected");
+                };
+                let proxy_auth = invite2
+                    .headers
+                    .get("proxy-authorization")
+                    .expect("Proxy-Authorization が付くべき (RFC 3261 §22.3)");
+                assert!(proxy_auth.starts_with("Digest "));
+                assert!(proxy_auth.contains(r#"realm="proxy.example""#));
+                assert!(proxy_auth.contains(r#"nonce="proxynonce-xyz""#));
+                // Authorization (= 401 用) は付かないこと
+                assert!(invite2.headers.get("authorization").is_none());
+                let invite2_cseq_num = parse_cseq_num(&invite2.headers);
+                assert_eq!(
+                    invite2_cseq_num,
+                    invite1_cseq_num + 1,
+                    "retry INVITE CSeq = +1 (RFC 3261 §8.1.3.5)"
+                );
+                let mut ok = crate::sip::transaction::build_response_skeleton(&invite2, 200, "OK");
+                ok.headers.set(
+                    "To",
+                    format!("{};tag=tag407", invite2.headers.get("to").unwrap()),
+                );
+                ok.headers.set("Contact", "<sip:remote@127.0.0.1:9999>");
+                // Record-Route で next-hop を FQDN に → fallback で ACK が
+                // テストサーバに戻ってくる (Issue #143 race 解消)。
+                ok.headers.add("Record-Route", "<sip:proxy.example;lr>");
+                server_clone.send_to(&ok.to_bytes(), peer2).await.unwrap();
+
+                // 4) 2xx ACK (RFC 3261 §13.2.2.4): retry INVITE CSeq と一致。
+                let (n3, _) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed3 = crate::sip::message::parse_message(&buf[..n3]).unwrap();
+                let SipMessage::Request(ack) = parsed3 else {
+                    panic!("2xx ACK expected");
+                };
+                assert_eq!(ack.method, SipMethod::Ack);
+                let ack_cseq_num = parse_cseq_num(&ack.headers);
+                assert_eq!(
+                    ack_cseq_num, invite2_cseq_num,
+                    "2xx ACK CSeq must match retry INVITE CSeq (RFC 3261 §13.2.2.4)"
+                );
+
+                // 5) BYE: retry INVITE CSeq + 1 (RFC 3261 §12.2.1.1)。
+                let (n4, peer4) = server_clone.recv_from(&mut buf).await.unwrap();
+                let parsed4 = crate::sip::message::parse_message(&buf[..n4]).unwrap();
+                let SipMessage::Request(bye) = parsed4 else {
+                    panic!("BYE expected");
+                };
+                assert_eq!(bye.method, SipMethod::Bye);
+                let bye_cseq_num = parse_cseq_num(&bye.headers);
+                assert_eq!(
+                    bye_cseq_num,
+                    invite2_cseq_num + 1,
+                    "BYE CSeq must be retry INVITE CSeq + 1 (RFC 3261 §12.2.1.1)"
+                );
+                let bye_resp = crate::sip::transaction::build_response_skeleton(&bye, 200, "OK");
+                server_clone
+                    .send_to(&bye_resp.to_bytes(), peer4)
+                    .await
+                    .unwrap();
+            });
+
+            let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
+            let mut uac_cfg = cfg_with_auth("0312345678", "p4ssw0rd");
+            uac_cfg.local_addr = client_local;
+            let uac = Uac::new(uac_cfg, layer, server_addr);
+            let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
+            let outcome = uac.invite(plan, None).await.expect("invite");
+            let mut dlg = match outcome {
+                InviteOutcome::Established(call) => {
+                    assert_eq!(call.dialog.dialog().id().remote_tag, "tag407");
+                    assert_eq!(
+                        call.dialog.invite_cseq(),
+                        2,
+                        "UacDialog::invite_cseq は retry INVITE CSeq (RFC 3261 §13.2.2.4)"
+                    );
+                    call.dialog
+                }
+                InviteOutcome::Failed { response } => {
+                    panic!(
+                        "expected Established after 407 retry, got {}",
+                        response.status_code
+                    )
+                }
             };
-            assert!(invite1.headers.get("proxy-authorization").is_none());
-            let mut resp407 = crate::sip::transaction::build_response_skeleton(
-                &invite1,
-                407,
-                "Proxy Authentication Required",
-            );
-            resp407.headers.set(
-                "Proxy-Authenticate",
-                r#"Digest realm="proxy.example", nonce="proxynonce-xyz", algorithm=MD5, qop="auth""#,
-            );
-            server_clone
-                .send_to(&resp407.to_bytes(), peer)
-                .await
-                .unwrap();
-
-            // 2) RFC 3261 §17.1.1.3 auto-ACK 吸収
-            let (n_ack, _) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed_ack = crate::sip::message::parse_message(&buf[..n_ack]).unwrap();
-            let SipMessage::Request(auto_ack) = parsed_ack else {
-                panic!("auto-ACK expected after 407");
-            };
-            assert_eq!(auto_ack.method, SipMethod::Ack);
-
-            // 3) 2nd INVITE (with Proxy-Authorization) → 200 OK
-            let (n2, peer2) = server_clone.recv_from(&mut buf).await.unwrap();
-            let parsed2 = crate::sip::message::parse_message(&buf[..n2]).unwrap();
-            let SipMessage::Request(invite2) = parsed2 else {
-                panic!("2nd INVITE expected");
-            };
-            let proxy_auth = invite2
-                .headers
-                .get("proxy-authorization")
-                .expect("Proxy-Authorization が付くべき (RFC 3261 §22.3)");
-            assert!(proxy_auth.starts_with("Digest "));
-            assert!(proxy_auth.contains(r#"realm="proxy.example""#));
-            assert!(proxy_auth.contains(r#"nonce="proxynonce-xyz""#));
-            // Authorization (= 401 用) は付かないこと
-            assert!(invite2.headers.get("authorization").is_none());
-            let mut ok = crate::sip::transaction::build_response_skeleton(&invite2, 200, "OK");
-            ok.headers.set(
-                "To",
-                format!("{};tag=tag407", invite2.headers.get("to").unwrap()),
-            );
-            ok.headers.set("Contact", "<sip:remote@127.0.0.1:9999>");
-            server_clone.send_to(&ok.to_bytes(), peer2).await.unwrap();
-
-            // 4) 2xx ACK
-            let (_n3, _) = server_clone.recv_from(&mut buf).await.unwrap();
-        });
-
-        let (layer, _inbound_rx) = TransactionLayer::spawn(client_sock);
-        let mut uac_cfg = cfg_with_auth("0312345678", "p4ssw0rd");
-        uac_cfg.local_addr = client_local;
-        let uac = Uac::new(uac_cfg, layer, server_addr);
-        let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
-        let outcome = uac.invite(plan, None).await.expect("invite");
-        match outcome {
-            InviteOutcome::Established(call) => {
-                assert_eq!(call.dialog.dialog().id().remote_tag, "tag407");
-            }
-            InviteOutcome::Failed { response } => {
-                panic!(
-                    "expected Established after 407 retry, got {}",
-                    response.status_code
-                )
-            }
-        }
-        server_handle.await.unwrap();
+            let bye_resp = dlg.send_bye().await.expect("BYE 送信");
+            assert_eq!(bye_resp.status_code, 200);
+            server_handle.await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), test_body)
+            .await
+            .expect("Issue #143 race regression: test exceeded 30 s budget");
     }
 
     /// RFC 3261 §22.2 (UAC は再認証後の 2 段目 challenge は failure 扱い):

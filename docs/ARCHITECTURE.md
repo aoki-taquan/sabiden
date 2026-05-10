@@ -87,6 +87,18 @@ src/
 - トランザクション ID (branch + via-sent-by + cseq-method)
 - タイマー T1/T2/T4 管理
 - 再送制御
+- **応答 skeleton header echo の不変条件 (RFC 3261 §8.2.6.2 / §12.1.1 / §20.38, Issue #90)**:
+  `src/sip/transaction.rs::build_response_skeleton` は受信 request から
+  応答に必須 / 推奨される ヘッダを **過不足なく** コピーする:
+  - Via / From / To / Call-ID / CSeq: §8.2.6.2 で MUST copy。
+  - **Record-Route**: §12.1.1 で 2xx 応答は MUST copy (順序と多重度を保つ)。
+    UAS 側で echo しないと UAC 側 dialog の route set (§12.1.2 で逆順) が
+    空になり、 in-dialog BYE / Re-INVITE / UPDATE が proxy 多段経路で
+    loose routing 解決失敗する。 全応答 (provisional / final) で一律 echo
+    して呼出側の漏れを防ぐ (UAC 側は 2xx のみ参照する仕様)。
+  - **Timestamp**: §20.38 で SHOULD echo (RTT 計測用途)。
+  - **意図的に非コピー**: Contact (§20.10 で UAS 連絡先)、 Route (§16.4
+    request 側ヘッダ)、 Max-Forwards / Allow / Supported 等は呼出側で組み立てる。
 
 ### SIP Dialog Layer (RFC 3261 §12)
 - ダイアログ ID (Call-ID + From-tag + To-tag)

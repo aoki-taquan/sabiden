@@ -653,8 +653,11 @@ sequenceDiagram
 > 200 OK SDP body は `c=IN IP4 0.0.0.0` / `m=audio 9` のままなので、
 > `NgnInboundHandler::handle_invite` は **502 Bad Gateway** を返して呼を
 > 放棄する (Issue #73 review)。 transparent モード (`call_manager == None`,
-> Issue #15 互換) でも、 `is_unrewritten_webrtc_sdp` が `0.0.0.0:9` を
-> 検知したら 502 に切り替える。 SIP leg のみの transparent 動作は従来どおり。
+> Issue #15 互換) でも、 `is_undirected_or_webrtc_placeholder_sdp` が
+> 「`c=IN IP4 0.0.0.0` **かつ** `m=audio 9`」 (= 未書換 WebRTC placeholder)
+> を検知したら 502 に切り替える (Issue #122 🟡 #2: 旧名 `is_unrewritten_webrtc_sdp` は
+> `c=0.0.0.0` 単独で true を返し、 RFC 4566 §5.7 hold/silenced 正規 SIP UA を
+> 誤検知して 502 で呼を落としていた)。 SIP leg のみの transparent 動作は従来どおり。
 
 > **BYE 伝搬 (Issue #81 / RFC 3261 §15.1.2 + RFC 5853 §3.2.2 SBC framework)**:
 > SIP 内線レッグは UAS 側ダイアログから build_bye → ext_layer.send_request で

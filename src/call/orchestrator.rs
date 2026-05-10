@@ -220,25 +220,40 @@ pub struct WebRtcOutboundEntry {
 /// どちらの方向 (NGN→PWA / PWA→NGN) からも引ける。
 pub type WebRtcOutboundActive = Arc<Mutex<HashMap<String, Arc<WebRtcOutboundEntry>>>>;
 
-/// 内線レッグの answer SDP が「WebRTC peer から戻ったまま未書換」かを推定する。
+/// 内線レッグの answer SDP が「WebRTC peer から戻ったまま未書換のプレースホルダ」
+/// かを推定する。
 ///
 /// `run_webrtc_leg` が組み立てる 200 OK 用 SDP は browser answer を
-/// `convert_savpf_to_avp` で AVP に変換しただけなので、 `c=IN IP4 0.0.0.0` か
-/// `m=audio 9` が残っている場合「呼出側の `start_bridge_for_inbound` が
+/// `convert_savpf_to_avp` で AVP に変換しただけなので、 `c=IN IP4 0.0.0.0`
+/// **かつ** `m=audio 9` (= "discard port", RFC 4566 §5.14 / IANA discard) が
+/// 両方残っている場合「呼出側の `start_bridge_for_inbound` が
 /// `rewrite_rtp_endpoint` で書き換える前提の中間状態」であり、 そのまま NGN に
-/// 流すと到達不能 (RFC 4566 §5.7 / `docs/asterisk-real-invite.md` §5.2)。
+/// 流すと到達不能 (RFC 4566 §5.2 origin + §5.7 connection / `docs/asterisk-real-invite.md` §5.2)。
 ///
-/// 通常の SIP 内線が返す answer は LAN IP / 実 RTP port なので false。
-fn is_unrewritten_webrtc_sdp(body: &[u8]) -> bool {
+/// Issue #122 🟡 #2 修正: 旧実装は `c=IN IP4 0.0.0.0` 単独でも true を返したため、
+/// 普通の SIP UA が RFC 4566 §5.7 の hold/silenced semantics で
+/// `c=IN IP4 0.0.0.0` + `m=audio 30000` のような実 RTP port を返した場合に
+/// 誤検知して 502 で呼が落ちた。 transparent モード SIP 内線では `c=0.0.0.0` 単独は
+/// 「hold」、 WebRTC leg placeholder は「c=0.0.0.0 **かつ** port 9」なので、
+/// AND 判定で誤検知を排除する。
+///
+/// 通常の SIP 内線が返す answer は LAN IP / 実 RTP port なので false を返す。
+fn is_undirected_or_webrtc_placeholder_sdp(body: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(body) else {
         return false;
     };
-    text.lines().any(|line| {
+    let mut has_zero_conn = false;
+    let mut has_discard_port_audio = false;
+    for line in text.lines() {
         let l = line.trim_end();
-        l == "c=IN IP4 0.0.0.0"
-            || l.starts_with("m=audio 9 RTP/AVP")
-            || l.starts_with("m=audio 9 UDP/TLS/RTP/SAVPF")
-    })
+        if l == "c=IN IP4 0.0.0.0" {
+            has_zero_conn = true;
+        } else if l.starts_with("m=audio 9 RTP/AVP") || l.starts_with("m=audio 9 UDP/TLS/RTP/SAVPF")
+        {
+            has_discard_port_audio = true;
+        }
+    }
+    has_zero_conn && has_discard_port_audio
 }
 
 /// NGN 着信ハンドラ。`TransactionLayer::spawn` の `inbound_rx` を消費する。
@@ -756,7 +771,10 @@ impl NgnInboundHandler {
                         .await
                     {
                         Ok(rewritten) => rewritten,
-                        Err(e) if bridged_mode || is_unrewritten_webrtc_sdp(&response.body) => {
+                        Err(e)
+                            if bridged_mode
+                                || is_undirected_or_webrtc_placeholder_sdp(&response.body) =>
+                        {
                             warn!(
                                 error=%e,
                                 "RTP ブリッジ起動失敗 → 502 Bad Gateway で呼を放棄"
@@ -3597,7 +3615,10 @@ pub async fn fork_to_bindings(
 ///   `pending` は触らない (`fork_to_bindings` 側で他 leg を続行できる)。
 /// - WS 送信失敗 / answer タイムアウト時は `pending.cancel` で予約だけ撤去する。
 /// - `peer.accept_answer` 失敗時は既に `deliver` が `pending` を消費済みなので
-///   何もしない (`Errored` を返す)。
+///   `pending` は触らないが、 str0m 側は `pending_offer` を保持したまま、 browser
+///   側は answer 消費済で宙ぶらりんになる。 そのため `peer.close()` をベスト
+///   エフォートで呼んで str0m run_loop を畳む (Issue #122 🟡 #3 / W3C WebRTC
+///   §4.4.1 close semantics) → `Errored` を返す。
 ///
 /// # 注意 (Issue #121 follow-up)
 ///
@@ -3684,8 +3705,13 @@ async fn run_webrtc_leg(
 
     // (5) str0m に answer を流し込み DTLS/ICE 確立を促す。
     //   `pending` は (4) の `deliver` で既に消費済みなので追加クリーンアップ不要。
+    //   Issue #122 🟡 #3: 失敗時は str0m run_loop が `pending_offer` 保持で
+    //   宙ぶらりんになるので `peer.close()` をベストエフォートで呼ぶ。
+    //   `close()` は str0m 実装上 cmd_tx send 失敗 (run_loop 既終了) も無視する。
+    //   W3C WebRTC §4.4.1: close で peerconnection state を `closed` に倒す。
     if let Err(e) = peer.accept_answer(&answer).await {
         warn!(%aor, error=%e, "WebRTC leg: peer.accept_answer 失敗 (browser SDP 不正?)");
+        let _ = peer.close().await;
         return LegResult::Errored { aor };
     }
 
@@ -3715,7 +3741,7 @@ async fn run_webrtc_leg(
         None => {
             // stub backend / 取得済みなど。 bridge は起動できないが SIP
             // 経路は維持する (orchestrator 側で 502 にする / 透過にするは
-            // is_unrewritten_webrtc_sdp 判定で分岐済)。
+            // is_undirected_or_webrtc_placeholder_sdp 判定で分岐済)。
             debug!(%aor, "WebRTC leg: peer.take_media_rx None (stub backend?)");
             None
         }
@@ -4300,31 +4326,47 @@ mod tests {
         );
     }
 
-    /// `is_unrewritten_webrtc_sdp` が WebRTC leg 由来の `0.0.0.0:9` SDP を検出する。
-    /// 正常な SIP leg の LAN IP / 実 port SDP は false にすること。
+    /// `is_undirected_or_webrtc_placeholder_sdp` が WebRTC leg 由来の `0.0.0.0:9`
+    /// プレースホルダ SDP を検出する。 正常な SIP leg の LAN IP / 実 port SDP、
+    /// および RFC 4566 §5.7 hold/silenced (= `c=0.0.0.0` + 実 port) は false に
+    /// すること (Issue #122 🟡 #2 修正)。
     #[test]
-    fn unrewritten_webrtc_sdp_detection_matches_only_webrtc_junk() {
+    fn rfc4566_5_2_5_14_undirected_or_webrtc_placeholder_requires_both_zero_conn_and_port_9() {
+        // WebRTC leg placeholder: c=0.0.0.0 かつ m=audio 9 → true
         let webrtc_avp = b"v=0\r\no=- 9 9 IN IP4 0.0.0.0\r\ns=-\r\n\
                            c=IN IP4 0.0.0.0\r\nt=0 0\r\n\
                            m=audio 9 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-        assert!(is_unrewritten_webrtc_sdp(webrtc_avp));
+        assert!(is_undirected_or_webrtc_placeholder_sdp(webrtc_avp));
 
         let webrtc_savpf = b"v=0\r\no=- 9 9 IN IP4 0.0.0.0\r\ns=-\r\n\
                              c=IN IP4 0.0.0.0\r\nt=0 0\r\n\
                              m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n";
-        assert!(is_unrewritten_webrtc_sdp(webrtc_savpf));
+        assert!(is_undirected_or_webrtc_placeholder_sdp(webrtc_savpf));
 
+        // 通常 SIP UA: LAN IP + 実 port → false
         let normal_sip = b"v=0\r\no=- 1 1 IN IP4 192.168.1.10\r\ns=-\r\n\
                            c=IN IP4 192.168.1.10\r\nt=0 0\r\n\
                            m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-        assert!(!is_unrewritten_webrtc_sdp(normal_sip));
+        assert!(!is_undirected_or_webrtc_placeholder_sdp(normal_sip));
 
-        // c= が 0.0.0.0 でも m= port が実値なら WebRTC junk ではない (現状判定はこの形)。
-        // (理論上 RFC 4566 §5.7 で "hold" を意味する 0.0.0.0 は別問題なので保守的に拾う)
+        // Issue #122 🟡 #2 重要回帰: RFC 4566 §5.7 hold/silenced semantics で
+        // SIP UA が `c=IN IP4 0.0.0.0` + 実 RTP port を返した場合は **false**。
+        // 旧実装は ここを true として 502 で呼を落としていた (誤検知)。
         let session_held = b"v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\n\
                              c=IN IP4 0.0.0.0\r\nt=0 0\r\n\
                              m=audio 30000 RTP/AVP 0\r\n";
-        assert!(is_unrewritten_webrtc_sdp(session_held));
+        assert!(
+            !is_undirected_or_webrtc_placeholder_sdp(session_held),
+            "RFC 4566 §5.7 hold/silenced は WebRTC placeholder ではない (Issue #122 🟡 #2)"
+        );
+
+        // 逆ケース: m=audio 9 のみ (c= は実 IP) → false (offer に対する完全な
+        // discard port 拒否は別 semantics で、 本判定は WebRTC peer 由来の
+        // 「0.0.0.0:9 中間状態」を狭く拾う)。
+        let port_9_only = b"v=0\r\no=- 1 1 IN IP4 192.168.1.10\r\ns=-\r\n\
+                            c=IN IP4 192.168.1.10\r\nt=0 0\r\n\
+                            m=audio 9 RTP/AVP 0\r\n";
+        assert!(!is_undirected_or_webrtc_placeholder_sdp(port_9_only));
     }
 
     /// NGN 着信 INVITE → 内線フォーク (200) → 200 OK が NGN 側に届く。
@@ -7815,6 +7857,7 @@ mod tests {
         struct FailingAcceptAnswerPeer {
             create_calls: AtomicUsize,
             accept_calls: AtomicUsize,
+            close_calls: AtomicUsize,
             offer_sdp: String,
         }
         #[async_trait::async_trait]
@@ -7834,6 +7877,7 @@ mod tests {
                 Ok(())
             }
             async fn close(&self) -> anyhow::Result<()> {
+                self.close_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
         }
@@ -7841,6 +7885,7 @@ mod tests {
         let peer_inner = Arc::new(FailingAcceptAnswerPeer {
             create_calls: AtomicUsize::new(0),
             accept_calls: AtomicUsize::new(0),
+            close_calls: AtomicUsize::new(0),
             offer_sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
                         t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
                         a=ice-ufrag:srvuf\r\na=ice-pwd:srvpasswordsrvpassword\r\n\
@@ -7927,6 +7972,15 @@ mod tests {
         assert!(
             !again,
             "pending は accept_answer 到達前に deliver で消費済みのはず"
+        );
+
+        // Issue #122 🟡 #3: accept_answer 失敗時は str0m / browser が宙ぶらりんに
+        // ならないよう `peer.close()` がベストエフォートで呼ばれていること。
+        // W3C WebRTC §4.4.1: close で peerconnection state を `closed` に倒す。
+        assert_eq!(
+            peer_inner.close_calls.load(Ordering::SeqCst),
+            1,
+            "accept_answer 失敗時は peer.close() を 1 度だけ呼ぶべき (Issue #122 🟡 #3)"
         );
     }
 
@@ -8446,6 +8500,132 @@ mod tests {
         assert!(
             got_cancel,
             "Issue #81/#83 review #2: 502 fallback で browser に Cancel が push されるべき"
+        );
+    }
+
+    /// Issue #122 🟡 #4: **bridged モード** (`CallManager` 接続済 = NGN 直収本番経路)
+    /// で `start_bridge_for_inbound` が失敗した場合に 502 Bad Gateway が NGN に
+    /// 返ることを直接検証する。
+    ///
+    /// PR #76 で `bridged_mode || is_undirected_or_webrtc_placeholder_sdp` の OR
+    /// 分岐を追加したが、 `bridged_mode = true` 側を直接ヒットさせる単体テストが
+    /// なかった (transparent モード = `call_manager.is_none()` 側だけ
+    /// `transparent_mode_webrtc_leg_returns_502_with_cancel_to_browser` でカバー
+    /// していた)。 本テストは SIP 内線 (= WebRTC 経路を経由しない) でも、
+    /// 内線 200 OK answer SDP が `extract_rtp_endpoint` で parse 失敗するような
+    /// 異常値だった場合、 bridged モードでは透過せず 502 で打ち切ることを担保する。
+    ///
+    /// RFC 3261 §21.5.2 (502 Bad Gateway): "The server, while acting as a gateway
+    /// or proxy, received an invalid response from the downstream server."
+    /// — 内線 leg の SDP が壊れていて bridge 起動できないのは正に B2BUA 下流応答が
+    /// invalid な状況。
+    #[tokio::test]
+    async fn rfc3261_21_5_2_bridged_mode_bridge_failure_returns_502_to_ngn() {
+        use crate::call::manager::CallManager;
+        use crate::sip::message::parse_message;
+        use crate::sip::message::SipMessage;
+        use crate::sip::transaction::TransactionLayer;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // sabiden NGN SIP ソケット
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        // mock NGN UA
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+
+        // 内線レジストリにダミー SIP 内線を 1 件入れる (WebRTC ではなく通常 SIP)
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6001".to_string(),
+                "127.0.0.1:6001".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // ScriptedInviter: 200 OK だが **answer SDP が壊れている** (c= も m= も無い)。
+        // start_bridge_for_inbound の `extract_rtp_endpoint(ext_answer)?` で
+        // 「SDP に audio media がない」 Err となり、 bridge 起動全体が失敗する。
+        let broken_answer = b"v=0\r\no=- 1 1 IN IP4 192.168.1.10\r\ns=-\r\nt=0 0\r\n".to_vec();
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(broken_answer)
+            .build();
+
+        // bridged モード: CallManager を接続した handler
+        let mgr = CallManager::new(extensions.clone());
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound_with_manager(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+            mgr.clone(),
+        );
+
+        // NGN INVITE 送信 (正常な PCMU SDP)
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKbridged-fail", ngn_addr),
+        );
+        invite
+            .headers
+            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn-br");
+        invite.headers.set("To", "<sip:0312345678@sabiden>");
+        invite.headers.set("Call-ID", "ngn-bridged-fail-cid");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Content-Type", "application/sdp");
+        invite.body = b"v=0\r\n\
+                        o=- 1 1 IN IP4 192.0.2.1\r\n\
+                        s=-\r\n\
+                        c=IN IP4 192.0.2.1\r\n\
+                        t=0 0\r\n\
+                        m=audio 20000 RTP/AVP 0\r\n\
+                        a=rtpmap:0 PCMU/8000\r\n"
+            .to_vec();
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // NGN は 100 Trying と 502 Bad Gateway を期待する
+        let mut buf = vec![0u8; 8192];
+        let mut got_100 = false;
+        let mut final_status: Option<u16> = None;
+        for _ in 0..6 {
+            match timeout(Duration::from_secs(3), ngn_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                        match r.status_code {
+                            100 => got_100 = true,
+                            code => {
+                                final_status = Some(code);
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_100, "100 Trying が NGN 側に届くべき");
+        assert_eq!(
+            final_status,
+            Some(502),
+            "bridged モードで start_bridge_for_inbound が失敗した場合、 NGN に 502 を返すべき (Issue #122 🟡 #4 / RFC 3261 §21.5.2)"
+        );
+
+        // bridge が起動していないので CallManager にエントリは無い
+        assert_eq!(
+            mgr.len().await,
+            0,
+            "bridge 起動失敗時は CallManager にエントリが登録されてはいけない"
         );
     }
 

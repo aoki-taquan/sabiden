@@ -3920,7 +3920,7 @@ mod tests {
             _ => panic!("INVITE 期待"),
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4444,7 +4444,7 @@ mod tests {
             _ => panic!("INVITE 期待"),
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4541,7 +4541,7 @@ mod tests {
         info_req.body = b"Signal=5\r\nDuration=200\r\n".to_vec();
         let info_stx =
             ServerTransaction::new(info_req.clone(), phone_addr, sabiden_uas_sock.clone()).unwrap();
-        let info_responder = crate::sip::uas::ResponderHandle::__test_new(info_stx);
+        let info_responder = crate::testing::builders::responder_handle_for_test(info_stx);
         event_tx
             .send(UasEvent::Info {
                 request: info_req,
@@ -4730,7 +4730,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4779,7 +4779,7 @@ mod tests {
         assert_eq!(bye_req.method, SipMethod::Bye);
         let bye_stx =
             ServerTransaction::new(bye_req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let bye_responder = crate::sip::uas::ResponderHandle::__test_new(bye_stx);
+        let bye_responder = crate::testing::builders::responder_handle_for_test(bye_stx);
         event_tx
             .send(UasEvent::Bye {
                 request: bye_req,
@@ -4937,7 +4937,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -5093,7 +5093,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -5120,7 +5120,7 @@ mod tests {
         cancel.headers.set("CSeq", "1 CANCEL");
         let cancel_stx =
             ServerTransaction::new(cancel.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let cancel_responder = crate::sip::uas::ResponderHandle::__test_new(cancel_stx);
+        let cancel_responder = crate::testing::builders::responder_handle_for_test(cancel_stx);
         event_tx
             .send(UasEvent::Cancel {
                 request: cancel,
@@ -5447,7 +5447,7 @@ mod tests {
             panic!("Re-INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
 
         handler
             .handle_ext_reinvite(req, remote, responder)
@@ -5534,7 +5534,7 @@ mod tests {
             req.headers.set("CSeq", "1 INVITE");
             let stx =
                 ServerTransaction::new(req, pending_resp_addr, pending_responder_sock).unwrap();
-            crate::sip::uas::ResponderHandle::__test_new(stx)
+            crate::testing::builders::responder_handle_for_test(stx)
         };
         let pending = Arc::new(PendingOutbound {
             ext_call_id: pending_call_id.to_string(),
@@ -5592,7 +5592,7 @@ mod tests {
             panic!("Re-INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
 
         handler
             .handle_ext_reinvite(req, remote, responder)
@@ -5659,7 +5659,7 @@ mod tests {
                 req.headers.set("CSeq", "1 INVITE");
                 let stx =
                     ServerTransaction::new(req, "127.0.0.1:9999".parse().unwrap(), sock).unwrap();
-                crate::sip::uas::ResponderHandle::__test_new(stx)
+                crate::testing::builders::responder_handle_for_test(stx)
             },
             cancelled: tokio::sync::Notify::new(),
             cancelled_flag: std::sync::atomic::AtomicBool::new(false),

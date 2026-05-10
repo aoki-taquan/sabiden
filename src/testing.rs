@@ -735,8 +735,13 @@ pub mod pcsf {
                     } else {
                         let mut resp = build_response_skeleton(req, 401, "Unauthorized");
                         ensure_to_tag(&mut resp);
-                        resp.headers
-                            .set("WWW-Authenticate", build_www_authenticate(realm, nonce));
+                        // RFC 7616 §3.3: mock server は first-time challenge と
+                        // して stale=false / opaque 無しを返す (テスト UA は
+                        // 1 回しか challenge を受けない設計)。
+                        resp.headers.set(
+                            "WWW-Authenticate",
+                            build_www_authenticate(realm, nonce, false, None),
+                        );
                         let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
                     }
                 }

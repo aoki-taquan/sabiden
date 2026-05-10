@@ -73,11 +73,15 @@ src/
   Path / Service-Route / Authentication-Info 多段で 8 KB を超える事例があるため、上限まで確保する
   (issue #88)。`n == buf.len()` で受信した場合は truncate の兆候として warn ログを残す
   (RFC 3261 §18.4 Error Handling)。
-- `parse_message` は **生バイト** ベース。 Content-Length (RFC 3261 §20.14)
-  を見て本文を切り出し、 truncate 検知時 / 重複 Content-Length 時は `Err` で
-  drop。 body は opaque octet 列 (RFC 3261 §7.4) として扱い、UTF-8 妥当性は
-  要求しない。 ヘッダ部も `from_utf8_lossy` で U+FFFD 置換し、 不正バイト
-  混入による DoS 経路を遮断する (詳細 → [`architecture.md`](./architecture.md) §11.6)。
+- `parse_message_classified` は **生バイト** ベース。 Content-Length (RFC 3261 §20.14)
+  を見て本文を切り出し、 truncate 検知時 / 重複 Content-Length 時 / 非数値
+  Content-Length 時は分類済 `ParseError` を返し、`recv_loop` 側で必須ヘッダ
+  (Via/From/To/Call-ID/CSeq) を best-effort 抽出できれば RFC 3261 §21.4.1
+  に従い `400 Bad Request` を UDP source へ返送する (Issue #126)。 抽出
+  不能なケースは silent drop (RFC 3261 §16.3)。 body は opaque octet 列
+  (RFC 3261 §7.4) として扱い、UTF-8 妥当性は要求しない。 ヘッダ部も
+  `from_utf8_lossy` で U+FFFD 置換し、 不正バイト混入による DoS 経路を
+  遮断する (詳細 → [`architecture.md`](./architecture.md) §11.6)。
 
 ### SIP Transaction Layer (RFC 3261 §17)
 - トランザクション ID (branch + via-sent-by + cseq-method)

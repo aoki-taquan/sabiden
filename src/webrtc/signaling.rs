@@ -2133,4 +2133,246 @@ mod tests {
         assert_eq!(s2.keepalive_interval, Duration::from_secs(5));
         assert_eq!(s2.idle_timeout, Duration::from_secs(10));
     }
+
+    // ---------------------------------------------------------------
+    // Issue #135 🟡 2: trickle ICE 任意順序到達テスト
+    // (RFC 8839 §4 Trickle ICE / RFC 8445 §5.1.1)
+    //
+    // PR #134 (Issue #91) は frontend 側 PWA の `pendingIceCandidates` バッファ
+    // を導入したが、 server 側 (sabiden WS) の `process_client_message` でも
+    // ICE → Offer / Offer → ICE / Offer → ICE → Bye 等の **任意順序** で
+    // `peer.add_ice_candidate` がエラー無く受理されることを担保する必要が
+    // ある。 RFC 8839 §4.2: candidate は SDP exchange の任意の時点で送出
+    // できる。 sabiden は WS open 時点で `peer` を生成済 (signaling.rs:496)
+    // なので、 offer が来る前の ICE も受理しなければならない。
+    //
+    // 本テスト群は `StubPeerSession` で挙動を確認する。 `Str0mPeerSession`
+    // は別途 `str0m_session_add_ice_candidate_accepts_browser_format` で
+    // SDP 文法のみ検証している。
+    // ---------------------------------------------------------------
+
+    /// RFC 8839 §4.2: ICE candidate が SDP offer **より先** に届いても WS
+    /// 層は受理 (Continue を返す)。 frontend の pendingIceCandidates 不在時
+    /// にも server 側で握りつぶさないことを担保する (Issue #135 🟡 2)。
+    #[tokio::test]
+    async fn rfc8839_trickle_ice_before_offer_is_accepted() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        // (1) Offer 受信前に ICE が先に届く
+        let act_ice = process_client_message(
+            ClientMessage::Ice {
+                candidate: "candidate:1 1 udp 2122252543 1.2.3.4 56789 typ host".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(act_ice, SessionAction::Continue));
+
+        // (2) その後 Offer が届くと Answer を返す
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
+                     a=rtpmap:111 OPUS/48000/2\r\n";
+        let act_offer = process_client_message(
+            ClientMessage::Offer {
+                sdp: offer.into(),
+                target: None,
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            act_offer,
+            SessionAction::Reply(ServerMessage::Answer { .. })
+        ));
+    }
+
+    /// RFC 8839 §4.2: 古典順 `Offer → ICE → Answer` (sabiden 視点で
+    /// receiver=Offer→push ICE) でも ICE は受理される。
+    #[tokio::test]
+    async fn rfc8839_trickle_ice_after_offer_is_accepted() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
+                     a=rtpmap:111 OPUS/48000/2\r\n";
+        let act_offer = process_client_message(
+            ClientMessage::Offer {
+                sdp: offer.into(),
+                target: None,
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            act_offer,
+            SessionAction::Reply(ServerMessage::Answer { .. })
+        ));
+
+        for cand in [
+            "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host",
+            "candidate:2 1 udp 1685987071 203.0.113.5 56789 typ srflx raddr 192.168.1.10 rport 56789",
+        ] {
+            let action = process_client_message(
+                ClientMessage::Ice {
+                    candidate: cand.into(),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            assert!(matches!(action, SessionAction::Continue), "cand={}", cand);
+        }
+    }
+
+    /// RFC 8839 §4.2: 複数 ICE が interleave で届いても全て受理 (Stub Peer
+    /// は内部 vec に蓄積するので候補数を直接観測できる)。
+    #[tokio::test]
+    async fn rfc8839_multiple_interleaved_ice_candidates_all_accepted() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let stub = StubPeerSession::new();
+        let peer: Arc<dyn PeerSession> = stub.clone();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        // ICE → Offer → ICE → ICE → end-of-candidates
+        let events: Vec<ClientMessage> = vec![
+            ClientMessage::Ice {
+                candidate: "candidate:1 1 udp 2122252543 10.0.0.1 1000 typ host".into(),
+            },
+            ClientMessage::Offer {
+                sdp: "v=0\r\n\
+                      o=- 1 1 IN IP4 192.0.2.1\r\n\
+                      s=-\r\n\
+                      c=IN IP4 192.0.2.1\r\n\
+                      t=0 0\r\n\
+                      m=audio 50000 UDP/TLS/RTP/SAVPF 0\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n"
+                    .into(),
+                target: None,
+            },
+            ClientMessage::Ice {
+                candidate: "candidate:2 1 udp 2122252543 10.0.0.2 2000 typ host".into(),
+            },
+            ClientMessage::Ice {
+                candidate: "candidate:3 1 udp 1685987071 203.0.113.5 3000 typ srflx".into(),
+            },
+            // RFC 8839 §4.2 / W3C: end-of-candidates は空文字 or "end-of-candidates"
+            ClientMessage::Ice {
+                candidate: "".into(),
+            },
+            ClientMessage::Ice {
+                candidate: "end-of-candidates".into(),
+            },
+        ];
+
+        for ev in events {
+            let _ = process_client_message(
+                ev,
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+        }
+
+        // 実候補 3 件が peer に蓄積されている (end-of-candidates / 空は
+        // signaling 層で silent OK され peer には流れない)。
+        let cands = stub.candidates().await;
+        assert_eq!(
+            cands.len(),
+            3,
+            "trickle ICE 候補 3 件が peer に到達すべき: {:?}",
+            cands
+        );
+        assert!(cands[0].contains("10.0.0.1"));
+        assert!(cands[1].contains("10.0.0.2"));
+        assert!(cands[2].contains("203.0.113.5"));
+    }
+
+    /// RFC 8839 §4.2 / W3C WebRTC §4.4.1: 空文字 / "end-of-candidates"
+    /// マーカは silent OK で受理し、 peer の add_ice_candidate には流さない
+    /// (PR #134 で導入された signaling.rs:954 のガード回帰)。
+    #[tokio::test]
+    async fn rfc8839_end_of_candidates_marker_is_silent_continue() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let stub = StubPeerSession::new();
+        let peer: Arc<dyn PeerSession> = stub.clone();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        for marker in [
+            "",
+            "   ",
+            "end-of-candidates",
+            "candidate:end-of-candidates",
+        ] {
+            let action = process_client_message(
+                ClientMessage::Ice {
+                    candidate: marker.into(),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            assert!(
+                matches!(action, SessionAction::Continue),
+                "marker={:?}",
+                marker
+            );
+        }
+        assert!(
+            stub.candidates().await.is_empty(),
+            "終端マーカは peer に流してはならない"
+        );
+    }
 }

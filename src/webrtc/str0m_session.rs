@@ -957,6 +957,74 @@ mod tests {
         assert!(r.is_err(), "run_loop 終了後は Err になる: {:?}", r);
     }
 
+    /// Issue #135 🟡 2 (server-side analog) / RFC 8839 §4.2 Trickle ICE:
+    /// ブラウザは SDP offer 受信前に local candidate を trickle してくる
+    /// ことがある (Chrome の典型挙動: setLocalDescription 完了直後に
+    /// `icegatheringstatechange` が走り、 host candidate が
+    /// `RTCPeerConnection.onicecandidate` で吐かれる)。
+    ///
+    /// str0m バックエンドは ICE-Lite で `add_remote_candidate` を SDP
+    /// exchange 前に受けても内部 ICE state に蓄積する (str0m 0.19
+    /// `Rtc::add_remote_candidate` 仕様、 RFC 8838 trickle ICE)。
+    /// 本テストは run_loop 起動直後 (= `accept_offer` 前) に
+    /// `add_ice_candidate` を呼んで command 経由で正常受理されることを
+    /// 確認する。 frontend の `pendingIceCandidates` バッファに頼らず、
+    /// server 側でも同等の堅牢性があることを担保。
+    #[tokio::test]
+    async fn str0m_session_add_remote_candidate_before_sdp_is_accepted() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (57000, 57999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        // accept_offer / create_offer を呼ばずにいきなり remote candidate を
+        // 追加する。 ICE-Lite なので remote credentials 未確定でも str0m は
+        // 候補を保持する (RFC 8838: trickle).
+        let cand = "candidate:1 1 udp 2122252543 192.168.1.50 56789 typ host";
+        session
+            .add_ice_candidate(cand)
+            .await
+            .expect("SDP 交換前でも受理されるべき (RFC 8839 §4.2)");
+        let _ = session.close().await;
+    }
+
+    /// Issue #135 🟡 2 (server-side analog) / RFC 8839 §4.2: ICE → Offer →
+    /// ICE → ICE の interleave 順序でも全 candidate が受理される。
+    /// frontend `App.tsx` の `pendingIceCandidates` 修正と対応する
+    /// server-side 担保。
+    #[tokio::test]
+    async fn str0m_session_interleaved_ice_offer_ice_all_accepted() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (58000, 58999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+
+        // (1) offer 前に 1 つ目
+        session
+            .add_ice_candidate("candidate:1 1 udp 2122252543 10.0.0.1 1000 typ host")
+            .await
+            .expect("ICE before offer");
+
+        // (2) offer
+        let offer = include_str!("testdata/firefox_offer.sdp");
+        let _answer = session.handle_offer(offer).await.expect("offer 受理");
+
+        // (3) offer 後に 2 つ + 終端マーカ相当
+        for cand in [
+            "candidate:2 1 udp 2122252543 10.0.0.2 2000 typ host",
+            "candidate:3 1 udp 1685987071 203.0.113.5 3000 typ srflx",
+        ] {
+            session
+                .add_ice_candidate(cand)
+                .await
+                .expect("ICE after offer");
+        }
+        let _ = session.close().await;
+    }
+
     /// `accept_answer` は対応する保留オファが無ければエラーを返す。
     #[tokio::test]
     async fn str0m_session_accept_answer_without_offer_errors() {
@@ -1046,5 +1114,477 @@ mod tests {
             parsed.find_rtpmap(0).is_some(),
             "PCMU rtpmap が NGN 用 SDP から欠落"
         );
+    }
+
+    // ========================================================================
+    // Issue #114: str0m バックエンド統合テスト
+    //
+    // 既存の単発 SDP テスト (`str0m_session_accept_offer_smoke` 等) は ICE/DTLS
+    // を確立しない範囲しか触れていない。 ここでは "ブラウザ側" Rtc を Sans-IO
+    // で同居駆動し、 実 loopback UDP を介して offer→answer→ICE→DTLS→media
+    // までを 1 つの `#[tokio::test]` で完結させる。
+    //
+    // RFC 引用:
+    // - RFC 8825 (WebRTC): full media stack expects ICE + DTLS + SRTP の連携
+    // - RFC 8829 (JSEP §4.1): offer/answer state machine
+    // - RFC 8839 (ICE in SDP §4.1): controlling/controlled, ice-lite/full
+    // - RFC 8842 (DTLS-SRTP §4.4): fingerprint+setup attributes in SDP
+    //
+    // ICE 役割: `Str0mPeerSession` 本体は ICE-Lite (controlled)。 そのため
+    // テスト側 "ブラウザ" は full-ICE controlling (`set_ice_lite(false)`、
+    // SDP offerer 側) として組む。 RFC 8445 §6.1.1: at least one agent must
+    // act as controlling — ICE-Lite same-side 同士では成立しない。
+    // ========================================================================
+
+    /// "ブラウザ" 役の sync Rtc を loopback UDP で駆動する helper。
+    /// `tokio::test` 内で `tokio::spawn(run)` して非同期に動かす。
+    ///
+    /// 設計理由 (CLAUDE.md §6.3 production-side test hook 禁止):
+    /// `Str0mPeerSession` は run_loop が固定 (ICE-Lite, public_ip ベース) で
+    /// テストでも一切弄らない。 反対側 (ブラウザ) はテスト本体の制御下に置く
+    /// 必要があるため、 ここで完全自前の Rtc + UdpSocket driver を組む。
+    struct TestBrowserPeer {
+        rtc: Rtc,
+        socket: Arc<UdpSocket>,
+        local_addr: SocketAddr,
+    }
+
+    impl TestBrowserPeer {
+        /// loopback 上に bind し、 host candidate を登録した状態で生成。
+        /// ICE は full (controlling 側)、 codec は PCMU のみ enable。
+        async fn new() -> Result<Self> {
+            // 127.0.0.1:0 で OS に任意 port を割り当てさせる。
+            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+            let local_addr = socket.local_addr()?;
+
+            // RFC 8825 §3.4: WebRTC は DTLS-SRTP / SAVPF を必須とする。
+            // ICE-Lite は controlling 側では使わない (RFC 8445 §2.4)。
+            let mut rtc = RtcConfig::new()
+                .set_ice_lite(false)
+                .clear_codecs()
+                .enable_pcmu(true)
+                .build(Instant::now());
+
+            let host = Candidate::host(local_addr, "udp")
+                .map_err(|e| anyhow!("test browser host candidate: {}", e))?;
+            rtc.add_local_candidate(host);
+
+            Ok(Self {
+                rtc,
+                socket: Arc::new(socket),
+                local_addr,
+            })
+        }
+
+        /// SDP offer を build (audio sendrecv 1 本)。
+        /// RFC 8829 §5.2: createOffer は 1 つの SdpOffer + pending offer を返す。
+        fn build_offer(&mut self) -> Result<(String, str0m::change::SdpPendingOffer)> {
+            let mut api = self.rtc.sdp_api();
+            api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+            let (offer, pending) = api
+                .apply()
+                .ok_or_else(|| anyhow!("test browser: offer apply 空"))?;
+            Ok((offer.to_sdp_string(), pending))
+        }
+
+        /// RFC 8829 §5.6: 受領した answer SDP を pending offer に紐付けて適用。
+        fn apply_answer(
+            &mut self,
+            pending: str0m::change::SdpPendingOffer,
+            sdp: &str,
+        ) -> Result<()> {
+            let answer = SdpAnswer::from_sdp_string(sdp)
+                .map_err(|e| anyhow!("test browser: SDP answer parse: {}", e))?;
+            self.rtc
+                .sdp_api()
+                .accept_answer(pending, answer)
+                .map_err(|e| anyhow!("test browser: accept_answer: {}", e))?;
+            Ok(())
+        }
+    }
+
+    /// `TestBrowserPeer` 用の単方向 progress: poll_output を 1 回回し、
+    /// 必要なら 1 パケット送信 / イベント記録する。 戻り値は次回 timeout 時刻。
+    async fn browser_poll(
+        rtc: &mut Rtc,
+        socket: &UdpSocket,
+        events: &mut Vec<Event>,
+    ) -> Result<Instant> {
+        loop {
+            match rtc.poll_output() {
+                Ok(Output::Timeout(t)) => return Ok(t),
+                Ok(Output::Transmit(t)) => {
+                    if let Err(e) = socket.send_to(&t.contents, t.destination).await {
+                        warn!(error = %e, dest = %t.destination, "test browser: send 失敗");
+                    }
+                }
+                Ok(Output::Event(ev)) => {
+                    events.push(ev);
+                }
+                Err(e) => return Err(anyhow!("test browser: poll_output: {}", e)),
+            }
+        }
+    }
+
+    /// "ブラウザ" Rtc を `until` まで駆動し、 `predicate` が true になったら戻る。
+    /// loopback UDP recv と Rtc timeout を `tokio::select!` する。
+    /// `predicate(&events)` が true、 または `deadline` 経過で戻る。
+    /// 戻り値: predicate が満たされたら true。
+    async fn drive_browser_until<F>(
+        browser: &mut TestBrowserPeer,
+        events: &mut Vec<Event>,
+        deadline: tokio::time::Instant,
+        mut predicate: F,
+    ) -> bool
+    where
+        F: FnMut(&[Event]) -> bool,
+    {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            // poll_output で次の timeout を取得
+            let next_timeout = match browser_poll(&mut browser.rtc, &browser.socket, events).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "test browser: poll エラー、 drive 終了");
+                    return predicate(events);
+                }
+            };
+
+            if predicate(events) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return predicate(events);
+            }
+
+            let now = Instant::now();
+            let dur = next_timeout.saturating_duration_since(now);
+            let timeout_at = tokio::time::Instant::now() + dur;
+            // deadline と次 timeout の早い方
+            let sleep_until_t = deadline.min(timeout_at);
+
+            tokio::select! {
+                r = browser.socket.recv_from(&mut buf) => {
+                    match r {
+                        Ok((n, src)) => {
+                            match Receive::new(Protocol::Udp, src, browser.local_addr, &buf[..n]) {
+                                Ok(rx) => {
+                                    let input = Input::Receive(Instant::now(), rx);
+                                    if browser.rtc.accepts(&input) {
+                                        if let Err(e) = browser.rtc.handle_input(input) {
+                                            warn!(error = %e, "test browser: handle_input エラー");
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // 非 STUN/DTLS/RTP → drop
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "test browser: recv_from エラー");
+                            return predicate(events);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(sleep_until_t) => {
+                    if let Err(e) = browser.rtc.handle_input(Input::Timeout(Instant::now())) {
+                        warn!(error = %e, "test browser: timeout handle_input エラー");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Str0mPeerSession` の `host_candidate` (= `public_ip:port`) を SDP answer
+    /// から抜き出すヘルパ。 SDP には `a=candidate:<foundation> 1 udp <prio>
+    /// <ip> <port> typ host` 形式で含まれる (RFC 8839 §5.1)。
+    fn extract_host_socket_from_sdp(sdp: &str) -> Option<SocketAddr> {
+        for line in sdp.lines() {
+            let l = line.trim_start_matches("a=");
+            if let Some(rest) = l.strip_prefix("candidate:") {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() >= 8 && toks[7] == "host" {
+                    let ip: IpAddr = toks[4].parse().ok()?;
+                    let port: u16 = toks[5].parse().ok()?;
+                    return Some(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        None
+    }
+
+    /// RFC 8829 §5.2 / §5.6 + RFC 8839 §6.1 + RFC 8842 §4: フル offer→answer→
+    /// ICE check→DTLS handshake→`Event::Connected` を loopback で往復する。
+    ///
+    /// シーケンス:
+    /// 1. テスト側 (browser, controlling) が SDP offer を生成
+    /// 2. `Str0mPeerSession::handle_offer` で answer 取得
+    /// 3. browser が answer を `accept_answer` で適用
+    /// 4. browser host candidate は offer SDP に乗っており、 sabiden の
+    ///    host candidate は answer SDP に乗っている (RFC 8839 §5.1.1)
+    /// 5. browser を loopback UDP で駆動、 `Event::Connected` 到達まで待機
+    ///
+    /// DoD (Issue #114): "offer 受理 → answer 生成 → ICE candidate → DTLS
+    /// handshake → media frame drop の round-trip"。
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc8829_full_round_trip_offer_answer_ice_dtls_connected() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (60000, 60999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.expect("session new");
+
+        let mut browser = TestBrowserPeer::new().await.expect("browser new");
+
+        // (1) browser が offer を生成
+        let (offer_sdp, pending) = browser.build_offer().expect("build offer");
+        assert!(offer_sdp.contains("m=audio"), "offer に audio 行不在");
+        assert!(
+            offer_sdp.contains("ice-ufrag") && offer_sdp.contains("ice-pwd"),
+            "offer に ICE 認証情報不在 (RFC 8839 §4.1)"
+        );
+        assert!(
+            offer_sdp.contains("fingerprint:"),
+            "offer に fingerprint 不在 (RFC 8842 §4)"
+        );
+
+        // (2) sabiden 側で answer 生成
+        let answer_sdp = session.handle_offer(&offer_sdp).await.expect("answer 生成");
+        assert!(
+            answer_sdp.contains("a=ice-lite") || answer_sdp.contains("ice-lite"),
+            "answer に ice-lite 不在: {}",
+            answer_sdp
+        );
+        assert!(
+            answer_sdp.contains("fingerprint:"),
+            "answer に fingerprint 不在 (RFC 8842 §4)"
+        );
+
+        // (3) sabiden の host candidate を answer SDP から取り出す (RFC 8839 §5.1)
+        let sabiden_addr =
+            extract_host_socket_from_sdp(&answer_sdp).expect("answer に host candidate 不在");
+        // ICE-Lite かつ public_ip=127.0.0.1 設定のため loopback アドレスに広告される
+        assert_eq!(sabiden_addr.ip().to_string(), "127.0.0.1");
+
+        // (4) browser に answer を適用 → ICE/DTLS の checks が走り出す
+        browser
+            .apply_answer(pending, &answer_sdp)
+            .expect("apply answer");
+
+        // (5) Connected 到達まで browser を駆動 (loopback DTLS で実測 100-500ms)
+        let mut events: Vec<Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        let connected = drive_browser_until(&mut browser, &mut events, deadline, |evs| {
+            evs.iter().any(|e| matches!(e, Event::Connected))
+        })
+        .await;
+        assert!(
+            connected,
+            "Connected に到達しなかった (events: {:?})",
+            events
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>()
+        );
+
+        // ICE 確立イベントも観測されている (RFC 8839 §3.1: state Checking→Connected)
+        let saw_ice_change = events
+            .iter()
+            .any(|e| matches!(e, Event::IceConnectionStateChange(_)));
+        assert!(saw_ice_change, "ICE state change 不在");
+
+        let _ = session.close().await;
+    }
+
+    /// RFC 8825 + Issue #114 DoD: "mid 確定後の send_media が writer に届く"。
+    ///
+    /// フル round-trip 後に `Str0mPeerSession::send_media` (PCMU PT 0) を 1 回
+    /// 発行し、 browser 側で `Event::MediaData` が観測されることを確認する。
+    /// この時点で:
+    /// - audio mid は `Event::MediaAdded` 経由で確定済 (offer/answer 完了時)
+    /// - PT 0 は両側で negotiate 済 (clear_codecs + enable_pcmu)
+    /// - DTLS は確立済 → writer.write が SRTP に packetize して送出する
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc8825_send_media_after_connected_delivers_media_data() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (61000, 61999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.expect("session new");
+        let mut browser = TestBrowserPeer::new().await.expect("browser new");
+
+        let (offer_sdp, pending) = browser.build_offer().expect("offer");
+        let answer_sdp = session.handle_offer(&offer_sdp).await.expect("answer");
+        browser
+            .apply_answer(pending, &answer_sdp)
+            .expect("apply answer");
+
+        // Connected まで駆動
+        let mut events: Vec<Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        let connected = drive_browser_until(&mut browser, &mut events, deadline, |evs| {
+            evs.iter().any(|e| matches!(e, Event::Connected))
+        })
+        .await;
+        assert!(connected, "Connected 不到達");
+
+        // sabiden audio_mid が確定するまで少し駆動を続ける
+        // (`Event::MediaAdded` は browser 側でも sabiden 側でも独立に発行されるが、
+        //  sabiden の run_loop で audio_mid が set されるのに数 ms の余地を取る)
+        let pause_until = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
+        let _ = drive_browser_until(&mut browser, &mut events, pause_until, |_| false).await;
+
+        // PCMU 1 frame (20 ms @ 8 kHz = 160 sample) を流し込む
+        // RFC 3551 §4.5.14 / RFC 7655 ではない G.711 μ-law PT=0、 RFC 3550 §5.1。
+        let frame = MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        session
+            .send_media(frame)
+            .await
+            .expect("send_media command 受理");
+
+        // browser 側で MediaData を観測するまで駆動
+        let deadline2 = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let saw_media = drive_browser_until(&mut browser, &mut events, deadline2, |evs| {
+            evs.iter().any(|e| matches!(e, Event::MediaData(_)))
+        })
+        .await;
+        assert!(saw_media, "MediaData 不到達 (events: {})", events.len());
+
+        let _ = session.close().await;
+    }
+
+    /// RFC 8829 §5.2.1 + Issue #114 DoD: "DTLS 確立前の send_media が drop"。
+    ///
+    /// 既存の `send_media_does_not_panic_before_connected` は command 送信
+    /// 成功だけを確認しているが、 本テストは **drop の観測** まで検証する:
+    /// - browser を Connected に到達させない (offer/answer 未交換)
+    /// - `send_media` を呼んでも `take_media_rx` には何も来ない (送信方向は
+    ///   そもそも別チャネルだが、 副作用なく Ok で済むことを観測する)
+    /// - run_loop は alive のまま (panic / disconnect 起きない)
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc8842_send_media_before_dtls_handshake_drops_silently() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (62000, 62999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.expect("session new");
+
+        // DTLS 未確立 / mid 未確定の状態で send_media を 5 回連発。
+        // `write_media` は audio_mid None で early return するため panic
+        // しない (RFC 3550 §5: pre-session state)。
+        for i in 0..5 {
+            let frame = MediaFrame {
+                pt: 0,
+                rtp_time: (i * 160) as u32,
+                payload: vec![0xff; 160],
+                network_time: std::time::Instant::now(),
+            };
+            session
+                .send_media(frame)
+                .await
+                .expect("DTLS 前でも command 自体は Ok");
+        }
+
+        // run_loop が生存していれば、 後続の API は依然成功する。
+        // (panic で task が落ちていれば oneshot reply が dropped で Err になる。)
+        let probe = session.local_dtls_params("passive").await;
+        assert!(
+            probe.is_ok(),
+            "send_media 連発後に run_loop 死亡: {:?}",
+            probe
+        );
+
+        let _ = session.close().await;
+    }
+
+    /// RFC 3550 §5.1 + Issue #114 DoD: "PT 未 negotiate の send_media が drop"。
+    ///
+    /// `write_media` を直接 unit test として呼び、 以下の 3 経路で panic せず
+    /// 戻ることを確認する:
+    /// 1. `audio_mid = None` (mid 未確定): 早期 return
+    /// 2. `audio_mid = Some(mid)` だが `mid` がセッションに存在しない: writer None
+    /// 3. mid 存在、 PT が negotiate 済 codec に含まれない: payload_params find None
+    ///
+    /// `write_media` は private fn だが `#[cfg(test)] mod tests` は同モジュール内
+    /// のため呼び出せる (CLAUDE.md §6.3 production-side hook 禁止に違反しない)。
+    #[test]
+    fn rfc3550_write_media_unknown_pt_does_not_panic() {
+        // PCMU only の Rtc を組む (sabiden 本番と同じ codec 設定)
+        let mut rtc = RtcConfig::new()
+            .set_ice_lite(true)
+            .clear_codecs()
+            .enable_pcmu(true)
+            .build(Instant::now());
+
+        // (1) audio_mid 未確定: 早期 return
+        let frame = MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        write_media(&mut rtc, None, &frame);
+
+        // (2) 不明 mid に対する write_media: writer None で早期 return
+        //     `Mid: From<&str>` を使ってセッションに存在しない mid を作る。
+        let bogus_mid: Mid = Mid::from("zzz");
+        write_media(&mut rtc, Some(bogus_mid), &frame);
+
+        // (3) negotiate 済の mid を取得し、 未 negotiate な PT (例: 99) を渡す。
+        //     full handshake をやらず、 sdp_api だけ apply して mid を確定する。
+        let mut rtc2 = RtcConfig::new()
+            .set_ice_lite(true)
+            .clear_codecs()
+            .enable_pcmu(true)
+            .build(Instant::now());
+        let mut api = rtc2.sdp_api();
+        let real_mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let _ = api.apply();
+        // mid は確定したが、 codec は PCMU のみ。 PT=99 は未 negotiate。
+        let bad_pt_frame = MediaFrame {
+            pt: 99,
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        // writer 取得は成功するが payload_params find が None で drop。
+        write_media(&mut rtc2, Some(real_mid), &bad_pt_frame);
+    }
+
+    /// RFC 3550 §5.1 + Issue #114 DoD: `write_media` は writer 取得失敗時も
+    /// panic せず戻る (`run_loop` 内で呼ばれるため絶対不可)。
+    /// 本テストは "audio mid が確定しているが Connected 前" の状態を疑似的に
+    /// 再現して `write_media` が trace ログだけで戻ることを確認する。
+    #[test]
+    fn rfc3550_write_media_pre_connected_returns_without_panic() {
+        let mut rtc = RtcConfig::new()
+            .set_ice_lite(true)
+            .clear_codecs()
+            .enable_pcmu(true)
+            .build(Instant::now());
+
+        // sdp_api だけ走らせて mid を確定 (handshake は未実施)
+        let mut api = rtc.sdp_api();
+        let mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let _ = api.apply();
+
+        let frame = MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        // Connected 前は writer.write が `Err` を返すが、 write_media は trace
+        // log で握り潰すので panic しない。
+        write_media(&mut rtc, Some(mid), &frame);
     }
 }

@@ -556,7 +556,7 @@ async fn make_forker_wraps_uac_via_harness() {
 async fn extension_call_with_callmanager_rewrites_sdp_port_to_sabiden_socket() {
     use crate::sdp::SessionDescription;
     use crate::sip::transaction::ServerTransaction;
-    use crate::sip::uas::{ResponderHandle, UasEvent};
+    use crate::sip::uas::UasEvent;
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
 
@@ -664,7 +664,7 @@ async fn extension_call_with_callmanager_rewrites_sdp_port_to_sabiden_socket() {
         panic!("INVITE 期待");
     };
     let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-    let responder = ResponderHandle::__test_new(stx);
+    let responder = builders::responder_handle_for_test(stx);
     event_tx
         .send(UasEvent::Invite {
             from_aor: "iphone".to_string(),

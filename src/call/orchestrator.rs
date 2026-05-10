@@ -796,8 +796,8 @@ impl NgnInboundHandler {
             };
             let rewritten =
                 rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
-            let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
-                super::transcoder::WebRtcAudioConfig {
+            let bridge: MediaBridge =
+                super::transcoder::WebRtcAudioBridge::start(super::transcoder::WebRtcAudioConfig {
                     ngn_socket: ngn_bridge_sock,
                     ngn_peer: Some(ngn_peer),
                     peer: handle.peer,
@@ -810,9 +810,8 @@ impl NgnInboundHandler {
                     // で全パケット消える (実機検証 2026-05-10)。
                     direct_pcmu_passthrough: true,
                     metrics: Some(self.metrics.clone()),
-                },
-            )?
-            .into();
+                })
+                .into();
             let cid = mgr.create_call().await;
             mgr.attach_media_bridge(cid, bridge).await?;
             self.active
@@ -2326,7 +2325,10 @@ impl PwaOutboundHandler for UasEventHandler {
                             browser_answer_for_opus.as_bytes(),
                         )
                         .unwrap_or(super::transcoder::DEFAULT_OPUS_PT);
-                        let bridge_res = super::transcoder::WebRtcAudioBridge::start(
+                        // Issue #135 🟡 3: `WebRtcAudioBridge::start` は infallible。
+                        // 旧 `Result<Self>` 戻り値での error path は実行時に到達不能
+                        // だったので、 戻り値を `Self` に変更し match を省く。
+                        let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
                             super::transcoder::WebRtcAudioConfig {
                                 ngn_socket: ngn_bridge_sock,
                                 ngn_peer: Some(ngn_peer),
@@ -2337,22 +2339,8 @@ impl PwaOutboundHandler for UasEventHandler {
                                 direct_pcmu_passthrough: true,
                                 metrics: Some(metrics.clone()),
                             },
-                        );
-                        let bridge: MediaBridge = match bridge_res {
-                            Ok(b) => b.into(),
-                            Err(e) => {
-                                warn!(error=%e, "WebRtcAudioBridge 起動失敗");
-                                metrics.record_invite_pwa_outbound(InviteResult::Error);
-                                let _ = ws_sink_clone.send(ServerMessage::error(
-                                    "outbound_failed",
-                                    format!("bridge 起動失敗: {}", e),
-                                ));
-                                if let Err(be) = ngn_dialog.send_bye().await {
-                                    warn!(error=%be, "NGN BYE (cleanup) 失敗");
-                                }
-                                return Err(anyhow!("WebRtcAudioBridge 起動失敗: {}", e));
-                            }
-                        };
+                        )
+                        .into();
 
                         let mgr = match call_manager.as_ref() {
                             Some(m) => m,
@@ -3932,7 +3920,7 @@ mod tests {
             _ => panic!("INVITE 期待"),
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4456,7 +4444,7 @@ mod tests {
             _ => panic!("INVITE 期待"),
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4553,7 +4541,7 @@ mod tests {
         info_req.body = b"Signal=5\r\nDuration=200\r\n".to_vec();
         let info_stx =
             ServerTransaction::new(info_req.clone(), phone_addr, sabiden_uas_sock.clone()).unwrap();
-        let info_responder = crate::sip::uas::ResponderHandle::__test_new(info_stx);
+        let info_responder = crate::testing::builders::responder_handle_for_test(info_stx);
         event_tx
             .send(UasEvent::Info {
                 request: info_req,
@@ -4742,7 +4730,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -4791,7 +4779,7 @@ mod tests {
         assert_eq!(bye_req.method, SipMethod::Bye);
         let bye_stx =
             ServerTransaction::new(bye_req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let bye_responder = crate::sip::uas::ResponderHandle::__test_new(bye_stx);
+        let bye_responder = crate::testing::builders::responder_handle_for_test(bye_stx);
         event_tx
             .send(UasEvent::Bye {
                 request: bye_req,
@@ -4949,7 +4937,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -5105,7 +5093,7 @@ mod tests {
             panic!("INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
         event_tx
             .send(UasEvent::Invite {
                 from_aor: "iphone".to_string(),
@@ -5132,7 +5120,7 @@ mod tests {
         cancel.headers.set("CSeq", "1 CANCEL");
         let cancel_stx =
             ServerTransaction::new(cancel.clone(), remote, sabiden_ext_sock.clone()).unwrap();
-        let cancel_responder = crate::sip::uas::ResponderHandle::__test_new(cancel_stx);
+        let cancel_responder = crate::testing::builders::responder_handle_for_test(cancel_stx);
         event_tx
             .send(UasEvent::Cancel {
                 request: cancel,
@@ -5459,7 +5447,7 @@ mod tests {
             panic!("Re-INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
 
         handler
             .handle_ext_reinvite(req, remote, responder)
@@ -5546,7 +5534,7 @@ mod tests {
             req.headers.set("CSeq", "1 INVITE");
             let stx =
                 ServerTransaction::new(req, pending_resp_addr, pending_responder_sock).unwrap();
-            crate::sip::uas::ResponderHandle::__test_new(stx)
+            crate::testing::builders::responder_handle_for_test(stx)
         };
         let pending = Arc::new(PendingOutbound {
             ext_call_id: pending_call_id.to_string(),
@@ -5604,7 +5592,7 @@ mod tests {
             panic!("Re-INVITE 期待");
         };
         let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
-        let responder = crate::sip::uas::ResponderHandle::__test_new(stx);
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
 
         handler
             .handle_ext_reinvite(req, remote, responder)
@@ -5671,7 +5659,7 @@ mod tests {
                 req.headers.set("CSeq", "1 INVITE");
                 let stx =
                     ServerTransaction::new(req, "127.0.0.1:9999".parse().unwrap(), sock).unwrap();
-                crate::sip::uas::ResponderHandle::__test_new(stx)
+                crate::testing::builders::responder_handle_for_test(stx)
             },
             cancelled: tokio::sync::Notify::new(),
             cancelled_flag: std::sync::atomic::AtomicBool::new(false),

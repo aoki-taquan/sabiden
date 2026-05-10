@@ -332,6 +332,20 @@ pub mod builders {
             .unwrap_or(1);
         crate::sip::uac::build_cancel(invite, cseq)
     }
+
+    /// 既存 `ServerTransaction` から [`crate::sip::uas::ResponderHandle`] を
+    /// 構築するテスト用ヘルパ (Issue #106)。
+    ///
+    /// 過去は `ResponderHandle::__test_new` という production-side test hook が
+    /// uas.rs に露出していたが、CLAUDE.md §6.3 違反のため撤去し、本ヘルパに
+    /// 集約した。`crate::testing` モジュールは `#[cfg(test)]` ゲート済みのため
+    /// production ビルドには含まれない (`src/testing.rs:33` の
+    /// `#![cfg(test)]` 参照)。
+    pub fn responder_handle_for_test(
+        tx: crate::sip::transaction::ServerTransaction,
+    ) -> crate::sip::uas::ResponderHandle {
+        crate::sip::uas::ResponderHandle::new(tx)
+    }
 }
 
 // =============================================================================

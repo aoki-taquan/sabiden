@@ -129,6 +129,14 @@ pub enum ForkResult {
         /// 入手元は [`crate::call::orchestrator::fork_to_bindings`] (WebRTC
         /// 専用 leg)。 [`fork_to_extensions`] (SIP only) では常に `None`。
         webrtc_handle: Option<crate::call::orchestrator::WebRtcLegArtifacts>,
+        /// Issue #81: WebRTC レッグが winner の場合に NGN 側 BYE を browser
+        /// に伝搬するための WS ハンドル。 SIP レッグなら `None`。
+        ///
+        /// `NgnInboundHandler` は確立通話の Call-ID とこの WS を紐づけて
+        /// 保持し、 NGN BYE 受信時に `ServerMessage::Bye` を push する
+        /// (RFC 3261 §15.1.2 dialog 終了通知の B2BUA 伝搬。 RFC 5853 §3.2.2
+        /// SBC framework: 内線レッグへの BYE 翻訳は B2BUA の責務)。
+        webrtc_ws: Option<crate::webrtc::signaling::WsSink>,
     },
     /// 全レッグが Busy/Decline で確定失敗。
     AllFailed { last_status: Option<u16> },
@@ -206,6 +214,7 @@ pub async fn fork_to_extensions(
                     winner_uri,
                     response,
                     webrtc_handle: None,
+                    webrtc_ws: None,
                 };
             }
             LegOutcome::Failed { status, .. } => {

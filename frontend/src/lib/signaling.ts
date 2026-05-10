@@ -47,7 +47,7 @@
 //   時に 1011 で close してくる。 これは「token 失効」ではなく「無線の眠り」
 //   なので、 1011 を permanent にすると Issue #119 の auto-reconnect が
 //   keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
-//   `maxReconnectAttempts` (10 分上限) で達成済みなので、 1011 を permanent に
+//   `maxReconnectAttempts` (約 8 分上限) で達成済みなので、 1011 を permanent に
 //   入れる利得がない。
 //
 //   1006 は token 失効でも瞬断でも区別が付かないため transient 扱い (再接続は

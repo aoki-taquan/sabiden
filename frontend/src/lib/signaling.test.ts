@@ -431,7 +431,7 @@ describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
     // バックグラウンド) 時に 1011 を送る。 これは「token 失効」ではなく
     // 「無線の眠り」 なので、 permanent にすると Issue #119 の auto-reconnect が
     // keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
-    // `maxReconnectAttempts` (10 分上限) で達成済み。
+    // `maxReconnectAttempts` (約 8 分上限) で達成済み。
     expect(isPermanentCloseCode(1011)).toBe(false);
   });
 

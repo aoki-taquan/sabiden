@@ -6,10 +6,13 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  isPermanentCloseCode,
   parseExtIdFromToken,
   parseServerMessage,
+  permanentCloseReason,
   SignalingClient,
   type ReconnectOptions,
+  type SignalingCloseReason,
 } from "./signaling";
 
 /** 最小限の WebSocket mock。 onopen / onclose / onerror を手動で発火させて
@@ -347,5 +350,393 @@ describe("parseExtIdFromToken", () => {
   it("returns null for malformed token", () => {
     expect(parseExtIdFromToken("nodot")).toBeNull();
     expect(parseExtIdFromToken("a.b.c.d")).toBeNull();
+  });
+});
+
+describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
+  it("treats 1000 (Normal Closure) as permanent", () => {
+    expect(isPermanentCloseCode(1000)).toBe(true);
+    expect(permanentCloseReason(1000)).toBe("normal");
+  });
+
+  it("treats 1008 (Policy Violation) as permanent auth failure", () => {
+    expect(isPermanentCloseCode(1008)).toBe(true);
+    expect(permanentCloseReason(1008)).toBe("auth");
+  });
+
+  it("treats 1011 (Internal Server Error) as transient (Issue #127 review #1)", () => {
+    // sabiden サーバ (`src/webrtc/signaling.rs`) は WS keepalive Pong 不着
+    // (= モバイル WiFi スリープ / Cloudflare Tunnel 100s idle / 端末
+    // バックグラウンド) 時に 1011 を送る。 これは「token 失効」ではなく
+    // 「無線の眠り」 なので、 permanent にすると Issue #119 の auto-reconnect が
+    // keepalive 1 発で永続停止する回帰を起こす。 ループ防止は
+    // `maxReconnectAttempts` (10 分上限) で達成済み。
+    expect(isPermanentCloseCode(1011)).toBe(false);
+  });
+
+  it("treats 4xxx (private use) as permanent auth failure", () => {
+    expect(isPermanentCloseCode(4000)).toBe(true);
+    expect(isPermanentCloseCode(4401)).toBe(true);
+    expect(isPermanentCloseCode(4999)).toBe(true);
+    expect(permanentCloseReason(4401)).toBe("auth");
+  });
+
+  it("treats transient codes (1001 / 1006 / 1009 / 1011 / 1012) as non-permanent", () => {
+    expect(isPermanentCloseCode(1001)).toBe(false);
+    expect(isPermanentCloseCode(1006)).toBe(false);
+    expect(isPermanentCloseCode(1009)).toBe(false);
+    expect(isPermanentCloseCode(1011)).toBe(false);
+    expect(isPermanentCloseCode(1012)).toBe(false);
+    // 5000+ もまだ未割当なので non-permanent。
+    expect(isPermanentCloseCode(5000)).toBe(false);
+  });
+});
+
+describe("SignalingClient close-code handling (Issue #127)", () => {
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  /** 共通テストハーネス: client + reasons 配列 + states 配列 + sockets/timer。 */
+  function setup(overrides: Partial<ReconnectOptions> = {}) {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+    const states: string[] = [];
+    const reasons: SignalingCloseReason[] = [];
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onStateChange: (s) => states.push(s),
+        onClosedReason: (r) => reasons.push(r),
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+        ...overrides,
+      },
+    );
+    return { client, sockets, timer, states, reasons };
+  }
+
+  it("does NOT reconnect after close code 1000 (Normal Closure)", () => {
+    const { client, sockets, timer, states, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    expect(client.state).toBe("open");
+
+    sockets[0].fireClose(1000);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["normal"]);
+    expect(states).toContain("closed");
+    expect(timer.pendingCount()).toBe(0);
+
+    // 念押し: backoff schedule が完全に止まっていること。
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("does NOT reconnect after close code 1008 (Policy Violation, token invalid)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    sockets[0].fireClose(1008);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("DOES reconnect after close code 1011 (Issue #127 review #1)", () => {
+    // sabiden サーバの WS keepalive idle timeout (= モバイル WiFi スリープ /
+    // Cloudflare Tunnel 100s idle / 端末バックグラウンド) で送られてくる
+    // 1011 は transient 扱い。 1 発で permanent 停止すると Issue #119 の
+    // 「無線復帰時に自動再接続」 が壊れる。
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    expect(client.state).toBe("open");
+
+    sockets[0].fireClose(1011);
+    expect(client.state).toBe("reconnecting");
+    expect(reasons).toEqual([]); // permanent な諦めはしていない
+    expect(timer.pendingCount()).toBe(1);
+
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
+  });
+
+  it("does NOT reconnect after close code 4401 (application auth close)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    sockets[0].fireClose(4401);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("DOES reconnect after close code 1006 (Abnormal Closure, transient)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    expect(client.state).toBe("open");
+
+    sockets[0].fireClose(1006);
+    expect(client.state).toBe("reconnecting");
+    expect(reasons).toEqual([]); // まだ諦めていない
+    expect(timer.pendingCount()).toBe(1);
+
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
+  });
+
+  it("gives up after maxReconnectAttempts and reports `exhausted`", () => {
+    // maxReconnectAttempts=3 + maxDelayMs=1000 で短時間に上限到達を再現。
+    const { client, sockets, timer, reasons } = setup({
+      initialDelayMs: 1000,
+      maxDelayMs: 1000,
+      maxReconnectAttempts: 3,
+    });
+    void client.connect();
+    sockets[0].fireOpen();
+
+    // 1 回目の close → reconnectAttempts=0 → schedule (1s)
+    sockets[0].fireClose(1006);
+    expect(client.state).toBe("reconnecting");
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
+    // この時点で reconnectAttempts は 1 にインクリメント済み
+
+    // 2 回目: open しないまま close
+    sockets[1].fireClose(1006);
+    timer.advance(1000);
+    expect(sockets.length).toBe(3);
+
+    // 3 回目: open しないまま close
+    sockets[2].fireClose(1006);
+    timer.advance(1000);
+    expect(sockets.length).toBe(4);
+
+    // 4 回目: ここで close が来ても reconnectAttempts=3 で上限到達なので
+    // 新しい WS は張られず、 reason="exhausted" + closed に遷移する。
+    sockets[3].fireClose(1006);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["exhausted"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(4);
+  });
+
+  it("explicit close() reports reason=`normal` exactly once", () => {
+    const { client, sockets, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    client.close();
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["normal"]);
+
+    // 二重 close() しても再発火しない。
+    client.close();
+    expect(reasons).toEqual(["normal"]);
+  });
+
+  it("auth close before any successful open also reports reason=`auth`", () => {
+    // Cloudflare Access が WS upgrade 前に 401 を返し、 ブラウザが 1008 で
+    // close する想定 (RFC 6455 §7.4.1 1008 Policy Violation 相当)。
+    const { client, sockets, timer, reasons } = setup();
+    const promise = client.connect();
+    expect(client.state).toBe("connecting");
+
+    sockets[0].fireClose(1008);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    return promise.catch(() => {
+      // connect() の Promise は reject されてよい。
+      expect(client.state).toBe("closed");
+    });
+  });
+});
+
+describe("App.tsx connect() catch-race against onClosedReason (Issue #127 round-2 review #1)", () => {
+  // App.tsx は `await signaling.connect()` の catch で setView({kind:"dialer"})
+  // していたが、 永続 close (1008/4xxx) の場合は ws.onclose 内で finalize() →
+  // onClosedReason() が同期発火し、 そこで setView({kind:"login"}) +
+  // signaling=null が確定してから connect() Promise が reject される。
+  //
+  // catch が無条件に dialer view へ遷移すると login view を握り潰すため、
+  // catch では「onClosedReason が既に終端確定したか」 を signaling 参照の null
+  // 化で検出して setView をスキップする (App.tsx::connect 内 fix)。
+  //
+  // この describe では SignalingClient API の契約として
+  // 「onClosedReason は connect() Promise reject の **前** に同期発火する」
+  // ことと、 App.tsx と同形のコールバック構造で書いた client コードが
+  // 「auth/exhausted 時に login view を保持し、 transient 時に dialer view へ
+  // 進む」 ことを検証する。
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  it("fires onClosedReason synchronously before connect() Promise rejects (auth)", async () => {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+    const events: string[] = [];
+
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (r) => events.push(`closedReason:${r}`),
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    const promise = client.connect();
+    promise.catch(() => events.push("connectReject"));
+
+    // 永続 close (1008) → onClosedReason が同期発火、 connect() reject は
+    // microtask で後追い。
+    sockets[0].fireClose(1008);
+
+    // この時点で onClosedReason は同期的に発火済み、 reject はまだ enqueue 中。
+    expect(events).toEqual(["closedReason:auth"]);
+
+    // microtask を flush して reject を処理。
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(events).toEqual(["closedReason:auth", "connectReject"]);
+  });
+
+  it("App-shaped callback flow keeps `login` view on auth close (catch must not overwrite)", async () => {
+    // App.tsx の挙動を最小再現: view 状態 + signaling 参照 + try/catch を
+    // closure に書き、 auth close で login view が保たれることを assert する。
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    let view: "login" | "dialer" = "login";
+    let signaling: SignalingClient | null = null;
+
+    signaling = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (reason) => {
+          // App.tsx と同じ: auth/exhausted で login へ強制遷移 + 参照切断。
+          if (reason === "auth" || reason === "exhausted") {
+            signaling = null;
+            view = "login";
+          }
+        },
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    // App.tsx::connect の try/catch を最小再現。 catch で
+    // signaling===null なら setView をスキップする (round-2 review #1 fix)。
+    const runAppConnect = async () => {
+      try {
+        await signaling!.connect();
+        view = "dialer";
+      } catch {
+        if (signaling === null) return; // round-2 review #1 fix
+        view = "dialer";
+      }
+    };
+
+    const done = runAppConnect();
+    // open する前に auth close。
+    sockets[0].fireClose(1008);
+    await done;
+
+    // login view が保持されていること (= catch が握り潰していない)。
+    expect(view).toBe("login");
+    expect(signaling).toBeNull();
+  });
+
+  it("App-shaped callback flow advances to `dialer` view on transient close (regression guard)", async () => {
+    // 対偶ケース: transient (1006) ではユーザに「再接続中」 を見せて dialer に
+    // 進むのが Issue #119 以来の正しい挙動。 round-2 review #1 fix で
+    // この path が壊れていないことを確認する。
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    let view: "login" | "dialer" = "login";
+    let signaling: SignalingClient | null = null;
+
+    signaling = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onClosedReason: (reason) => {
+          if (reason === "auth" || reason === "exhausted") {
+            signaling = null;
+            view = "login";
+          }
+        },
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    const runAppConnect = async () => {
+      try {
+        await signaling!.connect();
+        view = "dialer";
+      } catch {
+        if (signaling === null) return;
+        view = "dialer";
+      }
+    };
+
+    const done = runAppConnect();
+    sockets[0].fireClose(1006); // transient → schedule reconnect
+    await done;
+
+    // dialer に遷移、 signaling は生きていて次の backoff を待っている。
+    expect(view).toBe("dialer");
+    expect(signaling).not.toBeNull();
+    expect(signaling!.state).toBe("reconnecting");
   });
 });

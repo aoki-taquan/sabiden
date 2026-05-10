@@ -186,10 +186,41 @@ export const App: Component = () => {
             setStatusOk(false);
             break;
           case "closed":
-            setStatus("切断");
+            // 文言は onClosedReason で reason 別に上書きされる。
             setStatusOk(false);
             break;
         }
+      },
+      onClosedReason: (reason) => {
+        // Issue #127: 自動再接続を諦めた理由を UI に表示する。
+        // `auth` / `exhausted` の場合 token を入れ直さない限り復旧できないため、
+        // signaling 参照を破棄 + token を invalidate + login view に自動遷移
+        // させる (review #2)。 そうしないと dialer view に居続けて
+        // 「disposed な signaling instance を握ったまま」 race の温床になる。
+        switch (reason) {
+          case "normal":
+            setStatus("切断");
+            break;
+          case "auth":
+            setStatus("認証失敗 (token を入れ直してください)");
+            // disposed instance race を防ぐため参照を切る。
+            signaling = null;
+            teardownCall();
+            clearToken();
+            setView({ kind: "login" });
+            break;
+          case "exhausted":
+            setStatus("接続不可 (再ログインしてください)");
+            signaling = null;
+            teardownCall();
+            // exhausted は token 自体は有効かもしれないが、 ネットワーク復旧
+            // 後にユーザが明示的にログインし直す方が安全 (古い token で
+            // 即再接続して 401 ループを再発させるリスク回避)。
+            clearToken();
+            setView({ kind: "login" });
+            break;
+        }
+        setStatusOk(false);
       },
     });
     try {
@@ -197,9 +228,20 @@ export const App: Component = () => {
       setView({ kind: "dialer" });
     } catch (e) {
       console.error(e);
+      // Issue #127 review #2 race fix:
+      //   onClosedReason は ws.onclose 内で同期的に発火し、 そこで signaling=null +
+      //   setView({kind:"login"}) を済ませている可能性がある (auth / exhausted)。
+      //   その後で connect() Promise が reject され、 ここの catch に入る。
+      //   何もチェックせず setView({kind:"dialer"}) に上書きすると、 onClosedReason
+      //   が決めた login view を握り潰してしまう (= ユーザが認証失敗時に dialer に
+      //   戻されて再ログインの導線を失う)。 onClosedReason 側が既に終端状態を確定
+      //   していたら (signaling 参照が null になっていたら) ここでは何もしない。
+      if (signaling === null) {
+        return;
+      }
       // 初回 connect の resolve は失敗したが、 SignalingClient は内部で
-      // backoff 再接続を継続している。 ユーザーには再接続中であることを
-      // 示し、 dialer view には移行する (発信ボタンは statusOk で disable)。
+      // backoff 再接続を継続している (transient close)。 ユーザーには再接続中で
+      // あることを示し、 dialer view には移行する (発信ボタンは statusOk で disable)。
       setStatus("再接続中...");
       setStatusOk(false);
       setView({ kind: "dialer" });

@@ -319,6 +319,67 @@ describe("SignalingClient auto-reconnect (Issue #119)", () => {
   });
 });
 
+describe("ClientMessage offer schema (Issue #145)", () => {
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  it("send {type:'offer', sdp, target} serialises with target field (PWA→NGN outbound)", () => {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      { onMessage: vi.fn() },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    void client.connect();
+    sockets[0].fireOpen();
+    client.send({ type: "offer", sdp: "v=0\r\nbrowser-savpf\r\n", target: "117" });
+
+    expect(sockets[0].sent.length).toBe(1);
+    const obj = JSON.parse(sockets[0].sent[0]);
+    expect(obj.type).toBe("offer");
+    expect(obj.sdp).toContain("browser-savpf");
+    expect(obj.target).toBe("117");
+  });
+
+  it("send {type:'offer', sdp} (no target) is the legacy echo mode shape", () => {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      { onMessage: vi.fn() },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+      },
+    );
+
+    void client.connect();
+    sockets[0].fireOpen();
+    client.send({ type: "offer", sdp: "v=0" });
+    const obj = JSON.parse(sockets[0].sent[0]);
+    expect(obj.target).toBeUndefined();
+  });
+});
+
 describe("parseServerMessage", () => {
   it("parses registered", () => {
     expect(parseServerMessage(JSON.stringify({ type: "registered", ext_id: "x" }))).toEqual({

@@ -700,6 +700,130 @@ sequenceDiagram
 | fork timeout/AllFailed → PWA Cancel | **Issue #83 で解消済**: `fork_to_bindings` cleanup を `Answered` 限定から `Answered \| Timeout \| AllFailed` に拡張、 winner 以外の WebRTC leg に `ServerMessage::Cancel` を一律 push (W3C WebRTC §4.4.1) | (現状で完成) |
 | ICE failure 通知 | `local_cand_rx` が drop されたら run_loop 終了するだけ | `B2buaCall` に通知 → NGN レッグで CANCEL 発射 |
 | `ExtTransport::WebRtc` の bind 構造 | `registrar.rs` が `webrtc::peer::PeerSession` を直接 import (層越境) | `ExtCallTarget` trait 経由 |
+| PWA→NGN 発信フロー | **Issue #145 で解消済**: `ClientMessage::Offer { sdp, target }` を受けた `process_client_message` が `PwaOutboundHandler::handle_pwa_outbound_offer` 経由で `peer.handle_offer` → SAVPF→AVP→PCMU 変換 → NGN INVITE → 200 OK → `MediaBridge::WebRtcAudio` 起動を駆動する。 既存の `UasEventHandler` が同 trait を実装し `Uac` / `CallManager` / RTP bridge bind IP を流用する。 PWA→NGN 発信通話の双方向 BYE 連動 (NGN→PWA BYE の WS 通知) は別 issue (= 内線 SIP dialog を持たないため `OutboundCallRegistry` 拡張が必要) | (PWA→NGN BYE 連動を専用テーブル `webrtc_outbound_active: HashMap<Call-ID, (UacDialog, WsSink)>` で実装) |
+
+### 4.3a PWA peer 発信 (ブラウザ → NGN, Issue #145)
+
+PWA UI からダイアル発信したフロー。 `ClientMessage::Offer { sdp, target: "117" }`
+が WS で sabiden に届くと、 sabiden は **B2BUA** として 2 つの SDP 交渉を独立に
+回す (RFC 3264 §5/§6 / RFC 8829):
+
+- **browser ⇔ sabiden 側**: browser を offerer として SAVPF/Opus を交渉
+  (sabiden は str0m が answer 担当)。
+- **sabiden ⇔ NGN 側**: sabiden を offerer として AVP/PCMU を交渉
+  (NGN P-CSCF は SAVPF / DTLS / ICE / Opus を解釈しないため、
+  `convert_savpf_to_avp` + `restrict_audio_to_pcmu_with_dtmf` で「NGN 仕様」
+  に縮退してから INVITE を出す。 `docs/asterisk-real-invite.md` §2 / §5.2)。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Browser as ブラウザ PWA
+  participant Sig as SignalingState<br/>(/signal)
+  participant PwaH as PwaOutboundHandler<br/>(= UasEventHandler)
+  participant Peer as Str0mPeerSession
+  participant Bg as background task<br/>(tokio::spawn)
+  participant NgnUac as Uac(NGN)
+  participant Pcscf as NGN P-CSCF
+  participant Mgr as CallManager
+  participant Trans as WebRtcAudioBridge
+
+  Browser->>Browser: getUserMedia + RTCPeerConnection.createOffer
+  Browser->>Sig: { type: offer, sdp: SAVPF/Opus, target: "117" }
+
+  Note over Sig: target ホワイトリスト検証<br/>RFC 3261 §25.1 user 文法<br/>サブセット [0-9*#+]{1,32}
+  Sig->>PwaH: handle_pwa_outbound_offer("117", browser_offer, peer, ws_sink)
+
+  rect rgba(180, 220, 255, 0.5)
+    Note over PwaH,Peer: 同期パス (= browser 即返し)
+    PwaH->>Peer: peer.handle_offer(savpf_offer)
+    Note over Peer: str0m が ICE/DTLS 状態機械を進める
+    Peer-->>PwaH: SAVPF answer
+    PwaH->>Peer: peer.take_media_rx() (1 度しか取れない)
+    Peer-->>PwaH: media_rx
+    PwaH->>PwaH: bind ngn_bridge_sock<br/>convert_savpf_to_avp →<br/>restrict_audio_to_pcmu_with_dtmf →<br/>rewrite_rtp_endpoint
+    PwaH->>Bg: tokio::spawn(NGN INVITE → bridge 起動)
+    PwaH-->>Sig: Ok(PwaOutboundOutcome { savpf_answer, completion })
+    Sig-->>Browser: { type: answer, sdp: savpf_answer }
+  end
+
+  rect rgba(255, 220, 180, 0.5)
+    Note over Bg,Pcscf: 背景パス (PR #146 review #1 🟡#2)
+    Bg->>NgnUac: build_invite("sip:117@<P-CSCF>", pcmu_avp_sdp)
+    NgnUac->>Pcscf: INVITE (Request-URI = P-CSCF IP+port,<br/>SDP = AVP/PCMU, c=/m= → sabiden NGN bridge)
+    Pcscf-->>NgnUac: 200 OK (RTP/AVP PCMU, NGN 側 RTP endpoint)
+    NgnUac->>Pcscf: ACK (RFC 3261 §13.2.2.4)
+    NgnUac-->>Bg: InviteOutcome::Established { dialog, response }
+    Bg->>Trans: WebRtcAudioBridge::start { ngn_socket, ngn_peer, peer, peer_media_rx, opus_pt }
+    Bg->>Mgr: create_call + attach_media_bridge(WebRtcAudio)
+    Note over Bg: NGN 失敗時は ws_sink 経由で<br/>{ type: error, code: outbound_failed }<br/>を browser に push
+  end
+
+  par ICE candidate 交換 (trickle, RFC 8839 §4)
+    Note over Sig,Peer: 背景タスク実行中も WS 受信ループは止まらないので<br/>ICE candidate は遅延なく流れる
+    Peer-->>Sig: local cand
+    Sig-->>Browser: { type: ice, candidate }
+    Browser-->>Sig: { type: ice, candidate }
+    Sig->>Peer: add_ice_candidate
+  end
+  Note over Browser,Peer: ICE / DTLS-SRTP 確立
+
+  Note over Pcscf,Browser: 双方向音声 (Opus⇔PCMU トランスコード)
+  Browser-->>Peer: SRTP Opus
+  Peer-->>Trans: Event::MediaData → MediaFrame (Opus)
+  Trans-->>NgnUac: Opus decode → 48k → 8k → μ-law → RTP
+  NgnUac-->>Pcscf: RTP PCMU
+  Pcscf-->>NgnUac: RTP PCMU
+  NgnUac->>Trans: μ-law → 8k → 48k → Opus encode
+  Trans->>Peer: peer.send_media(MediaFrame)
+  Peer-->>Browser: SRTP Opus
+```
+
+#### 設計ポイント
+
+- **schema 拡張**: `ClientMessage::Offer` に `target: Option<String>` を足し、
+  `target` 付きが PWA→NGN 発信、 `target` 無しは旧来 echo モード (sabiden 内
+  str0m 折返し、 試験用) を維持する。
+- **target ホワイトリスト (PR #146 review #1 🔴#1, RFC 3261 §25.1 user 文法
+  サブセット)**: `target` は `[0-9*#+]{1,32}` でサーバ側強制再検証する。
+  frontend `Dialer.tsx` の UI フィルタは改造 browser / 直接 WS 接続で迂回
+  可能 (OWASP A03:2021 Injection)。 攻撃ベクタ:
+  `target = "117\r\nFoo: bar\r\n\r\nINVITE sip:..."` で sabiden が任意 SIP
+  メッセージを NGN に注入できる (CRLF smuggling)、 `target = "117@evil.com"`
+  で Request-URI host を上書きして外部 SIP UA に向け INVITE 送出。
+  `process_client_message` (signaling) と `PwaOutboundHandler` 実装側
+  (orchestrator) の両方で検証する (defense in depth)。
+- **同期パス / 背景パス分離 (PR #146 review #1 🟡#2, RFC 8839 §4 trickle ICE)**:
+  `peer.handle_offer` 直後に SAVPF answer を即返し、 NGN INVITE → 200 OK →
+  bridge 起動は `tokio::spawn` で背景化する。 `peer.take_media_rx` は 1 度
+  しか取れないため background spawn の **前** に同期で取得する。 ICE
+  candidate (`ClientMessage::Ice`) は WS 受信ループで処理されるが、 NGN
+  INVITE が同期だと数秒〜数十秒間 WS が詰まり ICE 確立遅延 / Disconnected を
+  起こすので、 ハンドラ戻り値を `PwaOutboundOutcome { savpf_answer,
+  completion: JoinHandle<Result<()>> }` とし、 production は `completion` を
+  drop (= detach) して即返す。 テストは `completion.await` で完了確認する。
+- **背景失敗時の通知**: NGN 503 / 486 / トランスポート失敗等は背景タスク内で
+  発生するので、 ハンドラに `ws_sink: &WsSink` を渡し、 失敗時に
+  `ServerMessage::Error { code: "outbound_failed", ... }` を browser へ push
+  する責務をハンドラ側に持たせる。
+- **メトリクスは PWA outbound 専用カウンタ (PR #146 review #1 🟡#1)**:
+  PWA outbound 通話成立は内線 SIP レッグを伴わないので、
+  `record_invite_extension(Answered)` は呼ばない。 専用 direction
+  `pwa_outbound` (`record_invite_pwa_outbound`) を追加し、
+  `sabiden_sip_invite_total{direction="pwa_outbound",result="..."}` で
+  独立に観測する (NGN レッグそのものは別途 `record_invite_ngn` 経由)。
+- **ハンドラの責務分離**: `PwaOutboundHandler` trait はシグナリング層から呼べる
+  最小インタフェースで、 実装は `UasEventHandler` に乗せる (= `Uac` /
+  `CallManager` / RTP bridge bind IP を再利用)。 PWA outbound 専用構造体を作る
+  と Uac / Manager の 2 重保持になり band-aid (CLAUDE.md §6.1) になる。
+- **B2BUA SDP anchoring**: browser の SAVPF SDP と NGN の AVP SDP は完全に独立。
+  `c=` / `m= port` は「sabiden が広告するエンドポイント」 にそれぞれ書き換える
+  (browser 側は str0m の host candidate、 NGN 側は新規 bind した bridge socket)。
+  そのまま透過すると ICE/DTLS 必須の browser や PCMU only の NGN に引っかかる。
+- **NGN→PWA BYE 伝搬は別 issue**: 現実装は `OutboundCallRegistry` (内線 SIP
+  dialog 必須) に登録しないため、 NGN→sabiden BYE が来ても WS 経由で PWA に
+  伝搬しない。 PWA は WebRTC `connectionState=disconnected` で気付く運用 (双方
+  向 BYE 連動の整備は将来 issue / `webrtc_outbound_active` 専用テーブル新設)。
 
 ### 4.4 早期切断 / CANCEL / 競合 BYE
 

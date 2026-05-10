@@ -298,10 +298,12 @@ export const App: Component = () => {
     try {
       call = newCall(signaling);
       await call.acquireMic();
-      await call.createOffer();
+      // Issue #145: PWA→NGN 発信。 ダイアル番号を `target` で渡すと
+      // sabiden は browser に SAVPF answer を返した上で AVP/PCMU SDP の
+      // INVITE を NGN へ出す (RFC 3264 §5)。
+      await call.createOffer(number);
       // Issue #91: call 生成前に届いた ICE candidate を flush。
       await flushPendingIce();
-      // INVITE 送出はサーバ側 TODO (Issue #25 と協調). offer/answer 折返しのみ動作。
     } catch (e) {
       console.error("call setup failed", e);
       setView((v) => (v.kind === "call" ? { ...v, state: "ended" } : v));

@@ -293,6 +293,32 @@ pub mod builders {
         req
     }
 
+    /// NGN P-CSCF → sabiden 向けの任意メソッドのリクエスト。
+    ///
+    /// `NgnInboundHandler` が NOTIFY / SUBSCRIBE / PRACK / PUBLISH / UPDATE /
+    /// INFO / MESSAGE / REFER 等を個別に応答するかを検証するためのビルダ
+    /// (Issue #110)。 `invite_from_ngn` と同じ最小ヘッダ集合 (Via / From / To /
+    /// Call-ID / CSeq / Max-Forwards) を載せる。
+    pub fn request_from_ngn(
+        ngn_addr: &SocketAddr,
+        method: SipMethod,
+        request_uri: &str,
+        call_id: &str,
+        branch: &str,
+    ) -> SipRequest {
+        let method_str = method.as_str().to_string();
+        let mut req = SipRequest::new(method, request_uri);
+        req.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", ngn_addr, branch));
+        req.headers.set("Max-Forwards", "70");
+        req.headers
+            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn-test");
+        req.headers.set("To", format!("<{}>", request_uri));
+        req.headers.set("Call-ID", call_id.to_string());
+        req.headers.set("CSeq", format!("1 {}", method_str));
+        req
+    }
+
     /// 既存ダイアログを終了する BYE (RFC 3261 §15.1.1)。
     pub fn bye(
         from_addr: &SocketAddr,

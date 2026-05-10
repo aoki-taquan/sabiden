@@ -500,15 +500,58 @@ pub async fn signal_ws_handler(
 }
 
 /// `Authorization: Bearer ...` ヘッダ または `?token=...` を抽出。
+///
+/// auth-scheme (`Bearer`) は **case-insensitive** で比較する
+/// (RFC 6750 §2.1, RFC 9110 §11.1 / 旧 RFC 7235 §2.1)。
+/// `Bearer` / `bearer` / `BEARER` / `BeArEr` 全てを受理する。
+///
+/// scheme と token68 の区切りは RFC 9110 §5.6.3 の `RWS = 1*( SP / HTAB )`
+/// を許容する。 単一 SP しか許さない実装は仕様違反 (Issue #95)。
 pub fn extract_token(headers: &HeaderMap, query: &AuthQuery) -> Option<String> {
     if let Some(h) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(rest) = h.strip_prefix("Bearer ") {
-            if !rest.is_empty() {
-                return Some(rest.to_string());
-            }
+        if let Some(tok) = parse_bearer(h) {
+            return Some(tok);
         }
     }
     query.token.as_ref().filter(|s| !s.is_empty()).cloned()
+}
+
+/// `Authorization` ヘッダ値から `Bearer` scheme の token68 部分を抽出する。
+///
+/// # 文法
+///
+/// ```text
+/// credentials = auth-scheme [ 1*SP ( token68 / [ #auth-param ] ) ]
+/// auth-scheme = token            ; case-insensitive (RFC 9110 §11.1)
+/// ```
+///
+/// 厳密には RFC 9110 §11.6.2 の `credentials` は `1*SP` 区切りだが、
+/// §5.6.3 の一般原則 (RWS = 1*( SP / HTAB )) に倣って HTAB も受理する。
+/// 多くの実装 (`actix-web-httpauth` / `axum-auth` / `tower-http`) も同様。
+///
+/// 戻り値:
+/// - `Some(token)`: scheme が `Bearer` (大文字小文字無視) かつ token が非空
+/// - `None`: scheme 不一致 / token 空 / フォーマット不正
+fn parse_bearer(header_value: &str) -> Option<String> {
+    // 先頭の OWS を捨てる (実用上 axum はトリム済だが防御的に)。
+    let trimmed = header_value.trim_start();
+    // scheme と rest を 1 文字目の ASCII SP / HTAB で分割。
+    let sep_idx = trimmed
+        .char_indices()
+        .find(|(_, c)| *c == ' ' || *c == '\t')
+        .map(|(i, _)| i)?;
+    let (scheme, rest) = trimmed.split_at(sep_idx);
+    // RFC 9110 §11.1: auth-scheme は case-insensitive。
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    // RWS を読み飛ばし、 token 部分を取得。
+    let token = rest.trim_start_matches([' ', '\t']);
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 /// 認証済みセッションのメインループ。
@@ -1354,6 +1397,86 @@ mod tests {
     fn extract_token_ignores_empty_bearer() {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer ".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert!(extract_token(&h, &q).is_none());
+    }
+
+    /// RFC 9110 §11.1 (旧 RFC 7235 §2.1): `auth-scheme = token` は
+    /// case-insensitive で比較しなければならない。 RFC 6750 §2.1 の
+    /// `Bearer` scheme も同様。
+    #[test]
+    fn rfc6750_2_1_extract_token_accepts_lowercase_bearer_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "bearer abc.123.sig".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert_eq!(extract_token(&h, &q).as_deref(), Some("abc.123.sig"));
+    }
+
+    /// RFC 9110 §11.1: 大文字 `BEARER` も受理されなければならない
+    /// (auth-scheme は case-insensitive)。
+    #[test]
+    fn rfc9110_11_1_extract_token_accepts_uppercase_bearer_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "BEARER abc.123.sig".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert_eq!(extract_token(&h, &q).as_deref(), Some("abc.123.sig"));
+    }
+
+    /// RFC 9110 §11.1: mixed-case (`BeArEr`) も受理されなければならない。
+    #[test]
+    fn rfc9110_11_1_extract_token_accepts_mixed_case_bearer_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "BeArEr abc.123.sig".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert_eq!(extract_token(&h, &q).as_deref(), Some("abc.123.sig"));
+    }
+
+    /// RFC 9110 §5.6.3: `RWS = 1*( SP / HTAB )`。 scheme と token68 の間
+    /// に HTAB が来ても受理する (一般実装と互換)。
+    #[test]
+    fn rfc9110_5_6_3_extract_token_accepts_htab_after_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer\tabc.123.sig".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert_eq!(extract_token(&h, &q).as_deref(), Some("abc.123.sig"));
+    }
+
+    /// RFC 9110 §5.6.3: 複数 SP / HTAB の混在 (`1*( SP / HTAB )`) も RWS
+    /// として有効。 軽率な space-1個固定パーサで落ちないことを確認。
+    #[test]
+    fn rfc9110_5_6_3_extract_token_accepts_multiple_whitespace_after_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer   abc.123.sig".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert_eq!(extract_token(&h, &q).as_deref(), Some("abc.123.sig"));
+    }
+
+    /// RFC 6750 §2.1: scheme が `Bearer` 以外の場合は token を抽出しない。
+    /// (Basic / Digest 等を Bearer と誤認しないこと。)
+    #[test]
+    fn rfc6750_2_1_extract_token_rejects_non_bearer_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert!(extract_token(&h, &q).is_none());
+    }
+
+    /// scheme と token を区切る空白が無い場合 (`Bearertoken`) は不正。
+    /// RFC 9110 §11.6.2 の `credentials` 文法は scheme と credentials の間に
+    /// `1*SP` を要求する。
+    #[test]
+    fn rfc9110_11_6_2_extract_token_rejects_scheme_without_separator() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearertoken".parse().unwrap());
+        let q = AuthQuery { token: None };
+        assert!(extract_token(&h, &q).is_none());
+    }
+
+    /// token 部が空白だけのとき (`bearer \t  `) は token68 が空なので拒否。
+    #[test]
+    fn extract_token_ignores_whitespace_only_token_for_lowercase_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "bearer  \t  ".parse().unwrap());
         let q = AuthQuery { token: None };
         assert!(extract_token(&h, &q).is_none());
     }

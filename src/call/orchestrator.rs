@@ -3369,6 +3369,150 @@ mod tests {
         assert!(to.contains(";tag="), "tag 無しなら新規付与: To={}", to);
     }
 
+    /// RFC 3264 §6.1 / RFC 4733 §2.4.1: `offer_has_telephone_event` は SDP offer
+    /// に `telephone-event` の `a=rtpmap` が含まれる場合のみ true を返す。
+    ///
+    /// この判定は RFC 3264 §6.1 (answer の payload type は offer の subset)
+    /// 違反防止に critical: NGN offer に telephone-event 宣言が無いのに
+    /// answer 側で PT 101 を残すと NGN は SDP 不整合で 488/415 を返し、
+    /// 通話が確立しない。 Issue #149 review で発覚した分岐に対する unit test。
+    ///
+    /// case 1: PT 101 が `a=rtpmap:101 telephone-event/8000` で含まれる
+    ///         (RFC 4733 §2.4.1 の標準 PT) → true。
+    #[test]
+    fn rfc4733_2_4_1_offer_has_telephone_event_pt101_returns_true() {
+        let offer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0 101\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n\
+                      a=rtpmap:101 telephone-event/8000\r\n\
+                      a=fmtp:101 0-15\r\n";
+        assert!(
+            offer_has_telephone_event(offer),
+            "RFC 4733 §2.4.1: PT 101 telephone-event/8000 を検出する"
+        );
+    }
+
+    /// RFC 3264 §6.1: PCMU のみで telephone-event が無い SDP は false。
+    /// answer に PT 101 を出してはならない (offer subset 違反になる)。
+    #[test]
+    fn rfc3264_6_1_offer_has_telephone_event_pcmu_only_returns_false() {
+        let offer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n";
+        assert!(
+            !offer_has_telephone_event(offer),
+            "RFC 3264 §6.1: telephone-event 無し offer は false (answer に PT 101 を残さない)"
+        );
+    }
+
+    /// RFC 4733 §2.4.1: PT は dynamic range (96-127) で任意 (PT 101 は慣用)。
+    /// PT 96 で telephone-event/8000 が宣言されていても true を返すこと。
+    #[test]
+    fn rfc4733_2_4_1_offer_has_telephone_event_dynamic_pt96_returns_true() {
+        let offer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0 96\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n\
+                      a=rtpmap:96 telephone-event/8000\r\n";
+        assert!(
+            offer_has_telephone_event(offer),
+            "RFC 4733 §2.4.1: dynamic PT (96) でも telephone-event は検出する"
+        );
+    }
+
+    /// 不正 UTF-8 byte sequence は判定不能。 RFC 3264 §6.1 違反を避けるため
+    /// 安全側 (= false) を返し、 answer から PT 101 を除外する。
+    #[test]
+    fn offer_has_telephone_event_invalid_utf8_returns_false() {
+        // 0xff 0xfe は UTF-8 として不正 (continuation byte が invalid)。
+        let offer: &[u8] = &[
+            0xff, 0xfe, b'a', b'=', b'r', b't', b'p', b'm', b'a', b'p', b':', b'1', b'0', b'1',
+            b' ', b't', b'e', b'l', b'e', b'p', b'h', b'o', b'n', b'e', b'-', b'e', b'v', b'e',
+            b'n', b't', b'/', b'8', b'0', b'0', b'0',
+        ];
+        assert!(
+            !offer_has_telephone_event(offer),
+            "不正 UTF-8 は from_utf8 失敗 → 安全側 false"
+        );
+    }
+
+    /// `a=rtpmap:` 行が存在しない (= telephone-event 宣言が無い) SDP は false。
+    /// `m=audio` 行に PT 101 が並んでいても rtpmap 無しなら判定不可なので
+    /// 安全側に倒す (RFC 3264 §6.1)。
+    #[test]
+    fn rfc3264_6_1_offer_has_telephone_event_no_rtpmap_returns_false() {
+        // m= 行に PT 101 はあるが a=rtpmap が一切ない (静的 PT のみ前提の最小 SDP)。
+        let offer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0 101\r\n";
+        assert!(
+            !offer_has_telephone_event(offer),
+            "rtpmap 無し SDP は telephone-event 宣言 not present → false"
+        );
+
+        // a=fmtp に "telephone-event" 文字列が紛れていても a=rtpmap 行ではないので false
+        // (RFC 4566 §6 attribute 行は line type で判定する)。
+        let offer_fmtp_only = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                                c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                                m=audio 30000 RTP/AVP 0 101\r\n\
+                                a=rtpmap:0 PCMU/8000\r\n\
+                                a=fmtp:101 telephone-event-stub\r\n";
+        assert!(
+            !offer_has_telephone_event(offer_fmtp_only),
+            "a=fmtp 行のみは a=rtpmap 行ではないので false"
+        );
+    }
+
+    /// RFC 4566 §6 / RFC 4733 §3.2: SDP encoding name は case-insensitive
+    /// (`PCMU` も `pcmu` も同義)。 `telephone-event` も spec 上は
+    /// `Telephone-Event` / `TELEPHONE-EVENT` と等価。
+    ///
+    /// **現状の実装は ASCII case-sensitive**:
+    /// `offer_has_telephone_event` は `l.contains("telephone-event")` で
+    /// 比較するため、 大文字混在の rtpmap は false を返す。 これは
+    /// RFC 4566 §6 厳密準拠ではないが、 NGN / Asterisk 実機の rtpmap は
+    /// 慣例的に小文字のため運用上は問題が出ていない。
+    /// 本 test は **現状の実装挙動を pin する**: もし将来 case-insensitive
+    /// 化するなら本 test を反転させる (Issue #151 の判定: 「production code
+    /// 変更しない」 範囲で現挙動を文書化する)。
+    #[test]
+    fn rfc4566_6_offer_has_telephone_event_uppercase_current_behavior_is_case_sensitive() {
+        // 大文字混在 (RFC 4566 §6 では本来 true 相当だが実装は case-sensitive)
+        let upper = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0 101\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n\
+                      a=rtpmap:101 Telephone-Event/8000\r\n";
+        assert!(
+            !offer_has_telephone_event(upper),
+            "現状 ASCII case-sensitive: `Telephone-Event` は match しない (RFC 4566 §6 厳密準拠ではない)"
+        );
+
+        // 全大文字も同様 false
+        let all_upper = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                          c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                          m=audio 30000 RTP/AVP 0 101\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=rtpmap:101 TELEPHONE-EVENT/8000\r\n";
+        assert!(
+            !offer_has_telephone_event(all_upper),
+            "現状 ASCII case-sensitive: `TELEPHONE-EVENT` も match しない"
+        );
+
+        // 完全 lower-case は当然 true (回帰防止)
+        let lower = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\n\
+                      c=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                      m=audio 30000 RTP/AVP 0 101\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n\
+                      a=rtpmap:101 telephone-event/8000\r\n";
+        assert!(
+            offer_has_telephone_event(lower),
+            "lower-case `telephone-event` は match する (NGN / Asterisk 実機の慣例形)"
+        );
+    }
+
     /// `is_unrewritten_webrtc_sdp` が WebRTC leg 由来の `0.0.0.0:9` SDP を検出する。
     /// 正常な SIP leg の LAN IP / 実 port SDP は false にすること。
     #[test]

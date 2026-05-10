@@ -63,7 +63,24 @@ export class WebRtcCall {
           warn("ICE send failed", e);
         }
       } else {
-        log(this.elapsed(), "onicecandidate: end-of-candidates (null)");
+        // Issue #92 / RFC 8840 §4 (Trickle ICE) / W3C WebRTC §4.4.7
+        // (`icecandidate` event): `event.candidate === null` は ICE gathering
+        // complete を表す。 これを wire 上で `{type:"ice",candidate:""}` として
+        // sabiden に送出し、 server-side trickle ICE 終端を通知する
+        // (sabiden 側 `process_client_message::Ice` は RFC 8840 §4 に従い
+        //  空文字列を end-of-candidates marker として silent OK 受理する)。
+        //
+        // sabiden は ICE-Lite (controlled、 RFC 8445 §2.4) で str0m が
+        // 「end-of-remote-candidates を IceAgent に通知する」 public API を
+        // 持たないため、 server-side 観測ログのみに使われる。 PWA→sabiden 方向の
+        // 候補列挙終了は、 RFC 8840 §4 が SHOULD としているシグナリング層通知を
+        // 実装する目的 (相互運用性、 将来 str0m が API を公開した時の前方互換性)。
+        log(this.elapsed(), "onicecandidate: end-of-candidates (null) → wire ''");
+        try {
+          this.signaling.send({ type: "ice", candidate: "" });
+        } catch (e) {
+          warn("ICE end-of-candidates send failed", e);
+        }
       }
     };
 
@@ -164,10 +181,39 @@ export class WebRtcCall {
     log(this.elapsed(), "acceptIncomingOffer done, answer sent");
   }
 
-  /** サーバから受け取った ICE candidate を追加。 */
+  /**
+   * サーバから受け取った ICE candidate を追加。
+   *
+   * Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) / W3C WebRTC
+   * §4.4.1.6 (`RTCPeerConnection.addIceCandidate`): 空文字列 / `end-of-candidates`
+   * 文字列は trickle ICE の **終端マーカ** であり、 candidate 本体ではない。
+   * これを `addIceCandidate(null)` (= W3C 仕様で end-of-candidates と等価) に
+   * 翻訳することで、 ブラウザ ICE エージェントは「以後候補は来ない」と確定し、
+   * RFC 8445 §6.1.4 の nominated pair 不在 → ICE failed/disconnected 遷移
+   * timer を即時起動できる。
+   *
+   * 旧挙動 (空文字列を silent return) では、 ブラウザは候補追加待ちで
+   * `connectionState=failed` 検知が iceTransportPolicy の既定 timeout
+   * (chromium で 30 秒以上) まで遅延し、 UI が「応答」 → 30 秒沈黙 → ended の
+   * 遷移を起こしていた (Issue #92)。
+   */
   async addIce(candidate: string): Promise<void> {
-    if (!candidate) {
-      log(this.elapsed(), "addIce: empty (skip)");
+    // RFC 8840 §4 / W3C WebRTC §4.4.1.6: 空文字列 / `end-of-candidates` 文字列を
+    // 終端マーカとして扱い、 null candidate (= end-of-candidates) に翻訳する。
+    // server-side (sabiden `signaling.rs`) は両方の形式を「同じ意味」として送出
+    // するため、 受信側はどちらでも end-of-candidates として処理する。
+    const trimmed = candidate.trim();
+    if (trimmed === "" || trimmed.includes("end-of-candidates")) {
+      log(this.elapsed(), "addIce: end-of-candidates (RFC 8840 §4)");
+      try {
+        // W3C WebRTC §4.4.1.6: `addIceCandidate(null)` または
+        // `addIceCandidate({ candidate: "" })` で end-of-candidates を表す。
+        await this.pc.addIceCandidate(null);
+      } catch (e) {
+        // 古いブラウザは null を受理しない場合がある。 silent ignore (end-of-
+        // candidates は MUST ではなく SHOULD なので、 不在でも ICE 確立自体は通る)。
+        warn("addIceCandidate(null) failed (browser may not support it)", e);
+      }
       return;
     }
     log(this.elapsed(), "addIce", { candidate });

@@ -648,6 +648,15 @@ pub async fn run_session(
     // str0m バックエンドが local candidates を流すので、その receiver を
     // 取り出して trickle 出力タスクを spawn する。stub は None を返すので
     // タスクは起動されない。
+    //
+    // Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates): str0m run_loop は
+    // host candidate を 1 件送出した直後に **空文字列を end-of-candidates marker**
+    // として送る (`str0m_session.rs::handle_event` 参照)。 本タスクはチャネル
+    // 値をそのまま `ServerMessage::Ice` の wire 表現に乗せるため、 empty 文字列
+    // は wire 上でも `{"type":"ice","candidate":""}` として PWA に届く。 PWA 側
+    // (`frontend/src/lib/webrtc.ts::addIce`) は空文字列を `pc.addIceCandidate(null)`
+    // に翻訳して RFC 8839 §4.2 / W3C WebRTC §4.4.1.6 の end-of-candidates として
+    // 解釈する。
     if let Some(mut local_cand_rx) = peer.take_local_candidates().await {
         let push = ws_sink.clone();
         tokio::spawn(async move {
@@ -1072,10 +1081,27 @@ pub async fn process_client_message(
             }
         }
         ClientMessage::Ice { candidate } => {
-            // RFC 8839 §4.2 / W3C WebRTC §4.4.1: 空文字 / `end-of-candidates` は
-            // trickle ICE の終端マーカで candidate ではない。 silent OK で受理する。
+            // RFC 8839 §4.2 / RFC 8840 §4 / W3C WebRTC §4.4.1.6: 空文字 /
+            // `end-of-candidates` は trickle ICE の終端マーカで candidate ではない。
+            // silent OK で受理する (Issue #92)。
+            //
+            // str0m 0.19 (= sabiden の WebRTC バックエンド) は public API として
+            // 「end-of-remote-candidates を IceAgent に通知する」 メソッドを
+            // 提供していない (is-0.9.0/src/agent.rs line 205-208 のコメント:
+            // "We never end trickle ice and it's always possible to come back
+            //  if more remote candidates are added")。 したがって本処理は marker
+            // を観測ログに残すのみとし、 ICE 失敗判定は str0m の内部 timer
+            // (RFC 8445 §6.1.4 nominated pair 不在による Failed/Disconnected
+            //  transition) に委ねる。
+            //
+            // 設計上 sabiden は ICE-Lite (controlled、 RFC 8445 §2.4) のため、
+            // remote (=ブラウザ controlling 側) からの candidate 列挙完了を
+            // 待つ必要がない: sabiden 側 host candidate ペアと checks が成立
+            // すれば即 Connected に進む。 そのため本 marker 受理欠落で ICE 確立
+            // 自体が遅延することはない (上記 RFC 8840 §4 の「シグナリング層
+            // で受理しても良い (MAY)」 を満たす)。
             if candidate.trim().is_empty() || candidate.contains("end-of-candidates") {
-                tracing::info!("ICE: end-of-candidates / empty");
+                tracing::info!("ICE: end-of-candidates / empty (RFC 8840 §4)");
                 return SessionAction::Continue;
             }
             tracing::info!(candidate = %candidate, "ICE candidate received from browser");
@@ -2576,6 +2602,78 @@ mod tests {
         assert!(
             stub.candidates().await.is_empty(),
             "終端マーカは peer に流してはならない"
+        );
+    }
+
+    /// Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) /
+    /// RFC 8839 §4.2 / W3C WebRTC §4.4.1.6: server → client 方向の trickle
+    /// 出力タスクは、 受信した文字列を加工せず `ServerMessage::Ice { candidate }`
+    /// として wire に乗せる。 これにより str0m バックエンドが host candidate
+    /// 後に流す空文字列 (end-of-candidates marker) は `{candidate: ""}` として
+    /// 透過し、 PWA 側 `addIce("")` で `pc.addIceCandidate(null)` に翻訳される。
+    ///
+    /// 本テストは forwarder 経路の純粋な round-trip 性を確認する unit test。
+    /// str0m run_loop は `str0m_session.rs` 側の
+    /// `rfc8840_4_str0m_session_emits_end_of_candidates_after_host` でカバー。
+    #[tokio::test]
+    async fn rfc8840_4_server_to_client_forwarder_propagates_end_of_candidates() {
+        // WsSink + 集約用 receiver を準備
+        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let sink = WsSink::new(tx);
+
+        // (1) 実 candidate 1 件を流す
+        sink.send(ServerMessage::Ice {
+            candidate: "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host".into(),
+        })
+        .expect("send 成功");
+
+        // (2) end-of-candidates marker (空文字列) を流す
+        sink.send(ServerMessage::Ice {
+            candidate: String::new(),
+        })
+        .expect("send 成功");
+
+        // 受信側で 2 件が順序保存で届くことを確認
+        let m1 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("1 件目を 1 秒以内に受信")
+            .expect("送信側が close せずに 1 件目を流す");
+        match m1 {
+            ServerMessage::Ice { candidate } => {
+                assert!(
+                    candidate.contains("typ host"),
+                    "1 件目は host candidate: {:?}",
+                    candidate
+                );
+            }
+            other => panic!("1 件目は Ice であるべき: {:?}", other),
+        }
+
+        let m2 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("2 件目を 1 秒以内に受信")
+            .expect("送信側が close せずに 2 件目を流す");
+        match m2 {
+            ServerMessage::Ice { candidate } => {
+                assert_eq!(
+                    candidate, "",
+                    "2 件目は end-of-candidates marker (空文字列): {:?}",
+                    candidate
+                );
+            }
+            other => panic!("2 件目は Ice であるべき: {:?}", other),
+        }
+
+        // Wire 形式の round-trip: serde で empty 文字列が消えないこと
+        // (skip_serializing_if 等で落とさない)
+        let wire = serde_json::to_string(&ServerMessage::Ice {
+            candidate: String::new(),
+        })
+        .expect("シリアライズ成功");
+        assert!(
+            wire.contains("\"candidate\":\"\""),
+            "empty candidate が JSON 上で消えてはならない: {}",
+            wire
         );
     }
 

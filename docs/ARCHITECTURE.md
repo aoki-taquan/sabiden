@@ -55,7 +55,9 @@ src/
 ├── dhcp/             # DHCP Option 120 検出 (RFC 3361)
 ├── call/             # 通話制御 (Call Manager)
 │   ├── manager.rs    # 着信フォーク・通話状態管理
-│   └── bridge.rs     # RTPブリッジ
+│   ├── bridge.rs     # RTPブリッジ
+│   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound)
+│   └── rate_limiter.rs # outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1, Issue #157)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
 ├── health/           # ヘルスチェック HTTP サーバ
 └── main.rs
@@ -199,6 +201,10 @@ NGN ──INVITE──► sabiden(UAC)
                     │
                     │ 内線認証
                     │
+                    │ [OutboundRateLimiter::check_and_record(from_aor)]
+                    │   Allow → 続行
+                    │   Deny  → 503 Service Unavailable + Retry-After で内線へ返却
+                    │
 sabiden(UAC) ──INVITE──► NGN
                     │
 sabiden ◄──200 OK── NGN
@@ -206,6 +212,47 @@ sabiden ◄──200 OK── NGN
 
 [RTPブリッジ確立]
 ```
+
+#### outbound INVITE per-AOR rate limiter (Issue #157)
+
+TTC JJ-90.24v2 §5.7.1 (連続リクエスト送信制限) / §5.7.3 (INVITE 5xx 自動 retry
+禁止) を遵守するため、 `UasEventHandler` は per-AOR で発信間隔を計測し、
+short window 内の連投を local で **503 Service Unavailable + Retry-After**
+(RFC 3261 §21.5.4 / §20.33) で早期拒否する。 これにより NGN P-CSCF が
+過負荷状態に入って 5xx を返し、 周辺端末まで巻き込まれる事故 (= cooldown 連鎖)
+を防ぐ。
+
+```rust
+struct OutboundRateLimiter {
+    state: Mutex<HashMap<AOR, AorState>>,
+    config: RateLimiterConfig {
+        min_interval: Duration,            // 既定 3 秒 (HGW 推定値)
+        failure_backoff_steps: Vec<Duration>, // 既定 [5, 10, 30] 秒
+    },
+}
+```
+
+判定ロジック (TTC §5.7.1 / §5.7.3):
+
+| 状態 | effective wait | 出口 |
+|---|---|---|
+| 初回発信 | 0 (即時 Allow) | Allow |
+| 直近 INVITE が成功 (2xx) | `min_interval` | Allow / 短い Retry-After |
+| 直近 INVITE が 5xx | `max(min_interval, failure_backoff_steps[streak-1])` | 長めの Retry-After |
+| NGN から `Retry-After: N` 受信中 | 上記の max と Retry-After 残時間 | NGN 指示時間まで Deny |
+
+- **fail feedback**: NGN INVITE が 5xx で失敗したら `record_failure(aor, status, retry_after_secs)`
+  を呼んで `failure_streak` を 1 増やし、 `Retry-After` ヘッダがあれば
+  `retry_after_until` を記録する。 4xx (例 486 Busy Here) は streak 対象外。
+- **success feedback**: 2xx 確立で `record_success(aor)` → `failure_streak=0` リセット。
+- **AOR 抽出**: 内線→NGN は `UasEvent::Invite::from_aor`、 PWA→NGN は
+  `ngn_uac.config().local_uri` (sabiden REGISTER 番号、 全 PWA WS で共通) を bucket key にする。
+
+メトリクス (`/metrics` Prometheus exposition):
+
+- `sabiden_sip_invite_blocked_by_rate_limit_total{direction=...}` — rate limiter で
+  503 拒否した INVITE 累計 (TTC §5.7.1 適用回数)。
+- `sabiden_sip_invite_interval_seconds_{sum,count}` — 連続 outbound INVITE 発射間隔の summary。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 
@@ -216,6 +263,9 @@ UAC として通常の SIP INVITE で発呼する。 B2BUA SDP anchoring (RFC 58
 
 ```
 PWA ──ClientMessage::Offer{target,sdp(SAVPF)}──► sabiden(WS シグナリング)
+                                                       │
+                                                       │ [OutboundRateLimiter::check_and_record(ngn_aor)]
+                                                       │   Deny → ServerMessage::Error{code:"rate_limited", retry_after} で PWA へ返却
                                                        │
                                                        │ peer.handle_offer → SAVPF answer
                                                        ▼
@@ -231,6 +281,10 @@ sabiden ──ACK──► NGN                  (RFC 3261 §17.1.1.3 ACK for 2xx
                                        │
 [MediaBridge::WebRtcAudio 起動: NGN UDP ⇄ Opus⇔PCMU ⇄ str0m peer]
 ```
+
+PWA 経路の rate limiter 詳細は「発信 (スマホ → NGN)」セクション (Issue #157) を参照。
+PWA 経路では bucket key として ngn_uac の REGISTER AOR を使うため、 複数 PWA
+WS セッションが同時に連投しても同じ bucket で集約され、 NGN cooldown 連鎖を防ぐ。
 
 **双方向 BYE 連動 (Issue #147)**:
 

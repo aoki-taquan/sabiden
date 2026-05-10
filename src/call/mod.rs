@@ -17,6 +17,7 @@ pub mod codec_pipeline;
 pub mod dtmf;
 pub mod manager;
 pub mod orchestrator;
+pub mod rate_limiter;
 pub mod transcoder;
 
 // Issue #42: ハーネスを使った E2E テスト。`#[cfg(test)]` でゲートしているため

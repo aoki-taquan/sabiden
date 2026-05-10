@@ -756,23 +756,68 @@ it had sent in the same dialog still pending, it MUST return a 491 (Request
 Pending) response to the received INVITE"。 内線 UA は 491 を受けて
 Section 14.1 のバックオフ (T1 数倍の random jitter) で Re-INVITE を再試行する。
 
+**SDP 書換 (Issue #138)**:
+
+内線が出した Re-INVITE オファ SDP は **NGN へ転送する前に必ず** 初回 INVITE
+経路と同じ NGN 制約フィルタを通す (CLAUDE.md §5):
+
+- `force_rewrite_sdp_for_ngn`: `c=`/`o=` IP を eth1 IP (= sent-by) に強制書換
+- `restrict_audio_to_pcmu_with_dtmf`: PCMU(0) + telephone-event(101) 以外を削除
+
+これにより内線 UA が LAN private IP + Opus 等 multi-codec を載せた Re-INVITE
+を出しても、 NGN レッグへは PCMU only + eth1 IP の sanitized SDP が流れる。
+hold/un-hold (`a=sendonly` ↔ `a=sendrecv` 切替) や `a=ptime` 変更は保持される。
+
+**Min-SE / Retry-After relay (Issue #138)**:
+
+NGN レッグの Re-INVITE 応答に **Min-SE** / **Retry-After** が乗っていた場合、
+sabiden は内線への応答にも同値をコピーする:
+
+- RFC 4028 §7.1 / §10: **422 Session Interval Too Small** には Min-SE 必須。
+  内線 UA はこの値で Re-INVITE を再送するため、 中継を欠くと Session-Timer
+  更新が失敗し続ける。
+- RFC 3261 §20.33: 5xx (+ 404/413/480/486/600/603) の Retry-After は中継推奨。
+  内線 UA が無駄な即時 retry を避けて backoff を取れる。
+
+**NGN→sabiden 方向 Re-INVITE (Issue #138 / RFC 3261 §14.2)**:
+
+sabiden は通常 `refresher=uac` で Session-Timer refresh を打つため NGN 由来の
+Re-INVITE は稀だが、 NGN 側ピアが起こす hold / un-hold (RFC 3264 §8) や
+NGN-initiated session refresh (RFC 4028 §7.4) を内線へ届けるため、 双方向
+透過処理を実装:
+
+```
+NGN ──Re-INVITE (To-tag=existing)──► sabiden(UAS for NGN)
+                                            │
+                                            │ NgnInboundHandler::handle_invite
+                                            │ → To に tag あり = in-dialog
+                                            │ → outbound_forwarder.try_forward_ngn_reinvite
+                                            │ → UasEventHandler::handle_ngn_reinvite
+                                            │   (registry.lookup_by_ngn で entry を引く)
+                                            │
+sabiden(UAC for ext) ──Re-INVITE (新 SDP)──► 内線
+                                            │
+sabiden ◄──200 OK + 新 SDP answer── 内線
+NGN ◄──200 OK + 新 SDP answer + Contact── sabiden
+NGN ──ACK──► sabiden
+```
+
+該当 outbound 通話が registry に無ければ 481 Call/Transaction Does Not Exist
+を返す (RFC 3261 §12.2.2)。
+
 **既知の制限** (Phase R3 で改善):
 
-- RTP ブリッジ媒介時の Re-INVITE SDP 書換 (sabiden 側 port / IP 差替) は
+- RTP ブリッジ媒介時の Re-INVITE SDP 書換 (sabiden 側 RTP port 差替) は
   未実装。 現状は SDP 透過モードでの hold/un-hold / Session-Timer 更新のみ
   正しく動く。 ブリッジ媒介時の Re-INVITE 経路は `prepare_outbound_bridge` /
-  `finalize_outbound_bridge` を `handle_ext_reinvite` にも結線する必要がある
-  (`docs/refactor-plan.md` §1.4 / Phase R3 Negotiator)。
+  `finalize_outbound_bridge` を `handle_ext_reinvite` / `handle_ngn_reinvite`
+  にも結線する必要がある (`docs/refactor-plan.md` §1.4 / Phase R3 Negotiator)。
 - PRACK / 100rel (RFC 3262)、 UPDATE (RFC 3311) は内線 UAS 側で **未対応**
   (Phase R2)。 NGN 側は Issue #110 で 481 default を返すよう整理済 (「NGN UAS
   メソッド ディスパッチ」セクション参照)。
-- NGN 側 Re-INVITE が 4xx/5xx で失敗した場合は同コードを内線へ中継する
-  (491 Request Pending を含む RFC 3261 §14.2 glare 解消は内線 UA の責務)。
-- **Follow-up: Issue #138** —
-  Re-INVITE 200 OK 中継時の SDP rewrite (RTP ブリッジ媒介での sabiden 側
-  port / IP 差し替え)、 Min-SE (RFC 4028 §5) の整合、 NGN→sabiden 向き
-  Re-INVITE (NGN-initiated re-negotiation) の対応は本 PR #136 の scope
-  外として #138 で別途追跡。
+- NGN 側 Re-INVITE が 4xx/5xx で失敗した場合は同コード + Min-SE / Retry-After
+  を内線へ中継する (491 Request Pending を含む RFC 3261 §14.2 glare 解消は
+  内線 UA の責務)。
 
 ## Phase 計画
 

@@ -71,6 +71,13 @@ pub struct Metrics {
     pub invite_extension_busy: AtomicU64,
     pub invite_extension_timeout: AtomicU64,
     pub invite_extension_error: AtomicU64,
+    /// PR #146 review #1 🟡#1: PWA→NGN 発信 (Issue #145) は内線 SIP レッグが
+    /// 存在しないため、 既存 `invite_extension_*` には乗らない。 専用 direction
+    /// `pwa_outbound` を追加し、 NGN→200/486/timeout の結果を独立に観測する。
+    pub invite_pwa_outbound_answered: AtomicU64,
+    pub invite_pwa_outbound_busy: AtomicU64,
+    pub invite_pwa_outbound_timeout: AtomicU64,
+    pub invite_pwa_outbound_error: AtomicU64,
     pub call_active: AtomicU64,
     pub rtp_bridge_ngn_to_ext: AtomicU64,
     pub rtp_bridge_ext_to_ngn: AtomicU64,
@@ -141,6 +148,21 @@ impl Metrics {
         .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// PR #146 review #1 🟡#1: PWA→NGN 発信 (Issue #145) の結果を記録する。
+    /// 内線 SIP レッグが無いため `record_invite_extension` は使わない。
+    /// `record_invite_ngn` は NGN レッグそのものとして別途呼ばれる
+    /// (= 1 通話で `record_invite_pwa_outbound` と `record_invite_ngn` が
+    /// 同じ result で +1 されうる: 例 Answered で両方 +1)。
+    pub fn record_invite_pwa_outbound(&self, result: InviteResult) {
+        match result {
+            InviteResult::Answered => &self.invite_pwa_outbound_answered,
+            InviteResult::Busy => &self.invite_pwa_outbound_busy,
+            InviteResult::Timeout => &self.invite_pwa_outbound_timeout,
+            InviteResult::Error => &self.invite_pwa_outbound_error,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Prometheus text exposition format で全メトリクスを書き出す。
     /// `health::metrics` から呼ばれる。
     pub fn render_prometheus(&self, registered: bool) -> String {
@@ -185,6 +207,16 @@ impl Metrics {
                     ("busy", &self.invite_extension_busy),
                     ("timeout", &self.invite_extension_timeout),
                     ("error", &self.invite_extension_error),
+                ],
+            ),
+            // PR #146 review #1 🟡#1: PWA→NGN 発信 (Issue #145) を独立 direction として公開する。
+            (
+                "pwa_outbound",
+                [
+                    ("answered", &self.invite_pwa_outbound_answered),
+                    ("busy", &self.invite_pwa_outbound_busy),
+                    ("timeout", &self.invite_pwa_outbound_timeout),
+                    ("error", &self.invite_pwa_outbound_error),
                 ],
             ),
         ] {
@@ -544,6 +576,9 @@ mod tests {
         m.record_register(false);
         m.record_invite_ngn(InviteResult::Answered);
         m.record_invite_extension(InviteResult::Busy);
+        // PR #146 review #1 🟡#1: PWA→NGN 発信専用カウンタ
+        m.record_invite_pwa_outbound(InviteResult::Answered);
+        m.record_invite_pwa_outbound(InviteResult::Timeout);
         m.inc_call_active();
         m.add_rtp_ngn_to_ext(5);
         m.add_rtp_ext_to_ngn(7);
@@ -557,6 +592,11 @@ mod tests {
         assert!(
             body.contains("sabiden_sip_invite_total{direction=\"extension\",result=\"busy\"} 1")
         );
+        assert!(body.contains(
+            "sabiden_sip_invite_total{direction=\"pwa_outbound\",result=\"answered\"} 1"
+        ));
+        assert!(body
+            .contains("sabiden_sip_invite_total{direction=\"pwa_outbound\",result=\"timeout\"} 1"));
         assert!(body.contains("sabiden_call_active 1"));
         assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ngn_to_ext\"} 5"));
         assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ext_to_ngn\"} 7"));

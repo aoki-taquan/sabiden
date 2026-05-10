@@ -161,42 +161,108 @@ pub fn stub_peer_factory() -> PeerFactory {
     })
 }
 
+/// PWA→NGN 発信ハンドラの戻り値 (Issue #145, PR #146 review #1 🟡#2)。
+///
+/// browser には `savpf_answer` を即座に `ServerMessage::Answer` で返し
+/// (= `peer.handle_offer` の SAVPF answer。 RFC 3264 §6 / RFC 8829)、
+/// NGN への INVITE 〜 `MediaBridge::WebRtcAudio` 起動は `completion`
+/// (= `JoinHandle`) として **背景タスクで継続** する。 これにより WS 受信
+/// ループは数秒の NGN INVITE→200 OK / 408 タイムアウト中もブロックされず、
+/// trickle ICE (`ClientMessage::Ice`, RFC 8839 §4) を即時処理できる。
+///
+/// 背景タスク内のエラーは `ws_sink` 経由で `ServerMessage::Error` を browser
+/// に push する責務がハンドラ側にある。
+///
+/// 本構造体は `must_use` を付ける。 `completion` を drop すると tokio が
+/// 背景タスクを継続するが (= JoinHandle を drop しても task は cancel
+/// されない、 tokio 1.x docs)、 production の `process_client_message` では
+/// 明示的に `let _ = outcome.completion;` で意図を残す。 テストは
+/// `outcome.completion.await` で完了を確認する。
+#[must_use = "completion JoinHandle を drop すると background task は継続するが、 テストで完了を確認したい場合は await すること"]
+#[derive(Debug)]
+pub struct PwaOutboundOutcome {
+    /// browser に返す SAVPF SDP answer (`peer.handle_offer` の戻り値そのまま)。
+    pub savpf_answer: String,
+    /// NGN INVITE → 200 OK → `MediaBridge::WebRtcAudio` 起動の背景タスク。
+    /// 失敗時は背景タスクが `ws_sink` で `ServerMessage::Error` を browser に push する。
+    pub completion: tokio::task::JoinHandle<Result<()>>,
+}
+
 /// PWA→NGN 発信ハンドラ (Issue #145)。
 ///
 /// `ClientMessage::Offer { target, sdp }` を受けたとき、 sabiden が
-/// 1. `peer.handle_offer(savpf)` で str0m が ICE/DTLS の準備
-/// 2. SAVPF answer → AVP → PCMU only に変換した SDP で NGN へ INVITE
-/// 3. 200 OK 受信 → `MediaBridge::WebRtcAudio` を起動 (NGN UDP socket ⇄
+/// 1. `peer.handle_offer(savpf)` で str0m が ICE/DTLS の準備 (= browser に
+///    即返すため同期実行)
+/// 2. `peer.take_media_rx()` で MediaFrame mpsc receiver を取得 (= 1 度しか
+///    取れないので background spawn 前に確実に押さえる必要がある)
+/// 3. SAVPF answer → AVP → PCMU only に変換した SDP で NGN へ INVITE
+///    (= 数秒かかる可能性があるため background spawn)
+/// 4. 200 OK 受信 → `MediaBridge::WebRtcAudio` を起動 (NGN UDP socket ⇄
 ///    Opus⇔PCMU トランスコーダ ⇄ str0m peer)
-/// 4. 戻り値の SAVPF answer を browser へ返す
+/// 5. 戻り値の SAVPF answer を browser へ即返す
 ///
 /// を担当するために、 シグナリング層から呼べる薄いインタフェース。
 /// 本トレイトを実装する型 (本番は `UasEventHandler` 経由) は `Uac` /
 /// `CallManager` / RTP bridge bind IP を保持する。
 ///
-/// 実装は `tokio::spawn` で非同期に駆動して構わないが、 戻り値の
-/// `String` (SAVPF answer) は browser へ即返す必要があるので、
-/// `accept_answer` までは関数内で完了させる必要がある。
+/// PR #146 review #1 🟡#2 (WS 受信ループ長時間ブロック対策): NGN INVITE
+/// は `tokio::spawn` で背景化し、 SAVPF answer は `peer.handle_offer` 直後
+/// に即返す。 これにより `ClientMessage::Ice` (trickle ICE) が NGN 200 OK
+/// 待ちの間も処理され、 ICE 確立遅延 / Disconnected を避ける。
 #[async_trait::async_trait]
 pub trait PwaOutboundHandler: Send + Sync {
-    /// PWA→NGN 発信フローを駆動する。 戻り値は browser に返す SAVPF SDP answer。
+    /// PWA→NGN 発信フローを駆動する。 戻り値は browser に返す SAVPF SDP answer
+    /// と background task の JoinHandle (`PwaOutboundOutcome`)。
     ///
     /// # 引数
     /// - `target`: 発信先番号 (例 "117")。 sabiden が P-CSCF host:port を補う。
+    ///   呼出側 (`process_client_message`) で RFC 3261 §25.1 user 文法
+    ///   (`[0-9*#+]{1,32}`) に絞ったホワイトリスト検証済みの値が渡される前提。
+    ///   実装側でも防御的に再検証する (defense in depth)。
     /// - `browser_offer_sdp`: browser が送ってきた SAVPF SDP。
     /// - `peer`: 当該 WS セッションの `PeerSession`。
     ///   `take_media_rx` を内部で呼び出して bridge に渡すので、 呼出後の peer
     ///   は media を別経路では取れなくなる点に注意。
+    /// - `ws_sink`: 背景タスクからの `ServerMessage::Error` push 用。
+    ///   NGN 503 / 486 等の失敗を browser に通知するため。
     ///
-    /// # エラー
-    /// - peer.handle_offer 失敗 / NGN INVITE 失敗 / bridge 起動失敗のいずれかで `Err`。
-    ///   呼出側 (`process_client_message`) は `ServerMessage::Error` を返す。
+    /// # エラー (同期 = `Result<_, _>` の Err)
+    /// - target validation 失敗 / `peer.handle_offer` 失敗 / `peer.take_media_rx`
+    ///   None (stub backend 等) のいずれかで `Err`。 呼出側は
+    ///   `ServerMessage::Error` を返す。
+    ///
+    /// # エラー (非同期 = completion JoinHandle の戻り値)
+    /// - NGN INVITE 失敗 / bridge 起動失敗。 ハンドラは `ws_sink` 経由で
+    ///   browser に `ServerMessage::Error` を push してから `Err` を返す。
     async fn handle_pwa_outbound_offer(
         &self,
         target: &str,
         browser_offer_sdp: &str,
         peer: &Arc<dyn PeerSession>,
-    ) -> Result<String>;
+        ws_sink: &WsSink,
+    ) -> Result<PwaOutboundOutcome>;
+}
+
+/// 発信先 `target` の文字種ホワイトリスト (Issue #145, PR #146 review #1 🔴#1)。
+///
+/// browser からの任意文字列が NGN INVITE の Request-URI user 部に流れる
+/// 経路を塞ぐ。 攻撃ベクタ: `target = "117\r\nFoo: bar\r\n\r\nINVITE sip:..."`
+/// で sabiden が任意 SIP メッセージを NGN に注入できる (CRLF injection)。
+///
+/// RFC 3261 §25.1 の `user` 産生 (`unreserved / escaped / user-unreserved`)
+/// は `+` を含むが、 sabiden は電話番号 / 短縮番号のみを扱うため、
+/// dial pad と同じ `[0-9*#+]` の 4 種に絞る (frontend `Dialer.tsx` の UI
+/// フィルタと一致)。 長さは 32 文字 (E.164 max 15 + 国際 prefix + マージン)。
+///
+/// frontend の UI フィルタは server-side で再検証必要 (browser 改造 / 直接
+/// WS 接続による迂回防止、 OWASP A03:2021 Injection)。
+fn is_valid_dial_target(target: &str) -> bool {
+    if target.is_empty() || target.len() > 32 {
+        return false;
+    }
+    target
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '*' || c == '#' || c == '+')
 }
 
 /// シグナリングサーバの共有状態。
@@ -746,10 +812,17 @@ pub async fn process_client_message(
             // 取り、 `MediaBridge::WebRtcAudio` で peer ⇄ NGN socket を結線する。
             // target 無しは旧来 echo モード (試験用、 NGN へは出さない)。
             if let Some(target) = target.as_deref() {
-                if target.is_empty() {
+                // PR #146 review #1 🔴#1 (CRLF injection / SIP message smuggling
+                // 防御): browser からの任意文字列が NGN INVITE Request-URI user
+                // 部に流れる経路を、 RFC 3261 §25.1 user 文法のサブセット
+                // `[0-9*#+]{1,32}` のホワイトリストで塞ぐ。 Dialer.tsx UI フィルタは
+                // server-side で **必ず再検証** が必要 (改造 browser / 直接 WS
+                // 接続を想定、 OWASP A03:2021 Injection)。
+                if !is_valid_dial_target(target) {
+                    warn!(target = %target.escape_default(), "invalid dial target rejected");
                     return SessionAction::Reply(ServerMessage::error(
                         "invalid_target",
-                        "target is empty",
+                        "target must match [0-9*#+]{1,32}",
                     ));
                 }
                 let Some(handler) = state.pwa_outbound.as_ref() else {
@@ -759,9 +832,24 @@ pub async fn process_client_message(
                         "PWA→NGN 発信ハンドラが未配線",
                     ));
                 };
-                match handler.handle_pwa_outbound_offer(target, &sdp, peer).await {
-                    Ok(savpf_answer) => {
-                        SessionAction::Reply(ServerMessage::Answer { sdp: savpf_answer })
+                // PR #146 review #1 🟡#2 (WS 受信ループ非ブロック化): handler は
+                // `peer.handle_offer` + `take_media_rx` を同期で済ませて SAVPF
+                // answer を返し、 NGN INVITE 〜 bridge 起動は背景タスク化する。
+                // completion JoinHandle は production では drop (= detach)、
+                // tests のみ await する。 NGN 失敗時は handler が `ws_sink` 経由で
+                // `ServerMessage::Error` を push する責務。
+                match handler
+                    .handle_pwa_outbound_offer(target, &sdp, peer, ws_sink)
+                    .await
+                {
+                    Ok(outcome) => {
+                        // background task は drop で detach (tokio 1.x: JoinHandle
+                        // を drop しても task は cancel されない)。
+                        // `clippy::let_underscore_future` 回避のため `drop` を明示。
+                        drop(outcome.completion);
+                        SessionAction::Reply(ServerMessage::Answer {
+                            sdp: outcome.savpf_answer,
+                        })
                     }
                     Err(e) => {
                         SessionAction::Reply(ServerMessage::error("outbound_failed", e.to_string()))
@@ -1207,10 +1295,16 @@ mod tests {
                 target: &str,
                 _browser_offer: &str,
                 _peer: &Arc<dyn PeerSession>,
-            ) -> Result<String> {
+                _ws_sink: &WsSink,
+            ) -> Result<PwaOutboundOutcome> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 *self.seen_target.lock().unwrap() = Some(target.to_string());
-                Ok(self.answer.clone())
+                let answer = self.answer.clone();
+                let completion = tokio::spawn(async move { Ok(()) });
+                Ok(PwaOutboundOutcome {
+                    savpf_answer: answer,
+                    completion,
+                })
             }
         }
         let fake = Arc::new(FakeHandler {
@@ -1255,34 +1349,137 @@ mod tests {
         );
     }
 
-    /// 空 target は `invalid_target` で拒否する (PWA からの誤送信防御)。
+    /// PR #146 review #1 🔴#1 (CRLF injection / SIP message smuggling) の
+    /// 回帰テスト: target ホワイトリスト `[0-9*#+]{1,32}` (RFC 3261 §25.1
+    /// user 文法のサブセット) を逸脱する入力は **必ず** `invalid_target` で
+    /// 拒否し、 `pwa_outbound` ハンドラに到達しない。
+    ///
+    /// 攻撃ベクタ:
+    /// - 空文字 — frontend filter 漏れ
+    /// - 33 文字超 — E.164 + マージンを超え、 buffer / parser 攻撃面を増やす
+    /// - `@host` 形式 — `target = "117@evil.com"` で Request-URI host を上書き
+    ///   して NGN P-CSCF を経由しない外部 SIP UA に向け INVITE 送出
+    /// - CRLF — `target = "117\r\nFoo: bar\r\n\r\nINVITE sip:..."` で任意 SIP
+    ///   メッセージ注入
+    /// - スペース / 特殊記号 — header parser 不整合
     #[tokio::test]
-    async fn offer_with_empty_target_returns_invalid_target() {
-        let (state, _reg) = make_state(b"k");
-        let claims = dummy_claims("alice");
-        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
-        let mut aor: Option<String> = None;
-        let (sink, pending, _c, _kg) = ws_sink_and_recv();
-        let action = process_client_message(
-            ClientMessage::Offer {
-                sdp: "v=0".into(),
-                target: Some("".into()),
-            },
-            &state,
-            &claims,
-            &peer,
-            dummy_addr(),
-            &mut aor,
-            &sink,
-            &pending,
-        )
-        .await;
-        match action {
-            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
-                assert_eq!(code, "invalid_target");
-            }
-            _ => panic!("error 期待"),
+    async fn offer_with_invalid_target_rejected_before_handler() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingHandler {
+            calls: AtomicU32,
         }
+        #[async_trait::async_trait]
+        impl PwaOutboundHandler for CountingHandler {
+            async fn handle_pwa_outbound_offer(
+                &self,
+                _target: &str,
+                _browser_offer: &str,
+                _peer: &Arc<dyn PeerSession>,
+                _ws_sink: &WsSink,
+            ) -> Result<PwaOutboundOutcome> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let completion = tokio::spawn(async move { Ok(()) });
+                Ok(PwaOutboundOutcome {
+                    savpf_answer: "v=0\r\nshould-not-reach\r\n".into(),
+                    completion,
+                })
+            }
+        }
+        let h = Arc::new(CountingHandler {
+            calls: AtomicU32::new(0),
+        });
+
+        let bad_targets: &[&str] = &[
+            "",                                               // empty
+            "117@evil.com",                                   // SIP-URI host hijack
+            "117\r\nINVITE sip:evil@example.com SIP/2.0\r\n", // CRLF smuggling
+            "117\r\n",                                        // bare CRLF
+            "117\nINVITE",                                    // bare LF
+            "117 ",                                           // space
+            "abc",                                            // letters
+            "117;tag=evil",                                   // SIP param chars
+            &"1".repeat(33),                                  // length > 32
+            "+", // 1 char OK shape but only `+` (no digits) — still allowed by charset; keep last for boundary
+        ];
+
+        // 最後の "+" は **charset 的には許容**。 charset 違反だけを拒否する
+        // ことの確認のため、 `+` は別ケースで accept される (boundary check)
+        // → ここでは "+" は対象外にし、 charset 違反のみ列挙する。
+        let charset_violations = &bad_targets[..bad_targets.len() - 1];
+
+        for &t in charset_violations {
+            let (state, _reg) = make_state(b"k");
+            let mut state = state;
+            state.pwa_outbound = Some(h.clone() as Arc<dyn PwaOutboundHandler>);
+            let claims = dummy_claims("alice");
+            let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+            let mut aor: Option<String> = None;
+            let (sink, pending, _c, _kg) = ws_sink_and_recv();
+            let action = process_client_message(
+                ClientMessage::Offer {
+                    sdp: "v=0".into(),
+                    target: Some(t.into()),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            match action {
+                SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                    assert_eq!(code, "invalid_target", "input: {:?}", t);
+                }
+                _ => panic!("invalid_target 期待 (input={:?})", t),
+            }
+        }
+        assert_eq!(
+            h.calls.load(Ordering::SeqCst),
+            0,
+            "ホワイトリスト違反の target は handler に到達してはならない (defense in depth)"
+        );
+    }
+
+    /// `is_valid_dial_target` 単体テスト: charset / 長さ境界を直接確認する。
+    /// production の `process_client_message` と handler の defense-in-depth 双方の
+    /// 一次防衛線。
+    #[test]
+    fn dial_target_whitelist_accepts_digits_star_hash_plus() {
+        // accept: 全種類
+        for t in [
+            "0",
+            "117",
+            "*99",
+            "#1",
+            "+819012345678",
+            "0312345678",
+            &"1".repeat(32), // 境界: 32 文字 OK
+        ] {
+            assert!(is_valid_dial_target(t), "should accept: {:?}", t);
+        }
+        // reject: charset 違反
+        for t in [
+            "",
+            "abc",
+            "117a",
+            "117@evil",
+            "117 ",
+            " 117",
+            "117\r\n",
+            "117\nINVITE",
+            "117;param",
+            "117/9",
+            "117?h=v",
+        ] {
+            assert!(!is_valid_dial_target(t), "should reject: {:?}", t);
+        }
+        // reject: 長さ > 32
+        let too_long: String = "1".repeat(33);
+        assert!(!is_valid_dial_target(&too_long));
     }
 
     /// WebSocket E2E: 実際に axum サーバを spawn し、tokio-tungstenite で

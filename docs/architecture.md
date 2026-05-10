@@ -722,6 +722,7 @@ sequenceDiagram
   participant Sig as SignalingState<br/>(/signal)
   participant PwaH as PwaOutboundHandler<br/>(= UasEventHandler)
   participant Peer as Str0mPeerSession
+  participant Bg as background task<br/>(tokio::spawn)
   participant NgnUac as Uac(NGN)
   participant Pcscf as NGN P-CSCF
   participant Mgr as CallManager
@@ -729,27 +730,37 @@ sequenceDiagram
 
   Browser->>Browser: getUserMedia + RTCPeerConnection.createOffer
   Browser->>Sig: { type: offer, sdp: SAVPF/Opus, target: "117" }
-  Sig->>PwaH: handle_pwa_outbound_offer("117", browser_offer, peer)
 
-  PwaH->>Peer: peer.handle_offer(savpf_offer)
-  Note over Peer: str0m が ICE/DTLS 状態機械を進める
-  Peer-->>PwaH: SAVPF answer (sabiden 側 ICE/DTLS 認証情報入り)
+  Note over Sig: target ホワイトリスト検証<br/>RFC 3261 §25.1 user 文法<br/>サブセット [0-9*#+]{1,32}
+  Sig->>PwaH: handle_pwa_outbound_offer("117", browser_offer, peer, ws_sink)
 
-  PwaH->>PwaH: bind ngn_bridge_sock (eth1)<br/>convert_savpf_to_avp(answer) →<br/>restrict_audio_to_pcmu_with_dtmf →<br/>rewrite_rtp_endpoint to sabiden NGN
+  rect rgba(180, 220, 255, 0.5)
+    Note over PwaH,Peer: 同期パス (= browser 即返し)
+    PwaH->>Peer: peer.handle_offer(savpf_offer)
+    Note over Peer: str0m が ICE/DTLS 状態機械を進める
+    Peer-->>PwaH: SAVPF answer
+    PwaH->>Peer: peer.take_media_rx() (1 度しか取れない)
+    Peer-->>PwaH: media_rx
+    PwaH->>PwaH: bind ngn_bridge_sock<br/>convert_savpf_to_avp →<br/>restrict_audio_to_pcmu_with_dtmf →<br/>rewrite_rtp_endpoint
+    PwaH->>Bg: tokio::spawn(NGN INVITE → bridge 起動)
+    PwaH-->>Sig: Ok(PwaOutboundOutcome { savpf_answer, completion })
+    Sig-->>Browser: { type: answer, sdp: savpf_answer }
+  end
 
-  PwaH->>NgnUac: build_invite("sip:117@<P-CSCF>", pcmu_avp_sdp)
-  NgnUac->>Pcscf: INVITE (Request-URI = P-CSCF IP+port,<br/>SDP = AVP/PCMU, c=/m= → sabiden NGN bridge)
-  Pcscf-->>NgnUac: 200 OK (RTP/AVP PCMU, NGN 側 RTP endpoint)
-  NgnUac->>Pcscf: ACK (RFC 3261 §13.2.2.4)
-  NgnUac-->>PwaH: InviteOutcome::Established { dialog, response }
-
-  PwaH->>Peer: peer.take_media_rx() (Opus PT 抽出も browser answer から)
-  PwaH->>Trans: WebRtcAudioBridge::start { ngn_socket, ngn_peer, peer, peer_media_rx, opus_pt }
-  PwaH->>Mgr: create_call + attach_media_bridge(WebRtcAudio)
-  PwaH-->>Sig: Ok(savpf_answer)
-  Sig-->>Browser: { type: answer, sdp: savpf_answer }
+  rect rgba(255, 220, 180, 0.5)
+    Note over Bg,Pcscf: 背景パス (PR #146 review #1 🟡#2)
+    Bg->>NgnUac: build_invite("sip:117@<P-CSCF>", pcmu_avp_sdp)
+    NgnUac->>Pcscf: INVITE (Request-URI = P-CSCF IP+port,<br/>SDP = AVP/PCMU, c=/m= → sabiden NGN bridge)
+    Pcscf-->>NgnUac: 200 OK (RTP/AVP PCMU, NGN 側 RTP endpoint)
+    NgnUac->>Pcscf: ACK (RFC 3261 §13.2.2.4)
+    NgnUac-->>Bg: InviteOutcome::Established { dialog, response }
+    Bg->>Trans: WebRtcAudioBridge::start { ngn_socket, ngn_peer, peer, peer_media_rx, opus_pt }
+    Bg->>Mgr: create_call + attach_media_bridge(WebRtcAudio)
+    Note over Bg: NGN 失敗時は ws_sink 経由で<br/>{ type: error, code: outbound_failed }<br/>を browser に push
+  end
 
   par ICE candidate 交換 (trickle, RFC 8839 §4)
+    Note over Sig,Peer: 背景タスク実行中も WS 受信ループは止まらないので<br/>ICE candidate は遅延なく流れる
     Peer-->>Sig: local cand
     Sig-->>Browser: { type: ice, candidate }
     Browser-->>Sig: { type: ice, candidate }
@@ -772,8 +783,35 @@ sequenceDiagram
 
 - **schema 拡張**: `ClientMessage::Offer` に `target: Option<String>` を足し、
   `target` 付きが PWA→NGN 発信、 `target` 無しは旧来 echo モード (sabiden 内
-  str0m 折返し、 試験用) を維持する。 `target` 空文字は `invalid_target` で拒否
-  (誤送信防御)。
+  str0m 折返し、 試験用) を維持する。
+- **target ホワイトリスト (PR #146 review #1 🔴#1, RFC 3261 §25.1 user 文法
+  サブセット)**: `target` は `[0-9*#+]{1,32}` でサーバ側強制再検証する。
+  frontend `Dialer.tsx` の UI フィルタは改造 browser / 直接 WS 接続で迂回
+  可能 (OWASP A03:2021 Injection)。 攻撃ベクタ:
+  `target = "117\r\nFoo: bar\r\n\r\nINVITE sip:..."` で sabiden が任意 SIP
+  メッセージを NGN に注入できる (CRLF smuggling)、 `target = "117@evil.com"`
+  で Request-URI host を上書きして外部 SIP UA に向け INVITE 送出。
+  `process_client_message` (signaling) と `PwaOutboundHandler` 実装側
+  (orchestrator) の両方で検証する (defense in depth)。
+- **同期パス / 背景パス分離 (PR #146 review #1 🟡#2, RFC 8839 §4 trickle ICE)**:
+  `peer.handle_offer` 直後に SAVPF answer を即返し、 NGN INVITE → 200 OK →
+  bridge 起動は `tokio::spawn` で背景化する。 `peer.take_media_rx` は 1 度
+  しか取れないため background spawn の **前** に同期で取得する。 ICE
+  candidate (`ClientMessage::Ice`) は WS 受信ループで処理されるが、 NGN
+  INVITE が同期だと数秒〜数十秒間 WS が詰まり ICE 確立遅延 / Disconnected を
+  起こすので、 ハンドラ戻り値を `PwaOutboundOutcome { savpf_answer,
+  completion: JoinHandle<Result<()>> }` とし、 production は `completion` を
+  drop (= detach) して即返す。 テストは `completion.await` で完了確認する。
+- **背景失敗時の通知**: NGN 503 / 486 / トランスポート失敗等は背景タスク内で
+  発生するので、 ハンドラに `ws_sink: &WsSink` を渡し、 失敗時に
+  `ServerMessage::Error { code: "outbound_failed", ... }` を browser へ push
+  する責務をハンドラ側に持たせる。
+- **メトリクスは PWA outbound 専用カウンタ (PR #146 review #1 🟡#1)**:
+  PWA outbound 通話成立は内線 SIP レッグを伴わないので、
+  `record_invite_extension(Answered)` は呼ばない。 専用 direction
+  `pwa_outbound` (`record_invite_pwa_outbound`) を追加し、
+  `sabiden_sip_invite_total{direction="pwa_outbound",result="..."}` で
+  独立に観測する (NGN レッグそのものは別途 `record_invite_ngn` 経由)。
 - **ハンドラの責務分離**: `PwaOutboundHandler` trait はシグナリング層から呼べる
   最小インタフェースで、 実装は `UasEventHandler` に乗せる (= `Uac` /
   `CallManager` / RTP bridge bind IP を再利用)。 PWA outbound 専用構造体を作る

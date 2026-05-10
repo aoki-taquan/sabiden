@@ -43,7 +43,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rand::Rng;
 use str0m::change::{SdpAnswer, SdpOffer};
-use str0m::media::{Direction, MediaKind};
+use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
@@ -51,8 +51,15 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::{debug, info, trace, warn};
 
-use super::peer::PeerSession;
+use super::peer::{MediaFrame, PeerSession};
 use crate::sdp::builder::DtlsIceParams;
+
+/// PWA → orchestrator 方向の MediaFrame mpsc バッファ容量。
+///
+/// 20 ms ごとに 1 frame、 transcoder 側で 1 frame 処理 (~数 ms) なので
+/// 64 frame ≒ 1.3 秒分。 NGN レッグ pacing 不在の高負荷時にも数秒の
+/// 余裕がある。 RFC 3550 §6.4.1 ジッタ計算は受信側 (transcoder) で行う。
+const MEDIA_RX_BUFFER: usize = 64;
 
 /// `[webrtc]` config からこのバックエンド向けに切り出した最小限のパラメータ。
 #[derive(Debug, Clone)]
@@ -126,6 +133,13 @@ enum Command {
         setup: String,
         reply: oneshot::Sender<Result<DtlsIceParams>>,
     },
+    /// orchestrator → str0m 方向の音声フレーム送信
+    /// (RFC 8835 §3 WebRTC media plane)。 run_loop が
+    /// `Rtc::writer(mid).write(pt, wallclock, rtp_time, payload)` で
+    /// SRTP 化して UDP に出す。
+    SendMedia {
+        frame: MediaFrame,
+    },
     Close,
 }
 
@@ -134,6 +148,9 @@ pub struct Str0mPeerSession {
     cmd_tx: mpsc::Sender<Command>,
     /// `take_local_candidates` で 1 度だけ取り出される。
     local_cand_rx: Mutex<Option<mpsc::Receiver<String>>>,
+    /// `take_media_rx` で 1 度だけ取り出される (Issue #87)。
+    /// run_loop が `Event::MediaData` を受けたときに 1 frame を流す。
+    media_in_rx: Mutex<Option<mpsc::Receiver<MediaFrame>>>,
 }
 
 impl Str0mPeerSession {
@@ -151,6 +168,10 @@ impl Str0mPeerSession {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
         let (local_cand_tx, local_cand_rx) = mpsc::channel::<String>(8);
+        // Issue #87: ブラウザ → orchestrator の Opus メディアフレーム経路
+        // (RFC 7587 / RFC 8835 §3)。 run_loop の `Event::MediaData` から
+        // 1 frame ずつ流す。
+        let (media_in_tx, media_in_rx) = mpsc::channel::<MediaFrame>(MEDIA_RX_BUFFER);
 
         // ICE host candidate を生成 (str0m に登録するアドレスは "対外的に
         // ブラウザが到達するアドレス"。Cloudflare Tunnel の場合は LAN IP でも
@@ -179,12 +200,15 @@ impl Str0mPeerSession {
             host_candidate: host,
             cmd_rx,
             local_cand_tx,
+            media_in_tx,
+            audio_mid: None,
             pending_offer: None,
         }));
 
         Ok(Arc::new(Self {
             cmd_tx,
             local_cand_rx: Mutex::new(Some(local_cand_rx)),
+            media_in_rx: Mutex::new(Some(media_in_rx)),
         }))
     }
 
@@ -273,6 +297,25 @@ impl PeerSession for Str0mPeerSession {
         self.local_cand_rx.lock().await.take()
     }
 
+    /// Issue #87: ブラウザ → orchestrator の Opus メディアフレーム
+    /// receiver を 1 度だけ取り出す (RFC 8835 §3 WebRTC media plane)。
+    async fn take_media_rx(&self) -> Option<mpsc::Receiver<MediaFrame>> {
+        self.media_in_rx.lock().await.take()
+    }
+
+    /// Issue #87: orchestrator → ブラウザの Opus メディアフレーム送信
+    /// (RFC 3550 §5.1 / RFC 7587)。 run_loop に command で渡し、
+    /// `Rtc::writer(mid).write` 経由で SRTP 化して UDP に送出する。
+    async fn send_media(&self, frame: MediaFrame) -> Result<()> {
+        // run_loop が既に終了している場合は受信側 drop で `Err` になる。
+        // 呼出側 (RtpBridge ループ) は loop continue で次フレームに進む
+        // 想定。 panic / unwrap は使わない。
+        self.cmd_tx
+            .send(Command::SendMedia { frame })
+            .await
+            .map_err(|_| anyhow!("str0m run_loop が既に終了"))
+    }
+
     async fn close(&self) -> Result<()> {
         // ベストエフォート: run_loop が既に終了していても無視。
         let _ = self.cmd_tx.send(Command::Close).await;
@@ -287,6 +330,15 @@ struct RunCtx {
     host_candidate: Candidate,
     cmd_rx: mpsc::Receiver<Command>,
     local_cand_tx: mpsc::Sender<String>,
+    /// Issue #87: 受信 Opus フレームを orchestrator に流すチャネル。
+    /// `Event::MediaData` 1 件ごとに 1 frame 送る。 受信側が居なければ
+    /// `try_send` で drop する (RFC 3550 §6.4.1: 失われた RTP パケット
+    /// はエンド端側でジッタ計算する) — orchestrator 側で `take_media_rx`
+    /// しない構成では media は流れないが ICE/DTLS は確立する。
+    media_in_tx: mpsc::Sender<MediaFrame>,
+    /// 最初に negotiate された audio Mid (`Event::MediaAdded` で確定)。
+    /// `Command::SendMedia` で `Rtc::writer(mid)` に渡すために保持する。
+    audio_mid: Option<Mid>,
     /// `create_offer` で出した SDP の保留オファ。`accept_answer` で消費する。
     pending_offer: Option<str0m::change::SdpPendingOffer>,
 }
@@ -322,6 +374,8 @@ async fn run_loop(mut ctx: RunCtx) {
                     &ctx.local_cand_tx,
                     &mut sent_local_cand,
                     &ctx.host_candidate,
+                    &ctx.media_in_tx,
+                    &mut ctx.audio_mid,
                 )
                 .await;
                 continue;
@@ -361,6 +415,9 @@ async fn run_loop(mut ctx: RunCtx) {
                     Some(Command::GetLocalDtlsParams { setup, reply }) => {
                         let r = get_local_dtls_params(&mut ctx.rtc, &setup);
                         let _ = reply.send(r);
+                    }
+                    Some(Command::SendMedia { frame }) => {
+                        write_media(&mut ctx.rtc, ctx.audio_mid, &frame);
                     }
                     Some(Command::Close) | None => {
                         debug!("str0m: close コマンド受信");
@@ -500,6 +557,8 @@ async fn handle_event(
     local_cand_tx: &mpsc::Sender<String>,
     sent_local_cand: &mut bool,
     host_candidate: &Candidate,
+    media_in_tx: &mpsc::Sender<MediaFrame>,
+    audio_mid: &mut Option<Mid>,
 ) {
     match ev {
         Event::IceConnectionStateChange(s) => {
@@ -520,22 +579,86 @@ async fn handle_event(
         }
         Event::MediaAdded(m) => {
             info!(mid = ?m.mid, kind = ?m.kind, dir = ?m.direction, "str0m: media added");
+            // Issue #87: SendMedia で `Rtc::writer(mid)` に渡すために
+            // 最初の audio mid を保存する。 PCMU only 構成なので audio は 1 本だけ。
+            if matches!(m.kind, MediaKind::Audio) && audio_mid.is_none() {
+                *audio_mid = Some(m.mid);
+            }
         }
         Event::MediaData(d) => {
-            // 本 PR では取り回しのみ確認。Call Manager 結線は別 PR。
+            // Issue #87: 受信 Opus フレームを orchestrator (RtpBridge) に渡す。
+            // RFC 7587 §4.2: Opus は通常 20 ms = 960 samples@48kHz だが、
+            // 本実装は RtpTime / payload を素通しして transcoder 側で扱う。
             trace!(
                 mid = ?d.mid,
                 pt = ?d.pt,
                 bytes = d.data.len(),
                 "str0m: 受信 media frame"
             );
-            // TODO(#29): Opus → G.711 トランスコード経由で内線/NGN 側 RTP に
-            // ブリッジ。今は単に drop。
+            let frame = MediaFrame {
+                pt: *d.pt,
+                rtp_time: d.time.numer() as u32,
+                payload: d.data.clone(),
+                network_time: d.network_time,
+            };
+            // 受信側未接続 / 満杯時は drop (RFC 3550 §6.4.1: パケットロス想定)。
+            // panic / unwrap は禁止 (CLAUDE.md §6.5)。
+            if let Err(e) = media_in_tx.try_send(frame) {
+                trace!(error = %e, "str0m: media_in_tx try_send 失敗 (drop)");
+            }
         }
         Event::RtpPacket(_) => {
             // RTP モードでは PR スコープ外。Event::MediaData を採用するため到達しない。
         }
         _ => {}
+    }
+}
+
+/// Issue #87: orchestrator → str0m の音声フレームを `Rtc::writer(mid).write` で
+/// SRTP 化して送出する。
+///
+/// # 仕様
+///
+/// - **RFC 3550 §5.1**: `pt` (payload type) と `rtp_time` (timestamp) は
+///   フレーム単位の単調増加数。 sabiden 側 transcoder が NGN→PWA 方向で
+///   生成した値をそのまま渡す前提。
+/// - **RFC 7587 §4.2** (Opus payload format): WebRTC は通常 48 kHz 単位の
+///   timestamp。 PCMU 直送経路では 8 kHz。 codec config に依存するため
+///   呼出側責務とする。
+/// - **str0m `Writer::write` の仕様** (`media/writer.rs`): Connected 前の
+///   write は drop されるが panic はしない。 mid 不在 / pt 未 negotiate は
+///   `Err(RtcError)` を返すので警告のみ。
+fn write_media(rtc: &mut Rtc, audio_mid: Option<Mid>, frame: &MediaFrame) {
+    let Some(mid) = audio_mid else {
+        trace!(pt = frame.pt, "str0m: audio mid 未確定 → media drop");
+        return;
+    };
+    let writer = match rtc.writer(mid) {
+        Some(w) => w,
+        None => {
+            trace!(?mid, "str0m: writer 取得失敗 (media 未 negotiate?)");
+            return;
+        }
+    };
+    let pt: Pt = Pt::from(frame.pt);
+    // RFC 7587: Opus は 48 kHz、 RFC 3551: PCMU は 8 kHz。 codec 判定は
+    // 呼出側 (transcoder) が `frame.pt` で済ませているので、 ここでは
+    // negotiate 済 codec の clock rate を `Frequency` として取り出し、
+    // RTP timestamp を `MediaTime` に組み立てる。
+    let freq = match writer
+        .payload_params()
+        .find(|p| p.pt() == pt)
+        .map(|p| p.spec().clock_rate)
+    {
+        Some(f) => f,
+        None => {
+            trace!(pt = frame.pt, "str0m: PT 未 negotiate → media drop");
+            return;
+        }
+    };
+    let media_time = MediaTime::new(u64::from(frame.rtp_time), freq);
+    if let Err(e) = writer.write(pt, frame.network_time, media_time, frame.payload.clone()) {
+        trace!(error = %e, "str0m: writer.write 失敗 (Connected 前 / pt 不一致)");
     }
 }
 
@@ -767,6 +890,67 @@ mod tests {
         let _ = session.create_offer().await.expect("1 回目");
         let r = session.create_offer().await;
         assert!(r.is_err(), "2 回目は保留中のためエラーであるべき");
+    }
+
+    /// Issue #87: `take_media_rx` は 1 度だけ Some、 2 度目は None。
+    /// (sender 側生存中は他者が同じ receiver を奪えない。)
+    #[tokio::test]
+    async fn str0m_session_take_media_rx_once() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (54000, 54999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let first = session.take_media_rx().await;
+        assert!(first.is_some(), "1 度目は受信器が取れる");
+        let second = session.take_media_rx().await;
+        assert!(second.is_none(), "2 度目は None");
+        let _ = session.close().await;
+    }
+
+    /// Issue #87: `send_media` は run_loop 終了済でも Result で返す
+    /// (panic / unwrap 禁止)。 Connected 前なら drop されるが Ok。
+    #[tokio::test]
+    async fn str0m_session_send_media_does_not_panic_before_connected() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (55000, 55999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let frame = MediaFrame {
+            pt: 0, // PCMU
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        // Connected 前 / mid 未確定 → run_loop 内部で drop されるが
+        // command 送信自体は成功するはず。
+        session.send_media(frame).await.expect("command 送信成功");
+        let _ = session.close().await;
+    }
+
+    /// Issue #87: close 後の `send_media` は Err を返す (panic 禁止)。
+    #[tokio::test]
+    async fn str0m_session_send_media_after_close_returns_error() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (56000, 56999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        let _ = session.close().await;
+        // run_loop が close 命令で抜けるのを待つ
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let frame = MediaFrame {
+            pt: 0,
+            rtp_time: 0,
+            payload: vec![],
+            network_time: std::time::Instant::now(),
+        };
+        let r = session.send_media(frame).await;
+        assert!(r.is_err(), "run_loop 終了後は Err になる: {:?}", r);
     }
 
     /// `accept_answer` は対応する保留オファが無ければエラーを返す。

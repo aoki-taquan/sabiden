@@ -40,10 +40,33 @@ export const App: Component = () => {
 
   let signaling: SignalingClient | null = null;
   let call: WebRtcCall | null = null;
+  // Issue #91: NGN→PWA 着信フローで sabiden 側が trickle ICE で host
+  // candidate を 1 つ push してくる (RFC 8839 §4 trickle ICE)。
+  // ブラウザ PeerConnection は応答ボタン押下時に初めて生成されるため、
+  // それ以前に届いた ICE candidate を捨てると ICE 確立が遅延 / 失敗する。
+  // バッファに溜め、 acceptIncomingOffer / placeCall で call を生成した
+  // 直後に flush する (W3C WebRTC §4.4.6: setRemoteDescription 前の
+  // candidate は buffer 推奨)。
+  let pendingIceCandidates: string[] = [];
 
   const teardownCall = () => {
     call?.hangup();
     call = null;
+    pendingIceCandidates = [];
+  };
+
+  /** バッファ済 ICE candidate を call に流し込む (失敗は warn のみ). */
+  const flushPendingIce = async () => {
+    if (!call || pendingIceCandidates.length === 0) return;
+    const buffered = pendingIceCandidates;
+    pendingIceCandidates = [];
+    for (const cand of buffered) {
+      try {
+        await call.addIce(cand);
+      } catch (e) {
+        console.warn("flushPendingIce: addIce failed", e);
+      }
+    }
   };
 
   const handleSignalMessage = async (msg: ServerMessage) => {
@@ -64,6 +87,9 @@ export const App: Component = () => {
         // NGN 着信: sabiden が生成した offer をブラウザに push してきた。
         // ringing UI を出して、ユーザの応答ボタン待ち。
         // 多重着信は後勝ち (現行の View が単一通話前提なので).
+        // Issue #91: 新着信受信時に古い ICE buffer は捨てる (teardownCall が
+        // pendingIceCandidates をクリアする)。 ただし新着信に紐づく ICE は
+        // この行以降に到達するので、 teardownCall は offer 受信時 1 回だけ。
         if (!signaling) break;
         teardownCall();
         // caller display name は Issue #41 のスコープ外: TODO で call_id を表示。
@@ -88,7 +114,14 @@ export const App: Component = () => {
         teardownCall();
         break;
       case "ice":
-        await call?.addIce(msg.candidate);
+        // Issue #91: call が無ければ buffer に積む (RFC 8839 §4 trickle ICE
+        // のうち remote description / PeerConnection 未確立期間の candidate は
+        // 受信側で buffer すべき)。 acceptIncomingOffer / placeCall 後に flush。
+        if (call) {
+          await call.addIce(msg.candidate);
+        } else {
+          pendingIceCandidates.push(msg.candidate);
+        }
         break;
       case "error":
         console.error("signaling error", msg);
@@ -224,6 +257,8 @@ export const App: Component = () => {
       call = newCall(signaling);
       await call.acquireMic();
       await call.createOffer();
+      // Issue #91: call 生成前に届いた ICE candidate を flush。
+      await flushPendingIce();
       // INVITE 送出はサーバ側 TODO (Issue #25 と協調). offer/answer 折返しのみ動作。
     } catch (e) {
       console.error("call setup failed", e);
@@ -243,6 +278,9 @@ export const App: Component = () => {
       call = newCall(signaling);
       await call.acquireMic();
       await call.acceptIncomingOffer(v.callId, v.pendingOfferSdp);
+      // Issue #91: ringing 中に届いていた ICE candidate を flush。
+      // setRemoteDescription 完了 (acceptIncomingOffer 内) 後に流す必要がある。
+      await flushPendingIce();
     } catch (e) {
       console.error("accept incoming failed", e);
       setView((curr) => (curr.kind === "call" ? { ...curr, state: "ended" } : curr));

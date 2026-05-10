@@ -302,11 +302,11 @@ graph LR
 | `src/call/orchestrator.rs` | NGN ⇔ 内線 B2BUA orchestration (NgnInboundHandler / UasEventHandler) | RFC 5853, RFC 3261 §13/§15 | ✗ | 現 worktree 1657 行 / main 3188 行と巨大。`pending` / `active` / `by_ext` 4 表に分散。あるべき: `B2buaCall` 単一構造体 + `B2buaRegistry` (Phase R4) |
 | `src/call/manager.rs` | フォーク INVITE (`fork_to_extensions`) + 通話状態テーブル + `UacForker` | (B2BUA 内部) | ▲ | `fork_to_extensions` (SIP only) と orchestrator 内の `fork_to_bindings` (transport-aware) が並存予定 (Phase R6 で統合) |
 | `src/call/bridge.rs` | RTP リレー (G.711 透過) — late-binding peer learning | RFC 3550 (transparent relay) | ◎ | 設計クリーン |
-| `src/call/transcoder.rs` | Opus ↔ G.711 トランスコード (双方向 spawn) | RFC 6716, RFC 3551 | ◎ | bridge と並列にあるが responsibilities は分離。**現状 orchestrator から呼ばれていない** (Phase R6 致命的欠落) |
+| `src/call/transcoder.rs` | Opus ↔ G.711 トランスコード: `TranscodingBridge` (内線 UDP) + `WebRtcAudioBridge` (peer MediaFrame mpsc, Issue #87/#121) の 2 種 | RFC 6716, RFC 3551, RFC 7587 | ◎ | bridge と並列にあるが responsibilities は分離。 NGN→PWA 着信は `WebRtcAudioBridge`、 NGN↔SIP 内線 (Linphone Opus 等) は `TranscodingBridge`、 両側 PCMU は `RtpBridge` |
 | `src/webrtc/auth.rs` | HMAC-SHA256 トークン検証 (`AuthClaims`) | (実装独自 / Cloudflare 連携) | ◎ | constant-time 比較 |
 | `src/webrtc/signaling.rs` | WS シグナリング (`/signal`): register / offer / answer / ice / bye + サーバ → ブラウザ keepalive Ping (RFC 6455 §5.5.2, 既定 30s 周期 / 60s idle close, Issue #98) | (アプリ独自 JSON) | ◎ | `process_client_message` 分離テスト容易性あり、 keepalive ループは `KeepaliveSender` trait + `run_keepalive_loop` で fake 注入できる構造 |
-| `src/webrtc/peer.rs` | `PeerSession` trait + stub | (抽象) | ◎ | trait 設計良い |
-| `src/webrtc/str0m_session.rs` | str0m バックエンド (Sans-IO + tokio run-loop) | RFC 5245 (ICE), RFC 8445, RFC 5763/5764 (DTLS-SRTP) | ▲ | ICE-Lite で接続まで動くが **`Event::MediaData` を drop**。Issue #29 で `TranscodingBridge` 結線。IPv6 public_ip 未対応 |
+| `src/webrtc/peer.rs` | `PeerSession` trait + stub。 [`MediaFrame`] I/O (`take_media_rx` / `send_media`) を含む (Issue #87) | (抽象) | ◎ | trait 設計良い |
+| `src/webrtc/str0m_session.rs` | str0m バックエンド (Sans-IO + tokio run-loop)。 `Event::MediaData` を `media_in_tx` で MediaFrame mpsc に流し、 `Rtc::writer(mid).write` で送出する (Issue #87) | RFC 5245 (ICE), RFC 8445, RFC 5763/5764 (DTLS-SRTP), RFC 7587 (Opus) | ◎ | ICE-Lite + メディア結線完了。 IPv6 public_ip 未対応 |
 | `src/observability/mod.rs` | メトリクス + SIP トレース dump (`Authorization` redact) | (Prometheus text) | ◎ | 自前 atomic counter |
 | `src/health/mod.rs` | `/healthz` `/readyz` `/metrics` `/signal` 同居 axum HTTP | (K8s probe spec) | ◎ | clean |
 | `src/config/mod.rs` | TOML + 環境変数 override + NGN 直収モード分岐 | (アプリ独自) | ◎ | NGN 直収モード (`[ngn] direct_mode = true`) で `Authorization` 強制 off |
@@ -558,13 +558,21 @@ sequenceDiagram
 ### 4.3 WebRTC peer 着信 (NGN INVITE → ブラウザ)
 
 WebRTC peer がブラウザから WS で `register` 済みの状態で、NGN から着信が
-来た場合のフロー。**現状一部未結線**: `Event::MediaData` を str0m から
-`TranscodingBridge` に流す経路と、 RtpBridge と WebRTC peer の RTP 結線が
-未実装 (Phase R6 / Issue #29 + Issue #73 follow-up)。
+来た場合のフロー。
+
+**メディア結線完了**: Issue #87 / #91 / #121 で str0m の `Event::MediaData`
+取り出しと `Rtc::writer(mid).write` 経由の送出、 NGN UDP socket と peer の
+MediaFrame mpsc を Opus⇔PCMU トランスコーダで橋渡しする
+[`MediaBridge::WebRtcAudio`](../src/call/transcoder.rs) を結線済み。
 
 Issue #73 で sabiden 自身が **offerer** に切り替わった (NGN 由来生 SDP は
 ブラウザが DTLS-SRTP / ICE 認証情報不在で拒絶するため、`peer.create_offer()`
 で SAVPF/PCMU オファを生成して push する。RFC 8827 §6.5, RFC 8839 §4.1)。
+
+Issue #91: PWA 側は `pendingIceCandidates` バッファを持ち、 `call` 生成前に
+届いた ICE candidate を蓄積し、 `acceptIncomingOffer` / `placeCall` 直後に
+flush する (RFC 8445 §6.1.2.1, RFC 8839 §4 trickle ICE: remote description /
+PeerConnection 確立前の candidate は受信側で buffer すべき)。
 
 ```mermaid
 sequenceDiagram
@@ -613,15 +621,16 @@ sequenceDiagram
   NgnInb->>Pcscf: 200 OK (sabiden の RTP socket を指す SDP)
   Pcscf->>NgnInb: ACK
 
-  Note over Pcscf,Browser: メディア結線 (現状 TODO #29 + 別 Issue)
-  Pcscf-->>NgnInb: RTP PCMU
-  NgnInb-->>Trans: (TODO) RTP transcoder 経由
-  Trans-->>Peer: RTP Opus → str0m write_rtp
-  Peer-->>Browser: SRTP Opus
+  Note over Pcscf,Browser: メディア結線 (Issue #87 / #121 で結線済)
+  Note over NgnInb,Peer: start_bridge_for_inbound が WebRtcLegArtifacts を<br/>受けて MediaBridge::WebRtcAudio を起動
+  Pcscf-->>NgnInb: RTP PCMU (NGN UDP socket)
+  NgnInb->>Trans: μ-law decode → 8k PCM → upsample 48k → Opus encode
+  Trans->>Peer: peer.send_media(MediaFrame{pt=opus,rtp_time,payload})
+  Peer-->>Browser: SRTP Opus (str0m Rtc::writer(mid).write)
   Browser-->>Peer: SRTP Opus
-  Peer-->>Trans: (TODO) Event::MediaData 取り出し
-  Trans-->>NgnInb: RTP PCMU
-  NgnInb-->>Pcscf: RTP PCMU
+  Peer-->>Trans: Event::MediaData → media_in_tx → MediaFrame
+  Trans-->>NgnInb: Opus decode → 48k PCM → downsample 8k → μ-law encode
+  NgnInb-->>Pcscf: RTP PCMU (NGN UDP socket)
 ```
 
 > なお `start_bridge_for_inbound` が起動できなかった場合、 WebRTC leg の
@@ -633,11 +642,12 @@ sequenceDiagram
 
 #### 現状実装と「あるべき」のギャップ
 
-| 項目 | 現状 (`webrtc/str0m_session.rs:386` 周辺) | あるべき (Phase R6) |
+| 項目 | 現状 | あるべき (Phase R6) |
 |---|---|---|
-| `Event::MediaData` の扱い | drop (TODO #29) | `media_in_tx: mpsc::Sender<MediaPacket>` 経由で `TranscodingBridge` に流す |
+| `Event::MediaData` の扱い | **Issue #87 で解消済**: `media_in_tx: mpsc::Sender<MediaFrame>` 経由で `WebRtcAudioBridge` (= `TranscodingBridge` の peer 版) に流す | (現状で完成) |
 | NGN SDP → browser SDP 変換 | Issue #73 で `peer.create_offer()` 経由に切替済 (SAVPF/PCMU オファを sabiden 側生成、DTLS fingerprint / ICE 認証情報込み)。Negotiator API (RFC 3264 統合) は別 Issue (Phase R3) | `Negotiator::for_webrtc()` で NGN ⇔ browser のコーデック折衝を Opus 含めて一元化 |
-| WebRTC peer ↔ RtpBridge 結線 | `extract_rtp_endpoint(savpf_answer) = 0.0.0.0:9` で意味のある RTP 宛先にならない (str0m が独自 UDP socket を持つため、 `RtpBridge` 経由の relay には別経路が必要) | str0m の RTP I/O を `MediaPacket` チャンネルに繋ぎ、 `TranscodingBridge` で NGN 側 PCMU と双方向中継 (Issue #73 follow-up) |
+| WebRTC peer ↔ RtpBridge 結線 | **Issue #121 で解消済**: `MediaBridge::WebRtcAudio` を新設し、 内線側 UDP socket を bind せず `peer.send_media` / `peer.take_media_rx` の MediaFrame mpsc で双方向結線。 NGN UDP socket とは Opus⇔PCMU トランスコードで橋渡し | (現状で完成) |
+| ICE candidate pre-buffer | **Issue #91 で解消済**: PWA `App.tsx` が `call` 生成前に届いた `ServerMessage::Ice` を `pendingIceCandidates: string[]` に蓄積、 `acceptIncomingOffer` / `placeCall` 直後に `flushPendingIce()` で順次 `addIce` する (RFC 8445 §6.1.2.1) | (現状で完成) |
 | ICE failure 通知 | `local_cand_rx` が drop されたら run_loop 終了するだけ | `B2buaCall` に通知 → NGN レッグで CANCEL 発射 |
 | `ExtTransport::WebRtc` の bind 構造 | `registrar.rs` が `webrtc::peer::PeerSession` を直接 import (層越境) | `ExtCallTarget` trait 経由 |
 

@@ -122,6 +122,13 @@ pub enum ForkResult {
     Answered {
         winner_uri: String,
         response: SipResponse,
+        /// Issue #87 / #121: WebRTC レッグが winner の場合に
+        /// `start_bridge_for_inbound` から peer の MediaFrame I/O に
+        /// アクセスするための handle。 SIP レッグなら `None`。
+        ///
+        /// 入手元は [`crate::call::orchestrator::fork_to_bindings`] (WebRTC
+        /// 専用 leg)。 [`fork_to_extensions`] (SIP only) では常に `None`。
+        webrtc_handle: Option<crate::call::orchestrator::WebRtcLegArtifacts>,
     },
     /// 全レッグが Busy/Decline で確定失敗。
     AllFailed { last_status: Option<u16> },
@@ -198,6 +205,7 @@ pub async fn fork_to_extensions(
                 return ForkResult::Answered {
                     winner_uri,
                     response,
+                    webrtc_handle: None,
                 };
             }
             LegOutcome::Failed { status, .. } => {

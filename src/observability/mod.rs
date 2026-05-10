@@ -82,6 +82,15 @@ pub struct Metrics {
     pub rtp_bridge_ngn_to_ext: AtomicU64,
     pub rtp_bridge_ext_to_ngn: AtomicU64,
     pub extension_registered: AtomicU64,
+    /// Issue #157: rate limiter で拒否された outbound INVITE 累計
+    /// (TTC JJ-90.24 §5.7.1 連続抑制適用回数)。 direction で内線/PWA を区別する。
+    pub invite_blocked_by_rate_limit_extension: AtomicU64,
+    pub invite_blocked_by_rate_limit_pwa_outbound: AtomicU64,
+    /// Issue #157: 連続発信間隔 (ms 解像度) の累計とサンプル数。
+    /// 平均値 = sum / count で計算可能 (簡易ヒストグラム代替)。
+    /// `last_invite_at` から現在発信までの経過時間を `Allow` 時に記録する。
+    pub invite_interval_total_ms: AtomicU64,
+    pub invite_interval_samples: AtomicU64,
 }
 
 impl Metrics {
@@ -161,6 +170,24 @@ impl Metrics {
             InviteResult::Error => &self.invite_pwa_outbound_error,
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #157: 連続発信抑制 (TTC JJ-90.24 §5.7.1) で 503 / busy 早期拒否
+    /// した outbound INVITE を direction 別に記録する。
+    pub fn record_invite_blocked_by_rate_limit(&self, direction: OutboundDirection) {
+        match direction {
+            OutboundDirection::Extension => &self.invite_blocked_by_rate_limit_extension,
+            OutboundDirection::PwaOutbound => &self.invite_blocked_by_rate_limit_pwa_outbound,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #157: BYE 200 OK / 連続 INVITE の発射間隔 (ms) を記録する。
+    /// `sabiden_sip_invite_interval_seconds` の sum/count に対応 (簡易 histogram)。
+    pub fn record_invite_interval_ms(&self, interval_ms: u64) {
+        self.invite_interval_total_ms
+            .fetch_add(interval_ms, Ordering::Relaxed);
+        self.invite_interval_samples.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format で全メトリクスを書き出す。
@@ -255,6 +282,42 @@ impl Metrics {
             self.extension_registered.load(Ordering::Relaxed)
         ));
 
+        // Issue #157: TTC JJ-90.24 §5.7.1 連続抑制で拒否された outbound INVITE。
+        out.push_str(
+            "# HELP sabiden_sip_invite_blocked_by_rate_limit_total \
+             連続発信抑制 (TTC JJ-90.24 §5.7.1 / RFC 3261 §21.5.4) で 503 拒否した INVITE 累計\n",
+        );
+        out.push_str("# TYPE sabiden_sip_invite_blocked_by_rate_limit_total counter\n");
+        out.push_str(&format!(
+            "sabiden_sip_invite_blocked_by_rate_limit_total{{direction=\"extension\"}} {}\n",
+            self.invite_blocked_by_rate_limit_extension
+                .load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_sip_invite_blocked_by_rate_limit_total{{direction=\"pwa_outbound\"}} {}\n",
+            self.invite_blocked_by_rate_limit_pwa_outbound
+                .load(Ordering::Relaxed)
+        ));
+
+        // Issue #157: 連続 INVITE 発射間隔 (秒)。 簡易 histogram 代替として
+        // sum + count を公開する (Prometheus summary 互換)。
+        out.push_str(
+            "# HELP sabiden_sip_invite_interval_seconds 連続 outbound INVITE 発射間隔 (秒、 sum/count で平均算出可)\n",
+        );
+        out.push_str("# TYPE sabiden_sip_invite_interval_seconds summary\n");
+        let total_ms = self.invite_interval_total_ms.load(Ordering::Relaxed);
+        let samples = self.invite_interval_samples.load(Ordering::Relaxed);
+        // ms → 秒変換 (浮動小数で 3 桁精度)。
+        let sum_secs = (total_ms as f64) / 1000.0;
+        out.push_str(&format!(
+            "sabiden_sip_invite_interval_seconds_sum {:.3}\n",
+            sum_secs
+        ));
+        out.push_str(&format!(
+            "sabiden_sip_invite_interval_seconds_count {}\n",
+            samples
+        ));
+
         out
     }
 }
@@ -266,6 +329,26 @@ pub enum InviteResult {
     Busy,
     Timeout,
     Error,
+}
+
+/// Issue #157: rate limiter / interval メトリクスの outbound 方向ラベル。
+///
+/// - `Extension`: 内線 SIP UA → sabiden → NGN (`UasEventHandler::handle_invite`)
+/// - `PwaOutbound`: WebRTC PWA → sabiden → NGN (`UasEventHandler::handle_pwa_outbound_offer`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDirection {
+    Extension,
+    PwaOutbound,
+}
+
+impl OutboundDirection {
+    /// Prometheus ラベル文字列。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutboundDirection::Extension => "extension",
+            OutboundDirection::PwaOutbound => "pwa_outbound",
+        }
+    }
 }
 
 /// SIP メッセージファイルダンパ。
@@ -579,6 +662,10 @@ mod tests {
         // PR #146 review #1 🟡#1: PWA→NGN 発信専用カウンタ
         m.record_invite_pwa_outbound(InviteResult::Answered);
         m.record_invite_pwa_outbound(InviteResult::Timeout);
+        // Issue #157: rate limiter / interval metrics
+        m.record_invite_blocked_by_rate_limit(OutboundDirection::Extension);
+        m.record_invite_blocked_by_rate_limit(OutboundDirection::PwaOutbound);
+        m.record_invite_interval_ms(2500);
         m.inc_call_active();
         m.add_rtp_ngn_to_ext(5);
         m.add_rtp_ext_to_ngn(7);
@@ -597,6 +684,14 @@ mod tests {
         ));
         assert!(body
             .contains("sabiden_sip_invite_total{direction=\"pwa_outbound\",result=\"timeout\"} 1"));
+        // Issue #157
+        assert!(body
+            .contains("sabiden_sip_invite_blocked_by_rate_limit_total{direction=\"extension\"} 1"));
+        assert!(body.contains(
+            "sabiden_sip_invite_blocked_by_rate_limit_total{direction=\"pwa_outbound\"} 1"
+        ));
+        assert!(body.contains("sabiden_sip_invite_interval_seconds_sum 2.500"));
+        assert!(body.contains("sabiden_sip_invite_interval_seconds_count 1"));
         assert!(body.contains("sabiden_call_active 1"));
         assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ngn_to_ext\"} 5"));
         assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ext_to_ngn\"} 7"));

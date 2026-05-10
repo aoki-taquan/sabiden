@@ -51,9 +51,10 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use super::bridge::{BridgeConfig, MediaBridge, RtpBridge};
 use super::codec_pipeline::{select_media_plan, MediaPlan};
 use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker};
+use super::rate_limiter::{parse_retry_after, OutboundRateLimiter, RateLimitDecision};
 use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
-use crate::observability::{InviteResult, Metrics};
+use crate::observability::{InviteResult, Metrics, OutboundDirection};
 use crate::sdp::builder::{
     convert_savpf_to_avp, restrict_audio_to_pcmu, restrict_audio_to_pcmu_with_dtmf,
     rewrite_rtp_endpoint,
@@ -1258,6 +1259,13 @@ pub struct UasEventHandler {
     webrtc_outbound_active: WebRtcOutboundActive,
     /// 観測カウンタ。内線発信 INVITE の結果を記録する。
     metrics: Arc<Metrics>,
+    /// Issue #157: outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1)。
+    /// 内線→NGN / PWA→NGN 双方の outbound 経路でこの 1 インスタンスを共有し、
+    /// 同 AOR への連投を 503 + Retry-After で早期拒否する (RFC 3261 §21.5.4)。
+    /// `Arc` で wrap せず本構造体に直に embedded すれば、 全 outbound 経路から
+    /// `&self.outbound_rate_limiter` で参照できる (内部は `Mutex<HashMap>` で
+    /// スレッド安全)。
+    outbound_rate_limiter: Arc<OutboundRateLimiter>,
 }
 
 impl UasEventHandler {
@@ -1277,6 +1285,7 @@ impl UasEventHandler {
             bridge_ext_bind_ip: None,
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
+            outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
         })
     }
 
@@ -1314,6 +1323,7 @@ impl UasEventHandler {
             bridge_ext_bind_ip,
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
+            outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
         })
     }
 
@@ -1339,7 +1349,24 @@ impl UasEventHandler {
             bridge_ext_bind_ip,
             webrtc_outbound_active,
             metrics,
+            outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
         })
+    }
+
+    /// Issue #157: 外部からカスタム設定の rate limiter を注入するための setter。
+    /// 構築直後 (まだ shared されていない) の `Arc<Self>` にのみ呼べる。
+    /// テスト / 設定駆動でパラメータを変更したい場合に使う (例: `min_interval`
+    /// を 1 秒に下げて E2E test を高速化)。
+    pub fn set_outbound_rate_limiter(self: &mut Arc<Self>, limiter: Arc<OutboundRateLimiter>) {
+        let me =
+            Arc::get_mut(self).expect("set_outbound_rate_limiter は単一所有時に呼ぶ必要がある");
+        me.outbound_rate_limiter = limiter;
+    }
+
+    /// Issue #157: rate limiter の Arc 参照を返す。
+    /// テスト / observability から最新状態を観察する用途。
+    pub fn outbound_rate_limiter(&self) -> Arc<OutboundRateLimiter> {
+        self.outbound_rate_limiter.clone()
     }
 
     /// `webrtc_outbound_active` の Arc を返す (Issue #147)。
@@ -1391,6 +1418,7 @@ impl UasEventHandler {
             bridge_ext_bind_ip,
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
+            outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
         })
     }
 
@@ -1508,6 +1536,32 @@ impl UasEventHandler {
         );
         async move {
             info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
+
+            // Issue #157: TTC JJ-90.24 §5.7.1 (連続リクエスト送信制限) を遵守し、
+            // 同 AOR からの連投を 503 Service Unavailable + Retry-After で
+            // 早期拒否する (RFC 3261 §21.5.4 / §20.33)。 NGN P-CSCF に流す前に
+            // 端末側で抑制することで、 NGN 側 cooldown (= 連鎖 5xx の原因) を
+            // 起こさない。
+            let rate_decision = self.outbound_rate_limiter.check_and_record(&from_aor);
+            if let RateLimitDecision::Deny { retry_after } = rate_decision {
+                let secs = retry_after.as_secs();
+                warn!(
+                    aor = %from_aor,
+                    retry_after_secs = %secs,
+                    "内線 INVITE を rate limiter で 503 拒否 (TTC JJ-90.24 §5.7.1)"
+                );
+                self.metrics
+                    .record_invite_blocked_by_rate_limit(OutboundDirection::Extension);
+                self.metrics
+                    .record_invite_extension(InviteResult::Error);
+                // RFC 3261 §21.5.4: 503 + Retry-After で内線へ通知。
+                let resp = build_503_with_retry_after(&request, secs);
+                if let Err(e) = responder.respond(resp).await {
+                    warn!(error=%e, "503 Service Unavailable 送出失敗");
+                }
+                return Ok(());
+            }
+
             // Asterisk 実機準拠 (`docs/asterisk-real-invite.md` §5.1):
             // 内線が出した Request-URI (LAN private IP / NGN ドメイン) を
             // P-CSCF IP+port に正規化する。NGN は Request-URI host に P-CSCF
@@ -1586,6 +1640,9 @@ impl UasEventHandler {
 
             match outcome {
                 Ok(InviteOutcome::Established(call)) => {
+                    // Issue #157: 2xx 確立 = NGN 側 cooldown 解除と解釈し、
+                    // failure_streak をリセットする (TTC §5.7.1 連続抑制の継続を防ぐ)。
+                    self.outbound_rate_limiter.record_success(&from_aor);
                     if was_cancelled {
                         // CANCEL 後に NGN 200 OK が間に合った場合は RFC 3261 §15.1.1 に
                         // 従い直ちに BYE を送って通話を解放する。内線側は 487 で
@@ -1679,6 +1736,19 @@ impl UasEventHandler {
                         InviteResult::Error
                     };
                     self.metrics.record_invite_ngn(result);
+                    // Issue #157: TTC JJ-90.24 §5.7.3 (INVITE 5xx 自動 retry 禁止 +
+                    // Retry-After 尊重) を rate limiter にフィードバック。
+                    // NGN が Retry-After ヘッダを付けてくれば parser で抽出する
+                    // (RFC 3261 §20.33)。 4xx (例 486) は streak 対象外。
+                    let retry_after_secs = response
+                        .headers
+                        .get("retry-after")
+                        .and_then(parse_retry_after);
+                    self.outbound_rate_limiter.record_failure(
+                        &from_aor,
+                        response.status_code,
+                        retry_after_secs,
+                    );
                     responder
                         .quick(response.status_code, response.reason.as_str())
                         .await
@@ -1692,6 +1762,10 @@ impl UasEventHandler {
                     }
                     warn!(error=%e, "NGN 側 INVITE トランスポート失敗 → 503");
                     self.metrics.record_invite_ngn(InviteResult::Timeout);
+                    // Issue #157: トランスポート失敗も 5xx 相当として backoff 対象に含める。
+                    // タイムアウトの連続発射は NGN cooldown を起こす典型例。
+                    self.outbound_rate_limiter
+                        .record_failure(&from_aor, 503, None);
                     responder.quick(503, "Service Unavailable").await
                 }
             }
@@ -2368,6 +2442,40 @@ impl PwaOutboundHandler for UasEventHandler {
             ));
         }
 
+        // (a') Issue #157: TTC JJ-90.24 §5.7.1 連続抑制を PWA→NGN 経路にも適用する。
+        //      PWA は SIP dialog を持たず複数 WS セッションが共通の NGN AOR
+        //      (= sabiden REGISTER 番号) を共有するので、 ngn_uac の local AOR
+        //      を rate-limit bucket key として使う。 これにより複数タブからの
+        //      連投も同じ bucket でカウントされ、 NGN cooldown 連鎖を防ぐ。
+        //      拒否時は browser に `ServerMessage::Error { code: "rate_limited", ... }`
+        //      を返し、 PWA UI 側で「○秒お待ちください」を出す手掛かりにする
+        //      (frontend UI 連発抑止は別 issue、 本 PR の scope 外)。
+        let rate_aor = ngn_aor_from_uac(&self.ngn_uac);
+        if let RateLimitDecision::Deny { retry_after } =
+            self.outbound_rate_limiter.check_and_record(&rate_aor)
+        {
+            let secs = retry_after.as_secs();
+            warn!(
+                aor = %rate_aor,
+                retry_after_secs = %secs,
+                "PWA outbound INVITE を rate limiter で拒否 (TTC JJ-90.24 §5.7.1)"
+            );
+            self.metrics
+                .record_invite_blocked_by_rate_limit(OutboundDirection::PwaOutbound);
+            self.metrics.record_invite_pwa_outbound(InviteResult::Error);
+            let _ = ws_sink.send(ServerMessage::error(
+                "rate_limited",
+                format!(
+                    "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after {} sec",
+                    secs
+                ),
+            ));
+            return Err(anyhow!(
+                "PWA outbound rate-limited: retry after {} sec",
+                secs
+            ));
+        }
+
         // (b) browser SAVPF offer を str0m に渡し、 SAVPF answer を取得
         //     (RFC 3264 §6, RFC 8829)。
         let browser_answer = peer
@@ -2425,6 +2533,10 @@ impl PwaOutboundHandler for UasEventHandler {
         let ws_sink_clone = ws_sink.clone();
         let target_owned = target.to_string();
         let browser_answer_for_opus = browser_answer.clone();
+        // Issue #157: 背景タスクから結果を rate limiter にフィードバックする
+        // ため、 limiter / AOR の clone を持ち込む。
+        let rate_limiter = self.outbound_rate_limiter.clone();
+        let rate_aor_owned = rate_aor.clone();
         let span = info_span!("pwa_outbound_invite_bg", target = %target);
 
         let completion = tokio::spawn(
@@ -2440,6 +2552,8 @@ impl PwaOutboundHandler for UasEventHandler {
                             "NGN 200 OK 取得 → PWA peer ⇄ NGN bridge 起動"
                         );
                         metrics.record_invite_ngn(InviteResult::Answered);
+                        // Issue #157: 2xx 確立で rate limiter の failure_streak リセット。
+                        rate_limiter.record_success(&rate_aor_owned);
 
                         // Issue #147 leak 防止: ここから下で sabiden 側の bridge
                         // 起動 / CallManager 登録のいずれかが失敗すると、 NGN は既に
@@ -2572,6 +2686,17 @@ impl PwaOutboundHandler for UasEventHandler {
                         };
                         metrics.record_invite_ngn(result);
                         metrics.record_invite_pwa_outbound(result);
+                        // Issue #157: NGN 5xx + Retry-After を rate limiter にフィードバック。
+                        // TTC JJ-90.24 §5.7.3 (INVITE 5xx 自動 retry 禁止) / RFC 3261 §20.33。
+                        let retry_after_secs = response
+                            .headers
+                            .get("retry-after")
+                            .and_then(parse_retry_after);
+                        rate_limiter.record_failure(
+                            &rate_aor_owned,
+                            response.status_code,
+                            retry_after_secs,
+                        );
                         let _ = ws_sink_clone.send(ServerMessage::error(
                             "outbound_failed",
                             format!(
@@ -2589,6 +2714,9 @@ impl PwaOutboundHandler for UasEventHandler {
                         warn!(error=%e, "NGN INVITE トランスポート失敗");
                         metrics.record_invite_ngn(InviteResult::Timeout);
                         metrics.record_invite_pwa_outbound(InviteResult::Timeout);
+                        // Issue #157: トランスポート失敗 (timer B / I/O 等) も 5xx 相当として
+                        // backoff 対象にする。 失敗連投で NGN cooldown を起こすのと等価。
+                        rate_limiter.record_failure(&rate_aor_owned, 503, None);
                         let _ = ws_sink_clone.send(ServerMessage::error(
                             "outbound_failed",
                             format!("NGN INVITE 失敗: {}", e),
@@ -2716,6 +2844,58 @@ fn build_2xx_to_ext(invite: &SipRequest, body: &[u8], contact_uri: &str) -> SipR
     resp.headers.set("Contact", format!("<{}>", contact_uri));
     ensure_to_tag(&mut resp);
     resp
+}
+
+/// Issue #157: rate limiter で拒否した INVITE への 503 Service Unavailable +
+/// Retry-After ヘッダ付き応答を組み立てる。
+///
+/// RFC 3261 §21.5.4 (503 Service Unavailable):
+/// > "The server is temporarily unable to process the request due to a
+/// >  temporary overloading or maintenance of the server.  The server MAY
+/// >  indicate when the client should retry the request in a Retry-After
+/// >  header field."
+///
+/// RFC 3261 §20.33 (Retry-After): 秒単位整数を入れる。 sabiden の rate limiter
+/// が返す `retry_after` は最低 1 秒に切り上げ済 (`round_up_secs`)。
+///
+/// TTC JJ-90.24 §5.7.3: 内線/PWA が 5xx を受信した場合、 自動 retry せず
+/// Retry-After で示された時間内は同じ Request-URI への INVITE を出さない。
+/// sabiden が 503 + Retry-After を返すことで、 PWA / 内線が即時再発信
+/// (= NGN cooldown の連鎖を起こす最悪パターン) を回避する。
+fn build_503_with_retry_after(invite: &SipRequest, retry_after_secs: u64) -> SipResponse {
+    let mut resp = build_response_skeleton(invite, 503, "Service Unavailable");
+    resp.headers
+        .set("Retry-After", format!("{}", retry_after_secs));
+    // RFC 3261 §8.2.6.2: dialog を作らない final 応答にも To-tag を付与する。
+    ensure_to_tag(&mut resp);
+    resp
+}
+
+/// Issue #157: PWA→NGN 経路用の rate-limit bucket key (AOR) を `Uac` から取り出す。
+///
+/// PWA は SIP dialog を持たないため、 ハンドラ呼出時点で内線 From-AOR が無い。
+/// 代わりに「sabiden 自身が REGISTER している NGN AOR」(= ngn_uac の local URI)
+/// を共通 bucket key として使う。 複数の PWA WS セッションが同時にぶら下がっても
+/// 全部同じ key に集約されるため、 NGN P-CSCF から見た「同一 AOR からの連投」を
+/// 正しく抑制できる (TTC JJ-90.24 §5.7.1)。
+///
+/// `local_uri` (例 `sip:0312345678@ntt-east.ne.jp`) からユーザー部のみ取り出して
+/// 短い key にする。 抽出失敗時は URI 全体を fallback として使う (= ロジックは
+/// 変わらず、 ただ key が長いだけ)。
+fn ngn_aor_from_uac(uac: &Uac) -> String {
+    let local_uri = uac.config().local_addr_of_record();
+    extract_user_from_sip_uri(local_uri).unwrap_or_else(|| local_uri.to_string())
+}
+
+/// `sip:user@host[;params]` から `user` 部分を取り出す。 失敗時 None。
+/// `sip:host` (user 無し) も None。
+fn extract_user_from_sip_uri(uri: &str) -> Option<String> {
+    let after_scheme = uri.split_once(':').map(|x| x.1).unwrap_or(uri);
+    let user_part = after_scheme.split_once('@').map(|x| x.0)?;
+    if user_part.is_empty() {
+        return None;
+    }
+    Some(user_part.to_string())
 }
 
 /// `<sip:user@host>;tag=...` のような name-addr / addr-spec から URI 部分のみ抽出する。
@@ -9263,5 +9443,209 @@ mod tests {
             0,
             "inbound_mgr 側には何も登録されていない (= terminate は silent no-op)"
         );
+    }
+
+    /// Issue #157 / TTC JJ-90.24 §5.7.1 / RFC 3261 §21.5.4 / §20.33:
+    /// 内線→NGN 連投時、 sabiden は 2 本目を NGN に到達させる前に
+    /// 503 Service Unavailable + Retry-After で内線へ早期拒否する。
+    ///
+    /// シナリオ:
+    /// 1. AOR "iphone" から 1 本目の INVITE → rate limiter は Allow (初回)
+    /// 2. 即座に AOR "iphone" から 2 本目の INVITE → rate limiter は Deny
+    /// 3. 2 本目の応答は 503 + Retry-After ヘッダ付き
+    /// 4. NGN 側には 2 本目は届かない (fake NGN は 1 回しか受信しない)
+    #[tokio::test]
+    async fn rfc3261_21_5_4_extension_outbound_rate_limited_returns_503_retry_after() {
+        use crate::call::rate_limiter::{OutboundRateLimiter, RateLimiterConfig};
+        use crate::sip::uac::UacConfig;
+
+        // (1) フェイク NGN: INVITE を受けたら 200 OK を返す。
+        //     2 本目は届かない想定なので、 1 INVITE 分のループだけ用意する。
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let invite_count = Arc::new(StdMutex::new(0u32));
+        let invite_count_c = invite_count.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let res = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    fake_ngn_clone.recv_from(&mut buf),
+                )
+                .await;
+                let (n, peer) = match res {
+                    Ok(Ok(v)) => v,
+                    _ => break,
+                };
+                let parsed = parse_message(&buf[..n]).unwrap();
+                if let SipMessage::Request(req) = parsed {
+                    if req.method == SipMethod::Invite {
+                        *invite_count_c.lock().unwrap() += 1;
+                        let mut resp = build_response_skeleton(&req, 200, "OK");
+                        resp.headers.set(
+                            "To",
+                            format!("{};tag=ngn-tag", req.headers.get("to").unwrap()),
+                        );
+                        resp.headers
+                            .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+                        let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
+                    }
+                }
+            }
+        });
+
+        // (2) sabiden NGN 側 UAC
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // (3) UasEventHandler: rate limiter を超短 min_interval で構築すると
+        //     どうしても 1 本目と 2 本目の発射タイミング差で flaky になるので、
+        //     min_interval=60 秒に設定して 2 本目を確実に Deny させる。
+        let mut handler = UasEventHandler::new(ngn_uac);
+        handler.set_outbound_rate_limiter(Arc::new(OutboundRateLimiter::with_config(
+            RateLimiterConfig {
+                min_interval: Duration::from_secs(60),
+                failure_backoff_steps: vec![],
+            },
+        )));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        handler.clone().spawn(event_rx);
+
+        // (4) 模擬内線 UAS の sabiden 側 socket
+        let phone_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_addr = phone_sock.local_addr().unwrap();
+        let sabiden_uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+
+        // 共通の INVITE 生成 (Call-ID は毎回変える)
+        let make_invite = |call_id: &str| {
+            let mut invite = SipRequest::new(SipMethod::Invite, "sip:117@192.168.20.239");
+            invite.headers.set(
+                "Via",
+                format!("SIP/2.0/UDP {};branch=z9hG4bK-{}", phone_addr, call_id),
+            );
+            invite
+                .headers
+                .set("From", "<sip:iphone@sabiden>;tag=phonereq");
+            invite.headers.set("To", "<sip:117@192.168.20.239>");
+            invite.headers.set("Call-ID", call_id);
+            invite.headers.set("CSeq", "1 INVITE");
+            invite.headers.set("Content-Type", "application/sdp");
+            invite.body = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\n\
+                            c=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                            m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec();
+            invite
+        };
+
+        // (5) 1 本目: NGN へ届く
+        let invite1 = make_invite("rl-call-1");
+        phone_sock
+            .send_to(&invite1.to_bytes(), sabiden_uas_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) =
+            tokio::time::timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let parsed = parse_message(&buf[..n]).unwrap();
+        let req = match parsed {
+            SipMessage::Request(r) => r,
+            _ => panic!("INVITE 期待"),
+        };
+        let stx1 = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
+        let responder1 = crate::testing::builders::responder_handle_for_test(stx1);
+        event_tx
+            .send(UasEvent::Invite {
+                from_aor: "iphone".to_string(),
+                request: req,
+                remote,
+                responder: responder1,
+            })
+            .unwrap();
+        // 1 本目の処理が始まるのを待ってから 2 本目を出す
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // (6) 2 本目: rate limiter で 503 + Retry-After で返るはず
+        let invite2 = make_invite("rl-call-2");
+        let phone_sock2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        phone_sock2
+            .send_to(&invite2.to_bytes(), sabiden_uas_addr)
+            .await
+            .unwrap();
+        let (n2, remote2) =
+            tokio::time::timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let parsed2 = parse_message(&buf[..n2]).unwrap();
+        let req2 = match parsed2 {
+            SipMessage::Request(r) => r,
+            _ => panic!("INVITE 期待"),
+        };
+        let stx2 = ServerTransaction::new(req2.clone(), remote2, sabiden_uas_sock.clone()).unwrap();
+        let responder2 = crate::testing::builders::responder_handle_for_test(stx2);
+        event_tx
+            .send(UasEvent::Invite {
+                from_aor: "iphone".to_string(),
+                request: req2,
+                remote: remote2,
+                responder: responder2,
+            })
+            .unwrap();
+
+        // (7) 2 本目の応答を phone_sock2 で受信 → 503 + Retry-After 検証
+        let mut buf2 = vec![0u8; 4096];
+        let recv =
+            tokio::time::timeout(Duration::from_secs(3), phone_sock2.recv_from(&mut buf2)).await;
+        let (rn, _ra) = recv
+            .expect("2 本目への 503 応答がタイムアウト前に到着するべき")
+            .unwrap();
+        let resp_msg = parse_message(&buf2[..rn]).unwrap();
+        let resp = match resp_msg {
+            SipMessage::Response(r) => r,
+            _ => panic!("レスポンス期待"),
+        };
+        assert_eq!(
+            resp.status_code, 503,
+            "TTC JJ-90.24 §5.7.1 / RFC 3261 §21.5.4: rate-limited INVITE には 503"
+        );
+        let retry_after = resp
+            .headers
+            .get("retry-after")
+            .expect("RFC 3261 §20.33: 503 Service Unavailable には Retry-After ヘッダを付けるべき");
+        let secs: u32 = retry_after.parse().expect("Retry-After は整数秒");
+        assert!(
+            (1..=60).contains(&secs),
+            "Retry-After は 1..=60 の範囲 (min_interval=60): {}",
+            secs
+        );
+
+        // (8) NGN 側に届いた INVITE は 1 本のみ
+        // (1 本目の 200 OK→ACK→BYE で fake_ngn ループが drain して終わる)
+        // 少し待ってから検査する。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            *invite_count.lock().unwrap(),
+            1,
+            "rate limiter が 2 本目を NGN に流していないこと"
+        );
+
+        ngn_task.abort();
     }
 }

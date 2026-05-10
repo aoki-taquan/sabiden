@@ -395,6 +395,7 @@ impl NgnInboundHandler {
                 ForkResult::Answered {
                     winner_uri,
                     response,
+                    webrtc_handle,
                 } => {
                     info!(%winner_uri, "NGN 側に 200 OK を返す");
                     // RTP ブリッジを起動して 200 OK SDP の `c=`/`m= port` を
@@ -417,7 +418,12 @@ impl NgnInboundHandler {
                     //   従来通り answer をそのまま透過する。
                     let bridged_mode = self.call_manager.is_some();
                     let body_for_ngn = match self
-                        .start_bridge_for_inbound(&request.body, &response.body, &call_id)
+                        .start_bridge_for_inbound(
+                            &request.body,
+                            &response.body,
+                            &call_id,
+                            webrtc_handle,
+                        )
                         .await
                     {
                         Ok(rewritten) => rewritten,
@@ -534,13 +540,21 @@ impl NgnInboundHandler {
     /// sabiden 側に書き換えて返す。
     ///
     /// `ngn_offer` は NGN INVITE の SDP オファ、`ext_answer` は内線 200 OK の
-    /// SDP アンサ。両者から各ピアの RTP エンドポイントを抽出し、sabiden 側に
-    /// 中継用 UDP ソケットを 2 つ bind して `RtpBridge` を起動する。
+    /// SDP アンサ。
+    ///
+    /// # 分岐
+    ///
+    /// - SIP 内線レッグ: 両側に UDP socket を bind し、 [`RtpBridge`] (PCMU
+    ///   両側) または [`TranscodingBridge`] (Opus⇔PCMU) を起動する。
+    /// - WebRTC 内線レッグ (`webrtc_handle.is_some()`): 内線側の UDP socket は
+    ///   bind せず、 `peer.send_media` / `peer.take_media_rx` 経由で
+    ///   [`MediaBridge::WebRtcAudio`] を起動する (Issue #87 / #121)。
     async fn start_bridge_for_inbound(
         &self,
         ngn_offer: &[u8],
         ext_answer: &[u8],
         call_id: &str,
+        webrtc_handle: Option<WebRtcLegArtifacts>,
     ) -> Result<Vec<u8>> {
         let mgr = self
             .call_manager
@@ -551,13 +565,53 @@ impl NgnInboundHandler {
         }
 
         let ngn_peer = extract_rtp_endpoint(ngn_offer)?;
-        let ext_peer = extract_rtp_endpoint(ext_answer)?;
 
         let ngn_bind_ip = self.bridge_ngn_ip();
-        let ext_bind_ip = self.bridge_ext_ip();
         let ngn_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
-        let ext_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await?);
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
+
+        // Issue #87 / #121: WebRTC 内線レッグは UDP socket を持たない (peer
+        // 側は str0m が ICE/DTLS 上で多重化)。 `webrtc_handle` 経由で peer の
+        // MediaFrame I/O にアクセスし、 [`MediaBridge::WebRtcAudio`] を起動する。
+        if let Some(handle) = webrtc_handle {
+            info!(
+                ?ngn_peer,
+                sabiden_ngn=%sabiden_ngn_addr,
+                opus_pt=handle.opus_payload_type,
+                "WebRTC peer ⇔ NGN bridge 起動 (Issue #87 / #121)"
+            );
+            // NGN へ返す SDP は browser SDP 由来 (AVP に変換済) → PCMU only に
+            // 絞り、 `c=`/`m= port` を sabiden の NGN 側 socket に書き換える。
+            let pcmu_only = restrict_audio_to_pcmu_with_dtmf(ext_answer);
+            let rewritten = rewrite_rtp_endpoint(
+                &pcmu_only,
+                sabiden_ngn_addr.ip(),
+                sabiden_ngn_addr.port(),
+            )?;
+            let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
+                super::transcoder::WebRtcAudioConfig {
+                    ngn_socket: ngn_bridge_sock,
+                    ngn_peer: Some(ngn_peer),
+                    peer: handle.peer,
+                    peer_media_rx: handle.peer_media_rx,
+                    opus_payload_type: handle.opus_payload_type,
+                    metrics: Some(self.metrics.clone()),
+                },
+            )?
+            .into();
+            let cid = mgr.create_call().await;
+            mgr.attach_media_bridge(cid, bridge).await?;
+            self.active
+                .lock()
+                .await
+                .insert(call_id.to_string(), Some(cid));
+            return Ok(rewritten);
+        }
+
+        // SIP 内線レッグ: 既存パス (PCMU 純リレー / Opus⇔PCMU トランスコード)。
+        let ext_peer = extract_rtp_endpoint(ext_answer)?;
+        let ext_bind_ip = self.bridge_ext_ip();
+        let ext_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await?);
 
         info!(
             ?ngn_peer,
@@ -1745,6 +1799,10 @@ enum LegResult {
         aor: String,
         winner_uri: String,
         response: SipResponse,
+        /// Issue #87 / #121: WebRTC leg が winner の場合だけ Some。
+        /// `start_bridge_for_inbound` が `MediaBridge::WebRtcAudio` を起動する
+        /// ために peer の MediaFrame mpsc にアクセスする必要がある。
+        webrtc_handle: Option<WebRtcLegArtifacts>,
     },
     Failed {
         #[allow(dead_code)]
@@ -1755,6 +1813,22 @@ enum LegResult {
         #[allow(dead_code)]
         aor: String,
     },
+}
+
+/// Issue #87 / #121: WebRTC leg が winner になったときに
+/// `start_bridge_for_inbound` に渡す peer 関連のハンドル一式。
+///
+/// peer は SRTP 終端と Opus codec を抱えており、 `take_media_rx` は 1 度
+/// だけ取り出せる (= ここで取り出して所有権を bridge に渡す前提)。
+pub struct WebRtcLegArtifacts {
+    /// peer 本体 (SRTP / ICE / DTLS 終端済 [`PeerSession`])。
+    pub peer: Arc<dyn PeerSession>,
+    /// peer から `take_media_rx` で取り出した browser → orchestrator 方向の
+    /// MediaFrame receiver。 1 度だけ取れるので `WebRtcAudioBridge` に move
+    /// する想定。
+    pub peer_media_rx: mpsc::Receiver<crate::webrtc::peer::MediaFrame>,
+    /// SDP `a=rtpmap:<pt> opus/...` で negotiate した PT (Chromium 互換 既定 111)。
+    pub opus_payload_type: u8,
 }
 
 /// winner 決定後に Cancel を送るための WebRTC leg 識別子。
@@ -1800,6 +1874,7 @@ pub async fn fork_to_bindings(
                                 aor: aor_c,
                                 winner_uri: target_uri,
                                 response,
+                                webrtc_handle: None,
                             }
                         }
                         Ok(super::manager::LegOutcome::Failed { status, .. }) => {
@@ -1861,12 +1936,14 @@ pub async fn fork_to_bindings(
             LegResult::Established {
                 winner_uri,
                 response,
+                webrtc_handle,
                 ..
             } => {
                 info!(winner = %winner_uri, "fork_to_bindings: 内線 {} が応答", winner_uri);
                 break ForkResult::Answered {
                     winner_uri,
                     response,
+                    webrtc_handle,
                 };
             }
             LegResult::Failed { status, .. } => {
@@ -1996,6 +2073,28 @@ async fn run_webrtc_leg(
         }
     };
 
+    // (7) Issue #87 / #121: peer の MediaFrame I/O を取り出して bridge に
+    //   渡せるよう WebRtcLegArtifacts にまとめる。 `take_media_rx` は 1 度
+    //   しか取れないので、 ここで取り出して所有権を bridge に move する。
+    //   browser answer から Opus PT を抽出 (RFC 7587 §7.1)、 不在なら
+    //   Chromium 既定の 111 を使う。
+    let opus_pt = crate::call::transcoder::find_opus_payload_type(answer.as_bytes())
+        .unwrap_or(crate::call::transcoder::DEFAULT_OPUS_PT);
+    let webrtc_handle = match peer.take_media_rx().await {
+        Some(rx) => Some(WebRtcLegArtifacts {
+            peer: peer.clone(),
+            peer_media_rx: rx,
+            opus_payload_type: opus_pt,
+        }),
+        None => {
+            // stub backend / 取得済みなど。 bridge は起動できないが SIP
+            // 経路は維持する (orchestrator 側で 502 にする / 透過にするは
+            // is_unrewritten_webrtc_sdp 判定で分岐済)。
+            debug!(%aor, "WebRTC leg: peer.take_media_rx None (stub backend?)");
+            None
+        }
+    };
+
     let mut headers = SipHeaders::new();
     headers.set("Via", "SIP/2.0/WS webrtc.peer;branch=z9hG4bKwebrtc");
     headers.set("From", "<sip:webrtc>;tag=webrtc");
@@ -2013,6 +2112,7 @@ async fn run_webrtc_leg(
         aor,
         winner_uri: target_uri,
         response,
+        webrtc_handle,
     }
 }
 

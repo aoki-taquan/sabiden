@@ -69,7 +69,7 @@ frontend/
 │   ├── lib/
 │   │   ├── signaling.ts  # /signal WS クライアント (JSON プロトコル)
 │   │   ├── webrtc.ts     # RTCPeerConnection ラッパ
-│   │   └── storage.ts    # トークン保管 (localStorage)
+│   │   └── storage.ts    # トークン保管 (in-memory + sessionStorage、 Issue #109)
 │   ├── App.tsx
 │   ├── main.tsx
 │   └── styles.css        # iOS / Android 両対応

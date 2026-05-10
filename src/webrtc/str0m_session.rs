@@ -957,6 +957,74 @@ mod tests {
         assert!(r.is_err(), "run_loop 終了後は Err になる: {:?}", r);
     }
 
+    /// Issue #135 🟡 2 (server-side analog) / RFC 8839 §4.2 Trickle ICE:
+    /// ブラウザは SDP offer 受信前に local candidate を trickle してくる
+    /// ことがある (Chrome の典型挙動: setLocalDescription 完了直後に
+    /// `icegatheringstatechange` が走り、 host candidate が
+    /// `RTCPeerConnection.onicecandidate` で吐かれる)。
+    ///
+    /// str0m バックエンドは ICE-Lite で `add_remote_candidate` を SDP
+    /// exchange 前に受けても内部 ICE state に蓄積する (str0m 0.19
+    /// `Rtc::add_remote_candidate` 仕様、 RFC 8838 trickle ICE)。
+    /// 本テストは run_loop 起動直後 (= `accept_offer` 前) に
+    /// `add_ice_candidate` を呼んで command 経由で正常受理されることを
+    /// 確認する。 frontend の `pendingIceCandidates` バッファに頼らず、
+    /// server 側でも同等の堅牢性があることを担保。
+    #[tokio::test]
+    async fn str0m_session_add_remote_candidate_before_sdp_is_accepted() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (57000, 57999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+        // accept_offer / create_offer を呼ばずにいきなり remote candidate を
+        // 追加する。 ICE-Lite なので remote credentials 未確定でも str0m は
+        // 候補を保持する (RFC 8838: trickle).
+        let cand = "candidate:1 1 udp 2122252543 192.168.1.50 56789 typ host";
+        session
+            .add_ice_candidate(cand)
+            .await
+            .expect("SDP 交換前でも受理されるべき (RFC 8839 §4.2)");
+        let _ = session.close().await;
+    }
+
+    /// Issue #135 🟡 2 (server-side analog) / RFC 8839 §4.2: ICE → Offer →
+    /// ICE → ICE の interleave 順序でも全 candidate が受理される。
+    /// frontend `App.tsx` の `pendingIceCandidates` 修正と対応する
+    /// server-side 担保。
+    #[tokio::test]
+    async fn str0m_session_interleaved_ice_offer_ice_all_accepted() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (58000, 58999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.unwrap();
+
+        // (1) offer 前に 1 つ目
+        session
+            .add_ice_candidate("candidate:1 1 udp 2122252543 10.0.0.1 1000 typ host")
+            .await
+            .expect("ICE before offer");
+
+        // (2) offer
+        let offer = include_str!("testdata/firefox_offer.sdp");
+        let _answer = session.handle_offer(offer).await.expect("offer 受理");
+
+        // (3) offer 後に 2 つ + 終端マーカ相当
+        for cand in [
+            "candidate:2 1 udp 2122252543 10.0.0.2 2000 typ host",
+            "candidate:3 1 udp 1685987071 203.0.113.5 3000 typ srflx",
+        ] {
+            session
+                .add_ice_candidate(cand)
+                .await
+                .expect("ICE after offer");
+        }
+        let _ = session.close().await;
+    }
+
     /// `accept_answer` は対応する保留オファが無ければエラーを返す。
     #[tokio::test]
     async fn str0m_session_accept_answer_without_offer_errors() {

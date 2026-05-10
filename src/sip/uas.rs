@@ -31,7 +31,7 @@ use super::registrar::ExtensionRegistrar;
 use super::transaction::{
     build_response_skeleton, InboundRequest, ServerTransaction, TransactionLayer,
 };
-use super::utils::{new_call_id, new_tag};
+use super::utils::{has_to_tag, new_call_id, new_tag};
 use crate::config::{ExtensionConfig, UasConfig};
 use crate::observability::Metrics;
 
@@ -692,63 +692,6 @@ fn extract_user_from_addr(value: &str) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-/// `To:` ヘッダ値に `tag=` パラメータが付いているかを判定する。
-///
-/// RFC 3261 §14.2 / §12.2.2: 受信 INVITE の To に tag が付いている場合は
-/// in-dialog Re-INVITE (既存 dialog 内 SDP renegotiation 要求) であり、
-/// 新規 INVITE (To-tag 無し = dialog-creating) と扱いが異なる。
-///
-/// `;` で分割した各パラメータを `tag=` プレフィックスで判定する
-/// (`tag=` を含む URI 値部分 (`<sip:user;tag-x@host>` のような) を誤検出
-/// しないように、 `<...>` 内の `;` は無視する)。
-///
-/// パラメータ名 (`tag`) は **case-insensitive** に比較する
-/// (RFC 3261 §7.3.1 / §25.1: header parameter name は token であり、
-/// token の比較は大文字小文字を区別しない)。 そのため `;Tag=`、 `;TAG=` 等
-/// も Re-INVITE として扱う。 値部分は token 比較ではなく原文を保持するが、
-/// ここでは「空でないか」だけ検査する。
-fn has_to_tag(value: &str) -> bool {
-    // RFC 3261 §20.10: To = ( name-addr / addr-spec ) *( SEMI to-param )
-    // name-addr の山括弧 `<...>` 内には任意のセミコロンが現れるが、
-    // ヘッダパラメータとしての `;tag=` は山括弧の **外** にしか出ない。
-    let mut depth = 0i32;
-    let mut after_semi = false;
-    let mut start = 0usize;
-    let bytes = value.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'<' => depth += 1,
-            b'>' => depth -= 1,
-            b';' if depth == 0 => {
-                if after_semi && param_is_nonempty_tag(value[start..i].trim()) {
-                    return true;
-                }
-                after_semi = true;
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    if after_semi && param_is_nonempty_tag(value[start..].trim()) {
-        return true;
-    }
-    false
-}
-
-/// `tag=<value>` (パラメータ名 case-insensitive、 値非空) かを判定する。
-///
-/// RFC 3261 §7.3.1 / §25.1: header parameter name は token として
-/// case-insensitive 比較。 値 (token) は仕様上 case-sensitive だが、
-/// ここでは "tag が付いているか" だけが必要なので空チェックのみ。
-fn param_is_nonempty_tag(param: &str) -> bool {
-    let Some(eq_idx) = param.find('=') else {
-        return false;
-    };
-    let name = &param[..eq_idx];
-    let value = &param[eq_idx + 1..];
-    name.eq_ignore_ascii_case("tag") && !value.is_empty()
-}
-
 /// `Contact: <sip:user@host:port>;expires=...` から URI 部分を抽出。
 fn extract_uri_from_contact(contact: &str) -> String {
     let s = contact.trim();
@@ -762,9 +705,19 @@ fn extract_uri_from_contact(contact: &str) -> String {
 }
 
 /// レスポンスの To に tag が無ければ付与する (RFC 3261 §8.2.6.2)。
+///
+/// 既存 tag の有無判定は [`has_to_tag`] (RFC 3261 §7.3.1 / §25.1 で
+/// parameter name は case-insensitive) と同じヘルパに委ねる。 ナイーブに
+/// `to.contains("tag=")` で判定すると、 `;TAG=existing` のような大文字
+/// パラメータを「無し」と誤判定して `;tag=<new>` を末尾追加し、
+/// `To: <sip:dest>;TAG=existing;tag=new` の **二重 tag** で 200 OK を返す
+/// (RFC 3261 §12.2.2 違反; 内線 UA は ACK を送らず切断する) 罠がある。
+/// 共通ヘルパ経由にすることで `has_to_tag` (in-dialog Re-INVITE 判定) と
+/// `ensure_to_tag` (既存 tag 二重付与防止) の case-sensitivity を強制的に
+/// 揃える。
 fn ensure_to_tag(resp: &mut SipResponse) {
     if let Some(to) = resp.headers.get("to") {
-        if !to.contains("tag=") {
+        if !has_to_tag(to) {
             let new = format!("{};tag={}", to, new_tag());
             resp.headers.set("To", new);
         }
@@ -1303,39 +1256,6 @@ mod tests {
         );
     }
 
-    /// RFC 3261 §20.10 / §7.3.1 / §25.1 / Issue #94 / PR #136 review:
-    /// To ヘッダの tag パラメータ抽出は `tag=` を含む URI ユーザ部などを
-    /// 誤検出してはならず、 また parameter name (`tag`) は **case-insensitive**
-    /// 比較である。
-    #[test]
-    fn rfc3261_20_10_has_to_tag_detects_top_level_tag_only() {
-        // 通常の Re-INVITE 形式: name-addr + ;tag=
-        assert!(has_to_tag("<sip:dest@sabiden>;tag=abc123"));
-        // addr-spec + ;tag=
-        assert!(has_to_tag("sip:dest@sabiden;tag=xyz"));
-        // 新規 INVITE: tag 無し
-        assert!(!has_to_tag("<sip:dest@sabiden>"));
-        assert!(!has_to_tag("sip:dest@sabiden"));
-        // 山括弧内に `tag=` 文字列が含まれていても誤検出しない
-        // (URI userinfo / params が tag= と命名されているケース対策)
-        assert!(!has_to_tag("<sip:dest;tag=fake@sabiden>"));
-        // tag= の値が空なら無効扱い (RFC 3261 §19.3 token 必須)
-        assert!(!has_to_tag("<sip:dest@sabiden>;tag="));
-        // display-name 入りでも先頭 `<` の前に `;tag=` は出ない (構文上)。
-        // 例: `"alice" <sip:a@b>;tag=t1`
-        assert!(has_to_tag("\"alice\" <sip:a@b>;tag=t1"));
-        // RFC 3261 §7.3.1 / §25.1: parameter name は case-insensitive。
-        // `Tag=` `TAG=` `tAg=` 等も Re-INVITE として認識する必要がある。
-        assert!(has_to_tag("<sip:dest@sabiden>;Tag=abc"));
-        assert!(has_to_tag("<sip:dest@sabiden>;TAG=abc"));
-        assert!(has_to_tag("<sip:dest@sabiden>;tAg=abc"));
-        // 別パラメータ後の混在も正しく検出する
-        assert!(has_to_tag("<sip:dest@sabiden>;user=phone;Tag=abc"));
-        // `tag` で始まるが別名のパラメータ (`tagx=`) は検出しない
-        assert!(!has_to_tag("<sip:dest@sabiden>;tagx=abc"));
-        assert!(!has_to_tag("<sip:dest@sabiden>;TAGGED=abc"));
-    }
-
     #[test]
     fn extract_uri_brackets() {
         assert_eq!(
@@ -1349,6 +1269,72 @@ mod tests {
         assert_eq!(
             extract_uri_from_contact("sip:iphone@host"),
             "sip:iphone@host"
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 / §7.3.1 / §25.1 / §12.2.2 / PR #136 review fix:
+    /// `ensure_to_tag` は既存 To-tag の有無判定を **case-insensitive** で
+    /// 行わなければならない。 さもなくば内線が `;TAG=existing` 大文字で
+    /// 送ってきた Re-INVITE に対し sabiden が「tag 無し」と誤判定し
+    /// `;tag=<新規>` を末尾追加して `To: <sip:dest>;TAG=existing;tag=new`
+    /// の二重 tag を返す → 内線 UA は RFC 3261 §12.2.2 違反として ACK を
+    /// 送らず切断する。
+    #[test]
+    fn rfc3261_8_2_6_2_ensure_to_tag_is_case_insensitive_for_existing_tag() {
+        // 大文字 `;TAG=existing` (既存 dialog から内線が送ってきた Re-INVITE
+        // を sabiden が echo するケースを模擬)。 ensure_to_tag は既存 tag を
+        // 検出して **何もしない** べき。
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers
+            .set("To", "<sip:dest@sabiden>;TAG=existing-uas-tag");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;TAG=existing-uas-tag",
+            "case-insensitive に既存 tag を検出して二重付与してはならない: To={}",
+            to
+        );
+
+        // mixed case `;tAg=` も同様
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>;tAg=mixed");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;tAg=mixed",
+            "mixed case の既存 tag を保持: To={}",
+            to
+        );
+
+        // tag が本当に無いケース: ensure_to_tag が新規生成して付与するべき
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: crate::sip::message::SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            to.contains(";tag="),
+            "tag 無しなら付与する (RFC 3261 §8.2.6.2): To={}",
+            to
+        );
+        assert!(
+            !to.contains(";tag=;") && !to.ends_with(";tag="),
+            "値が空でない tag が付くべき: To={}",
+            to
         );
     }
 }

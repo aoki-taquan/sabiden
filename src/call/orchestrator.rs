@@ -695,9 +695,18 @@ impl NgnInboundHandler {
 }
 
 /// レスポンスの To に tag が無ければ付与する (RFC 3261 §8.2.6.2)。
+///
+/// 既存 tag の有無判定は [`crate::sip::utils::has_to_tag`] に委譲する
+/// (RFC 3261 §7.3.1 / §25.1 で parameter name は case-insensitive)。
+/// ナイーブに `to.contains("tag=")` で判定すると、 `;TAG=existing` の
+/// ような大文字 tag を「無し」と誤判定し `;tag=<new>` を末尾追加して
+/// `To: <sip:dest>;TAG=existing;tag=new` の二重 tag を返す
+/// (RFC 3261 §12.2.2 違反; 内線 UA は ACK を送らず切断する)。 内線が
+/// `;TAG=...` 大文字 Re-INVITE を送ってきた場合に 200 OK が壊れていた
+/// 問題 (PR #136 review) の根治。
 fn ensure_to_tag(resp: &mut SipResponse) {
     if let Some(to) = resp.headers.get("to") {
-        if !to.contains("tag=") {
+        if !crate::sip::utils::has_to_tag(to) {
             let new = format!("{};tag={}", to, crate::sip::utils::new_tag());
             resp.headers.set("To", new);
         }
@@ -2469,6 +2478,59 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
     use tokio::net::UdpSocket;
+
+    /// RFC 3261 §8.2.6.2 / §7.3.1 / §25.1 / §12.2.2 / PR #136 review fix:
+    /// orchestrator 側の `ensure_to_tag` も既存 To-tag 有無判定を
+    /// **case-insensitive** に行う。 `;TAG=existing` 大文字 / `;tAg=` 混在
+    /// に対し、 既存値を保持して二重 tag を作らないことを assert する。
+    /// 二重 tag を返すと内線 UA は §12.2.2 違反扱いで ACK を送らず切断する。
+    #[test]
+    fn rfc3261_8_2_6_2_orchestrator_ensure_to_tag_is_case_insensitive() {
+        // (1) 大文字 `;TAG=existing-uas-tag` → no-op で原文保持
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers
+            .set("To", "<sip:dest@sabiden>;TAG=existing-uas-tag");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;TAG=existing-uas-tag",
+            "orchestrator::ensure_to_tag: 大文字 TAG を尊重し二重付与しない: To={}",
+            to
+        );
+
+        // (2) mixed case `;tAg=` も保持
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>;tAg=mixed");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:dest@sabiden>;tAg=mixed",
+            "orchestrator::ensure_to_tag: mixed case を保持: To={}",
+            to
+        );
+
+        // (3) tag 真に無し: 新規付与する (RFC 3261 §8.2.6.2)
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            headers: SipHeaders::new(),
+            body: vec![],
+        };
+        resp.headers.set("To", "<sip:dest@sabiden>");
+        ensure_to_tag(&mut resp);
+        let to = resp.headers.get("to").unwrap();
+        assert!(to.contains(";tag="), "tag 無しなら新規付与: To={}", to);
+    }
 
     /// `is_unrewritten_webrtc_sdp` が WebRTC leg 由来の `0.0.0.0:9` SDP を検出する。
     /// 正常な SIP leg の LAN IP / 実 port SDP は false にすること。

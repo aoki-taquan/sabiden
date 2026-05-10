@@ -339,6 +339,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // (`[bridge] ngn_bind_ip` / `ext_bind_ip` は両方向で意味が同じ)。
             bridge_ngn_bind_ip: Some(bridge_ngn_ip),
             bridge_ext_bind_ip: Some(bridge_ext_ip),
+            // NGN へ返す 200 OK の Contact (in-dialog target) は eth1 sent-by IP
+            // を載せる。 socket bind は `0.0.0.0` なので socket.local_addr() を
+            // そのまま使うと NGN が ACK 不能で 10 秒後 CANCEL してくる。
+            ngn_local_addr: Some(local_addr_for_hdr),
         };
         // 着信 NGN→内線 用にも CallManager を渡す。outbound 側と同じ
         // `ext_registrar` を共有することで、登録テーブルを 1 つに保つ。

@@ -317,13 +317,23 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     // 由来で `iphone` 等が乗る → NGN は 500 Server Internal Error を返す)。
     // RFC 4566 §5.2 でも username が `-` (anonymous origin) は推奨形。
     sdp.origin.username = "-".to_string();
+    // ブラウザ生成 SDP は `o=- <huge-i64> 2 ...` のように 64-bit session-id を
+    // 出すが、NGN P-CSCF はおそらく 32-bit 値を期待しており overflow / 内部
+    // collision で 486 Busy Here を返す。 RFC 4566 §5.2 は uint64 を許すが、
+    // Asterisk 実機は小さい NTP 風数値 (例 397958033) を使っており確認済。
+    // 安全側で UNIX epoch 秒を採用 (32-bit に収まる、 単調増加、 衝突可能性低)。
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    sdp.origin.session_id = now_secs;
+    sdp.origin.session_version = now_secs;
     // セッションレベル c= は必ず sabiden を指すようにする
     sdp.connection = Some(Connection { address: addr });
 
     // 最初の audio media を sabiden 側に書き換える
     if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
         audio.port = port;
-        // メディアレベル c= が立っていればそちらも整合させる
         if audio.connection.is_some() {
             audio.connection = Some(Connection { address: addr });
         }
@@ -381,7 +391,15 @@ pub fn restrict_audio_to_pcmu(sdp_bytes: &[u8]) -> Vec<u8> {
                     | "record"
             ),
             Attribute::Property(p) => {
-                matches!(p.as_str(), "rtcp-mux" | "ice-lite" | "rtcp-rsize")
+                matches!(
+                    p.as_str(),
+                    "rtcp-mux"
+                        | "ice-lite"
+                        | "rtcp-rsize"
+                        | "extmap-allow-mixed"
+                        | "end-of-candidates"
+                        | "bundle-only"
+                )
             }
         }
     }
@@ -732,7 +750,15 @@ pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
                     | "record"
             ),
             Attribute::Property(p) => {
-                matches!(p.as_str(), "rtcp-mux" | "ice-lite" | "rtcp-rsize")
+                matches!(
+                    p.as_str(),
+                    "rtcp-mux"
+                        | "ice-lite"
+                        | "rtcp-rsize"
+                        | "extmap-allow-mixed"
+                        | "end-of-candidates"
+                        | "bundle-only"
+                )
             }
         }
     }

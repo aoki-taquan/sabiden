@@ -32,8 +32,51 @@ export const CallScreen: Component<CallScreenProps> = (props) => {
   createEffect(() => {
     const stream = props.remoteStream;
     if (audioEl && stream && audioEl.srcObject !== stream) {
+      const tracks = stream.getTracks();
+      console.log("[PWA/audio] srcObject set", {
+        track_count: tracks.length,
+        tracks: tracks.map((t) => ({
+          kind: t.kind,
+          enabled: t.enabled,
+          muted: t.muted,
+          readyState: t.readyState,
+        })),
+      });
       audioEl.srcObject = stream;
-      audioEl.play().catch((e) => console.warn("audio play blocked", e));
+      audioEl
+        .play()
+        .then(() =>
+          console.log("[PWA/audio] play() ok", {
+            paused: audioEl!.paused,
+            muted: audioEl!.muted,
+            volume: audioEl!.volume,
+          }),
+        )
+        .catch((e) =>
+          console.warn(
+            "[PWA/audio] play() blocked",
+            e,
+            "← どこかクリックすると Firefox の autoplay restriction が解除されます",
+          ),
+        );
+
+      // RTP が来てるかを 3 秒おきに統計確認 (デバッグ用)。
+      const id = window.setInterval(() => {
+        if (!audioEl?.srcObject) {
+          window.clearInterval(id);
+          return;
+        }
+        const at = stream.getAudioTracks()[0];
+        if (at) {
+          console.log("[PWA/audio] track tick", {
+            elapsed_s: audioEl.currentTime,
+            paused: audioEl.paused,
+            muted: at.muted,
+            enabled: at.enabled,
+            readyState: at.readyState,
+          });
+        }
+      }, 3000);
     }
   });
 

@@ -55,7 +55,8 @@ use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
 use crate::sdp::builder::{
-    convert_savpf_to_avp, restrict_audio_to_pcmu_with_dtmf, rewrite_rtp_endpoint,
+    convert_savpf_to_avp, restrict_audio_to_pcmu, restrict_audio_to_pcmu_with_dtmf,
+    rewrite_rtp_endpoint,
 };
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
@@ -82,6 +83,12 @@ pub struct NgnInboundConfig {
     pub bridge_ngn_bind_ip: Option<IpAddr>,
     /// RTP ブリッジ用の内線側 bind IP。`None` なら NGN 側と同じにする。
     pub bridge_ext_bind_ip: Option<IpAddr>,
+    /// NGN 向け 200 OK の `Contact` ヘッダに載せる sent-by アドレス。
+    /// SIP socket は `0.0.0.0:5060` で bind しているので `socket.local_addr()`
+    /// を直に使うと NGN が ACK を返せず 10 秒後に CANCEL してくる
+    /// (RFC 3261 §8.1.1.8 / §13.3.1.4: in-dialog target は Contact が確定する)。
+    /// `None` ならソケット側にフォールバック (テスト互換)。
+    pub ngn_local_addr: Option<SocketAddr>,
 }
 
 impl Default for NgnInboundConfig {
@@ -91,6 +98,7 @@ impl Default for NgnInboundConfig {
             realm: "sabiden".to_string(),
             bridge_ngn_bind_ip: None,
             bridge_ext_bind_ip: None,
+            ngn_local_addr: None,
         }
     }
 }
@@ -370,6 +378,7 @@ impl NgnInboundHandler {
                 self.metrics.record_invite_ngn(InviteResult::Error);
                 return Ok::<(), anyhow::Error>(());
             }
+
             // フォーク (内線レッグ): SIP / WebRTC を transport で分岐して並列に呼び出す。
             // NGN から CANCEL が来たら fork を打ち切るため Notify を仕込んで
             // `tokio::select!` で待ち合わせる (RFC 3261 §9.2 / §9.1)。
@@ -485,11 +494,19 @@ impl NgnInboundHandler {
                     }
                     // To に tag を必ず付与 (RFC 3261 §8.2.6.2)
                     ensure_to_tag(&mut resp_to_ngn);
-                    // sabiden の Contact (NGN 側ローカル) を載せる
-                    resp_to_ngn.headers.set(
-                        "Contact",
-                        format!("<sip:sabiden@{}>", self.socket.local_addr()?),
-                    );
+                    // sabiden の Contact (NGN 側ローカル) を載せる。
+                    // SIP socket は `0.0.0.0:5060` bind なので `socket.local_addr()`
+                    // をそのまま載せると NGN が ACK を `0.0.0.0` 宛に送ろうとして
+                    // 失敗、 10 秒後 CANCEL になる (実機検証 2026-05-10)。
+                    // `cfg.ngn_local_addr` (eth1 sent-by IP) があれば優先する。
+                    let contact_addr = self
+                        .cfg
+                        .ngn_local_addr
+                        .map(Ok)
+                        .unwrap_or_else(|| self.socket.local_addr())?;
+                    resp_to_ngn
+                        .headers
+                        .set("Contact", format!("<sip:sabiden@{}>", contact_addr));
                     tx.respond(resp_to_ngn).await?;
                     // 観測: NGN レッグも内線レッグも応答済みとして記録
                     self.metrics.record_invite_ngn(InviteResult::Answered);
@@ -649,7 +666,16 @@ impl NgnInboundHandler {
             );
             // NGN へ返す SDP は browser SDP 由来 (AVP に変換済) → PCMU only に
             // 絞り、 `c=`/`m= port` を sabiden の NGN 側 socket に書き換える。
-            let pcmu_only = restrict_audio_to_pcmu_with_dtmf(ext_answer);
+            // RFC 3264 §5.1: answer の payload type は offer の subset でなければ
+            // ならない。 NGN INVITE が PCMU (PT 0) のみ提示してきた場合に
+            // telephone-event (PT 101) を勝手に answer に乗せると NGN が dialog
+            // 確立直後に BYE で破棄してくる (実機検証 2026-05-10)。 そのため
+            // offer に telephone-event があるか否かで restrict 関数を切り替える。
+            let pcmu_only = if offer_has_telephone_event(ngn_offer) {
+                restrict_audio_to_pcmu_with_dtmf(ext_answer)
+            } else {
+                restrict_audio_to_pcmu(ext_answer)
+            };
             let rewritten =
                 rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
             let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
@@ -659,6 +685,12 @@ impl NgnInboundHandler {
                     peer: handle.peer,
                     peer_media_rx: handle.peer_media_rx,
                     opus_payload_type: handle.opus_payload_type,
+                    // sabiden の str0m は `enable_pcmu` 1 codec 構成なので
+                    // (`webrtc/str0m_session.rs:190`)、 NGN(μ-law) ↔ PWA(μ-law)
+                    // を transcoder で素通しする。 Opus 経路は str0m が
+                    // negotiate しないので使うと `PT 未 negotiate → media drop`
+                    // で全パケット消える (実機検証 2026-05-10)。
+                    direct_pcmu_passthrough: true,
                     metrics: Some(self.metrics.clone()),
                 },
             )?
@@ -686,12 +718,15 @@ impl NgnInboundHandler {
         );
 
         // NGN へ返す 200 OK SDP は sabiden の NGN 側ソケットを指すように書き換える。
-        // `restrict_audio_to_pcmu_with_dtmf` で内線 UA が乗せた WebRTC 由来属性
-        // (rtcp-fb / rtcp-mux / fingerprint 等) を除去し、コーデックを PCMU (PT 0)
-        // + telephone-event (PT 101 / RFC 4733) に絞り込む
-        // (`docs/asterisk-real-invite.md` §2 / `CLAUDE.md` §5: NGN は音声 PCMU only。
-        // ただし PT 101 telephone-event は in-band DTMF 用途で並走可能 / Issue #69)。
-        let pcmu_only = restrict_audio_to_pcmu_with_dtmf(ext_answer);
+        // RFC 3264 §5.1: answer の payload type は offer の subset でなければ
+        // ならない。 NGN INVITE が PT 101 を含めていない場合に勝手に
+        // telephone-event を answer に追加すると、 NGN が SDP を不正と判定して
+        // dialog 確立直後に BYE してくる (実機検証 2026-05-10)。
+        let pcmu_only = if offer_has_telephone_event(ngn_offer) {
+            restrict_audio_to_pcmu_with_dtmf(ext_answer)
+        } else {
+            restrict_audio_to_pcmu(ext_answer)
+        };
         let rewritten =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
 
@@ -759,6 +794,20 @@ impl NgnInboundHandler {
         ensure_to_tag(&mut resp);
         tx.respond(resp).await
     }
+}
+
+/// SDP オファに telephone-event (RFC 4733 PT 101 等) の rtpmap が含まれているか
+/// 判定する。 含まれる場合のみ answer に PT 101 を残してよい (RFC 3264 §5.1
+/// answer は offer の payload type subset)。 解析失敗時は安全側で false を
+/// 返し、 answer から telephone-event を除外する。
+fn offer_has_telephone_event(offer: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(offer) else {
+        return false;
+    };
+    text.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("a=rtpmap:") && l.contains("telephone-event")
+    })
 }
 
 /// レスポンスの To に tag が無ければ付与する (RFC 3261 §8.2.6.2)。
@@ -2038,9 +2087,12 @@ impl PwaOutboundHandler for UasEventHandler {
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
 
         // (e) NGN へ送る AVP/PCMU SDP を組み立てる (RFC 4566, `docs/asterisk-real-invite.md` §5.2)。
+        // 実機検証 2026-05-10: telephone-event (PT 101) を含めて NGN INVITE すると
+        // 500 Server Internal Error で拒否される (前作業時の Linphone→117 成功
+        // パターンは PT 0 only)。 outbound INVITE でも PT 0 only に絞る。
         let avp_sdp = convert_savpf_to_avp(browser_answer.as_bytes())
             .map_err(|e| anyhow!("SAVPF→AVP 変換失敗: {}", e))?;
-        let pcmu_only = restrict_audio_to_pcmu_with_dtmf(&avp_sdp);
+        let pcmu_only = restrict_audio_to_pcmu(&avp_sdp);
         let sdp_for_ngn =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())
                 .map_err(|e| anyhow!("NGN 向け SDP rewrite 失敗: {}", e))?;
@@ -2106,6 +2158,8 @@ impl PwaOutboundHandler for UasEventHandler {
                                 peer: peer_clone,
                                 peer_media_rx,
                                 opus_payload_type: opus_pt,
+                                // PCMU 直送 (str0m PCMU only 構成、 詳細は inbound 経路コメント参照)。
+                                direct_pcmu_passthrough: true,
                                 metrics: Some(metrics.clone()),
                             },
                         );

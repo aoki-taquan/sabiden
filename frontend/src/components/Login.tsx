@@ -85,12 +85,14 @@ export const Login: Component<{
             // 既存提案を出さない」 セマンティクス)。 完全には封じられない
             // が、 主要ブラウザの候補表示は止まる。
             autocomplete="new-password"
-            // ARIA: パスワード入力 input に明示ラベル付け (WAI-ARIA 1.2 §6.7
-            // labelling-by relation)。 同 label の <span> は visual で文字を
-            // 出しているが「ext.expiry.signature 形式」という入力指示を
-            // 補助テキストとして screen reader に届けるため aria-describedby
-            // を併用する。
-            aria-label="アクセストークン"
+            // ARIA: visible label「アクセストークン (HMAC)」 が囲み <label>
+            // 経由で input に紐付くため、 aria-label を重ねるとそれが
+            // accessible name を上書きして visible text と乖離する
+            // (WCAG 2.1 SC 2.5.3 "Label in Name" 違反)。 native HTML の
+            // <label> 親子関係で labelling は十分なので aria-label は付けない
+            // (W3C "First Rule of ARIA Use": don't use ARIA when native HTML
+            // works)。 補助テキスト「HMAC 形式: ext.expiry.signature」 のみ
+            // aria-describedby で screen reader に届ける。
             aria-describedby="token-help"
             placeholder="ext.expiry.signature"
             value={token()}

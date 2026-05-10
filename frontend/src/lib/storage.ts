@@ -64,14 +64,29 @@ function migrateLegacyLocalToken(): string | null {
  * 同一タブの 2 度目以降の onMount / リロード時は sessionStorage から復元する。
  * 旧 localStorage に残っていた token は本関数の初回呼び出し時にメモリへ移送
  * しつつ localStorage から削除する (Issue #109 一回限りの migration)。
+ *
+ * **defense-in-depth**: 戻り値経路 (memory hit / session hit / legacy migration /
+ * miss) のいずれであっても、 まず legacy `localStorage[sabiden.token]` を
+ * **無条件に scrub** する。 sessionStorage hit でも localStorage 残骸が残れば
+ * XSS 露出窓は閉じきれないため (PR #183 review fix)。
  */
 export function loadToken(): string | null {
+  // 経路に依らず legacy localStorage の残骸を最優先で削除する (XSS 窓 0 化)。
+  try {
+    localStorage.removeItem(LEGACY_TOKEN_LOCAL_KEY);
+  } catch {
+    /* ignore (private mode etc.) */
+  }
   if (memoryToken) return memoryToken;
   const fromSession = trySession(() => sessionStorage.getItem(TOKEN_SESSION_KEY), null);
   if (fromSession) {
     memoryToken = fromSession;
     return memoryToken;
   }
+  // ここまで到達した時点で localStorage は既に scrub 済 (上の無条件 remove)
+  // のため migrateLegacyLocalToken は何も移送できない。 履歴互換のために
+  // 一応呼び出すが、 戻り値は基本 null。 もし他コードが起動シーケンス中に
+  // 再書込してきた場合のみ拾える。
   const legacy = migrateLegacyLocalToken();
   if (legacy) {
     memoryToken = legacy;
@@ -141,7 +156,9 @@ export function consumeTokenFromHash(): string | null {
   return t;
 }
 
-/** テスト専用: in-memory state を初期化する。 production code から呼ばない。 */
-export function __resetTokenStateForTesting(): void {
-  memoryToken = null;
-}
+// PR #183 review fix: 旧版にあった `__resetTokenStateForTesting` は
+// production-side test hook (CLAUDE.md §6.3 違反) で、 production bundle に
+// export が残ると同一オリジン script から in-memory token を消去できる
+// (DoS / XSS 補助)。 よって撤去。 テスト側は `vi.resetModules()` +
+// 動的 import (`await import("./storage")`) で fresh module を取得して
+// state を初期化する (storage.test.ts の `loadStorage()` ヘルパ参照)。

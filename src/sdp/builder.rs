@@ -331,12 +331,16 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     // セッションレベル c= は必ず sabiden を指すようにする
     sdp.connection = Some(Connection { address: addr });
 
-    // 最初の audio media を sabiden 側に書き換える
+    // 最初の audio media を sabiden 側に書き換える。
+    // メディアレベル `c=` は **削除** する。 session-level `c=` を上で `addr` に
+    // 強制セット済なので、 media-level に同値の `c=` を残すと NGN P-CSCF が
+    // 重複セット連結した形で session を判定して 500 Server Internal Error を
+    // 返す事例を実機で確認済 (2026-05-10、 Firefox 由来 SDP)。 RFC 4566 §5.7
+    // 上は許容だが、 NGN 実機が許容しないので `audio.connection = None` で
+    // 揃える (Asterisk pcap も session-level のみで media-level c= は出さない)。
     if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
         audio.port = port;
-        if audio.connection.is_some() {
-            audio.connection = Some(Connection { address: addr });
-        }
+        audio.connection = None;
     }
 
     Ok(sdp.to_string_crlf().into_bytes())
@@ -865,9 +869,11 @@ mod tests {
         assert!(parsed.find_rtpmap(0).is_some());
     }
 
-    /// メディアレベル c= がある SDP も書き換わる。
+    /// メディアレベル c= がある SDP は **削除** される (session-level c= に統一)。
+    /// 実機検証 2026-05-10: NGN P-CSCF は session+media level で同値の c= が
+    /// 重複していると 500 Server Internal Error を返す (Firefox 由来 SDP)。
     #[test]
-    fn rewrite_rewrites_media_level_connection() {
+    fn rewrite_strips_media_level_connection_for_ngn_compatibility() {
         let original = b"v=0\r\n\
                          o=- 1 1 IN IP4 192.0.2.1\r\n\
                          s=-\r\n\
@@ -880,10 +886,8 @@ mod tests {
         let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
         assert_eq!(parsed.connection.as_ref().unwrap().address, new_addr);
         assert_eq!(parsed.media[0].port, 5004);
-        assert_eq!(
-            parsed.media[0].connection.as_ref().unwrap().address,
-            new_addr
-        );
+        // メディアレベル c= は削除されているはず
+        assert!(parsed.media[0].connection.is_none());
     }
 
     /// 不正な SDP はエラーで返る (元バイト列のまま流用するとピアが読めない)。

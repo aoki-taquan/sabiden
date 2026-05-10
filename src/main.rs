@@ -188,6 +188,15 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         domain: sip_cfg.domain.clone(),
         local_addr: local_addr_for_hdr,
         user_agent: "sabiden/0.1".to_string(),
+        // Issue #113: NGN レッグの INVITE 401/407 challenge に対応する
+        // ための Digest 資格情報。 NGN 直収モード (auth=none / `password = None`)
+        // では None のまま、 IMS / SBC 経由構成で password が設定されていれば
+        // INVITE 再認証に使う (RFC 3261 §22.2 §22.3)。
+        auth_username: sip_cfg
+            .password
+            .as_ref()
+            .map(|_| sip_cfg.phone_number.clone()),
+        auth_password: sip_cfg.password.clone(),
     };
     let ngn_uac = Arc::new(Uac::new(
         ngn_uac_cfg,
@@ -298,6 +307,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             domain: "internal".to_string(),
             local_addr: ext_send_sock.local_addr()?,
             user_agent: "sabiden-b2bua/0.1".to_string(),
+            // 内線レッグは sabiden が UAS、 INVITE は内線→sabiden 方向の
+            // み (NGN→内線 のフォーク INVITE は sabiden 発で内線が UAS)。
+            // 内線 UA に対しては auth challenge を返さない設計 (PR #63)
+            // のため UAC として再認証する経路もない。
+            auth_username: None,
+            auth_password: None,
         };
         // 各内線へ送るときは contact から得た remote を使うため server_addr は仮値。
         // 実装簡略化のため、forker の各 leg は target URI のホスト部を解決して送る

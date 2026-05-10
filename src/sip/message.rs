@@ -448,7 +448,188 @@ fn parse_kv_list(s: &str, sep: char) -> Vec<(String, String)> {
         .collect()
 }
 
-/// SIP メッセージのパーサ。
+/// SIP メッセージ パース失敗の分類 (RFC 3261 §16 / §21.4.1).
+///
+/// 受信 datagram が SIP メッセージとして整合しない場合のエラー種別。
+/// `recv_loop` (UAS 側) はここで返った種別を参照して、 RFC 3261 §21.4.1
+/// "400 Bad Request" 応答を組み立てるか silent drop するかを決める。
+///
+/// - 上位層が応答先 (Via / source address) を特定できる程度に「壊れていない」
+///   メッセージ (= 本 enum のうち [`ParseError::Truncated`] /
+///   [`ParseError::DuplicateContentLength`] /
+///   [`ParseError::NonNumericContentLength`] のように、 ヘッダ部は
+///   読めるが Content-Length 整合のみ崩れているケース) は 400 を返す
+///   候補。
+/// - [`ParseError::NoCrlfCrlf`] / [`ParseError::Empty`] /
+///   [`ParseError::MalformedRequestLine`] / [`ParseError::BadStatusCode`] /
+///   [`ParseError::UnknownMethod`] のように **ヘッダ部すら読めない**
+///   ケースは応答先 (Via / 必須ヘッダ) を抽出できないので silent drop
+///   (RFC 3261 §16.3: malformed request の応答先が決まらない場合は
+///   応答送信不能)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// 入力 datagram が空。
+    Empty,
+    /// CRLFCRLF (header / body 境界) が見つからない。 ヘッダ部の終端
+    /// すら確定できないので応答不能。 RFC 3261 §7.5。
+    NoCrlfCrlf,
+    /// `Content-Length: N` で実本文が N 未満 (truncate)。 RFC 3261 §18.3。
+    /// `recv_loop` の 8192 byte buf を超えた INVITE / 200 OK で発生しうる。
+    Truncated { declared: usize, actual: usize },
+    /// `Content-Length` が同 datagram 内に **2 件以上** 出現 (request
+    /// smuggling 風)。 RFC 3261 §7.3.1 / §20.14 違反。
+    DuplicateContentLength { count: usize },
+    /// `Content-Length` の値が 10 進整数として解釈できない。 RFC 3261 §20.14。
+    NonNumericContentLength { value: String },
+    /// Request line がスペース区切りでメソッド + URI を取り出せない (3xx に
+    /// fall-back する応答先も特定できないので silent drop)。
+    MalformedRequestLine { line: String },
+    /// Status line の status-code が 3 桁整数として解釈できない (応答に対する
+    /// 応答は出さないので silent drop で実害は少ない)。
+    BadStatusCode { value: String },
+    /// メソッドトークンが空 (`SipMethod::from_str` 由来)。
+    UnknownMethod { token: String },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::Empty => write!(f, "empty SIP message"),
+            ParseError::NoCrlfCrlf => write!(f, "malformed SIP message: no CRLFCRLF"),
+            ParseError::Truncated { declared, actual } => write!(
+                f,
+                "Content-Length {} exceeds available body bytes {}",
+                declared, actual
+            ),
+            ParseError::DuplicateContentLength { count } => write!(
+                f,
+                "duplicate Content-Length header (count={}): possible request smuggling",
+                count
+            ),
+            ParseError::NonNumericContentLength { value } => {
+                write!(f, "malformed Content-Length header value: {:?}", value)
+            }
+            ParseError::MalformedRequestLine { line } => {
+                write!(f, "malformed SIP request line: {}", line)
+            }
+            ParseError::BadStatusCode { value } => {
+                write!(f, "malformed SIP status code: {:?}", value)
+            }
+            ParseError::UnknownMethod { token } => {
+                write!(f, "empty/unknown SIP method: {:?}", token)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl ParseError {
+    /// 「ヘッダ部は読めるので 400 Bad Request を返せる候補」なら true。
+    ///
+    /// RFC 3261 §21.4.1: "The request could not be understood due to
+    /// malformed syntax." の応答は、 応答先 (Via) と 1st-hop の必須ヘッダ
+    /// (From/To/Call-ID/CSeq) が 取れる場合のみ意味を持つ。 truncate /
+    /// 重複 CL / 非数値 CL はヘッダ自体は parse 可能なので応答候補。
+    /// CRLFCRLF が無い等のケースはヘッダの末端が確定できないので応答不能
+    /// (silent drop)。
+    pub fn is_header_recoverable(&self) -> bool {
+        matches!(
+            self,
+            ParseError::Truncated { .. }
+                | ParseError::DuplicateContentLength { .. }
+                | ParseError::NonNumericContentLength { .. }
+        )
+    }
+}
+
+/// 不正メッセージから 400 Bad Request 応答を組み立てるための「素材」。
+///
+/// `recv_loop` で [`parse_message_classified`] が
+/// [`ParseError::is_header_recoverable`] な error を返したとき、
+/// 同 datagram から best-effort で抽出する。 不正な Content-Length を
+/// 信じて body を切り出さず、 ヘッダ部だけを lossy 化して読む点が
+/// [`parse_message`] との差。
+#[derive(Debug, Clone)]
+pub struct MalformedRequestSkeleton {
+    pub method: SipMethod,
+    pub uri: String,
+    /// 必須ヘッダのみ抽出 (Via / From / To / Call-ID / CSeq)。
+    /// 一つでも欠けたら抽出失敗 (Option ではなく [`extract_request_skeleton_for_400`]
+    /// 全体が `None` を返す)。
+    pub headers: SipHeaders,
+}
+
+/// 不正メッセージから 400 Bad Request 応答用の必須ヘッダ skeleton を抽出する。
+///
+/// RFC 3261 §8.2.6.2 (Headers and Tags): 応答は request の Via / From /
+/// To / Call-ID / CSeq をそのまま反映する必要がある。 これらが揃わない
+/// malformed message には 400 を返せない (応答先が決まらない / 応答が
+/// 上流で stateless rejection される)。
+///
+/// 失敗ケース:
+/// - CRLFCRLF が無い → header 終端不明
+/// - 1 行目が request line に見えない (= response かそれ以下)
+/// - Via / From / To / Call-ID / CSeq のいずれかが欠落
+pub fn extract_request_skeleton_for_400(data: &[u8]) -> Option<MalformedRequestSkeleton> {
+    // CRLFCRLF が無い場合はヘッダ終端不明。 「最後の \r\n まで」を試すと
+    // body 部が継ぎ足された garbage を header と誤認するので採用しない。
+    let header_end = find_subslice(data, b"\r\n\r\n")?;
+    let header_text = String::from_utf8_lossy(&data[..header_end]);
+
+    let mut lines = header_text.split("\r\n");
+    let first_line = lines.next()?;
+
+    // Response (`SIP/2.0 ...`) の場合は応答に対する応答を出さないので skip。
+    if first_line.starts_with("SIP/2.0 ") {
+        return None;
+    }
+
+    // Request line: METHOD URI SIP/2.0 (RFC 3261 §7.1).
+    let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let method: SipMethod = parts[0].parse().ok()?;
+    let uri = parts[1].to_string();
+
+    let mut headers = SipHeaders::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.add(k.trim(), v.trim());
+        }
+    }
+
+    // RFC 3261 §8.1.1: minimal essential headers.
+    if headers.get("via").is_none()
+        || headers.get("from").is_none()
+        || headers.get("to").is_none()
+        || headers.get("call-id").is_none()
+        || headers.get("cseq").is_none()
+    {
+        return None;
+    }
+
+    Some(MalformedRequestSkeleton {
+        method,
+        uri,
+        headers,
+    })
+}
+
+/// SIP メッセージのパーサ (anyhow ラッパ)。
+///
+/// 旧来の `Result<_, anyhow::Error>` API を維持するため、 内部で
+/// [`parse_message_classified`] を呼んで [`ParseError`] を anyhow に
+/// 持ち上げる。 エラー種別を見たい呼び出し側 (UAS の 400 応答経路) は
+/// [`parse_message_classified`] を直接使う。
+///
+/// 詳細仕様は [`parse_message_classified`] の docstring 参照。
+pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
+    parse_message_classified(data).map_err(anyhow::Error::from)
+}
+
+/// SIP メッセージのパーサ (分類済 error 版)。
 ///
 /// 入力は **生バイト列**として扱い、ヘッダ部 (start-line + headers)
 /// だけを文字列化する。本文 (message-body) は
@@ -464,14 +645,17 @@ fn parse_kv_list(s: &str, sep: char) -> Vec<(String, String)> {
 ///   - `N <= body_len` → `body[..N]` のみ採用。残余は drop
 ///     (1 datagram 内の余剰バイトは別 SIP メッセージまたは garbage と見なす。
 ///     RFC 3261 §18.3)。
-///   - `N > body_len` → `400 Bad Request` 相当の `Err`
-///     (UDP 切詰め検知、TCP では §18.3 上必須エラー)。
-///   - 同名複数値 (重複) は **`Err`**。 RFC 3261 §7.3.1 では同名複数値の
-///     合成は `,` 連結で意味が同じ場合のみ許容され、`Content-Length` のような
-///     単一値ヘッダで重複が現れた場合は protocol violation。 attacker が
+///   - `N > body_len` → [`ParseError::Truncated`]。 UAS 側で
+///     RFC 3261 §21.4.1 `400 Bad Request` 応答候補。
+///   - 同名複数値 (重複) は [`ParseError::DuplicateContentLength`]。
+///     RFC 3261 §7.3.1 では同名複数値の合成は `,` 連結で意味が同じ場合のみ
+///     許容され、`Content-Length` のような単一値ヘッダで重複が現れた場合は
+///     protocol violation。 attacker が
 ///     `Content-Length: 0\r\nContent-Length: 999\r\n` のような request
 ///     smuggling 風の食い違いを仕込んでも 1 件目だけ採用して silent に通る
 ///     ことを防ぐ。
+///   - 値が 10 進整数として解釈できなければ
+///     [`ParseError::NonNumericContentLength`] (RFC 3261 §20.14)。
 /// - `Content-Length` ヘッダが無い場合は datagram 末尾までを本文とする
 ///   (RFC 3261 §18.3: UDP は datagram 長から決まる)。
 ///
@@ -485,11 +669,14 @@ fn parse_kv_list(s: &str, sep: char) -> Vec<(String, String)> {
 /// `from_utf8_lossy` を使い、不正バイトは U+FFFD に置換してパースを
 /// 継続する (header 行に non-UTF8 が混入しても全 datagram drop には
 /// しない: §7.4 の body opaque 性と整合し、ヘッダ経路の DoS も塞ぐ)。
-pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
+pub fn parse_message_classified(data: &[u8]) -> Result<SipMessage, ParseError> {
+    if data.is_empty() {
+        return Err(ParseError::Empty);
+    }
+
     // ヘッダ末尾境界 (CRLFCRLF) を **生バイト** で検索する。
     // RFC 3261 §7.5 で header-body 区切りは厳密に CRLFCRLF と規定。
-    let header_end = find_subslice(data, b"\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("malformed SIP message: no CRLFCRLF"))?;
+    let header_end = find_subslice(data, b"\r\n\r\n").ok_or(ParseError::NoCrlfCrlf)?;
     let header_bytes = &data[..header_end];
     let body_bytes = &data[header_end + 4..];
 
@@ -500,9 +687,7 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
     let header_text = String::from_utf8_lossy(header_bytes);
 
     let mut lines = header_text.split("\r\n");
-    let first_line = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty SIP message"))?;
+    let first_line = lines.next().ok_or(ParseError::Empty)?;
 
     let mut headers = SipHeaders::new();
     for line in lines {
@@ -526,16 +711,17 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
             let raw = cl_values[0];
             let n: usize = raw
                 .parse()
-                .map_err(|_| anyhow::anyhow!("malformed Content-Length header value: {:?}", raw))?;
+                .map_err(|_| ParseError::NonNumericContentLength {
+                    value: raw.to_string(),
+                })?;
             if n > body_bytes.len() {
                 // RFC 3261 §18.3: 宣言サイズより datagram の本文部が短い場合、
                 // 切詰め (truncation) として扱う。 UDP では `recv_loop` の
                 // 8192 byte buf を超えた INVITE で発生しうる。
-                anyhow::bail!(
-                    "Content-Length {} exceeds available body bytes {}",
-                    n,
-                    body_bytes.len()
-                );
+                return Err(ParseError::Truncated {
+                    declared: n,
+                    actual: body_bytes.len(),
+                });
             }
             // n <= body_bytes.len(): 余剰は別 datagram 扱い (drop)
             body_bytes[..n].to_vec()
@@ -544,16 +730,17 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
             // RFC 3261 §7.3.1: 同名複数値の合成は `,` 連結で意味が同じ場合のみ。
             // Content-Length は単一値ヘッダ (§20.14) なので、重複は protocol
             // violation として `Err` で drop する (request smuggling 経路を遮断)。
-            anyhow::bail!(
-                "duplicate Content-Length header (count={}): possible request smuggling",
-                cl_values.len()
-            );
+            return Err(ParseError::DuplicateContentLength {
+                count: cl_values.len(),
+            });
         }
     };
 
     if let Some(rest) = first_line.strip_prefix("SIP/2.0 ") {
         let (code_str, reason) = rest.split_once(' ').unwrap_or((rest, ""));
-        let status_code: u16 = code_str.parse()?;
+        let status_code: u16 = code_str.parse().map_err(|_| ParseError::BadStatusCode {
+            value: code_str.to_string(),
+        })?;
         Ok(SipMessage::Response(SipResponse {
             status_code,
             reason: reason.to_string(),
@@ -563,9 +750,13 @@ pub fn parse_message(data: &[u8]) -> anyhow::Result<SipMessage> {
     } else {
         let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
         if parts.len() < 2 {
-            anyhow::bail!("malformed SIP request line: {}", first_line);
+            return Err(ParseError::MalformedRequestLine {
+                line: first_line.to_string(),
+            });
         }
-        let method: SipMethod = parts[0].parse()?;
+        let method: SipMethod = parts[0].parse().map_err(|_| ParseError::UnknownMethod {
+            token: parts[0].to_string(),
+        })?;
         let uri = parts[1].to_string();
         Ok(SipMessage::Request(SipRequest {
             method,
@@ -1089,5 +1280,152 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+
+    /// RFC 3261 §21.4.1 (400 Bad Request): truncate (Content-Length 宣言値が
+    /// datagram 本文長を上回る) は分類済 [`ParseError::Truncated`] を返し、
+    /// 抽出された宣言/実バイト長で診断できる。
+    #[test]
+    fn rfc3261_21_4_1_truncate_classified_as_truncated_variant() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 INVITE\r\n\
+                    Content-Length: 100\r\n\
+                    \r\n\
+                    short body";
+        let err = parse_message_classified(raw).expect_err("truncate must error");
+        assert!(
+            matches!(
+                err,
+                ParseError::Truncated {
+                    declared: 100,
+                    actual: 10
+                }
+            ),
+            "Truncated 種別で declared=100 actual=10 を持つこと: {:?}",
+            err
+        );
+        assert!(err.is_header_recoverable(), "truncate は 400 候補");
+    }
+
+    /// RFC 3261 §7.3.1 / §20.14: 重複 `Content-Length` は分類済
+    /// [`ParseError::DuplicateContentLength`] を返し、 件数を保持する。
+    #[test]
+    fn rfc3261_7_3_1_duplicate_content_length_classified_variant() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 INVITE\r\n\
+                    Content-Length: 0\r\n\
+                    Content-Length: 999\r\n\
+                    \r\n";
+        let err = parse_message_classified(raw).expect_err("duplicate CL must error");
+        assert!(
+            matches!(err, ParseError::DuplicateContentLength { count: 2 }),
+            "DuplicateContentLength 種別で count=2 を持つこと: {:?}",
+            err
+        );
+        assert!(err.is_header_recoverable(), "重複 CL は 400 候補");
+    }
+
+    /// RFC 3261 §20.14: 非数値 `Content-Length` は分類済
+    /// [`ParseError::NonNumericContentLength`] を返す。
+    #[test]
+    fn rfc3261_20_14_non_numeric_content_length_classified_variant() {
+        let raw = b"OPTIONS sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 OPTIONS\r\n\
+                    Content-Length: abc\r\n\
+                    \r\n";
+        let err = parse_message_classified(raw).expect_err("non-numeric CL must error");
+        match &err {
+            ParseError::NonNumericContentLength { value } => {
+                assert_eq!(value, "abc");
+            }
+            other => panic!("NonNumericContentLength 期待: {:?}", other),
+        }
+        assert!(err.is_header_recoverable(), "非数値 CL は 400 候補");
+    }
+
+    /// RFC 3261 §7.5: CRLFCRLF が無い datagram は header 終端不明で
+    /// [`ParseError::NoCrlfCrlf`]。 応答先抽出不能なので `is_header_recoverable`
+    /// は false。
+    #[test]
+    fn rfc3261_7_5_no_crlfcrlf_classified_variant_is_not_recoverable() {
+        // \r\n\r\n が一切含まれない断片 (recv buffer 切れ等)
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\nVia: SIP/2.0/UDP h:5060;branch=z9hG4bKa";
+        let err = parse_message_classified(raw).expect_err("no CRLFCRLF must error");
+        assert!(matches!(err, ParseError::NoCrlfCrlf));
+        assert!(!err.is_header_recoverable(), "header 終端不明は応答不能");
+    }
+
+    /// RFC 3261 §21.4.1 (400 Bad Request): truncate された malformed request
+    /// から、 必須ヘッダ (Via/From/To/Call-ID/CSeq) を best-effort で抽出
+    /// できること。 抽出結果は 400 応答の組み立て素材になる。
+    #[test]
+    fn rfc3261_21_4_1_extract_skeleton_from_truncated_request() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKabc\r\n\
+                    From: <sip:a@x>;tag=alice\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: skel-call-id@x\r\n\
+                    CSeq: 42 INVITE\r\n\
+                    Content-Length: 9999\r\n\
+                    \r\n\
+                    body";
+        let skel = extract_request_skeleton_for_400(raw).expect("skeleton must extract");
+        assert_eq!(skel.method, SipMethod::Invite);
+        assert_eq!(skel.uri, "sip:bob@x");
+        assert_eq!(
+            skel.headers.get("via"),
+            Some("SIP/2.0/UDP h:5060;branch=z9hG4bKabc")
+        );
+        assert_eq!(skel.headers.get("from"), Some("<sip:a@x>;tag=alice"));
+        assert_eq!(skel.headers.get("to"), Some("<sip:b@x>"));
+        assert_eq!(skel.headers.get("call-id"), Some("skel-call-id@x"));
+        assert_eq!(skel.headers.get("cseq"), Some("42 INVITE"));
+    }
+
+    /// RFC 3261 §8.1.1: Via/From/To/Call-ID/CSeq のいずれかを欠く request
+    /// からは skeleton を抽出しない (応答先 / 応答ヘッダが組み立てられない)。
+    #[test]
+    fn rfc3261_8_1_1_extract_skeleton_rejects_missing_required_headers() {
+        // Call-ID 欠落
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKabc\r\n\
+                    From: <sip:a@x>;tag=alice\r\n\
+                    To: <sip:b@x>\r\n\
+                    CSeq: 42 INVITE\r\n\
+                    \r\n";
+        assert!(extract_request_skeleton_for_400(raw).is_none());
+    }
+
+    /// 応答 (Status line) からは skeleton を抽出しない (応答に対する応答は
+    /// 出さない、 RFC 3261 §8.2.6)。
+    #[test]
+    fn rfc3261_8_2_6_extract_skeleton_rejects_response() {
+        let raw = b"SIP/2.0 200 OK\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>;tag=2\r\n\
+                    Call-ID: 123@x\r\n\
+                    CSeq: 1 INVITE\r\n\
+                    \r\n";
+        assert!(extract_request_skeleton_for_400(raw).is_none());
+    }
+
+    /// CRLFCRLF が無いと header 終端が不明で skeleton 抽出不能。
+    #[test]
+    fn rfc3261_7_5_extract_skeleton_rejects_no_crlfcrlf() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\nVia: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\nFrom: <sip:a@x>;tag=1\r\nTo: <sip:b@x>\r\nCall-ID: 123@x\r\nCSeq: 1 INVITE\r\n";
+        assert!(extract_request_skeleton_for_400(raw).is_none());
     }
 }

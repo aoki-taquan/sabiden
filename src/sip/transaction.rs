@@ -107,7 +107,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time;
 use tracing::{debug, trace, warn};
 
-use super::message::{parse_message, SipHeaders, SipMessage, SipMethod, SipRequest, SipResponse};
+#[cfg(test)]
+use super::message::parse_message;
+use super::message::{
+    extract_request_skeleton_for_400, parse_message_classified, ParseError, SipHeaders, SipMessage,
+    SipMethod, SipRequest, SipResponse,
+};
 use crate::observability::{extract_method_and_call_id, SipTraceWriter, TraceDir};
 
 /// RFC 3261 §17.1.1.1 Timer T1 (RTT 推定値)。デフォルトは 500ms。
@@ -1051,7 +1056,7 @@ impl TransactionLayer {
                     let data = &buf[..n];
                     // パース前にトレース dump (壊れた SIP も観測したいため)
                     write_trace(&self.tracer, TraceDir::Recv, data).await;
-                    match parse_message(data) {
+                    match parse_message_classified(data) {
                         Ok(SipMessage::Response(resp)) => {
                             self.dispatch_response(resp).await;
                         }
@@ -1074,6 +1079,15 @@ impl TransactionLayer {
                                 debug!(len = data.len(), "空 UDP/keepalive を無視");
                             } else {
                                 warn!(error=%e, "SIP メッセージ パース失敗");
+                                // RFC 3261 §16 / §21.4.1: malformed syntax は
+                                // `400 Bad Request` を返すべき。 ただし応答に
+                                // 必須な Via/From/To/Call-ID/CSeq が抽出
+                                // できなければ silent drop (応答先不明)。
+                                // 本流は header-recoverable なエラー
+                                // (truncate / 重複 CL / 非数値 CL) のみ。
+                                if e.is_header_recoverable() {
+                                    self.try_send_400_bad_request(data, remote, &e).await;
+                                }
                             }
                         }
                     }
@@ -1083,6 +1097,64 @@ impl TransactionLayer {
                     break;
                 }
             }
+        }
+    }
+
+    /// RFC 3261 §21.4.1 (400 Bad Request): malformed syntax を検出した
+    /// 受信 datagram に対して、 best-effort で抽出した Via/From/To/Call-ID/
+    /// CSeq を反映した 400 応答を **UDP source** へ返送する。
+    ///
+    /// - 応答先は `remote` (= `recv_from` の source address)。 RFC 3261 §18.2.2
+    ///   "received" / `rport` の方針と整合させるため、 Via に `received=` を
+    ///   付加する (`rport` 値は付加しない: stateless responder で via host
+    ///   との突合経路が無いため)。
+    /// - 抽出失敗 (CRLFCRLF 不在 / 必須ヘッダ欠落) は silent drop。
+    /// - send_to の I/O エラーも silent drop (それ自体を更に通知する経路が
+    ///   無く、 上流が再送して回復することを期待)。
+    async fn try_send_400_bad_request(&self, data: &[u8], remote: SocketAddr, err: &ParseError) {
+        let Some(skel) = extract_request_skeleton_for_400(data) else {
+            debug!("400 Bad Request 抑制 (Via/From/To/Call-ID/CSeq の抽出失敗で応答先不明)");
+            return;
+        };
+
+        // RFC 3261 §8.2.6: 応答は request の Via/From/To/Call-ID/CSeq を
+        // そのままコピーする。 `build_response_skeleton` は SipRequest を
+        // 必要とするので、 best-effort で SipRequest を再構築する (body は
+        // 空 = 400 応答に body は不要、 RFC 3261 §21.4.1 reason phrase で
+        // 十分)。
+        let dummy_req = SipRequest {
+            method: skel.method.clone(),
+            uri: skel.uri.clone(),
+            headers: skel.headers.clone(),
+            body: Vec::new(),
+        };
+        let mut resp = build_response_skeleton(&dummy_req, 400, "Bad Request");
+        // RFC 3261 §18.2.2 (received= の付加): UDP source IP が Via host と
+        // 異なる場合は MUST。 stateless responder では via host を信用せず
+        // 常に付加するのが安全 (上流 proxy が後段で剥がす)。
+        if let Some(via) = resp.headers.get("via") {
+            if !via.contains("received=") {
+                let augmented = format!("{};received={}", via, remote.ip());
+                resp.headers.set("Via", augmented);
+            }
+        }
+        // 診断のため Reason ヘッダ (RFC 3326) で具体エラー種別を残す。
+        // 上流が無視する側のヘッダなので副作用なし。
+        resp.headers.set(
+            "Reason",
+            format!("SIP;cause=400;text=\"{}\"", reason_text(err)),
+        );
+
+        let bytes = resp.to_bytes();
+        write_trace(&self.tracer, TraceDir::Sent, &bytes).await;
+        if let Err(io_err) = self.socket.send_to(&bytes, remote).await {
+            warn!(error = %io_err, %remote, "400 Bad Request 送信失敗 (silent drop)");
+        } else {
+            debug!(
+                %remote,
+                error = %err,
+                "400 Bad Request 返却 (RFC 3261 §21.4.1, malformed syntax)"
+            );
         }
     }
 
@@ -1254,6 +1326,24 @@ fn build_non2xx_ack(invite: &SipRequest, response: &SipResponse) -> Result<SipRe
     }
 
     Ok(ack)
+}
+
+/// `ParseError` を `Reason` ヘッダ (RFC 3326) に載せる短い英文へ変換する。
+///
+/// `Display` の長文 (filename / count 等) を載せると Reason ヘッダの BNF
+/// (`reason-text = quoted-string`) で扱いにくいので、 enum variant 名相当の
+/// 短い token を返す。
+fn reason_text(err: &ParseError) -> &'static str {
+    match err {
+        ParseError::Empty => "empty",
+        ParseError::NoCrlfCrlf => "no-crlfcrlf",
+        ParseError::Truncated { .. } => "content-length-truncated",
+        ParseError::DuplicateContentLength { .. } => "duplicate-content-length",
+        ParseError::NonNumericContentLength { .. } => "non-numeric-content-length",
+        ParseError::MalformedRequestLine { .. } => "malformed-request-line",
+        ParseError::BadStatusCode { .. } => "bad-status-code",
+        ParseError::UnknownMethod { .. } => "unknown-method",
+    }
 }
 
 /// レスポンス送信用ヘルパ。
@@ -2296,6 +2386,141 @@ mod tests {
             body_text.contains("m=audio 30000 RTP/AVP 0"),
             "SDP body が末端で truncate: {:?}",
             body_text
+        );
+    }
+
+    /// RFC 3261 §21.4.1 (400 Bad Request): `Content-Length` 宣言値が
+    /// datagram 本文長より大きい (truncate) request を受信したら、 必須
+    /// ヘッダ (Via/From/To/Call-ID/CSeq) を再現した 400 応答を **UDP source**
+    /// へ返送する。 応答に乗る Reason ヘッダ (RFC 3326) で truncate 起因と
+    /// 診断できることも確認する (Issue #126)。
+    #[tokio::test]
+    async fn rfc3261_21_4_1_truncated_request_yields_400_bad_request() {
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uas_addr = uas_sock.local_addr().unwrap();
+        let (_layer, _inbound_rx) = TransactionLayer::spawn(uas_sock.clone());
+
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Content-Length: 9999 と宣言するが body は 4 byte しかない truncate request
+        let raw = b"OPTIONS sip:sabiden SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP 127.0.0.1:0;branch=z9hG4bKtrunc126\r\n\
+                    From: <sip:caller@example>;tag=alice126\r\n\
+                    To: <sip:sabiden@127.0.0.1>\r\n\
+                    Call-ID: trunc-call-id-126@host\r\n\
+                    CSeq: 1 OPTIONS\r\n\
+                    Content-Length: 9999\r\n\
+                    \r\n\
+                    body";
+        client.send_to(raw, uas_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _peer) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("400 Bad Request が届かない (= silent drop に退化)")
+            .unwrap();
+        let resp_text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            resp_text.starts_with("SIP/2.0 400 "),
+            "400 Bad Request が返ってこない: {}",
+            resp_text
+        );
+        // Via / From / To / Call-ID / CSeq が原リクエストから保たれていること
+        assert!(
+            resp_text.contains("z9hG4bKtrunc126"),
+            "Via 不一致: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains("trunc-call-id-126@host"),
+            "Call-ID 不一致: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains("CSeq: 1 OPTIONS"),
+            "CSeq 不一致: {}",
+            resp_text
+        );
+        // Reason ヘッダ (RFC 3326) で truncate と分かる
+        assert!(
+            resp_text.contains("content-length-truncated"),
+            "Reason ヘッダで truncate と判別できない: {}",
+            resp_text
+        );
+    }
+
+    /// RFC 3261 §7.3.1 / §20.14 (400 Bad Request, request smuggling 防止):
+    /// 重複 `Content-Length` を含む request は 400 で拒否し、 1 件目だけ
+    /// 採用して silent に通す経路を遮断する (Issue #126)。
+    #[tokio::test]
+    async fn rfc3261_7_3_1_duplicate_content_length_yields_400_bad_request() {
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uas_addr = uas_sock.local_addr().unwrap();
+        let (_layer, _inbound_rx) = TransactionLayer::spawn(uas_sock.clone());
+
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let raw = b"OPTIONS sip:sabiden SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP 127.0.0.1:0;branch=z9hG4bKdup126\r\n\
+                    From: <sip:caller@example>;tag=alice126b\r\n\
+                    To: <sip:sabiden@127.0.0.1>\r\n\
+                    Call-ID: dup-call-id-126@host\r\n\
+                    CSeq: 2 OPTIONS\r\n\
+                    Content-Length: 0\r\n\
+                    Content-Length: 999\r\n\
+                    \r\n";
+        client.send_to(raw, uas_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _peer) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("400 Bad Request が届かない")
+            .unwrap();
+        let resp_text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            resp_text.starts_with("SIP/2.0 400 "),
+            "400 Bad Request が返ってこない: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains("z9hG4bKdup126"),
+            "Via 不一致: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains("dup-call-id-126@host"),
+            "Call-ID 不一致: {}",
+            resp_text
+        );
+        assert!(
+            resp_text.contains("duplicate-content-length"),
+            "Reason ヘッダで重複 CL と判別できない: {}",
+            resp_text
+        );
+    }
+
+    /// RFC 3261 §16.3 / §21.4.1 (silent drop): CRLFCRLF が無く header 終端
+    /// 不明な datagram は応答先が決まらないので silent drop。 400 を返さない
+    /// (= recv 側でタイムアウトすること) を確認する (Issue #126)。
+    #[tokio::test]
+    async fn rfc3261_16_3_no_crlfcrlf_silently_dropped_no_400() {
+        let uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let uas_addr = uas_sock.local_addr().unwrap();
+        let (_layer, _inbound_rx) = TransactionLayer::spawn(uas_sock.clone());
+
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // CRLFCRLF を欠く header 部だけの datagram
+        let raw =
+            b"INVITE sip:sabiden SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:0;branch=z9hG4bKnocrlf\r\n";
+        client.send_to(raw, uas_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let res =
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
+        assert!(
+            res.is_err(),
+            "応答先不明な malformed datagram に 400 が返ってきた (silent drop が壊れた): {:?}",
+            res
         );
     }
 }

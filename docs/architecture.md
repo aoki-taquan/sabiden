@@ -1764,21 +1764,31 @@ graph LR
 ### 11.6 メッセージレベル防御
 
 - **Authorization redact** (§10.2): SIP トレースに password が漏れない。
-- **SDP 詰め物攻撃**: parse 失敗で drop → 200 OK を返さないので silent drop。
-  あるべきは `400 Bad Request` (Phase R2)。
+- **SDP 詰め物攻撃 / malformed syntax** (RFC 3261 §16 / §21.4.1, Issue #126):
+  `parse_message_classified` (`src/sip/message.rs`) が分類済 [`ParseError`]
+  を返し、 `transaction.rs::recv_loop` がそれを参照して 400 Bad Request の
+  返却可否を決める。 truncate / 重複 Content-Length / 非数値 Content-Length
+  のように **header 部は読めるが本文整合のみ崩れている** ケースは、
+  `extract_request_skeleton_for_400` で必須ヘッダ (Via / From / To /
+  Call-ID / CSeq, RFC 3261 §8.1.1) を best-effort 抽出し、 全部揃えば
+  RFC 3261 §21.4.1 に従い `400 Bad Request` を **UDP source** へ返送する
+  (Reason ヘッダ RFC 3326 で具体エラー種別を提示)。 必須ヘッダが欠ける
+  / CRLFCRLF が無い / 1 行目が SIP/2.0 応答 のように **応答先が決まらない**
+  ケースは silent drop を維持する (RFC 3261 §16.3)。
 - **メッセージサイズ上限**: `transaction.rs::recv_loop` の buf は 8192 bytes 固定 →
   大きい SIP メッセージは truncate 危険 (Phase R5 で 64KB に拡張予定)。
 - **Content-Length 整合検証** (RFC 3261 §18.3 / §20.14, Issue #82):
-  `parse_message` (`src/sip/message.rs`) は `Content-Length` ヘッダ値と
-  CRLFCRLF 以降の datagram 残バイト長を比較する。 宣言値が残バイト長より
-  大きい場合は **truncate** と見なして `Err` を返し、`recv_loop` で warn
-  と共に drop する (≒ 400 Bad Request 相当の silent drop)。 これにより
-  8192 byte buf を超えた INVITE / 200 OK が SDP 半分受信のまま下流に流れる
-  事故を防ぐ。 値が残より小さい場合は先頭 N バイトのみ採用し、残余は
-  別 datagram (もしくは garbage) として drop する。
+  `parse_message_classified` (`src/sip/message.rs`) は `Content-Length`
+  ヘッダ値と CRLFCRLF 以降の datagram 残バイト長を比較する。 宣言値が
+  残バイト長より大きい場合は [`ParseError::Truncated`] を返し、`recv_loop`
+  で 400 Bad Request を返却 (Issue #126, 旧仕様の silent drop は廃止)。
+  これにより 8192 byte buf を超えた INVITE / 200 OK が SDP 半分受信のまま
+  下流に流れる事故を防ぐ。 値が残より小さい場合は先頭 N バイトのみ
+  採用し、残余は別 datagram (もしくは garbage) として drop する。
 - **Content-Length 重複検出** (RFC 3261 §7.3.1 / §20.14, Issue #82 follow-up):
   単一値ヘッダである `Content-Length` が同 datagram 内に **2 件以上** 現れた
-  場合は `Err` を返す。 attacker が `Content-Length: 0\r\nContent-Length: 999`
+  場合は [`ParseError::DuplicateContentLength`] を返し、 Issue #126 で
+  400 Bad Request 経路に切替済。 attacker が `Content-Length: 0\r\nContent-Length: 999`
   のように食い違う重複を仕込んでも 1 件目だけ採用して silent に通る
   (request smuggling 風) 経路を遮断する。 検出は `headers.get_all("content-length")`
   で `len() >= 2` を判定する。

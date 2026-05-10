@@ -6,10 +6,13 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  isPermanentCloseCode,
   parseExtIdFromToken,
   parseServerMessage,
+  permanentCloseReason,
   SignalingClient,
   type ReconnectOptions,
+  type SignalingCloseReason,
 } from "./signaling";
 
 /** 最小限の WebSocket mock。 onopen / onclose / onerror を手動で発火させて
@@ -347,5 +350,215 @@ describe("parseExtIdFromToken", () => {
   it("returns null for malformed token", () => {
     expect(parseExtIdFromToken("nodot")).toBeNull();
     expect(parseExtIdFromToken("a.b.c.d")).toBeNull();
+  });
+});
+
+describe("isPermanentCloseCode (Issue #127, RFC 6455 §7.4)", () => {
+  it("treats 1000 (Normal Closure) as permanent", () => {
+    expect(isPermanentCloseCode(1000)).toBe(true);
+    expect(permanentCloseReason(1000)).toBe("normal");
+  });
+
+  it("treats 1008 (Policy Violation) as permanent auth failure", () => {
+    expect(isPermanentCloseCode(1008)).toBe(true);
+    expect(permanentCloseReason(1008)).toBe("auth");
+  });
+
+  it("treats 1011 (Internal Server Error) as permanent auth failure", () => {
+    expect(isPermanentCloseCode(1011)).toBe(true);
+    expect(permanentCloseReason(1011)).toBe("auth");
+  });
+
+  it("treats 4xxx (private use) as permanent auth failure", () => {
+    expect(isPermanentCloseCode(4000)).toBe(true);
+    expect(isPermanentCloseCode(4401)).toBe(true);
+    expect(isPermanentCloseCode(4999)).toBe(true);
+    expect(permanentCloseReason(4401)).toBe("auth");
+  });
+
+  it("treats transient codes (1001 / 1006 / 1009 / 1012) as non-permanent", () => {
+    expect(isPermanentCloseCode(1001)).toBe(false);
+    expect(isPermanentCloseCode(1006)).toBe(false);
+    expect(isPermanentCloseCode(1009)).toBe(false);
+    expect(isPermanentCloseCode(1012)).toBe(false);
+    // 5000+ もまだ未割当なので non-permanent。
+    expect(isPermanentCloseCode(5000)).toBe(false);
+  });
+});
+
+describe("SignalingClient close-code handling (Issue #127)", () => {
+  const URL_BASE = "ws://example/signal";
+  const TOKEN = "ext1.999.sig";
+
+  /** 共通テストハーネス: client + reasons 配列 + states 配列 + sockets/timer。 */
+  function setup(overrides: Partial<ReconnectOptions> = {}) {
+    const { factory, sockets } = makeWsFactory();
+    const timer = makeFakeTimer();
+    const states: string[] = [];
+    const reasons: SignalingCloseReason[] = [];
+    const client = new SignalingClient(
+      URL_BASE,
+      TOKEN,
+      {
+        onMessage: () => {},
+        onStateChange: (s) => states.push(s),
+        onClosedReason: (r) => reasons.push(r),
+      },
+      {
+        initialDelayMs: 1000,
+        maxDelayMs: 30000,
+        maxJitterMs: 0,
+        random: () => 0,
+        webSocketFactory: factory,
+        setTimeout: timer.setTimeoutFn,
+        clearTimeout: timer.clearTimeoutFn,
+        ...overrides,
+      },
+    );
+    return { client, sockets, timer, states, reasons };
+  }
+
+  it("does NOT reconnect after close code 1000 (Normal Closure)", () => {
+    const { client, sockets, timer, states, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    expect(client.state).toBe("open");
+
+    sockets[0].fireClose(1000);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["normal"]);
+    expect(states).toContain("closed");
+    expect(timer.pendingCount()).toBe(0);
+
+    // 念押し: backoff schedule が完全に止まっていること。
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("does NOT reconnect after close code 1008 (Policy Violation, token invalid)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    sockets[0].fireClose(1008);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("does NOT reconnect after close code 1011 (Internal Server Error)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    sockets[0].fireClose(1011);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("does NOT reconnect after close code 4401 (application auth close)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    sockets[0].fireClose(4401);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(1);
+  });
+
+  it("DOES reconnect after close code 1006 (Abnormal Closure, transient)", () => {
+    const { client, sockets, timer, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+    expect(client.state).toBe("open");
+
+    sockets[0].fireClose(1006);
+    expect(client.state).toBe("reconnecting");
+    expect(reasons).toEqual([]); // まだ諦めていない
+    expect(timer.pendingCount()).toBe(1);
+
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
+  });
+
+  it("gives up after maxReconnectAttempts and reports `exhausted`", () => {
+    // maxReconnectAttempts=3 + maxDelayMs=1000 で短時間に上限到達を再現。
+    const { client, sockets, timer, reasons } = setup({
+      initialDelayMs: 1000,
+      maxDelayMs: 1000,
+      maxReconnectAttempts: 3,
+    });
+    void client.connect();
+    sockets[0].fireOpen();
+
+    // 1 回目の close → reconnectAttempts=0 → schedule (1s)
+    sockets[0].fireClose(1006);
+    expect(client.state).toBe("reconnecting");
+    timer.advance(1000);
+    expect(sockets.length).toBe(2);
+    // この時点で reconnectAttempts は 1 にインクリメント済み
+
+    // 2 回目: open しないまま close
+    sockets[1].fireClose(1006);
+    timer.advance(1000);
+    expect(sockets.length).toBe(3);
+
+    // 3 回目: open しないまま close
+    sockets[2].fireClose(1006);
+    timer.advance(1000);
+    expect(sockets.length).toBe(4);
+
+    // 4 回目: ここで close が来ても reconnectAttempts=3 で上限到達なので
+    // 新しい WS は張られず、 reason="exhausted" + closed に遷移する。
+    sockets[3].fireClose(1006);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["exhausted"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    timer.advance(60000);
+    expect(sockets.length).toBe(4);
+  });
+
+  it("explicit close() reports reason=`normal` exactly once", () => {
+    const { client, sockets, reasons } = setup();
+    void client.connect();
+    sockets[0].fireOpen();
+
+    client.close();
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["normal"]);
+
+    // 二重 close() しても再発火しない。
+    client.close();
+    expect(reasons).toEqual(["normal"]);
+  });
+
+  it("auth close before any successful open also reports reason=`auth`", () => {
+    // Cloudflare Access が WS upgrade 前に 401 を返し、 ブラウザが 1008 で
+    // close する想定 (RFC 6455 §7.4.1 1008 Policy Violation 相当)。
+    const { client, sockets, timer, reasons } = setup();
+    const promise = client.connect();
+    expect(client.state).toBe("connecting");
+
+    sockets[0].fireClose(1008);
+    expect(client.state).toBe("closed");
+    expect(reasons).toEqual(["auth"]);
+    expect(timer.pendingCount()).toBe(0);
+
+    return promise.catch(() => {
+      // connect() の Promise は reject されてよい。
+      expect(client.state).toBe("closed");
+    });
   });
 });

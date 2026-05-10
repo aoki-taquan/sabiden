@@ -186,10 +186,27 @@ export const App: Component = () => {
             setStatusOk(false);
             break;
           case "closed":
-            setStatus("切断");
+            // 文言は onClosedReason で reason 別に上書きされる。
             setStatusOk(false);
             break;
         }
+      },
+      onClosedReason: (reason) => {
+        // Issue #127: 自動再接続を諦めた理由を UI に表示する。
+        // `auth` の場合 token を入れ直さない限り復旧できないため、
+        // ユーザにログアウト → token 再投入を促す。
+        switch (reason) {
+          case "normal":
+            setStatus("切断");
+            break;
+          case "auth":
+            setStatus("認証失敗 (token を入れ直してください)");
+            break;
+          case "exhausted":
+            setStatus("接続不可 (再ログインしてください)");
+            break;
+        }
+        setStatusOk(false);
       },
     });
     try {

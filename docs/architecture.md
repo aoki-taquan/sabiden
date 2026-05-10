@@ -925,7 +925,7 @@ stateDiagram-v2
   Terminating --> [*]: bridge.stop + active.remove
 ```
 
-### 5.8 PWA SignalingClient 接続状態 (Issue #119)
+### 5.8 PWA SignalingClient 接続状態 (Issue #119, #127)
 
 ブラウザ PWA (`frontend/src/lib/signaling.ts::SignalingClient`) の WS 接続状態
 機械。 W3C WebSocket API §10.7 では「open 後の close からの再接続は application
@@ -933,18 +933,23 @@ stateDiagram-v2
 前提なので、 WiFi 電源管理 / モバイルデータ切替 / Cloudflare Tunnel idle timeout
 で WS が落ちても自動で復旧する必要がある。
 
+ただし token 失効等の **永続的エラー** を瞬断と同じ backoff で再試行すると、
+30 秒周期で 401 を撃ち続けて Cloudflare Access の rate-limit に当たる。 そのため
+RFC 6455 §7.4 の close code を 「永続 / 一時」 に分類し、 永続側は再接続せずに
+即 `closed` (reason=`auth`) に遷移する (Issue #127)。
+
 ```mermaid
 stateDiagram-v2
   [*] --> idle
   idle --> connecting: connect()
   connecting --> open: ws.onopen
-  connecting --> reconnecting: ws.onclose<br/>(open 前の失敗) → backoff schedule
-  open --> reconnecting: ws.onclose<br/>(瞬断) → backoff schedule
+  connecting --> reconnecting: ws.onclose<br/>(transient: 1006 等) → backoff schedule
+  connecting --> closed: ws.onclose (permanent: 1000/1008/1011/4xxx)<br/>または client.close()
+  open --> reconnecting: ws.onclose<br/>(transient: 瞬断) → backoff schedule
+  open --> closed: ws.onclose (permanent) または client.close()
   reconnecting --> reconnecting: backoff timer 満了 → 新 WS 試行<br/>(1s, 2s, 4s, 8s, ..., cap 30s + jitter)
   reconnecting --> open: ws.onopen<br/>(再接続成功 / attempts=0 リセット)
-  reconnecting --> closed: client.close()
-  open --> closed: client.close()
-  connecting --> closed: client.close()
+  reconnecting --> closed: ws.onclose (permanent)<br/>または attempts >= maxReconnectAttempts<br/>または client.close()
   closed --> [*]
 ```
 
@@ -958,6 +963,21 @@ stateDiagram-v2
   に再追従する。 トークンは `localStorage` に保管されているため、 ブラウザを
   reload しても保持される (`frontend/src/lib/storage.ts`)。
 - `client.close()` を呼ぶと以後の自動再接続は停止する (ログアウト時)。
+- close code → 永続性の判定 (RFC 6455 §7.4, Issue #127):
+  - **permanent (再接続せず closed)**:
+    - `1000` Normal Closure → reason=`normal`
+    - `1008` Policy Violation (token invalid 等) → reason=`auth`
+    - `1011` Internal Server Error → reason=`auth`
+    - `4000-4999` 私的使用域 (アプリ独自 close) → reason=`auth`
+  - **transient (backoff で再接続)**:
+    - `1001` Going Away, `1006` Abnormal Closure, `1009` Message Too Big,
+      `1012` Service Restart, その他未割当 1xxx
+    - 1006 は token 失効でも瞬断でも区別が付かないため transient 扱いだが、
+      `maxReconnectAttempts` (既定 20、 約 10 分) で必ず止まる。
+- 上限到達時は `closed` (reason=`exhausted`) に遷移し、 UI に 「接続不可」 を
+  表示してユーザに再ログインを促す。
+- `onClosedReason(reason)` は永続 closed への遷移時に 1 度だけ発火する
+  (`normal` / `auth` / `exhausted` の 3 値)。 `App.tsx` で UI 文言を出し分ける。
 
 ---
 

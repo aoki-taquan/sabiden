@@ -13,6 +13,29 @@
 //   close からの再接続は application 責務」 と明記されているため、 本クライアント
 //   は exponential backoff (1s, 2s, 4s, 8s, ..., cap 30s) + jitter で自動再接続
 //   する。 `close()` を明示的に呼んだ場合は再接続しない。
+//
+// close code 別扱い (Issue #127, RFC 6455 §7.4):
+//   token 期限切れ等でサーバが WS upgrade を拒否したケースを再接続ループから
+//   除外する必要がある (上記 backoff のままだと 30 秒周期で 401 を撃ち続け、
+//   Cloudflare Access の rate-limit に当たる)。 本クライアントは close code を
+//   3 つのカテゴリに分類する:
+//
+//     - normal (1000): 「正常終了」 RFC 6455 §7.4.1。 再接続しない (closed)。
+//     - auth (1008 / 1011 / 4xxx): 「ポリシー違反 / サーバ内部エラー / アプリ
+//       独自 close」 RFC 6455 §7.4.1, §7.4.2。 token 失効 (HTTP 401 → WS
+//       handshake 失敗 → ブラウザは多くの場合 1006 で fire するが、 sabiden
+//       Worker は明示的に 1008 を送るパスもあるため両対応) 等の永続的エラー
+//       として扱い、 再接続しない (closed + reason="auth")。
+//     - transient (1001 / 1006 / 1009 / 1012 / その他): 「going away / abnormal
+//       closure / message too big / service restart」 RFC 6455 §7.4.1。 既存の
+//       指数バックオフで再接続を継続。
+//
+//   ただし transient であっても `maxReconnectAttempts` (既定 20、 30s × 20 ≈
+//   10 分) に達したら停止する (closed + reason="exhausted")。
+//
+//   1006 は token 失効でも瞬断でも区別が付かないため transient 扱い (再接続は
+//   試みるが、 上限到達で必ず停止するためループにはならない)。 サーバが
+//   1008 を返してくるパスは確実に auth として早期に止める。
 
 export type ClientMessage =
   | { type: "register"; ext_id: string }
@@ -47,9 +70,22 @@ export type ServerMessage =
  * - `connecting`: 初回接続試行中 (open 待ち)。
  * - `open`: open 済み。 ハートビート的に messages を送受信できる。
  * - `reconnecting`: 一度 open した後 close され、 backoff 待ちまたは再 open 待ち。
- * - `closed`: `close()` で意図的に閉じた。 自動再接続しない。
+ * - `closed`: `close()` で意図的に閉じた、 または永続的エラー / 上限到達で
+ *   自動再接続を諦めた状態 (Issue #127)。 `onClosedReason(reason)` で詳細が
+ *   分かる。
  */
 export type SignalingState = "idle" | "connecting" | "open" | "reconnecting" | "closed";
+
+/**
+ * `closed` 状態の理由 (Issue #127)。 UI で 「token を入れ直してください」 等の
+ * 文言を出し分けるために用いる。
+ *
+ * - `normal`: `client.close()` の明示呼び出し / RFC 6455 §7.4.1 1000 受信。
+ * - `auth`: token 失効等でサーバが永続的にエラーを返した (RFC 6455 §7.4.1 1008,
+ *   §7.4.2 4xxx, または §7.4.1 1011)。 同じ token で再試行しても通らない。
+ * - `exhausted`: 一時的エラーが続き `maxReconnectAttempts` に達した。
+ */
+export type SignalingCloseReason = "normal" | "auth" | "exhausted";
 
 export type SignalingHandlers = {
   onMessage: (msg: ServerMessage) => void;
@@ -67,6 +103,12 @@ export type SignalingHandlers = {
   onError?: (ev: Event) => void;
   /** 状態変化通知 (UI 表示用)。 */
   onStateChange?: (state: SignalingState) => void;
+  /**
+   * 永続的に閉じた (= 自動再接続を諦めた) ときに、 理由付きで 1 度だけ発火する
+   * (Issue #127)。 UI で 「認証失敗、 token を入れ直してください」 等を出すため。
+   * `onStateChange("closed")` と一緒に呼ばれる。
+   */
+  onClosedReason?: (reason: SignalingCloseReason) => void;
 };
 
 /** 再接続 backoff の設定 (ms 単位)。 ユニットテストから差し替えるためにも export。 */
@@ -77,6 +119,12 @@ export type ReconnectOptions = {
   maxDelayMs: number;
   /** 加算する jitter の上限 (0..maxJitterMs の uniform 乱数)。 既定 250ms。 */
   maxJitterMs: number;
+  /**
+   * 連続失敗の上限 (Issue #127)。 既定 20 (≒ 30s × 20 = 10 分でギブアップ)。
+   * 0 以下を渡すと 「無制限」 として扱う (テスト用)。 既存の Issue #119 テスト
+   * との互換のため optional。
+   */
+  maxReconnectAttempts?: number;
   /** WebSocket factory。 テストから mock を注入するため。 既定は `new WebSocket(url)`。 */
   webSocketFactory?: (url: string) => WebSocket;
   /** setTimeout / clearTimeout を差し替えるためのフック (fake timer 用)。 */
@@ -90,10 +138,43 @@ const DEFAULT_RECONNECT: Required<Omit<ReconnectOptions, "webSocketFactory">> = 
   initialDelayMs: 1000,
   maxDelayMs: 30000,
   maxJitterMs: 250,
+  maxReconnectAttempts: 20,
   setTimeout: (h, ms) => window.setTimeout(h, ms) as unknown as number,
   clearTimeout: (id) => window.clearTimeout(id),
   random: Math.random,
 };
+
+/**
+ * close code → 永続的か (= 再接続をやめるべきか) の判定。
+ *
+ * - RFC 6455 §7.4.1 1000 (Normal Closure): サーバ / クライアントが行儀よく
+ *   閉じた。 再接続しない。
+ * - RFC 6455 §7.4.1 1008 (Policy Violation): token が認証ポリシー上 invalid。
+ *   再試行しても通らない。
+ * - RFC 6455 §7.4.1 1011 (Internal Server Error): サーバ側永続障害として保守的
+ *   に扱う。 リトライで治る系もあるが、 ループ防止優先。
+ * - RFC 6455 §7.4.2 4000-4999 (private use): アプリ独自 close。 sabiden Worker /
+ *   sabiden 本体は token 失効を 4401 / 4403 等で送出する想定。 RFC 上もこの帯は
+ *   アプリ仕様で定義してよい。
+ */
+export function isPermanentCloseCode(code: number): boolean {
+  if (code === 1000) return true;
+  if (code === 1008) return true;
+  if (code === 1011) return true;
+  if (code >= 4000 && code <= 4999) return true;
+  return false;
+}
+
+/**
+ * close code から `closed` 理由を導出する (永続終了確定時のみ呼ばれる)。
+ * 1000 のみ `normal`、 それ以外の永続コードは `auth` 扱い (UI に「認証失敗」 を
+ * 出す)。 `auth` の表現は厳密には 「再認証 / 永続失敗」 の意で、 1011 のような
+ * サーバエラーも含む — UI 文言はそれでも 「再ログインを試す」 で困らない。
+ */
+export function permanentCloseReason(code: number): SignalingCloseReason {
+  if (code === 1000) return "normal";
+  return "auth";
+}
 
 export class SignalingClient {
   private ws: WebSocket | null = null;
@@ -208,11 +289,18 @@ export class SignalingClient {
         settled = true;
         promise.onFail(new Error(`WebSocket closed before open (code=${ev.code})`));
       }
-      if (!this.disposed) {
-        this.scheduleReconnect();
-      } else {
-        this.setState("closed");
+      if (this.disposed) {
+        // close() 経由の close。 setState("closed") は close() 側で済んでいる。
+        return;
       }
+      // RFC 6455 §7.4: close code を見て auth 失敗等の永続的エラーを再接続
+      // ループから除外する (Issue #127)。 1006 (abnormal closure) は token
+      // 失効 / 瞬断の判別が付かないので transient 扱い (上限到達で必ず止まる)。
+      if (isPermanentCloseCode(ev.code)) {
+        this.finalize(permanentCloseReason(ev.code));
+        return;
+      }
+      this.scheduleReconnect();
     };
 
     ws.onerror = (ev) => {
@@ -229,10 +317,22 @@ export class SignalingClient {
   /**
    * 次の再接続を schedule する。 `1s, 2s, 4s, 8s, ..., cap 30s` + 小さな jitter。
    * Issue #119 の DoD に従う。
+   *
+   * Issue #127: `maxReconnectAttempts` 到達で諦める (closed + reason="exhausted")。
+   * これにより token 失効が close code 1006 (= 再接続継続) に化けるブラウザでも
+   * 永久ループを回避できる。
    */
   private scheduleReconnect(): void {
     if (this.disposed) return;
     if (this.reconnectTimer !== null) return; // 二重スケジュール防止
+
+    if (
+      this.opts.maxReconnectAttempts > 0 &&
+      this.reconnectAttempts >= this.opts.maxReconnectAttempts
+    ) {
+      this.finalize("exhausted");
+      return;
+    }
 
     const base = Math.min(
       this.opts.maxDelayMs,
@@ -249,6 +349,27 @@ export class SignalingClient {
     }, delay);
   }
 
+  /**
+   * 再接続を諦めて closed 状態に移行する (Issue #127)。 `disposed=true` を立て、
+   * pending timer を片付け、 onClosedReason / onStateChange を発火する。
+   * 以後 `connect()` 等は no-op (Promise.reject) になる。
+   */
+  private finalize(reason: SignalingCloseReason): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.reconnectTimer !== null) {
+      this.opts.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.ws = null;
+    try {
+      this.handlers.onClosedReason?.(reason);
+    } catch (e) {
+      console.error("signaling onClosedReason handler threw", e);
+    }
+    this.setState("closed");
+  }
+
   send(msg: ClientMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("signaling: not connected");
@@ -261,11 +382,7 @@ export class SignalingClient {
    * pending な backoff timer もキャンセルする。
    */
   close(): void {
-    this.disposed = true;
-    if (this.reconnectTimer !== null) {
-      this.opts.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.disposed) return;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify({ type: "bye" } satisfies ClientMessage));
@@ -274,12 +391,12 @@ export class SignalingClient {
       }
     }
     try {
-      this.ws?.close();
+      // RFC 6455 §7.1.1 / §7.4.1 1000 (Normal Closure) で閉じる。
+      this.ws?.close(1000, "client close");
     } catch {
       /* ignore */
     }
-    this.ws = null;
-    this.setState("closed");
+    this.finalize("normal");
   }
 
   get state(): SignalingState {

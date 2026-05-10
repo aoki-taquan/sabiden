@@ -244,16 +244,76 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// UAS 側で 401/407 にセットする `WWW-Authenticate` ヘッダ値を生成する。
+/// UAS 側で 401 にセットする `WWW-Authenticate` ヘッダ値を生成する。
 ///
-/// `nonce` は呼び出し側で十分にランダムな値を渡すこと
-/// (リプレイ防止のため `register::Registrar` 等のユーティリティ
-/// `new_call_id` 相当で 64bit 以上を推奨)。
-pub fn build_www_authenticate(realm: &str, nonce: &str) -> String {
-    format!(
-        r#"Digest realm="{}", nonce="{}", algorithm=MD5, qop="auth""#,
-        realm, nonce
-    )
+/// RFC 7616 §3.3 (The WWW-Authenticate Response Header Field) に従い、
+/// `stale` と `opaque` を含めて出力する。
+///
+/// - `nonce`: 呼び出し側で十分にランダムな値を渡すこと
+///   (リプレイ防止のため `register::Registrar` 等のユーティリティ
+///   `new_call_id` 相当で 64bit 以上を推奨)。
+/// - `stale`: RFC 7616 §3.3:
+///   > A case-insensitive flag indicating that the previous request from
+///   > the client was rejected because the nonce value was stale. If stale
+///   > is TRUE, the client may wish to simply retry the request with a new
+///   > encrypted response, without re-prompting the user for a new
+///   > username and password.
+///
+///   `true` を返すと UA は同じ credential のまま nonce だけ更新して再送する
+///   (パスワード再入力ダイアログを出さない)。
+/// - `opaque`: RFC 7616 §3.3:
+///   > A string of data, specified by the server, that SHOULD be returned
+///   > by the client unchanged in the Authorization header field of
+///   > subsequent requests with URIs in the same protection space.
+///
+///   `None` の場合はパラメータ自体を出力しない (RFC 2617/7616 とも `opaque`
+///   は SHOULD であり MUST ではない)。
+///
+/// 出力形式 (RFC 7616 §3.3 / RFC 2617 §3.2.1):
+/// ```text
+/// Digest realm="<realm>", nonce="<nonce>", algorithm=MD5,
+///        qop="auth", stale=<true|false>[, opaque="<opaque>"]
+/// ```
+pub fn build_www_authenticate(
+    realm: &str,
+    nonce: &str,
+    stale: bool,
+    opaque: Option<&str>,
+) -> String {
+    build_authenticate_value(realm, nonce, stale, opaque)
+}
+
+/// UAS 側で 407 (`Proxy Authentication Required`) にセットする
+/// `Proxy-Authenticate` ヘッダ値を生成する。
+///
+/// RFC 3261 §22.3 / RFC 7616 §3.3 に従い、`WWW-Authenticate` と同じ
+/// パラメータ集合 (Digest scheme + realm/nonce/algorithm/qop/stale/opaque)
+/// を返す。 ヘッダ名だけが異なる (proxy chain での再認可)。
+pub fn build_proxy_authenticate(
+    realm: &str,
+    nonce: &str,
+    stale: bool,
+    opaque: Option<&str>,
+) -> String {
+    build_authenticate_value(realm, nonce, stale, opaque)
+}
+
+/// `WWW-Authenticate` / `Proxy-Authenticate` の値を組み立てる共通実装。
+///
+/// RFC 7616 §3.3 のパラメータ順序は規定されていないが、 既存 UA との互換のため
+/// `realm, nonce, algorithm, qop, stale[, opaque]` の順で出力する。 `stale` は
+/// RFC 7616 §3.3 の例にならい引用符無し (`stale=true` / `stale=false`)、
+/// `opaque` は引用符付き (RFC 7616 §3.3: `opaque = "opaque" "=" quoted-string`)。
+fn build_authenticate_value(realm: &str, nonce: &str, stale: bool, opaque: Option<&str>) -> String {
+    let stale_str = if stale { "true" } else { "false" };
+    let mut header = format!(
+        r#"Digest realm="{}", nonce="{}", algorithm=MD5, qop="auth", stale={}"#,
+        realm, nonce, stale_str
+    );
+    if let Some(o) = opaque {
+        header.push_str(&format!(r#", opaque="{}""#, o));
+    }
+    header
 }
 
 #[cfg(test)]
@@ -324,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_build_www_authenticate_format() {
-        let header = build_www_authenticate("sabiden", "abcdef");
+        let header = build_www_authenticate("sabiden", "abcdef", false, None);
         assert!(header.starts_with("Digest "));
         assert!(header.contains(r#"realm="sabiden""#));
         assert!(header.contains(r#"nonce="abcdef""#));
@@ -335,5 +395,82 @@ mod tests {
     fn test_authorization_parse_missing_field() {
         let bad = r#"Digest username="x", realm="y""#;
         assert!(DigestAuthorization::parse(bad).is_err());
+    }
+
+    /// RFC 7616 §3.3: `stale` flag は first-time challenge では false。
+    /// 出力に `stale=false` が含まれること、 `opaque=None` のときは
+    /// `opaque` パラメータが現れないことを確認する。
+    #[test]
+    fn rfc7616_3_3_www_authenticate_stale_false_no_opaque() {
+        let header = build_www_authenticate("sabiden", "n0nce", false, None);
+        assert!(header.starts_with("Digest "));
+        assert!(header.contains("stale=false"));
+        assert!(!header.contains("stale=true"));
+        assert!(!header.contains("opaque="));
+    }
+
+    /// RFC 7616 §3.3: nonce が期限切れで再 challenge する場合は `stale=true`
+    /// を立てる。 これにより UA は user に password 再入力させずに再送する。
+    #[test]
+    fn rfc7616_3_3_www_authenticate_stale_true() {
+        let header = build_www_authenticate("sabiden", "n0nce", true, None);
+        assert!(header.contains("stale=true"));
+        assert!(!header.contains("stale=false"));
+    }
+
+    /// RFC 7616 §3.3: `opaque = "opaque" "=" quoted-string`. server-side
+    /// token を quoted-string で出力する。
+    #[test]
+    fn rfc7616_3_3_www_authenticate_with_opaque() {
+        let header = build_www_authenticate(
+            "sabiden",
+            "n0nce",
+            false,
+            Some("5ccc069c403ebaf9f0171e9517f40e41"),
+        );
+        assert!(header.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
+        assert!(header.contains("stale=false"));
+    }
+
+    /// RFC 7616 §3.3 互換性: 生成した `WWW-Authenticate` を
+    /// `DigestChallenge::parse` で読み戻して `realm` / `nonce` / `qop` /
+    /// `opaque` が往復することを確認する。 `stale` は `DigestChallenge` の
+    /// 既存フィールドに無いため (今回 issue 範囲外)、 文字列レベルでのみ確認する。
+    #[test]
+    fn rfc7616_3_3_www_authenticate_round_trip_via_digest_challenge() {
+        let header =
+            build_www_authenticate("ntt-east.ne.jp", "abc123", true, Some("opaque-token-xyz"));
+        let parsed = DigestChallenge::parse(&header).unwrap();
+        assert_eq!(parsed.realm, "ntt-east.ne.jp");
+        assert_eq!(parsed.nonce, "abc123");
+        assert_eq!(parsed.qop.as_deref(), Some("auth"));
+        assert_eq!(parsed.opaque.as_deref(), Some("opaque-token-xyz"));
+    }
+
+    /// RFC 3261 §22.3 / RFC 7616 §3.3: `Proxy-Authenticate` は
+    /// `WWW-Authenticate` と同じ Digest パラメータ集合を持つ (ヘッダ名のみ違う)。
+    /// `build_proxy_authenticate` も同じ format を返すことを確認する。
+    #[test]
+    fn rfc3261_22_3_proxy_authenticate_format_matches_www() {
+        let www = build_www_authenticate("sabiden", "n0nce", false, Some("op"));
+        let proxy = build_proxy_authenticate("sabiden", "n0nce", false, Some("op"));
+        assert_eq!(www, proxy);
+        assert!(proxy.starts_with("Digest "));
+        assert!(proxy.contains("stale=false"));
+        assert!(proxy.contains(r#"opaque="op""#));
+    }
+
+    /// RFC 7616 §3.3: `stale` 値は case-insensitive flag だが、 RFC 例では
+    /// `stale=TRUE` / `stale=true` の両表記が登場する。 sabiden は小文字
+    /// (`true` / `false`) で出力する (RFC 7616 §3.3 の ABNF 例に倣う)。
+    #[test]
+    fn rfc7616_3_3_stale_values_are_lowercase_unquoted() {
+        let h_true = build_www_authenticate("r", "n", true, None);
+        let h_false = build_www_authenticate("r", "n", false, None);
+        // 引用符無しで stale=true / stale=false が現れる
+        assert!(h_true.contains("stale=true"));
+        assert!(!h_true.contains(r#"stale="true""#));
+        assert!(h_false.contains("stale=false"));
+        assert!(!h_false.contains(r#"stale="false""#));
     }
 }

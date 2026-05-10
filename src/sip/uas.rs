@@ -498,7 +498,10 @@ impl ExtensionUas {
 
     async fn send_challenge(&self, responder: &ResponderHandle, reason: &str) -> Result<()> {
         let nonce = new_call_id(); // 実用上十分にランダム
-        let header = build_www_authenticate(&self.config.realm, &nonce);
+                                   // RFC 7616 §3.3: 初回 challenge は `stale=false`。 nonce ストア / 期限切れ
+                                   // 検出は別 issue (#104 本文 §修正案) で対応するため、 現状は常に false。
+                                   // `opaque` も server-side token の永続化が要るため別 issue で対応。
+        let header = build_www_authenticate(&self.config.realm, &nonce, false, None);
         let mut resp = {
             let tx = responder.inner.lock().await;
             build_response_skeleton(tx.request(), 401, reason)

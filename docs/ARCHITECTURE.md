@@ -38,7 +38,7 @@
 src/
 ├── sip/              # SIP プロトコル層
 │   ├── message.rs    # メッセージ パース/シリアライズ (RFC 3261)
-│   ├── auth.rs       # Digest 認証 (RFC 2617)
+│   ├── auth.rs       # Digest 認証 (RFC 2617 / RFC 7616 §3.3 stale + opaque)
 │   ├── transport.rs  # UDP/TLS トランスポート (将来)
 │   ├── transaction.rs # トランザクション層 (RFC 3261 §17)
 │   ├── dialog.rs     # ダイアログ層 (RFC 3261 §12)

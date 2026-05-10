@@ -270,6 +270,42 @@ RFC 6455 §5.5.3 自動応答)。 PWA の WS close ハンドリング (close cod
 接続 / バックオフ) は `frontend/src/lib/SignalingClient.ts` 側で完結する
 (Issue #119 / #127)。
 
+#### WS セッション終了時の resource cleanup (Issue #117)
+
+`run_session` が受信ループから抜けるとき (= WS close / `Bye` 受信 / keepalive
+idle / shutdown notify のいずれか) の **撤収シーケンス** は以下の固定順:
+
+1. `shutdown.notify_one()` で keepalive タスクを起こす (Issue #131)。
+2. `pwa_outbound_closer.close_pwa_outbound_for_ws(&ws_sink)` で PWA→NGN
+   outbound 通話に NGN BYE を撃つ (Issue #147)。 これで
+   `webrtc_outbound_active` テーブル内の同 WS 由来エントリ (= `WsSink`
+   クローン保持) が drop される。
+3. `pending_answers.cancel_all()` で **inbound fork waiter の全 oneshot::Sender
+   を drop** する (Issue #117)。 これにより orchestrator 側
+   `run_webrtc_leg::tokio::time::timeout(leg_timeout, waiter)` が `Ok(Err(_))`
+   で即時抜け、 `LegResult::Errored` が返って `close_and_drain_webrtc_legs`
+   で `WebRtcLegHandle.ws` (= `WsSink` クローン) が drop される。
+   旧挙動 (WS 切断 → leg_timeout 30 秒待ち → 408) を即時撤収に短縮する。
+4. `extensions.unregister(aor)` で `ExtensionRegistrar` から Binding を消す。
+   Binding が保持していた `ExtTransport::WebRtc { ws: WsSink, .. }` クローンも
+   ここで drop される。
+5. `peer.close()` で str0m PeerSession を閉じる。 trickle ICE forwarder タスク
+   は `local_cand_rx.recv() = None` で抜け、 自身が保持していた `WsSink`
+   クローンを drop する。
+6. `drop(ws_sink); drop(out_tx);` で `run_session` が握っている最後の `mpsc::
+   UnboundedSender` を解放する。
+
+全 sender が drop され次第 (= 上記 2-6 の完了時)、 forwarder タスクの
+`out_rx.recv()` は `None` を返してタスクが終了する (tokio mpsc 仕様: 全
+sender drop 時のみ recv が None)。 これにより **タスク / Sender / Mutex の
+リークが発生しない**。
+
+旧設計 (PR #165 以前) は `out_tx` を明示 drop しなかったため、 `run_session`
+を抜けたあとも forwarder が `out_rx.recv()` で永久待機し、 `Arc<Mutex<
+SplitSink>>` (= WebSocket sender) と forwarder タスクがリークしていた。
+ピーク 100 接続/秒の WS 切断流入で数千の orphan task が発生し、 メモリと
+CPU を浪費する事象が #117 で報告された。
+
 ### WebRtcAudioBridge メディア経路 (PWA ↔ NGN、 Issue #148 / #153)
 
 PWA レッグと NGN レッグはそれぞれ独立に SDP 交渉する (B2BUA SDP anchoring,

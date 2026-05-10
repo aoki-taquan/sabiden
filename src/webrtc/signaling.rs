@@ -139,6 +139,36 @@ impl PendingAnswers {
             false
         }
     }
+
+    /// Issue #117: WS セッション終了時 (close / `Bye` 受信) に、 当該 WS に
+    /// 紐づく **全 pending oneshot を即時キャンセル** する。
+    ///
+    /// `oneshot::Sender` を drop すると、 対応する `Receiver` は次回 await で
+    /// `Err(RecvError)` を返す (tokio 1.x docs)。 これにより orchestrator 側
+    /// (`src/call/orchestrator.rs::run_webrtc_leg`) の
+    /// `tokio::time::timeout(leg_timeout, waiter)` が `Ok(Err(_))` で即時
+    /// 抜け、 `LegResult::Errored` が返る。 結果として:
+    /// - 旧挙動: WS 切断 → leg_timeout (例 30 秒) 経過 → 408 で復帰
+    /// - 新挙動: WS 切断 → 即時 (= スケジューラ次 tick) `Errored` で復帰
+    ///
+    /// 戻り値はキャンセルしたエントリ数 (テスト / ログ用)。 既に空なら 0 件。
+    /// Idempotent: 二重呼び出しは 2 回目以降 0 件で安全。
+    pub async fn cancel_all(&self) -> usize {
+        let mut g = self.inner.lock().await;
+        let n = g.len();
+        g.clear();
+        n
+    }
+
+    /// 現在の予約数 (テスト / 観測用)。 production code は通常呼ばない。
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    /// 現在の予約が空か (テスト / 観測用)。
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
 }
 
 /// PeerSession を WS セッションごとに生成するファクトリ。
@@ -689,6 +719,11 @@ pub async fn run_session(
     // 経路で WS が落ちても、 NGN dialog が 5 分残って 486 を返す事象
     // (Issue #147 の根本要因) を防ぐ。 `ClientMessage::Bye` 経路で既に
     // cleanup 済みなら本呼び出しは 0 件 = no-op (idempotent)。
+    //
+    // 順序: `pending_answers.cancel_all()` (Issue #117) より **後** に呼ぶ。
+    // outbound 側 (`webrtc_outbound_active`) は本ハンドラで掃除されるが、
+    // inbound 側 (`webrtc_legs`) の waiter は `pending_answers` にぶら下がる
+    // ので、 こちらは下の `cancel_all` で即時起こす必要がある。
     if let Some(closer) = state.pwa_outbound_closer.as_ref() {
         let n = closer.close_pwa_outbound_for_ws(&ws_sink).await;
         if n > 0 {
@@ -699,12 +734,57 @@ pub async fn run_session(
         }
     }
 
+    // Issue #117: WS が close した時点で、 当該セッションに紐づく
+    // `PendingAnswers` の oneshot waiter は **二度と** answer が届かない
+    // (browser が居ない)。 即時 `cancel_all` で oneshot::Sender を drop し、
+    // orchestrator 側の `run_webrtc_leg` がぶら下がっている `waiter.await`
+    // を `Err(RecvError)` で即時起こす。 これで「WS 切断 → leg_timeout
+    // (30 秒) 経過 → 408」という遅延が解消する。
+    //
+    // `unregister` より **先** に実行する: 順序は実害無いが、 cancel_all で
+    // waiter を起こす方が「inbound fork が即時撤収」を観測しやすい。
+    // Idempotent なので、 すでに `Bye` 経路で空になっていれば 0 件。
+    let cancelled = pending_answers.cancel_all().await;
+    if cancelled > 0 {
+        debug!(
+            cancelled,
+            "PendingAnswers: WS close 時に全 oneshot waiter をキャンセル (Issue #117)"
+        );
+    }
+
     // クリーンアップ: AOR 失効 + PeerSession close
+    //
+    // `unregister(aor)` は ExtensionRegistrar の HashMap から Binding を消す
+    // ので、 binding が保持していた `ExtTransport::WebRtc { ws: WsSink, .. }`
+    // クローンも drop される。 これにより `out_tx` の参照カウントが減る。
     if let Some(aor) = registered_aor.lock().await.take() {
         state.extensions.unregister(&aor).await;
         info!(aor=%aor, "WebRTC AOR 失効");
     }
     let _ = peer.close().await;
+
+    // Issue #117: 送信 forwarder タスクの確実な終了。
+    //
+    // forwarder タスク (line 526-553) は `out_rx.recv()` ループで blocking
+    // しており、 全 `out_tx` クローンが drop されるまで `recv()` は終わらず
+    // タスクがリークする (tokio mpsc docs: 全 sender が drop されたとき
+    // のみ `recv()` が `None` を返す)。
+    //
+    // ここで `run_session` が握っている最後の sender を明示 drop することで、
+    // **本セッションが起源の sender** は確実に解放される。 残るクローン:
+    // - `peer` の str0m local-candidate forwarder task: `peer.close()` 完了で
+    //   `local_cand_rx` 経路が落ち、 trickle 出力タスクは `recv() = None` で
+    //   抜けて自前のクローンを drop する。
+    // - 進行中の inbound `WebRtcLegHandle.ws` クローン: 上の `cancel_all` で
+    //   `oneshot::Sender` が落ち、 `run_webrtc_leg` が `Errored` で即時撤収
+    //   する際に handle ごと drop される (`close_and_drain_webrtc_legs`)。
+    // - 進行中の outbound `webrtc_outbound_active.ws`: `close_pwa_outbound_for_ws`
+    //   で `extract_if` により entry ごと drop。
+    //
+    // よって本順序での drop により、 **数 await tick 以内** に forwarder の
+    // `out_rx.recv()` が `None` を返し、 タスクがリークしないことが保証される。
+    drop(ws_sink);
+    drop(out_tx);
 }
 
 /// 単一クライアントメッセージを処理した結果。
@@ -2374,5 +2454,296 @@ mod tests {
             stub.candidates().await.is_empty(),
             "終端マーカは peer に流してはならない"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #117: WS forwarder UAF / pending answers leak race tests
+    //
+    // 観点:
+    // (A) `PendingAnswers::cancel_all` は全 oneshot::Sender を drop し、
+    //     対応する Receiver が `Err(RecvError)` で即時起きる (tokio::sync::
+    //     oneshot::Receiver doc)。 これで `run_webrtc_leg` の
+    //     `tokio::time::timeout(leg_timeout, waiter)` が `Ok(Err(_))` で
+    //     即時抜け、 leg_timeout (30 秒等) 待ちが解消する。
+    // (B) WS セッション終了時に `out_tx` / `ws_sink` を drop することで、
+    //     全 `mpsc::UnboundedSender` クローンが解放され次第、 forwarder の
+    //     `out_rx.recv()` が `None` を返してタスクが終了する (tokio mpsc
+    //     doc: 全 sender が drop されたときのみ recv が None)。
+    //
+    // テストは仮想時計 / `tokio::task::yield_now` で deterministic に書く。
+    // flaky 化を避けるため、 sleep ベースの "wait for cleanup" は避け、
+    // 観測対象 (receiver の解決 / sender の `is_closed`) を直接 assert する。
+    // ---------------------------------------------------------------
+
+    /// Issue #117 (A): `cancel_all` が単一 waiter を即時起こす。
+    /// `oneshot::Sender` を drop することで `Receiver::await` は
+    /// `Err(RecvError)` を返す (tokio::sync::oneshot::Sender doc)。
+    #[tokio::test]
+    async fn issue117_pending_answers_cancel_all_wakes_single_waiter() {
+        let pending = PendingAnswers::new();
+        let waiter = pending.register("call-1").await;
+        assert_eq!(pending.len().await, 1, "register で 1 件追加");
+
+        let n = pending.cancel_all().await;
+        assert_eq!(n, 1, "cancel_all が 1 件キャンセル");
+        assert!(pending.is_empty().await, "テーブルは空");
+
+        // Receiver は即時 Err で resolve するはず。 1 秒タイムアウトは安全マージン
+        // (実際は 1 つの yield で resolve する)。
+        let res = tokio::time::timeout(Duration::from_secs(1), waiter).await;
+        let inner = res.expect("oneshot::Receiver が 1 秒以内に resolve しない");
+        assert!(
+            inner.is_err(),
+            "cancel_all 後の Receiver は RecvError であるはず (Sender drop = canceled)"
+        );
+    }
+
+    /// Issue #117 (A): `cancel_all` が複数 waiter を全て即時起こす。
+    /// 内線フォーク (NGN → 複数 PWA) で複数の `call_id` が同時 register された
+    /// ときの想定 (`fork_to_bindings` フロー)。
+    #[tokio::test]
+    async fn issue117_pending_answers_cancel_all_wakes_all_waiters() {
+        let pending = PendingAnswers::new();
+        let mut waiters = Vec::new();
+        for i in 0..5 {
+            waiters.push(pending.register(&format!("call-{}", i)).await);
+        }
+        assert_eq!(pending.len().await, 5);
+
+        let n = pending.cancel_all().await;
+        assert_eq!(n, 5, "全 5 件キャンセル");
+        assert!(pending.is_empty().await);
+
+        for (i, w) in waiters.into_iter().enumerate() {
+            let res = tokio::time::timeout(Duration::from_secs(1), w).await;
+            let inner = res.unwrap_or_else(|_| panic!("waiter {} が timeout", i));
+            assert!(inner.is_err(), "waiter {} は Err であるはず", i);
+        }
+    }
+
+    /// Issue #117 (A): `cancel_all` は idempotent。 2 度呼んでも 2 回目は
+    /// 0 件で安全に no-op。 `ClientMessage::Bye` 経路と WS close 経路の
+    /// 双方で呼ばれる可能性があるため重要。
+    #[tokio::test]
+    async fn issue117_pending_answers_cancel_all_is_idempotent() {
+        let pending = PendingAnswers::new();
+        let _w1 = pending.register("call-a").await;
+        let _w2 = pending.register("call-b").await;
+
+        assert_eq!(pending.cancel_all().await, 2);
+        assert_eq!(pending.cancel_all().await, 0, "2 回目は 0 件 (idempotent)");
+        assert!(pending.is_empty().await);
+    }
+
+    /// Issue #117 (A): `cancel_all` 後に同じ `call_id` を再 register できる
+    /// (テーブルから消えているので再利用可能、 ハイブリッド再接続シナリオ)。
+    #[tokio::test]
+    async fn issue117_pending_answers_reusable_after_cancel_all() {
+        let pending = PendingAnswers::new();
+        let w1 = pending.register("call-x").await;
+        pending.cancel_all().await;
+        // w1 は Err になる。
+        let _ = tokio::time::timeout(Duration::from_secs(1), w1)
+            .await
+            .expect("w1 が timeout");
+
+        // 同じ key で再 register。 別の oneshot::Receiver が返る。
+        let w2 = pending.register("call-x").await;
+        // deliver 経路が動くこと。
+        let ok = pending.deliver("call-x", "v=0 reused".into()).await;
+        assert!(ok, "deliver 成功");
+        let got = w2.await.expect("w2 が deliver で起きる");
+        assert_eq!(got, "v=0 reused");
+    }
+
+    /// Issue #117 (A): `cancel_all` 後の `deliver` は false を返す
+    /// (= waiter が居ないので browser からの遅延 answer は捨てる)。
+    /// browser が WS 再接続前に answer を投げ込んでも UAF にならない。
+    #[tokio::test]
+    async fn issue117_deliver_after_cancel_all_returns_false() {
+        let pending = PendingAnswers::new();
+        let _w = pending.register("call-y").await;
+        pending.cancel_all().await;
+
+        // late answer は配送先が居ない。
+        let delivered = pending.deliver("call-y", "v=0 late".into()).await;
+        assert!(!delivered, "cancel_all 後の deliver は false");
+    }
+
+    /// Issue #117 (B): `WsSink` を drop した直後でも、 内部 mpsc は
+    /// **他のクローンが居る限り** is_closed = false (= forwarder は生きる)。
+    /// `run_session` の `drop(out_tx)` 単独では forwarder は終わらない
+    /// (registrar binding / WebRtcLegHandle / outbound entry の WsSink クローンが
+    /// 残っている可能性がある) ことを明示する基礎テスト。
+    #[tokio::test]
+    async fn issue117_ws_sink_drop_does_not_close_channel_while_clones_alive() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let sink1 = WsSink::new(tx);
+        let sink2 = sink1.clone();
+
+        drop(sink1);
+        assert!(
+            !sink2.is_closed(),
+            "クローンが生きている間は チャネルは閉じない"
+        );
+
+        drop(sink2);
+        // 全 sender drop 後は recv() = None で終わる (tokio mpsc doc)。
+        // ここでは sink を観測できないので、 forwarder 統合テスト
+        // (issue117_forwarder_task_exits_after_all_senders_dropped) で確認する。
+    }
+
+    /// Issue #117 (B): forwarder タスクは「全 `UnboundedSender` クローンが
+    /// drop された」ときのみ終了する (tokio mpsc::UnboundedReceiver::recv doc)。
+    /// `run_session` 末尾で `out_tx` / `ws_sink` を drop し、 かつ全外部
+    /// クローン (registrar binding / webrtc_legs / webrtc_outbound_active) も
+    /// drop された場合に forwarder が確実に抜けることを直接検証する。
+    ///
+    /// このテストは run_session を模した最小構造 (mpsc + spawn forwarder) で
+    /// シミュレートし、 production の `out_tx` / `ws_sink` drop 順序が正しい
+    /// (= 全 sender drop で recv が None を返す) ことを担保する。
+    #[tokio::test]
+    async fn issue117_forwarder_task_exits_after_all_senders_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let sink = WsSink::new(tx.clone());
+
+        // 「外部に居る」クローン (= registrar binding 内 ExtTransport::WebRtc.ws
+        // 相当 / WebRtcLegHandle.ws 相当)。
+        let external_clone = sink.clone();
+
+        // forwarder 相当タスク。 recv() ループ。
+        let observed_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_c = observed_exit.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(_msg) = rx.recv().await {
+                // 本物はここで WS frame に変換。
+            }
+            observed_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // run_session 末尾の drop 順序を再現:
+        // (1) ws_sink を drop
+        drop(sink);
+        // (2) out_tx (= tx) を drop
+        drop(tx);
+
+        // ここまでで「外部クローン」だけが残る。 forwarder は **まだ** 終わらない
+        // ことを確認する (tokio::yield で他タスクに進む機会を与えても続行)。
+        tokio::task::yield_now().await;
+        assert!(
+            !observed_exit.load(std::sync::atomic::Ordering::SeqCst),
+            "外部 sender が残っている間は forwarder は終わらない"
+        );
+
+        // (3) 外部クローンを drop → 全 sender が消える → recv() が None で抜ける。
+        drop(external_clone);
+
+        let res = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
+        assert!(
+            res.is_ok(),
+            "全 sender drop 後 forwarder が 2 秒以内に終了しない (Issue #117 回帰)"
+        );
+        assert!(
+            observed_exit.load(std::sync::atomic::Ordering::SeqCst),
+            "forwarder ループが None で抜けて終了タグが立つはず"
+        );
+    }
+
+    /// Issue #117 (A+B): WS close を模した「終了シーケンス」が完走する
+    /// 統合的検証。 PendingAnswers に inbound fork 由来の waiter が複数
+    /// あり、 同時に forwarder が WS frame の送信待ちでブロックしている
+    /// 状況で、 cancel_all + sender drop の組み合わせが両者を起こす。
+    #[tokio::test]
+    async fn issue117_ws_close_cleanup_unblocks_waiters_and_forwarder() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let sink = WsSink::new(tx.clone());
+        let pending = PendingAnswers::new();
+
+        // 3 つの inbound leg が register 済みと仮定 (NGN → 3 PWA フォーク)。
+        let mut waiters = Vec::new();
+        for i in 0..3 {
+            waiters.push(pending.register(&format!("call-{}", i)).await);
+        }
+
+        // forwarder 相当タスク。
+        let forwarder_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fc = forwarder_done.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(_m) = rx.recv().await {}
+            fc.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 受信ループ離脱を模した cleanup。 順序は production と同じ:
+        // (1) pending.cancel_all  (2) ws_sink drop  (3) out_tx drop
+        let cancelled = pending.cancel_all().await;
+        assert_eq!(cancelled, 3, "3 件キャンセル");
+
+        // 全 waiter が即時 Err で解決する。 タイムアウト 1 秒は十分。
+        for (i, w) in waiters.into_iter().enumerate() {
+            let inner = tokio::time::timeout(Duration::from_secs(1), w)
+                .await
+                .unwrap_or_else(|_| panic!("waiter {} が timeout (Issue #117 (A) 回帰)", i));
+            assert!(inner.is_err(), "waiter {} は Err", i);
+        }
+
+        // sender 全 drop で forwarder も抜ける。
+        drop(sink);
+        drop(tx);
+        let res = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
+        assert!(
+            res.is_ok(),
+            "forwarder が 2 秒以内に終了しない (Issue #117 (B) 回帰)"
+        );
+        assert!(forwarder_done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Issue #117 (race 仕様): `register` と `cancel_all` の interleave で
+    /// パニックしない (mutex guard 1 段で各操作はアトミック)。 deliver と
+    /// cancel_all の競合では「先勝で他方は no-op」になる。
+    /// race を deterministic に書くため、 `tokio::join!` で 2 並行 await し
+    /// 後続の `len() == 0` を assert。
+    #[tokio::test]
+    async fn issue117_register_and_cancel_all_concurrent_is_safe() {
+        let pending = PendingAnswers::new();
+        let p1 = pending.clone();
+        let p2 = pending.clone();
+
+        let registrar = async move {
+            for i in 0..10 {
+                // `register` の戻り値 oneshot::Receiver は使い捨て (cancel_all
+                // 後の Err 受信 / 後続 await は意図しない race を生む) なので
+                // 即時 drop する。
+                drop(p1.register(&format!("c{}", i)).await);
+            }
+        };
+        let canceller = async move {
+            // 何度か cancel_all を撃つ。
+            for _ in 0..5 {
+                let _ = p2.cancel_all().await;
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::join!(registrar, canceller);
+
+        // 最終状態: register が後勝ちなら高々 10 件、 cancel が後勝ちなら 0 件。
+        // どちらでもパニックしないことが要件。 race を断定せず、 len は valid 値。
+        let n = pending.len().await;
+        assert!(n <= 10, "len は 0..=10 (実測 {})", n);
+
+        // 仕上げに cancel_all → 残り全部消える。
+        pending.cancel_all().await;
+        assert!(pending.is_empty().await);
+    }
+
+    /// Issue #117: `WsSink::is_closed` はクローン数とは独立に、 「対応する
+    /// Receiver が drop されたか」を返す (tokio mpsc::UnboundedSender doc)。
+    /// 受信側のライフサイクル監視に使う既存 API の回帰確認。
+    #[tokio::test]
+    async fn issue117_ws_sink_is_closed_reflects_receiver_drop() {
+        let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let sink = WsSink::new(tx);
+        assert!(!sink.is_closed(), "receiver 生存中は false");
+        drop(rx);
+        assert!(sink.is_closed(), "receiver drop 後は true");
     }
 }

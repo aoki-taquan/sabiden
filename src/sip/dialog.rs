@@ -355,6 +355,32 @@ impl Dialog {
         &self.remote_target
     }
 
+    /// in-dialog リクエストの **次ホップ URI** を返す (RFC 3261 §12.2.1.1)。
+    ///
+    /// RFC 3261 §12.2.1.1 / §8.1.2 に従い、 UAC は in-dialog リクエストを
+    /// **「Request-URI が指す host」ではなく** 「next-hop」 = topmost Route が
+    /// あればその URI、 なければ Request-URI (= remote target) の host:port へ
+    /// 送らねばならない。 戻り値は次ホップを示す SIP URI (`sip:host[:port][;params]`)
+    /// であり、 呼び出し側が host:port を取り出して SocketAddr に解決する。
+    ///
+    /// 分岐 (RFC 3261 §12.2.1.1 末尾の「The UAC SHOULD send the request to ...」):
+    /// - route_set が空: remote_target を返す (Request-URI = remote_target)
+    /// - route_set 非空 + 先頭 ;lr (loose routing): 先頭 Route の URI を返す
+    /// - route_set 非空 + 先頭 ;lr 無し (strict routing): 先頭 Route の URI を返す
+    ///   (strict ではそれが Request-URI に書き換えられ、 RFC 3263 で次ホップ解決される)
+    ///
+    /// Issue #79: 旧実装は宛先 SocketAddr を `server_addr` (= P-CSCF 固定) に
+    /// 固定していたため、 P-CSCF 以外を含む Record-Route や、 そもそも Record-Route
+    /// 無し / 別ホストを Contact に乗せる相手 (Asterisk peer-to-peer 等) で
+    /// BYE / Re-INVITE / 2xx ACK が宛先不明先に飛んでいた。
+    pub fn next_hop_uri(&self) -> String {
+        if self.route_set.is_empty() {
+            return self.remote_target.clone();
+        }
+        // loose / strict のいずれでも次ホップは先頭 Route の URI。
+        extract_uri(&self.route_set[0])
+    }
+
     /// Route set の先頭 URI が `lr` (loose router) を含むかで Request-URI と
     /// Route ヘッダの組み立て方が変わる (RFC 3261 §12.2.1.1).
     ///
@@ -751,6 +777,56 @@ mod tests {
     fn split_route_header_handles_multi_value_line() {
         let split = split_route_header("<sip:a;lr>, <sip:b;lr>");
         assert_eq!(split, vec!["<sip:a;lr>", "<sip:b;lr>"]);
+    }
+
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_is_remote_target_when_route_set_empty() {
+        // Record-Route が空の対向 (peer-to-peer Asterisk 等) では、
+        // RFC 3261 §12.2.1.1 「If the route set is empty, the UAC MUST place
+        // the remote target URI into the Request-URI ... and SHOULD send the
+        // request to the address indicated by the Request-URI」 に従い、
+        // 次ホップは remote target (= 200 OK の Contact) になる。
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" {
+                new_headers.add(k, v);
+            }
+        }
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        // 200 OK の Contact = sip:0312345678@[2001:db8::99]:5060
+        assert_eq!(dlg.next_hop_uri(), "sip:0312345678@[2001:db8::99]:5060");
+    }
+
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_is_topmost_route_with_loose_routing() {
+        // Record-Route 2 つ (proxy1, proxy2 受信順 → UAC route_set は逆順
+        // proxy2, proxy1) のとき、 §12.2.1.1 「the UAC SHOULD send the
+        // request to the address indicated by the topmost Route header field
+        // value」 に従い、 次ホップは route_set[0] = proxy2。
+        let inv = invite_request();
+        let resp = ok_response_with_route();
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        assert_eq!(dlg.next_hop_uri(), "sip:proxy2.ntt-east.ne.jp;lr");
+    }
+
+    #[test]
+    fn rfc3261_12_2_1_1_next_hop_is_topmost_route_with_strict_routing() {
+        // 先頭 Route が ;lr 無し (strict) でも次ホップは先頭 Route の URI。
+        let inv = invite_request();
+        let mut resp = ok_response_with_route();
+        let mut new_headers = SipHeaders::new();
+        for (k, v) in resp.headers.iter() {
+            if k != "record-route" {
+                new_headers.add(k, v);
+            }
+        }
+        new_headers.add("Record-Route", "<sip:strict.example.com>");
+        resp.headers = new_headers;
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        assert_eq!(dlg.next_hop_uri(), "sip:strict.example.com");
     }
 
     #[test]

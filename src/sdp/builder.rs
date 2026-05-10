@@ -86,6 +86,13 @@ fn format_attr(a: &Attribute) -> String {
 ///
 /// 各値は SDP 行末に直接埋め込まれるため、改行や `:` 等のエスケープは行わない。
 /// 呼び出し側で str0m が生成した文字列をそのまま渡すこと。
+///
+/// `ssrc` / `cname` / `msid_*` は WebRTC ブラウザが
+/// [RFC 5576 §4.1](https://www.rfc-editor.org/rfc/rfc5576#section-4.1) /
+/// [RFC 8830 §2](https://www.rfc-editor.org/rfc/rfc8830#section-2) /
+/// [W3C webrtc-pc §5.7] に基づき RTP 受信側 track binding を行うため必要。
+/// 未指定 (`None`) なら [`DtlsIceParams::ssrc_or_default`] / [`Self::cname_or_default`]
+/// 等が `o=` の session-id 由来の安定値を返す。
 #[derive(Debug, Clone)]
 pub struct DtlsIceParams {
     /// `a=ice-ufrag:<v>` の値
@@ -98,10 +105,22 @@ pub struct DtlsIceParams {
     /// `a=setup:<role>` の役割。サーバ側受信時 (NGN→ブラウザ) は `passive`、
     /// 発信側として offer を出すなら `actpass` を渡すと良い。
     pub setup: String,
+    /// 任意の SSRC (RFC 5576 §4.1 `a=ssrc:<ssrc-id>`)。 未指定なら
+    /// session-id 由来のデフォルトを使う。
+    pub ssrc: Option<u32>,
+    /// 任意の CNAME (RFC 5576 §6.1 `a=ssrc:<id> cname:<cname>`)。
+    /// 未指定なら `"sabiden"` 固定文字列。
+    pub cname: Option<String>,
+    /// 任意の MediaStream ID (RFC 8830 §2 `a=msid:<stream-id> <track-id>`)。
+    /// 未指定なら `"sabiden"`。
+    pub msid_stream_id: Option<String>,
+    /// 任意の MediaStreamTrack ID (RFC 8830 §2)。
+    /// 未指定なら `"audio0"` (`a=mid:0` と整合)。
+    pub msid_track_id: Option<String>,
 }
 
 impl DtlsIceParams {
-    /// 既定値 (`setup=actpass`)。
+    /// 既定値 (`setup=actpass`、 ssrc / cname / msid 未指定)。
     pub fn new(
         ice_ufrag: impl Into<String>,
         ice_pwd: impl Into<String>,
@@ -112,7 +131,62 @@ impl DtlsIceParams {
             ice_pwd: ice_pwd.into(),
             fingerprint: fingerprint.into(),
             setup: "actpass".to_string(),
+            ssrc: None,
+            cname: None,
+            msid_stream_id: None,
+            msid_track_id: None,
         }
+    }
+
+    /// SSRC を上書きするビルダ (RFC 5576 §4.1)。
+    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
+        self.ssrc = Some(ssrc);
+        self
+    }
+
+    /// CNAME を上書きするビルダ (RFC 5576 §6.1 / RFC 7022)。
+    pub fn with_cname(mut self, cname: impl Into<String>) -> Self {
+        self.cname = Some(cname.into());
+        self
+    }
+
+    /// MediaStream / MediaStreamTrack ID (RFC 8830 §2) を上書きするビルダ。
+    pub fn with_msid(mut self, stream_id: impl Into<String>, track_id: impl Into<String>) -> Self {
+        self.msid_stream_id = Some(stream_id.into());
+        self.msid_track_id = Some(track_id.into());
+        self
+    }
+
+    /// SSRC が指定されていればそれを、無ければ `fallback_seed` 由来の安定値を返す。
+    /// RFC 5576 §4.1: SSRC は 32-bit unsigned。 0 は予約値なので避ける。
+    fn ssrc_or_default(&self, fallback_seed: u64) -> u32 {
+        if let Some(s) = self.ssrc {
+            return s;
+        }
+        // RFC 3550 §8.1: SSRC は衝突回避のため擬似乱数推奨だが、
+        // sabiden では呼の単位で十分に分散すれば良いので session-id seed から導出。
+        // 0 は予約値なので 1..=u32::MAX に丸める。
+        let s = (fallback_seed ^ (fallback_seed >> 32)) as u32;
+        if s == 0 {
+            1
+        } else {
+            s
+        }
+    }
+
+    fn cname_or_default(&self) -> &str {
+        // RFC 7022 §3.1: CNAME はセッション内で安定で、ホスト識別ではなく
+        // 短期セッション識別で良い。 sabiden は固定文字列で十分。
+        self.cname.as_deref().unwrap_or("sabiden")
+    }
+
+    fn msid_stream_id_or_default(&self) -> &str {
+        self.msid_stream_id.as_deref().unwrap_or("sabiden")
+    }
+
+    fn msid_track_id_or_default(&self) -> &str {
+        // `a=mid:0` と紐づけて `audio0` 既定 (RFC 8830 §2 例示風)。
+        self.msid_track_id.as_deref().unwrap_or("audio0")
     }
 }
 
@@ -128,17 +202,37 @@ impl DtlsIceParams {
 /// # 行う加工
 ///
 /// - 最初の `m=audio` の `proto` を `UDP/TLS/RTP/SAVPF` に書き換え
-/// - 既存の rtpmap / ptime / fmtp / sendrecv 系は保持 (PCMU PT=0 など)
+/// - 既存の rtpmap / ptime / fmtp 系は保持 (PCMU PT=0 など)
 /// - メディアレベル属性の先頭付近に以下を追加 (重複は事前に除去)
 ///   - `a=rtcp-mux`
+///   - `a=rtcp:<port>` ([RFC 3605 §2.1](https://www.rfc-editor.org/rfc/rfc3605#section-2.1):
+///     RTCP port を明示。 rtcp-mux 併用でも RFC 3605 §2.1 は冪等で問題なし)
 ///   - `a=ice-ufrag:<ufrag>` / `a=ice-pwd:<pwd>`
 ///   - `a=fingerprint:<fp>` / `a=setup:<role>`
 ///   - `a=mid:0`
+///   - `a=sendrecv` ([RFC 4566 §6](https://www.rfc-editor.org/rfc/rfc4566#section-6):
+///     direction が無いと sendrecv 既定だがブラウザは明示を期待する)
+///   - `a=msid:<stream-id> <track-id>` ([RFC 8830 §2](https://www.rfc-editor.org/rfc/rfc8830#section-2),
+///     [W3C webrtc-pc §5.8.2](https://www.w3.org/TR/webrtc/#dom-rtcrtpreceiver):
+///     ブラウザ側 `RTCRtpReceiver` の track binding に必須)
+///   - `a=ssrc:<ssrc> cname:<cname>` /
+///     `a=ssrc:<ssrc> msid:<stream-id> <track-id>`
+///     ([RFC 5576 §4.1 / §6.1](https://www.rfc-editor.org/rfc/rfc5576):
+///     SSRC ⇔ Stream の binding)
 /// - セッションレベルにブラウザが期待する属性を補う
-///   - `a=group:BUNDLE 0`
-///   - `a=msid-semantic:WMS *`
-///   - `a=ice-options:trickle`
+///   - `a=group:BUNDLE 0` ([RFC 8843 §7.2](https://www.rfc-editor.org/rfc/rfc8843#section-7.2))
+///   - `a=msid-semantic:WMS *` ([RFC 8830 §2](https://www.rfc-editor.org/rfc/rfc8830#section-2))
+///   - `a=ice-options:trickle` ([RFC 8840 §4](https://www.rfc-editor.org/rfc/rfc8840#section-4))
 ///   - `a=fingerprint:<fp>` (セッションレベルにも複製)
+///
+/// JSEP ([RFC 8829 §5.2.1](https://www.rfc-editor.org/rfc/rfc8829#section-5.2.1)) に
+/// 従い、 ブラウザの `setRemoteDescription()` が破棄なく受理できる SDP を構築する。
+///
+/// # SSRC / CNAME / MSID
+///
+/// `params.ssrc` / `cname` / `msid_stream_id` / `msid_track_id` が `None` の
+/// 場合は `o=` の session-id 由来の安定値 (CNAME は `"sabiden"` 固定) を補う。
+/// 既存の `a=ssrc:` 行が SDP に含まれていれば一旦削除して上書きする (冪等性)。
 ///
 /// 元 SDP のパースに失敗したら `Err` を返す。
 pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow::Result<Vec<u8>> {
@@ -170,6 +264,13 @@ pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow:
         value: params.fingerprint.clone(),
     });
 
+    // SSRC / msid 既定値の解決。 session-id を seed にして SSRC を導出するので
+    // 同一セッション内で再変換しても同値になる (冪等性確保、 RFC 5576 §4.1)。
+    let ssrc = params.ssrc_or_default(sdp.origin.session_id);
+    let cname = params.cname_or_default().to_string();
+    let msid_stream = params.msid_stream_id_or_default().to_string();
+    let msid_track = params.msid_track_id_or_default().to_string();
+
     // ---- 最初の m=audio をブラウザ向けに加工 ----
     let audio = sdp
         .media
@@ -177,18 +278,25 @@ pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow:
         .find(|m| m.media == "audio")
         .ok_or_else(|| anyhow::anyhow!("m=audio が見つからない"))?;
 
+    let audio_port = audio.port;
     audio.protocol = "UDP/TLS/RTP/SAVPF".to_string();
 
     // 既存の同名属性を除去してから上書きで追加する。
+    // direction (sendrecv/sendonly/recvonly/inactive) は元 SDP の意図を壊さない
+    // ため retain では消さず、 後段で「無ければ補う」方針にする (RFC 4566 §6)。
     audio.attributes.retain(|a| {
         !matches!(
             a.key(),
             "rtcp-mux"
+                | "rtcp"
                 | "ice-ufrag"
                 | "ice-pwd"
                 | "fingerprint"
                 | "setup"
                 | "mid"
+                | "msid"
+                | "ssrc"
+                | "ssrc-group"
                 | "candidate"
                 | "end-of-candidates"
         )
@@ -196,6 +304,12 @@ pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow:
     audio
         .attributes
         .push(Attribute::Property("rtcp-mux".to_string()));
+    // RFC 3605 §2.1: `a=rtcp:<port> [<nettype> <addrtype> <addr>]`。
+    // rtcp-mux 環境でも値は audio の port と同一を提示する (互換性のため)。
+    audio.attributes.push(Attribute::Value {
+        key: "rtcp".to_string(),
+        value: audio_port.to_string(),
+    });
     audio.attributes.push(Attribute::Value {
         key: "ice-ufrag".to_string(),
         value: params.ice_ufrag.clone(),
@@ -215,6 +329,40 @@ pub fn convert_avp_to_savpf(sdp_bytes: &[u8], params: &DtlsIceParams) -> anyhow:
     audio.attributes.push(Attribute::Value {
         key: "mid".to_string(),
         value: "0".to_string(),
+    });
+
+    // RFC 4566 §6: direction 属性 (sendrecv/sendonly/recvonly/inactive) が
+    // 既に存在すればそれを尊重 (NGN 由来 SDP に sendrecv が乗っているケース)。
+    // 無ければブラウザ向け既定として `sendrecv` を補う (W3C webrtc-pc §5.7
+    // のデフォルト)。
+    let has_direction = audio
+        .attributes
+        .iter()
+        .any(|a| matches!(a.key(), "sendrecv" | "sendonly" | "recvonly" | "inactive"));
+    if !has_direction {
+        audio
+            .attributes
+            .push(Attribute::Property("sendrecv".to_string()));
+    }
+
+    // RFC 8830 §2 / W3C webrtc-pc §5.7:
+    // `a=msid:<MediaStream-id> <MediaStreamTrack-id>` を 1 行追加する。
+    audio.attributes.push(Attribute::Value {
+        key: "msid".to_string(),
+        value: format!("{} {}", msid_stream, msid_track),
+    });
+
+    // RFC 5576 §6.1: `a=ssrc:<ssrc-id> cname:<cname>` (CNAME は必須)。
+    // §4.1: `a=ssrc:<ssrc-id> <attribute>:<value>` 形式で複数 attribute を出す。
+    // ブラウザは msid を ssrc-level にも要求するので両方出す (互換性のため
+    // session-level msid と二重化、 W3C unified-plan)。
+    audio.attributes.push(Attribute::Value {
+        key: "ssrc".to_string(),
+        value: format!("{} cname:{}", ssrc, cname),
+    });
+    audio.attributes.push(Attribute::Value {
+        key: "ssrc".to_string(),
+        value: format!("{} msid:{} {}", ssrc, msid_stream, msid_track),
     });
 
     Ok(sdp.to_string_crlf().into_bytes())
@@ -951,6 +1099,174 @@ mod tests {
         let _ = SessionDescription::parse(s).expect("再パース");
     }
 
+    /// RFC 5576 §6.1: `a=ssrc:<id> cname:<value>` が出力に含まれる。
+    /// RFC 5576 §4.1: ssrc-level 属性で SSRC ⇔ Stream binding を行う。
+    #[test]
+    fn rfc5576_4_1_convert_avp_to_savpf_emits_ssrc_cname() {
+        let ngn = b"v=0\r\n\
+                    o=- 100 100 IN IP4 192.0.2.1\r\n\
+                    s=-\r\n\
+                    c=IN IP4 192.0.2.1\r\n\
+                    t=0 0\r\n\
+                    m=audio 30000 RTP/AVP 0\r\n\
+                    a=rtpmap:0 PCMU/8000\r\n";
+        let params = make_dtls_params()
+            .with_ssrc(0xDEAD_BEEF)
+            .with_cname("test-cname");
+        let out = convert_avp_to_savpf(ngn, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+
+        assert!(
+            s.contains("a=ssrc:3735928559 cname:test-cname\r\n"),
+            "ssrc cname 行欠落 (RFC 5576 §6.1):\n{}",
+            s
+        );
+        // 再パース可能
+        let _ = SessionDescription::parse(s).expect("re-parse");
+    }
+
+    /// RFC 8830 §2: `a=msid:<stream-id> <track-id>` の媒体レベル行と
+    /// `a=ssrc:<id> msid:<stream-id> <track-id>` の二重化 (W3C unified-plan)。
+    #[test]
+    fn rfc8830_2_convert_avp_to_savpf_emits_msid() {
+        let ngn = b"v=0\r\n\
+                    o=- 100 100 IN IP4 192.0.2.1\r\n\
+                    s=-\r\n\
+                    c=IN IP4 192.0.2.1\r\n\
+                    t=0 0\r\n\
+                    m=audio 30000 RTP/AVP 0\r\n\
+                    a=rtpmap:0 PCMU/8000\r\n";
+        let params = make_dtls_params()
+            .with_ssrc(42)
+            .with_cname("c")
+            .with_msid("stream-7", "track-9");
+        let out = convert_avp_to_savpf(ngn, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+
+        // メディアレベル msid (RFC 8830 §2)
+        assert!(
+            s.contains("a=msid:stream-7 track-9\r\n"),
+            "msid 行欠落:\n{}",
+            s
+        );
+        // ssrc-level msid (W3C webrtc-pc / unified-plan、 ssrc と紐付け)
+        assert!(
+            s.contains("a=ssrc:42 msid:stream-7 track-9\r\n"),
+            "ssrc msid 行欠落:\n{}",
+            s
+        );
+    }
+
+    /// RFC 3605 §2.1: `a=rtcp:<port>` を媒体レベルで出力する (rtcp-mux 併用でも
+    /// audio.port と同一値を出して互換性を保つ)。
+    #[test]
+    fn rfc3605_2_1_convert_avp_to_savpf_emits_rtcp_port() {
+        let ngn = b"v=0\r\n\
+                    o=- 100 100 IN IP4 192.0.2.1\r\n\
+                    s=-\r\n\
+                    c=IN IP4 192.0.2.1\r\n\
+                    t=0 0\r\n\
+                    m=audio 31234 RTP/AVP 0\r\n\
+                    a=rtpmap:0 PCMU/8000\r\n";
+        let params = make_dtls_params();
+        let out = convert_avp_to_savpf(ngn, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+
+        assert!(
+            s.contains("a=rtcp:31234\r\n"),
+            "a=rtcp:<port> が m=audio port と一致していない:\n{}",
+            s
+        );
+    }
+
+    /// RFC 4566 §6: direction 属性 (sendrecv 等) が SDP に無ければ補う。
+    #[test]
+    fn rfc4566_6_convert_avp_to_savpf_supplies_default_direction() {
+        let ngn_no_direction = b"v=0\r\n\
+                                 o=- 1 1 IN IP4 192.0.2.1\r\n\
+                                 s=-\r\n\
+                                 c=IN IP4 192.0.2.1\r\n\
+                                 t=0 0\r\n\
+                                 m=audio 30000 RTP/AVP 0\r\n\
+                                 a=rtpmap:0 PCMU/8000\r\n";
+        let params = make_dtls_params();
+        let out = convert_avp_to_savpf(ngn_no_direction, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("a=sendrecv\r\n"),
+            "direction 既定 sendrecv 補完漏れ:\n{}",
+            s
+        );
+    }
+
+    /// RFC 4566 §6: 元 SDP に `a=recvonly` 等が乗っていればその direction を
+    /// 尊重し、 `sendrecv` で上書きしない。
+    #[test]
+    fn rfc4566_6_convert_avp_to_savpf_preserves_existing_direction() {
+        let ngn_recvonly = b"v=0\r\n\
+                             o=- 1 1 IN IP4 192.0.2.1\r\n\
+                             s=-\r\n\
+                             c=IN IP4 192.0.2.1\r\n\
+                             t=0 0\r\n\
+                             m=audio 30000 RTP/AVP 0\r\n\
+                             a=rtpmap:0 PCMU/8000\r\n\
+                             a=recvonly\r\n";
+        let params = make_dtls_params();
+        let out = convert_avp_to_savpf(ngn_recvonly, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("a=recvonly\r\n"), "recvonly 保持失敗:\n{}", s);
+        assert!(
+            !s.contains("a=sendrecv\r\n"),
+            "direction 二重化 (recvonly + sendrecv 両方) :\n{}",
+            s
+        );
+    }
+
+    /// RFC 8829 §5.2.1 (JSEP): 出力 SDP がブラウザ `setRemoteDescription()` で
+    /// 必要な ssrc / msid / rtcp / direction / mid / ice / dtls 属性を全て
+    /// 含むこと。 W3C webrtc-pc § 5.7 / 5.8 の RTCRtpReceiver 必須属性網羅。
+    #[test]
+    fn rfc8829_5_2_1_convert_avp_to_savpf_includes_all_browser_required_attrs() {
+        let ngn = b"v=0\r\n\
+                    o=- 12345 12345 IN IP4 192.0.2.1\r\n\
+                    s=-\r\n\
+                    c=IN IP4 192.0.2.1\r\n\
+                    t=0 0\r\n\
+                    m=audio 40000 RTP/AVP 0\r\n\
+                    a=rtpmap:0 PCMU/8000\r\n";
+        let params = make_dtls_params();
+        let out = convert_avp_to_savpf(ngn, &params).expect("convert");
+        let s = std::str::from_utf8(&out).unwrap();
+
+        // ICE / DTLS 必須 (RFC 8839 / 8842)
+        assert!(s.contains("a=ice-ufrag:"), "ice-ufrag 欠落");
+        assert!(s.contains("a=ice-pwd:"), "ice-pwd 欠落");
+        assert!(s.contains("a=fingerprint:"), "fingerprint 欠落");
+        assert!(s.contains("a=setup:"), "setup 欠落");
+
+        // bundling / multiplex (RFC 8843 / 8829)
+        assert!(s.contains("a=group:BUNDLE"), "BUNDLE 欠落");
+        assert!(s.contains("a=mid:0"), "mid 欠落");
+        assert!(s.contains("a=rtcp-mux"), "rtcp-mux 欠落");
+
+        // direction (RFC 4566 §6)
+        assert!(s.contains("a=sendrecv"), "direction 欠落");
+
+        // SSRC / CNAME / MSID (RFC 5576 / RFC 8830)
+        assert!(
+            s.contains("a=ssrc:") && s.contains("cname:"),
+            "ssrc cname 欠落"
+        );
+        assert!(s.contains("a=msid:"), "msid 欠落");
+        assert!(s.contains("a=msid-semantic:WMS"), "msid-semantic 欠落");
+
+        // RTCP port 明示 (RFC 3605 §2.1)
+        assert!(s.contains("a=rtcp:40000"), "a=rtcp:<port> 欠落");
+
+        // 再パース可能
+        let _ = SessionDescription::parse(s).expect("re-parse");
+    }
+
     /// AVP→SAVPF 変換は冪等 (二度かけても同名属性が重複しない)。
     #[test]
     fn convert_avp_to_savpf_is_idempotent() {
@@ -976,6 +1292,26 @@ mod tests {
         assert_eq!(count("a=group:"), 1);
         assert_eq!(count("a=msid-semantic:"), 1);
         assert_eq!(count("a=ice-options:"), 1);
+        // RFC 3605 §2.1: a=rtcp は 1 行
+        assert_eq!(count("a=rtcp:"), 1);
+        // RFC 8830 §2: メディアレベル msid は 1 行
+        // (ssrc-level の `a=ssrc:<id> msid:...` 行も msid を含むので、
+        //  ここでは a=msid: 行だけを数える)
+        assert_eq!(s.lines().filter(|l| l.starts_with("a=msid:")).count(), 1);
+        // RFC 5576 §4.1: ssrc-level 属性は 2 行 (cname + msid) でちょうど。
+        // 二度かけても増えない (旧 ssrc が retain で除去されるので冪等)。
+        assert_eq!(count("a=ssrc:"), 2);
+        // direction は 1 行のみ (sendrecv 既定)。
+        let direction_count = s
+            .lines()
+            .filter(|l| {
+                matches!(
+                    l.trim_end(),
+                    "a=sendrecv" | "a=sendonly" | "a=recvonly" | "a=inactive"
+                )
+            })
+            .count();
+        assert_eq!(direction_count, 1, "direction が 0 か 2 以上:\n{}", s);
     }
 
     /// SAVPF → AVP 変換: protocol が戻り、WebRTC 専用属性が消える。

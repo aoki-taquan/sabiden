@@ -59,8 +59,10 @@ max_expires = 3600
 # register_ttl_secs = 300
 # # メディア層: "stub" (テスト/開発用) または "str0m" (実 ICE/DTLS-SRTP)
 # backend = "str0m"
-# # 外部到達可能 IPv4 (ICE host candidate に載せる)
+# # 外部到達可能 IP (ICE host candidate に載せる、 IPv4 / IPv6 とも可、 Issue #103)
 # public_ip = "203.0.113.1"
+# # 例: 純 IPv6 構成 (NGN 直収ホスト + Cloudflare Tunnel IPv6 backbone 等)
+# # public_ip = "2001:db8::1"
 # # メディア用 UDP ポート範囲
 # udp_port_range = "40000-40999"
 # # 任意の TURN/STUN URL (本 PR では SDP 提示のみ、relay allocate は TODO)

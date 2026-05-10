@@ -221,6 +221,7 @@ Asterisk ソース解析 (どこで何を組み立てているか) → [`docs/as
 |---|---|---|
 | `P-Preferred-Identity` / `Privacy: none` ヘッダの追加 | 「IMS なら必須だろう」で投入 → 403 が解消しなかった | **撤去**。Asterisk pcap で両方無しで 200 OK が返ることを確認 (`docs/asterisk-real-invite.md` §5.3)。 |
 | `webrtc.local` という偽ホスト名でのフィルタ | フォーク先 binding を SIP / WebRTC で分けるための kludge | **撤去**。`ExtTransport` enum と trait object に置換 (`src/call/orchestrator.rs:3023` のテストコメントに痕跡)。 |
+| `ResponderHandle::__test_new` (production-side test hook、 §6.3 違反) | テスト容易化のため `src/sip/uas.rs` に `pub + #[doc(hidden)]` で露出していた。 `src/call/orchestrator.rs` 13 箇所 + e2e harness から呼ばれていた | **撤去** (Issue #106 / PR #176)。 `crate::testing::builders::responder_handle_for_test` (`#[cfg(test)]` ゲート、 `src/testing.rs`) に集約。 `ResponderHandle::new` は `pub(crate)` に変更。 `docs/test-strategy.md` §3.1 も更新済。 |
 | `SipMethod::Other(String)` を全部 405 で返す | NOTIFY / PRACK / UPDATE / MESSAGE をまとめて拒否していた | **未対応 (Phase R2 で個別バリアント化)**。NOTIFY は 481、PRACK は INVITE 側 100rel 受け入れ判断、MESSAGE は 200 OK 安全。`docs/refactor-plan.md` §4.4。 |
 | `restrict_audio_to_pcmu` の attribute ブラックリスト混在 | PCMU only 化と「WebRTC 由来属性の剥離」を 1 関数で実装 | **未対応 (Phase R3 で `Negotiator` 分離)**。`docs/refactor-plan.md` §1.4 / §4.2。 |
 | `static CSEQ` (`src/sip/register.rs:23`) | プロセス全体で 1 つの REGISTER CSeq | **未対応**。多回線対応時に衝突。`docs/refactor-plan.md` §1.1 register.rs 行。 |

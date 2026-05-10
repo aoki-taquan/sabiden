@@ -188,7 +188,7 @@ E2E : SIP UAS + Call Manager + UAC + RTP bridge を全部 + 上下 mock
 
 ### 3.1 原則
 
-1. **production code を曲げてテスト用フックを足さない** (現状違反 1 件: `src/sip/uas.rs:87` `__test_new`、`src/call/orchestrator.rs:1582` から呼ばれている。Issue #42 で削除候補)
+1. **production code を曲げてテスト用フックを足さない** (過去違反例: `ResponderHandle::__test_new` が `src/sip/uas.rs` に `pub + #[doc(hidden)]` で露出していた。Issue #106 / PR #176 で撤去し、`crate::testing::builders::responder_handle_for_test` (`#[cfg(test)]` ゲート) に集約済。CLAUDE.md §9 履歴も参照)
 2. **trait 境界でモックする**、内部関数の上書きはしない
 3. **socket / 時刻 / 乱数の依存はコンストラクタで注入する** (現状: socket は注入済み、時刻と乱数は `tokio::time::pause` / RNG 引数化が課題)
 4. **同じ trait に対する mock 実装は 1 箇所** (現在 `LegInviter` の `ScriptedInviter` が `manager.rs:400` と `orchestrator.rs:872` の 2 箇所に重複。Issue #42 で `tests/common/` に集約)

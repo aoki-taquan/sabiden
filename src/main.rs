@@ -295,6 +295,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     };
     let uas_handler_for_forwarder: Arc<dyn call::orchestrator::OutboundDialogForwarder> =
         uas_handler.clone();
+    // Issue #145: PWA→NGN 発信フローで `ClientMessage::Offer { target, sdp }`
+    // を受けたシグナリング層がここに dispatch する。 `UasEventHandler` を
+    // 流用することで、 既存の Uac / CallManager / RTP bridge bind IP の
+    // 設定を再利用できる。
+    let uas_handler_for_pwa_outbound: Arc<dyn webrtc::signaling::PwaOutboundHandler> =
+        uas_handler.clone();
 
     if let (Some(ext_registrar), Some(ext_send_sock)) =
         (ext_registrar.clone(), ext_socket_for_forker)
@@ -388,7 +394,8 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         backend,
                         ttl.as_secs()
                     );
-                    let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl);
+                    let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl)
+                        .with_pwa_outbound(uas_handler_for_pwa_outbound.clone());
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {
                             Ok(s_cfg) => {

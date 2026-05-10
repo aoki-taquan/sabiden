@@ -60,11 +60,26 @@ export class WebRtcCall {
     this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream!));
   }
 
-  /** offer を作成し、シグナリング経由で送出する。 */
-  async createOffer(): Promise<void> {
+  /**
+   * SDP offer を作成し、 シグナリング経由で送出する。
+   *
+   * `target` を渡すと sabiden は PWA→NGN 発信フローを起動する
+   * (Issue #145, RFC 3264 §5)。 sabiden 側は browser に SAVPF answer を
+   * 返しつつ、 内部で AVP/PCMU SDP に変換した INVITE を NGN へ出す。
+   *
+   * `target` 省略時は旧来 echo モード (sabiden 内 str0m との折返し、 試験用)。
+   */
+  async createOffer(target?: string): Promise<void> {
     const offer = await this.pc.createOffer({ offerToReceiveAudio: true });
     await this.pc.setLocalDescription(offer);
-    this.signaling.send({ type: "offer", sdp: offer.sdp ?? "" });
+    const msg: { type: "offer"; sdp: string; target?: string } = {
+      type: "offer",
+      sdp: offer.sdp ?? "",
+    };
+    if (target !== undefined) {
+      msg.target = target;
+    }
+    this.signaling.send(msg);
   }
 
   /** サーバから受け取った answer SDP を適用。 */

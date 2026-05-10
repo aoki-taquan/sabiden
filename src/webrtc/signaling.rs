@@ -161,6 +161,44 @@ pub fn stub_peer_factory() -> PeerFactory {
     })
 }
 
+/// PWA→NGN 発信ハンドラ (Issue #145)。
+///
+/// `ClientMessage::Offer { target, sdp }` を受けたとき、 sabiden が
+/// 1. `peer.handle_offer(savpf)` で str0m が ICE/DTLS の準備
+/// 2. SAVPF answer → AVP → PCMU only に変換した SDP で NGN へ INVITE
+/// 3. 200 OK 受信 → `MediaBridge::WebRtcAudio` を起動 (NGN UDP socket ⇄
+///    Opus⇔PCMU トランスコーダ ⇄ str0m peer)
+/// 4. 戻り値の SAVPF answer を browser へ返す
+///
+/// を担当するために、 シグナリング層から呼べる薄いインタフェース。
+/// 本トレイトを実装する型 (本番は `UasEventHandler` 経由) は `Uac` /
+/// `CallManager` / RTP bridge bind IP を保持する。
+///
+/// 実装は `tokio::spawn` で非同期に駆動して構わないが、 戻り値の
+/// `String` (SAVPF answer) は browser へ即返す必要があるので、
+/// `accept_answer` までは関数内で完了させる必要がある。
+#[async_trait::async_trait]
+pub trait PwaOutboundHandler: Send + Sync {
+    /// PWA→NGN 発信フローを駆動する。 戻り値は browser に返す SAVPF SDP answer。
+    ///
+    /// # 引数
+    /// - `target`: 発信先番号 (例 "117")。 sabiden が P-CSCF host:port を補う。
+    /// - `browser_offer_sdp`: browser が送ってきた SAVPF SDP。
+    /// - `peer`: 当該 WS セッションの `PeerSession`。
+    ///   `take_media_rx` を内部で呼び出して bridge に渡すので、 呼出後の peer
+    ///   は media を別経路では取れなくなる点に注意。
+    ///
+    /// # エラー
+    /// - peer.handle_offer 失敗 / NGN INVITE 失敗 / bridge 起動失敗のいずれかで `Err`。
+    ///   呼出側 (`process_client_message`) は `ServerMessage::Error` を返す。
+    async fn handle_pwa_outbound_offer(
+        &self,
+        target: &str,
+        browser_offer_sdp: &str,
+        peer: &Arc<dyn PeerSession>,
+    ) -> Result<String>;
+}
+
 /// シグナリングサーバの共有状態。
 #[derive(Clone)]
 pub struct SignalingState {
@@ -181,6 +219,10 @@ pub struct SignalingState {
     /// アイドル切断する。 既定 60 秒 = `keepalive_interval` の 2 倍。
     /// Cloudflare の 100 秒 timeout より十分小さい値を選んでいる。
     pub idle_timeout: Duration,
+    /// PWA→NGN 発信ハンドラ (Issue #145)。 None のとき `target` 付き
+    /// Offer は `ServerMessage::Error{code:"outbound_unavailable"}` で拒否
+    /// する (sabiden が NGN UAC を持っていない構成 = 内線無し設定など)。
+    pub pwa_outbound: Option<Arc<dyn PwaOutboundHandler>>,
 }
 
 impl SignalingState {
@@ -197,6 +239,7 @@ impl SignalingState {
             peer_factory: stub_peer_factory(),
             keepalive_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
+            pwa_outbound: None,
         }
     }
 
@@ -212,6 +255,12 @@ impl SignalingState {
         self.idle_timeout = idle_timeout;
         self
     }
+
+    /// PWA→NGN 発信ハンドラを差し込む (Issue #145)。
+    pub fn with_pwa_outbound(mut self, h: Arc<dyn PwaOutboundHandler>) -> Self {
+        self.pwa_outbound = Some(h);
+        self
+    }
 }
 
 /// クライアント → サーバ メッセージ。
@@ -221,9 +270,17 @@ pub enum ClientMessage {
     Register {
         ext_id: String,
     },
-    /// browser 発の offer (将来: WebRTC → NGN 発信用)
+    /// browser 発の offer。 `target` 付きなら PWA→NGN 発信フロー
+    /// (Issue #145, RFC 3264 §5 offerer flow)。 `target` 無しは旧来の
+    /// echo モード (peer.handle_offer の SAVPF answer をそのまま browser に
+    /// 返す。 試験用に残置)。
     Offer {
         sdp: String,
+        /// 発信先 (例 "117" や "0312345678")。 NGN INVITE の Request-URI
+        /// user 部に詰める。 sabiden 側で P-CSCF IP+port を host に補う
+        /// (RFC 3261 §19.1.1 / `docs/asterisk-real-invite.md` §5.1)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// sabiden 発の offer (NGN 着信を browser へ push) に対する応答。
     /// `call_id` で対応する着信を識別する。
@@ -682,10 +739,43 @@ pub async fn process_client_message(
             info!(aor=%ext_id, "WebRTC 内線登録");
             SessionAction::Reply(ServerMessage::Registered { ext_id })
         }
-        ClientMessage::Offer { sdp } => match peer.handle_offer(&sdp).await {
-            Ok(answer) => SessionAction::Reply(ServerMessage::Answer { sdp: answer }),
-            Err(e) => SessionAction::Reply(ServerMessage::error("offer_failed", e.to_string())),
-        },
+        ClientMessage::Offer { sdp, target } => {
+            // Issue #145: target 付きは PWA→NGN 発信フロー (RFC 3264 §5/§6)。
+            // sabiden は browser に SAVPF answer を返しつつ、 内部で
+            // SAVPF→AVP→PCMU 変換した SDP で NGN に INVITE を送り 200 OK を
+            // 取り、 `MediaBridge::WebRtcAudio` で peer ⇄ NGN socket を結線する。
+            // target 無しは旧来 echo モード (試験用、 NGN へは出さない)。
+            if let Some(target) = target.as_deref() {
+                if target.is_empty() {
+                    return SessionAction::Reply(ServerMessage::error(
+                        "invalid_target",
+                        "target is empty",
+                    ));
+                }
+                let Some(handler) = state.pwa_outbound.as_ref() else {
+                    warn!(%target, "PWA outbound 未配線 (sabiden NGN UAC 無し設定?)");
+                    return SessionAction::Reply(ServerMessage::error(
+                        "outbound_unavailable",
+                        "PWA→NGN 発信ハンドラが未配線",
+                    ));
+                };
+                match handler.handle_pwa_outbound_offer(target, &sdp, peer).await {
+                    Ok(savpf_answer) => {
+                        SessionAction::Reply(ServerMessage::Answer { sdp: savpf_answer })
+                    }
+                    Err(e) => {
+                        SessionAction::Reply(ServerMessage::error("outbound_failed", e.to_string()))
+                    }
+                }
+            } else {
+                match peer.handle_offer(&sdp).await {
+                    Ok(answer) => SessionAction::Reply(ServerMessage::Answer { sdp: answer }),
+                    Err(e) => {
+                        SessionAction::Reply(ServerMessage::error("offer_failed", e.to_string()))
+                    }
+                }
+            }
+        }
         ClientMessage::Answer { call_id, sdp } => {
             // sabiden が offer 側 (NGN 着信 push) になっているはずの call_id に対する応答。
             if pending_answers.deliver(&call_id, sdp).await {
@@ -836,7 +926,10 @@ mod tests {
                      a=rtpmap:111 OPUS/48000/2\r\n";
         let (sink, pending, _c, _kg) = ws_sink_and_recv();
         let action = process_client_message(
-            ClientMessage::Offer { sdp: offer.into() },
+            ClientMessage::Offer {
+                sdp: offer.into(),
+                target: None,
+            },
             &state,
             &claims,
             &peer,
@@ -1012,12 +1105,183 @@ mod tests {
 
     #[test]
     fn client_message_offer_round_trip() {
-        let m = ClientMessage::Offer { sdp: "v=0".into() };
+        let m = ClientMessage::Offer {
+            sdp: "v=0".into(),
+            target: None,
+        };
         let s = serde_json::to_string(&m).unwrap();
         let back: ClientMessage = serde_json::from_str(&s).unwrap();
         match back {
-            ClientMessage::Offer { sdp } => assert_eq!(sdp, "v=0"),
+            ClientMessage::Offer { sdp, target } => {
+                assert_eq!(sdp, "v=0");
+                assert_eq!(target, None);
+            }
             _ => panic!(),
+        }
+    }
+
+    /// Issue #145: `Offer` schema は `target` を任意フィールドとして受理する。
+    /// `target` 無しの旧来 JSON 形式 (echo モード) と、 `target` 付き
+    /// (PWA→NGN 発信) の両方が deserialize 可能で、 round-trip で消えない。
+    #[test]
+    fn client_message_offer_with_target_round_trips() {
+        // 旧来 (target 無し)
+        let no_tgt: ClientMessage =
+            serde_json::from_str(r#"{"type":"offer","sdp":"v=0"}"#).unwrap();
+        match no_tgt {
+            ClientMessage::Offer { sdp, target } => {
+                assert_eq!(sdp, "v=0");
+                assert_eq!(target, None);
+            }
+            _ => panic!(),
+        }
+
+        // 新規 (target 付き)
+        let with_tgt: ClientMessage =
+            serde_json::from_str(r#"{"type":"offer","sdp":"v=0","target":"117"}"#).unwrap();
+        match with_tgt.clone() {
+            ClientMessage::Offer { sdp, target } => {
+                assert_eq!(sdp, "v=0");
+                assert_eq!(target.as_deref(), Some("117"));
+            }
+            _ => panic!(),
+        }
+        // serialize → deserialize で target が保持される
+        let s = serde_json::to_string(&with_tgt).unwrap();
+        assert!(s.contains("\"target\":\"117\""));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::Offer { target, .. } => assert_eq!(target.as_deref(), Some("117")),
+            _ => panic!(),
+        }
+    }
+
+    /// Issue #145: target 付き Offer で `pwa_outbound` 未配線なら、
+    /// `outbound_unavailable` エラーを返す。 既存 echo モードに巻き添えで
+    /// 影響しないこと (= peer.handle_offer は呼ばれない) も意図する。
+    #[tokio::test]
+    async fn offer_with_target_without_handler_returns_outbound_unavailable() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        let action = process_client_message(
+            ClientMessage::Offer {
+                sdp: "v=0".into(),
+                target: Some("117".into()),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "outbound_unavailable");
+            }
+            _ => panic!("error 期待"),
+        }
+    }
+
+    /// Issue #145: target 付き Offer で `pwa_outbound` が結線されていれば、
+    /// handler が返した SAVPF answer がそのまま `ServerMessage::Answer` に
+    /// 載って browser へ返る。
+    #[tokio::test]
+    async fn offer_with_target_routes_through_pwa_outbound_handler() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct FakeHandler {
+            calls: AtomicU32,
+            seen_target: std::sync::Mutex<Option<String>>,
+            answer: String,
+        }
+        #[async_trait::async_trait]
+        impl PwaOutboundHandler for FakeHandler {
+            async fn handle_pwa_outbound_offer(
+                &self,
+                target: &str,
+                _browser_offer: &str,
+                _peer: &Arc<dyn PeerSession>,
+            ) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.seen_target.lock().unwrap() = Some(target.to_string());
+                Ok(self.answer.clone())
+            }
+        }
+        let fake = Arc::new(FakeHandler {
+            calls: AtomicU32::new(0),
+            seen_target: std::sync::Mutex::new(None),
+            answer: "v=0\r\nfake-savpf-answer\r\n".into(),
+        });
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_outbound = Some(fake.clone() as Arc<dyn PwaOutboundHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        let action = process_client_message(
+            ClientMessage::Offer {
+                sdp: "v=0\r\nbrowser-savpf\r\n".into(),
+                target: Some("117".into()),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Answer { sdp }) => {
+                assert!(sdp.contains("fake-savpf-answer"));
+            }
+            other => panic!(
+                "answer 期待: {:?}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.seen_target.lock().unwrap().as_deref(),
+            Some("117"),
+            "target が PwaOutboundHandler に伝わる"
+        );
+    }
+
+    /// 空 target は `invalid_target` で拒否する (PWA からの誤送信防御)。
+    #[tokio::test]
+    async fn offer_with_empty_target_returns_invalid_target() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        let action = process_client_message(
+            ClientMessage::Offer {
+                sdp: "v=0".into(),
+                target: Some("".into()),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "invalid_target");
+            }
+            _ => panic!("error 期待"),
         }
     }
 

@@ -54,7 +54,14 @@
 
 export type ClientMessage =
   | { type: "register"; ext_id: string }
-  | { type: "offer"; sdp: string }
+  /**
+   * browser 発の SDP offer。
+   * `target` を付けると PWA→NGN 発信フロー (Issue #145, RFC 3264 §5):
+   * sabiden は browser に SAVPF answer を返しつつ、 内部で
+   * SAVPF→AVP→PCMU 変換した SDP で NGN P-CSCF へ INVITE を出す。
+   * `target` 無しは旧来 echo モード (sabiden 内 str0m と P2P 折返し、 試験用)。
+   */
+  | { type: "offer"; sdp: string; target?: string }
   /**
    * sabiden 発の offer (NGN 着信を browser に push) に対する応答。
    * `call_id` は対応する S→C `offer` のものをそのまま返す。

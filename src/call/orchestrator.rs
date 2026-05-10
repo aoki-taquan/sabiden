@@ -54,7 +54,9 @@ use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, 
 use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics};
-use crate::sdp::builder::{restrict_audio_to_pcmu_with_dtmf, rewrite_rtp_endpoint};
+use crate::sdp::builder::{
+    convert_savpf_to_avp, restrict_audio_to_pcmu_with_dtmf, rewrite_rtp_endpoint,
+};
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
@@ -64,7 +66,7 @@ use crate::sip::transaction::{
 use crate::sip::uac::{InviteOutcome, InvitePlan, Uac, UacDialog};
 use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
-use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
+use crate::webrtc::signaling::{PendingAnswers, PwaOutboundHandler, ServerMessage, WsSink};
 
 /// NGN 着信処理の動作パラメータ。
 #[derive(Debug, Clone)]
@@ -1943,6 +1945,178 @@ impl UasEventHandler {
         let cid = mgr.create_call().await;
         mgr.attach_media_bridge(cid, bridge).await?;
         Ok((rewritten_for_ext, Some(cid)))
+    }
+}
+
+/// Issue #145: PWA→NGN 発信フローのハンドラ実装。
+///
+/// `UasEventHandler` は既に `ngn_uac` / `call_manager` / RTP bridge bind IP を
+/// 抱えているため、 これらを再利用して PWA→NGN 発信を駆動する。 内線→NGN
+/// 発信 (`handle_invite`) と概ね対称的だが、 内線レッグ側が SIP dialog ではなく
+/// `PeerSession` (str0m) なので以下が異なる:
+///
+/// - browser ← sabiden: SAVPF answer は `peer.handle_offer` の戻り値をそのまま返す
+/// - sabiden → NGN: AVP/PCMU SDP offer を新規ソケットで bind した RTP port に向けて出す
+/// - 200 OK 後: `MediaBridge::WebRtcAudio` を起動 (NGN UDP socket ⇄ Opus⇔PCMU
+///   ⇄ str0m peer)
+/// - 内線レッグの ext_dialog / ResponderHandle は無く、 BYE 連動は WS 専用経路
+///   で行う (`webrtc_active` に Call-ID で WS を保存して `NgnInboundHandler::handle_bye`
+///   と対称的に PWA に通知する将来拡張)。 現状は `UacDialog` を保持しないので
+///   NGN → PWA BYE 伝搬は別 issue。
+///
+/// # RFC 引用
+///
+/// - **RFC 3264 §5/§6** (SDP offer/answer): browser に対しては str0m の SAVPF
+///   answer を即返し (browser は offerer)、 NGN に対しては sabiden が offerer
+///   として AVP/PCMU で出す。 2 つの SDP 交渉は独立 (B2BUA SDP anchoring)。
+/// - **RFC 8829** (JSEP): str0m が browser SDP を `accept_offer` した時点で
+///   ICE/DTLS 状態機械が走り出す。 ICE candidate trickle は WS の `ServerMessage::Ice`
+///   と独立に進む (RFC 8839 §4 trickle ICE)。
+/// - **RFC 3550 §5.1 / RFC 3551 PT 0** (PCMU): NGN 側 RTP は `WebRtcAudioBridge`
+///   が μ-law でエンコードして送る。
+/// - **`docs/asterisk-real-invite.md` §2 / §5.2**: NGN 側 SDP は PCMU only
+///   (`restrict_audio_to_pcmu_with_dtmf`)、 `c=`/`o=` は NGN 側 IP に強制書換。
+#[async_trait::async_trait]
+impl PwaOutboundHandler for UasEventHandler {
+    async fn handle_pwa_outbound_offer(
+        &self,
+        target: &str,
+        browser_offer_sdp: &str,
+        peer: &Arc<dyn PeerSession>,
+    ) -> Result<String> {
+        let span = info_span!("pwa_outbound_invite", target = %target);
+        async move {
+            info!(%target, "PWA→NGN 発信フロー開始 (Issue #145)");
+
+            // (1) browser SAVPF offer を str0m に渡し、 SAVPF answer を取得
+            //     (RFC 3264 §6, RFC 8829)。 これで str0m は ICE/DTLS 状態を
+            //     進め始める。 戻り値は browser に返す SAVPF answer。
+            let browser_answer = peer.handle_offer(browser_offer_sdp).await.map_err(|e| {
+                anyhow!("peer.handle_offer 失敗 (browser SDP 不正?): {}", e)
+            })?;
+
+            // (2) NGN へ送る INVITE 用の AVP/PCMU SDP を作る。
+            //     browser_answer (SAVPF) → AVP → PCMU only にして、 さらに
+            //     RTP socket を bind して `c=`/`m= port` を sabiden NGN bridge
+            //     socket に書き換える (`docs/asterisk-real-invite.md` §5.2)。
+            //
+            //     NGN 側 RTP socket: `bridge_ngn_bind_ip` (eth1 NGN 側 IP) で
+            //     bind する。 未設定 (None) は内線→NGN 発信と同じ loopback fallback。
+            let ngn_bind_ip = self
+                .bridge_ngn_bind_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let ngn_bridge_sock =
+                Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+            let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
+
+            let avp_sdp = convert_savpf_to_avp(browser_answer.as_bytes())
+                .map_err(|e| anyhow!("SAVPF→AVP 変換失敗: {}", e))?;
+            let pcmu_only = restrict_audio_to_pcmu_with_dtmf(&avp_sdp);
+            let sdp_for_ngn =
+                rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())
+                    .map_err(|e| anyhow!("NGN 向け SDP rewrite 失敗: {}", e))?;
+
+            // (3) NGN INVITE の Request-URI を組み立て、 P-CSCF に向けて発射する。
+            //     `target` は番号文字列 (例 "117") 想定。 内線→NGN 発信の
+            //     `normalize_request_uri_for_ngn` と同じ規則で URI を作る。
+            let ngn_server = self.ngn_uac.server_addr();
+            let target_uri = format!(
+                "sip:{}@{}:{}",
+                target,
+                ngn_server.ip(),
+                ngn_server.port()
+            );
+            // 既存 normalize 関数で正規化 (idempotent)。 万一 target に
+            // `;transport=udp` 等が混入していても剥がれる (Issue #58)。
+            let target_uri =
+                normalize_request_uri_for_ngn(&target_uri, &ngn_server.ip().to_string(), ngn_server.port());
+
+            let plan = self
+                .ngn_uac
+                .build_invite(&target_uri, Some(&sdp_for_ngn), None);
+            let outcome = self.ngn_uac.invite(plan, Some(sdp_for_ngn.clone())).await;
+
+            match outcome {
+                Ok(InviteOutcome::Established(call)) => {
+                    info!(
+                        target = %target,
+                        ngn_local = %sabiden_ngn_addr,
+                        "NGN 200 OK 取得 → PWA peer ⇄ NGN bridge 起動"
+                    );
+                    self.metrics.record_invite_ngn(InviteResult::Answered);
+
+                    // (4) NGN answer から相手の RTP endpoint を取得し、
+                    //     `MediaBridge::WebRtcAudio` を起動する (Issue #87/#121)。
+                    let ngn_peer = extract_rtp_endpoint(&call.response.body)
+                        .map_err(|e| anyhow!("NGN 200 OK SDP に RTP endpoint なし: {}", e))?;
+                    // browser answer から Opus PT を抽出 (RFC 7587 §7.1; 既定 111)
+                    let opus_pt =
+                        super::transcoder::find_opus_payload_type(browser_answer.as_bytes())
+                            .unwrap_or(super::transcoder::DEFAULT_OPUS_PT);
+                    let peer_media_rx = peer.take_media_rx().await.ok_or_else(|| {
+                        anyhow!(
+                            "peer.take_media_rx None (stub backend? 既に取り出し済?) → bridge 起動不可"
+                        )
+                    })?;
+                    let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
+                        super::transcoder::WebRtcAudioConfig {
+                            ngn_socket: ngn_bridge_sock,
+                            ngn_peer: Some(ngn_peer),
+                            peer: peer.clone(),
+                            peer_media_rx,
+                            opus_payload_type: opus_pt,
+                            metrics: Some(self.metrics.clone()),
+                        },
+                    )
+                    .map_err(|e| anyhow!("WebRtcAudioBridge 起動失敗: {}", e))?
+                    .into();
+
+                    // CallManager 必須: PWA outbound は media anchoring が
+                    // 本質なので、 manager 無しでは bridge を保持できない。
+                    let mgr = self.call_manager.as_ref().ok_or_else(|| {
+                        anyhow!("CallManager 未注入 → PWA outbound bridge を保持できない")
+                    })?;
+                    let cid = mgr.create_call().await;
+                    mgr.attach_media_bridge(cid, bridge).await?;
+                    self.metrics.record_invite_extension(InviteResult::Answered);
+                    self.metrics.inc_call_active();
+
+                    // 注意: NGN UacDialog (call.dialog) は B2BUA BYE 連動の
+                    // 起点として保持したいが、 現状の `OutboundCallRegistry` は
+                    // `ext_dialog` (内線 SIP dialog) を必須としており、 PWA
+                    // peer は SIP dialog を持たないため `OutboundCallEntry` を
+                    // 構築できない。 PWA→NGN 発信通話の BYE 伝搬 (両側) は
+                    // 別 issue (RFC 5853 §3.2.2)。 現状は dialog を drop する
+                    // (NGN→sabiden BYE が来たときに sabiden は 200 OK を返した
+                    // あと WS BYE 通知の経路が無い → PWA は connectionState
+                    // 変化で気付く)。
+                    let _ = call.dialog;
+
+                    Ok(browser_answer)
+                }
+                Ok(InviteOutcome::Failed { response }) => {
+                    warn!(code = response.status_code, "NGN INVITE 失敗");
+                    let result = if response.status_code == 486 {
+                        InviteResult::Busy
+                    } else {
+                        InviteResult::Error
+                    };
+                    self.metrics.record_invite_ngn(result);
+                    Err(anyhow!(
+                        "NGN INVITE 失敗: {} {}",
+                        response.status_code,
+                        response.reason
+                    ))
+                }
+                Err(e) => {
+                    warn!(error=%e, "NGN INVITE トランスポート失敗");
+                    self.metrics.record_invite_ngn(InviteResult::Timeout);
+                    Err(anyhow!("NGN INVITE 失敗: {}", e))
+                }
+            }
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -6612,7 +6786,451 @@ mod tests {
         );
         assert!(
             got_cancel,
-            "race fix: slow loser に Cancel が push されるべき"
+            "got_cancel: slow loser に Cancel が push されるべき"
         );
+    }
+
+    // ===== Issue #145: PWA→NGN 発信フロー (PwaOutboundHandler) =====
+
+    /// Issue #145: `PwaOutboundHandler::handle_pwa_outbound_offer` 経由で
+    /// PWA→NGN 発信が成立することを end-to-end で検証する。
+    ///
+    /// 観点 (RFC 3264 §5/§6, RFC 8829, `docs/asterisk-real-invite.md` §5):
+    /// 1. browser SAVPF SDP を渡したら、 戻り値は SAVPF answer (browser に返る)
+    /// 2. NGN に届く INVITE の Request-URI が `sip:<target>@<P-CSCF>:<port>`
+    /// 3. NGN に届く INVITE の SDP は AVP/PCMU で、 `c=`/`m= port` が
+    ///    sabiden NGN bridge socket を指している (LAN private IP / `0.0.0.0:9` でない)
+    /// 4. `peer.handle_offer` が呼ばれ、 `peer.take_media_rx` も呼ばれる
+    ///    (= bridge に MediaFrame I/O を渡している)
+    /// 5. 200 OK 受信後 `MediaBridge::WebRtcAudio` が CallManager に登録される
+    #[tokio::test]
+    async fn rfc3264_pwa_outbound_dials_ngn_with_avp_pcmu_sdp_and_savpf_returned_to_browser() {
+        use crate::call::manager::CallManager;
+        use crate::call::transcoder::DEFAULT_OPUS_PT;
+        use crate::sip::uac::UacConfig;
+        use crate::webrtc::peer::{MediaFrame, PeerSession};
+        use crate::webrtc::signaling::PwaOutboundHandler;
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrder};
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Mutex as TokioMutex;
+
+        // ---- (1) フェイク NGN P-CSCF: INVITE を受けて 200 OK を返す ----
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        // NGN 側 RTP ピアとして使うソケット。 INVITE 200 OK の SDP に乗せる。
+        let ngn_peer_rtp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_peer_rtp_addr = ngn_peer_rtp.local_addr().unwrap();
+
+        let captured_uri: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_sdp: Arc<StdMutex<Option<Vec<u8>>>> = Arc::new(StdMutex::new(None));
+        let captured_uri_c = captured_uri.clone();
+        let captured_sdp_c = captured_sdp.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            if let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() {
+                assert_eq!(req.method, SipMethod::Invite);
+                *captured_uri_c.lock().unwrap() = Some(req.uri.clone());
+                *captured_sdp_c.lock().unwrap() = Some(req.body.clone());
+                let mut resp = build_response_skeleton(&req, 200, "OK");
+                resp.headers.set(
+                    "To",
+                    format!("{};tag=ngn-tag", req.headers.get("to").unwrap()),
+                );
+                resp.headers
+                    .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+                resp.headers.set("Content-Type", "application/sdp");
+                resp.body = format!(
+                    "v=0\r\n\
+                     o=- 9 9 IN IP4 {ip}\r\n\
+                     s=-\r\n\
+                     c=IN IP4 {ip}\r\n\
+                     t=0 0\r\n\
+                     m=audio {port} RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n",
+                    ip = ngn_peer_rtp_addr.ip(),
+                    port = ngn_peer_rtp_addr.port()
+                )
+                .into_bytes();
+                fake_ngn_clone
+                    .send_to(&resp.to_bytes(), peer)
+                    .await
+                    .unwrap();
+                // ACK は drop
+                let _ = fake_ngn_clone.recv_from(&mut buf).await;
+            }
+        });
+
+        // ---- (2) sabiden NGN UAC ----
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // ---- (3) UasEventHandler を CallManager 付きで構築 ----
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr.clone(),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+        let pwa_h: Arc<dyn PwaOutboundHandler> = handler.clone();
+
+        // ---- (4) PWA を模した PeerSession ----
+        struct PwaPeer {
+            handle_offer_count: AtomicU32,
+            seen_offer: StdMutex<Option<String>>,
+            answer_sdp: String,
+            // take_media_rx は 1 度だけ取れる
+            media_rx: TokioMutex<Option<mpsc::Receiver<MediaFrame>>>,
+        }
+        #[async_trait::async_trait]
+        impl PeerSession for PwaPeer {
+            async fn handle_offer(&self, sdp: &str) -> Result<String> {
+                self.handle_offer_count.fetch_add(1, AtomicOrder::SeqCst);
+                *self.seen_offer.lock().unwrap() = Some(sdp.to_string());
+                Ok(self.answer_sdp.clone())
+            }
+            async fn create_offer(&self) -> Result<String> {
+                Err(anyhow!("本フローでは create_offer を呼ばない"))
+            }
+            async fn accept_answer(&self, _sdp: &str) -> Result<()> {
+                Err(anyhow!(
+                    "PWA outbound では sabiden は browser に answer を返すだけで accept_answer は呼ばない"
+                ))
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn take_media_rx(&self) -> Option<mpsc::Receiver<MediaFrame>> {
+                self.media_rx.lock().await.take()
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        // browser SAVPF answer (Opus PT 111 + PCMU PT 0 を含めて、 SAVPF→AVP→PCMU
+        // 縮退の経路を網羅する):
+        let browser_answer_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 0.0.0.0\r\n\
+            s=-\r\n\
+            c=IN IP4 0.0.0.0\r\n\
+            t=0 0\r\n\
+            m=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=ice-ufrag:abc1\r\n\
+            a=ice-pwd:abcdefghabcdefghabcdef\r\n\
+            a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+            a=setup:passive\r\n\
+            a=mid:0\r\n\
+            a=rtcp-mux\r\n\
+            a=sendrecv\r\n"
+            .to_string();
+        let (_media_tx, media_rx) = mpsc::channel::<MediaFrame>(8);
+        let pwa_peer = Arc::new(PwaPeer {
+            handle_offer_count: AtomicU32::new(0),
+            seen_offer: StdMutex::new(None),
+            answer_sdp: browser_answer_sdp.clone(),
+            media_rx: TokioMutex::new(Some(media_rx)),
+        });
+        let pwa_peer_dyn: Arc<dyn PeerSession> = pwa_peer.clone();
+
+        // ---- (5) 発信フロー実行 ----
+        let browser_offer = "v=0\r\nbrowser-savpf-offer\r\n";
+        let returned_to_browser = pwa_h
+            .handle_pwa_outbound_offer("117", browser_offer, &pwa_peer_dyn)
+            .await
+            .expect("PWA outbound 成功");
+
+        // ---- (6) 検証 ----
+        assert_eq!(
+            returned_to_browser, browser_answer_sdp,
+            "browser に返る SDP は peer.handle_offer の戻り値そのまま (RFC 3264 §6 answer)"
+        );
+        assert_eq!(
+            pwa_peer.handle_offer_count.load(AtomicOrder::SeqCst),
+            1,
+            "peer.handle_offer は 1 回呼ばれる"
+        );
+        assert_eq!(
+            pwa_peer.seen_offer.lock().unwrap().as_deref(),
+            Some(browser_offer),
+            "peer.handle_offer は browser SAVPF offer を受け取る"
+        );
+
+        // NGN に届く INVITE の検証
+        let _ = tokio::time::timeout(Duration::from_secs(2), ngn_task).await;
+        let uri = captured_uri
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NGN に INVITE 到達");
+        let expected_uri = format!("sip:117@{}", fake_ngn_addr);
+        assert_eq!(
+            uri, expected_uri,
+            "Request-URI は P-CSCF IP+port を持つ (Asterisk pcap §5.1)"
+        );
+
+        // SDP の検証: AVP/PCMU only で c=/m= port が NGN bridge socket を指している
+        let ngn_sdp = captured_sdp
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NGN INVITE SDP");
+        let sdp_text = std::str::from_utf8(&ngn_sdp).unwrap();
+        assert!(
+            sdp_text.contains("RTP/AVP "),
+            "NGN 向け SDP は RTP/AVP (SAVPF→AVP 変換済): \n{}",
+            sdp_text
+        );
+        assert!(
+            !sdp_text.contains("UDP/TLS/RTP/SAVPF"),
+            "SAVPF proto が残っている (NGN は SAVPF を解釈しない): \n{}",
+            sdp_text
+        );
+        let parsed = crate::sdp::SessionDescription::parse(sdp_text).unwrap();
+        let m = parsed
+            .media
+            .iter()
+            .find(|m| m.media == "audio")
+            .expect("m=audio 必須");
+        // PCMU only (RFC 3551 PT 0) + telephone-event (RFC 4733 PT 101) に
+        // 絞られている (`docs/asterisk-real-invite.md` §2 + Issue #69 DTMF interop)。
+        // browser answer に PT 101 が無いケースなので 0 のみのはずだが、
+        // `restrict_audio_to_pcmu_with_dtmf` が PT 101 を補う場合もあるため
+        // 「0 が含まれる + 0/101 以外は無い」 の形で assert する。
+        assert!(
+            m.formats.contains(&"0".to_string()),
+            "PT 0 (PCMU) は必ず含まれる: {:?}",
+            m.formats
+        );
+        for f in &m.formats {
+            assert!(
+                f == "0" || f == "101",
+                "PCMU(0) / telephone-event(101) 以外の PT が漏れている: {:?}",
+                m.formats
+            );
+        }
+        // c= は loopback (テストでは 127.0.0.1 を bridge_ngn_bind_ip に指定)
+        let conn = parsed.connection.as_ref().unwrap();
+        assert_eq!(
+            conn.address.to_string(),
+            "127.0.0.1",
+            "c= は sabiden NGN 側 IP (LAN private が漏れていない)"
+        );
+        // m=audio port は sabiden が bind した実 port (`9` のままはダメ)
+        assert!(m.port > 0 && m.port != 9);
+        // ngn_peer_rtp_addr の port が NGN→sabiden 向け (= NGN answer 由来) なので
+        // sabiden が出した c=/m= port とは別
+        assert_ne!(
+            m.port,
+            ngn_peer_rtp_addr.port(),
+            "sabiden 自身の bridge port を広告すべきで、 NGN ピア port を漏らしてはいけない"
+        );
+
+        // CallManager に bridge が登録されている
+        assert_eq!(
+            mgr.len().await,
+            1,
+            "PWA outbound bridge が CallManager に登録される"
+        );
+
+        // browser answer から Opus PT 111 を拾えていることを find_opus_payload_type で再確認
+        // (handler 側で同じ抽出を行っている)
+        assert_eq!(
+            crate::call::transcoder::find_opus_payload_type(browser_answer_sdp.as_bytes()),
+            Some(111),
+        );
+        let _ = DEFAULT_OPUS_PT; // 参照だけ保持
+    }
+
+    /// Issue #145: peer.handle_offer が失敗したら handler は `Err` を返し、
+    /// NGN への INVITE は飛ばない (browser SDP 不正で交渉開始前に止まる)。
+    #[tokio::test]
+    async fn pwa_outbound_returns_err_when_peer_handle_offer_fails() {
+        use crate::call::manager::CallManager;
+        use crate::sip::uac::UacConfig;
+        use crate::webrtc::peer::PeerSession;
+        use crate::webrtc::signaling::PwaOutboundHandler;
+
+        // フェイク NGN: INVITE が来たら回数を数える (来てはいけない)
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let invite_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invite_seen_c = invite_seen.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        let _ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            if tokio::time::timeout(
+                Duration::from_millis(200),
+                fake_ngn_clone.recv_from(&mut buf),
+            )
+            .await
+            .is_ok()
+            {
+                invite_seen_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:test@local".to_string(),
+                domain: "local".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "test".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr.clone(),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+        let pwa_h: Arc<dyn PwaOutboundHandler> = handler.clone();
+
+        struct FailingPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for FailingPeer {
+            async fn handle_offer(&self, _sdp: &str) -> Result<String> {
+                Err(anyhow!("simulated SDP parse error"))
+            }
+            async fn create_offer(&self) -> Result<String> {
+                Err(anyhow!("not used"))
+            }
+            async fn accept_answer(&self, _sdp: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let peer: Arc<dyn PeerSession> = Arc::new(FailingPeer);
+
+        let r = pwa_h
+            .handle_pwa_outbound_offer("117", "garbage", &peer)
+            .await;
+        assert!(r.is_err(), "peer.handle_offer 失敗で Err");
+
+        // NGN には INVITE が飛んでいないこと (200ms 待機しても受信なし)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !invite_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "browser 側で SDP 失敗したら NGN へ INVITE は出さない"
+        );
+        assert_eq!(mgr.len().await, 0, "bridge は登録されない");
+    }
+
+    /// Issue #145: NGN が 486 Busy を返したら handler は `Err` を返し、
+    /// CallManager に bridge は登録されない。
+    #[tokio::test]
+    async fn pwa_outbound_returns_err_when_ngn_returns_486() {
+        use crate::call::manager::CallManager;
+        use crate::sip::uac::UacConfig;
+        use crate::webrtc::peer::{MediaFrame, PeerSession};
+        use crate::webrtc::signaling::PwaOutboundHandler;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let fake_ngn_clone = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
+            if let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() {
+                let mut resp = build_response_skeleton(&req, 486, "Busy Here");
+                resp.headers.set(
+                    "To",
+                    format!("{};tag=busy-tag", req.headers.get("to").unwrap()),
+                );
+                fake_ngn_clone
+                    .send_to(&resp.to_bytes(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:test@local".to_string(),
+                domain: "local".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "test".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+        let mgr = CallManager::new(ExtensionRegistrar::new());
+        let handler = UasEventHandler::with_call_manager(
+            ngn_uac,
+            mgr.clone(),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+        );
+        let pwa_h: Arc<dyn PwaOutboundHandler> = handler.clone();
+
+        struct OkPeer {
+            media_rx: TokioMutex<Option<mpsc::Receiver<MediaFrame>>>,
+        }
+        #[async_trait::async_trait]
+        impl PeerSession for OkPeer {
+            async fn handle_offer(&self, _sdp: &str) -> Result<String> {
+                Ok(
+                    "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n\
+                    m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+                        .to_string(),
+                )
+            }
+            async fn create_offer(&self) -> Result<String> {
+                Err(anyhow!("not used"))
+            }
+            async fn accept_answer(&self, _sdp: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn take_media_rx(&self) -> Option<mpsc::Receiver<MediaFrame>> {
+                self.media_rx.lock().await.take()
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (_tx, rx) = mpsc::channel::<MediaFrame>(8);
+        let peer: Arc<dyn PeerSession> = Arc::new(OkPeer {
+            media_rx: TokioMutex::new(Some(rx)),
+        });
+
+        let r = pwa_h.handle_pwa_outbound_offer("117", "v=0", &peer).await;
+        assert!(r.is_err(), "NGN 486 で Err");
+        assert_eq!(mgr.len().await, 0, "bridge は登録されない");
+        let _ = tokio::time::timeout(Duration::from_secs(2), ngn_task).await;
     }
 }

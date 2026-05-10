@@ -72,6 +72,56 @@ struct LegState {
     peer: Mutex<Option<SocketAddr>>,
 }
 
+/// 1 方向の RTP 送信ストリーム状態 (SSRC / seq / timestamp)。
+///
+/// RFC 3550 §5.1 (RTP Header):
+/// > The SSRC field identifies the synchronization source. The value is
+/// > chosen randomly, with the intent that no two synchronization sources
+/// > within the same RTP session will have the same SSRC identifier.
+/// > [...] The initial value of the sequence number SHOULD be random.
+/// > [...] The initial value of the timestamp SHOULD be random.
+///
+/// sabiden のトランスコード経路 (Opus⇔μ-law) では、 sabiden が新規 RTP
+/// source として出力するため、 入力 SSRC をそのまま使うのではなく
+/// **session の最初に random 値を 1 度払い出して維持する**。 これにより
+/// 受信側 (PWA jitter buffer / NGN 端末) は同一 source として認識でき、
+/// 途中で SSRC が変わって SSRC change handler が走る事故を防ぐ。
+///
+/// seq / timestamp も同じく random 初期値 + frame ごとに連番加算。
+/// timestamp の刻みは方向 / コーデックごとに異なる:
+/// - NGN→Web (μ-law→Opus) では出力 clock = 48 kHz なので 1 frame ごとに
+///   [`OPUS_FRAME_SAMPLES`] (= 960) 進む (RFC 7587 §4.1)。
+/// - Web→NGN (Opus→μ-law) では出力 clock = 8 kHz なので 1 frame ごとに
+///   [`SAMPLES_PER_FRAME`] (= 160) 進む (RFC 3551 §4.5.14)。
+#[derive(Debug)]
+struct RtpEgressState {
+    ssrc: u32,
+    seq: u16,
+    timestamp: u32,
+}
+
+impl RtpEgressState {
+    /// RFC 3550 §5.1 に従い SSRC / seq / timestamp を random に初期化する。
+    /// 起動 1 回だけ呼び、 同一 bridge 上の同一方向では使い回す。
+    fn new_random() -> Self {
+        Self {
+            ssrc: rand::random(),
+            seq: rand::random(),
+            timestamp: rand::random(),
+        }
+    }
+
+    /// 現在の (seq, timestamp, ssrc) を返し、 次回送信用に
+    /// seq +1 / timestamp += `ts_increment` を加算する。
+    /// timestamp 加算量はコーデックの sample clock 単位で 1 frame 分。
+    fn next(&mut self, ts_increment: u32) -> (u16, u32, u32) {
+        let snapshot = (self.seq, self.timestamp, self.ssrc);
+        self.seq = self.seq.wrapping_add(1);
+        self.timestamp = self.timestamp.wrapping_add(ts_increment);
+        snapshot
+    }
+}
+
 /// 1 通話分のトランスコード ブリッジ。
 pub struct TranscodingBridge {
     ngn_to_web: Option<JoinHandle<()>>,
@@ -85,7 +135,14 @@ pub struct TranscodingBridge {
     web_state: Arc<LegState>,
 }
 
-#[derive(Default)]
+/// Bridge 全体で共有する状態。 統計カウンタと、 各方向の送信 RTP egress 状態
+/// (RFC 3550 §5.1 の SSRC / seq / timestamp) を保持する。
+///
+/// Issue #112: SSRC / seq / timestamp はループローカル変数ではなく
+/// `BridgeState` に置くことで、
+/// (a) bridge lifetime の間 SSRC を維持する設計が型で表現される、
+/// (b) テストから SSRC 値を観測して "flow 中に変わらない" ことを検証できる、
+/// という 2 つの利点がある。
 struct BridgeState {
     /// NGN→WebRTC 方向で正しく送信できた RTP 数
     ngn_to_web_packets: std::sync::atomic::AtomicU64,
@@ -93,6 +150,23 @@ struct BridgeState {
     web_to_ngn_packets: std::sync::atomic::AtomicU64,
     /// デコード/エンコード失敗で drop した RTP 数
     transcode_errors: std::sync::atomic::AtomicU64,
+    /// NGN→WebRTC 方向の送信 RTP egress 状態 (RFC 3550 §5.1)。
+    /// bridge 起動時に random 初期化、 以降 worker loop が `&mut` で update。
+    ngn_to_web_egress: Mutex<RtpEgressState>,
+    /// WebRTC→NGN 方向の送信 RTP egress 状態 (RFC 3550 §5.1)。
+    web_to_ngn_egress: Mutex<RtpEgressState>,
+}
+
+impl Default for BridgeState {
+    fn default() -> Self {
+        Self {
+            ngn_to_web_packets: std::sync::atomic::AtomicU64::new(0),
+            web_to_ngn_packets: std::sync::atomic::AtomicU64::new(0),
+            transcode_errors: std::sync::atomic::AtomicU64::new(0),
+            ngn_to_web_egress: Mutex::new(RtpEgressState::new_random()),
+            web_to_ngn_egress: Mutex::new(RtpEgressState::new_random()),
+        }
+    }
 }
 
 impl TranscodingBridge {
@@ -196,6 +270,18 @@ impl TranscodingBridge {
             self.state.transcode_errors.load(Ordering::Relaxed),
         )
     }
+
+    /// 現在の NGN→WebRTC 方向の送信 SSRC (RFC 3550 §5.1)。
+    /// bridge 起動時に random 払い出された値で、 lifetime 中に変わらない。
+    /// テストおよび debug 用。
+    pub async fn ngn_to_web_ssrc(&self) -> u32 {
+        self.state.ngn_to_web_egress.lock().await.ssrc
+    }
+
+    /// 現在の WebRTC→NGN 方向の送信 SSRC (RFC 3550 §5.1)。
+    pub async fn web_to_ngn_ssrc(&self) -> u32 {
+        self.state.web_to_ngn_egress.lock().await.ssrc
+    }
 }
 
 impl Drop for TranscodingBridge {
@@ -239,10 +325,10 @@ async fn ngn_to_web_loop(
         }
     };
 
-    // 出力 RTP の seq/ts/ssrc は random 初期値で start (RFC 3550 §5.1)
-    let ssrc: u32 = rand::random();
-    let mut seq: u16 = rand::random();
-    let mut ts: u32 = rand::random();
+    // 出力 RTP の SSRC / seq / ts は session の最初に random 初期化された
+    // `BridgeState::ngn_to_web_egress` を共有して使う (RFC 3550 §5.1)。
+    // Issue #112: 以前は loop ローカル変数で各方向 random 初期化していたが、
+    // 「flow 中 SSRC 不変」を型と共有 state で表現する。
 
     let mut buf = vec![0u8; 1500];
     loop {
@@ -314,6 +400,13 @@ async fn ngn_to_web_loop(
             }
         };
 
+        // 共有 egress state から SSRC / seq / ts を払い出して 1 frame 分進める。
+        // RFC 7587 §4.1: Opus RTP clock = 48 kHz → 20ms = 960 samples。
+        let (seq, ts, ssrc) = {
+            let mut eg = state.ngn_to_web_egress.lock().await;
+            eg.next(OPUS_FRAME_SAMPLES as u32)
+        };
+
         let out_pkt = RtpPacket {
             payload_type: opus_pt & 0x7f,
             marker: false,
@@ -322,8 +415,6 @@ async fn ngn_to_web_loop(
             ssrc,
             payload: opus_payload,
         };
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(OPUS_FRAME_SAMPLES as u32);
 
         if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
             warn!(error=%e, "WebRTC へ RTP forward 失敗");
@@ -365,9 +456,7 @@ async fn web_to_ngn_loop(
         }
     };
 
-    let ssrc: u32 = rand::random();
-    let mut seq: u16 = rand::random();
-    let mut ts: u32 = rand::random();
+    // 出力 RTP egress 状態は `BridgeState::web_to_ngn_egress` を共有 (Issue #112)。
 
     let mut buf = vec![0u8; 1500];
     loop {
@@ -449,6 +538,13 @@ async fn web_to_ngn_loop(
             }
         };
 
+        // 共有 egress state から SSRC / seq / ts を払い出す。
+        // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
+        let (seq, ts, ssrc) = {
+            let mut eg = state.web_to_ngn_egress.lock().await;
+            eg.next(SAMPLES_PER_FRAME as u32)
+        };
+
         let out_pkt = RtpPacket {
             payload_type: PAYLOAD_TYPE_ULAW,
             marker: false,
@@ -457,8 +553,6 @@ async fn web_to_ngn_loop(
             ssrc,
             payload: ulaw,
         };
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(SAMPLES_PER_FRAME as u32);
 
         if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
             warn!(error=%e, "NGN へ RTP forward 失敗");
@@ -644,6 +738,12 @@ impl WebRtcAudioBridge {
             self.state.transcode_errors.load(Ordering::Relaxed),
         )
     }
+
+    /// 現在の peer→NGN 方向の送信 SSRC (RFC 3550 §5.1)。
+    /// bridge 起動時に random 払い出された値で、 lifetime 中に変わらない。
+    pub async fn peer_to_ngn_ssrc(&self) -> u32 {
+        self.state.web_to_ngn_egress.lock().await.ssrc
+    }
 }
 
 impl Drop for WebRtcAudioBridge {
@@ -699,7 +799,14 @@ async fn ngn_to_peer_loop(
 
     // RTP timestamp 単調増加 (RFC 7587 §4.1: Opus は 48kHz、 RFC 3551 §4.5.14:
     // PCMU は 8kHz)。 直送モードでは frame ごとに 160 サンプル進める。
-    let mut rtp_ts: u32 = rand::random();
+    // Issue #112: bridge lifetime で SSRC / seq / timestamp を一貫させるため
+    // `BridgeState::ngn_to_web_egress` を共有。 MediaFrame には SSRC / seq は
+    // 載らないため (str0m が WebRTC レッグ上で割り当てる) timestamp のみ消費。
+    let ts_increment = if direct_pcmu_passthrough {
+        SAMPLES_PER_FRAME as u32
+    } else {
+        OPUS_FRAME_SAMPLES as u32
+    };
 
     let mut buf = vec![0u8; 1500];
     loop {
@@ -737,22 +844,21 @@ async fn ngn_to_peer_loop(
             continue;
         }
 
-        let frame = if direct_pcmu_passthrough {
+        // payload を先に決めてから ts を払い出す (失敗時に ts を消費しないため)。
+        let (pt_out, payload_out) = if direct_pcmu_passthrough {
             // PCMU 直送: μ-law payload をそのまま PT 0 で peer に渡す。
             // RTP timestamp は 8kHz 単位 (RFC 3551 §4.5.14: PCMU clock=8000)、
             // 1 frame = SAMPLES_PER_FRAME (= 160) 進める。
-            let f = MediaFrame {
-                pt: PAYLOAD_TYPE_ULAW,
-                rtp_time: rtp_ts,
-                payload: pkt.payload.clone(),
-                network_time: std::time::Instant::now(),
-            };
-            rtp_ts = rtp_ts.wrapping_add(SAMPLES_PER_FRAME as u32);
-            f
+            (PAYLOAD_TYPE_ULAW, pkt.payload.clone())
         } else {
-            let (upsampler, encoder) = upsampler_enc
-                .as_mut()
-                .expect("upsampler_enc must be Some when not in direct mode");
+            let (upsampler, encoder) = match upsampler_enc.as_mut() {
+                Some(v) => v,
+                None => {
+                    trace!("upsampler/encoder 未初期化 (direct mode と矛盾) → drop");
+                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
             let pcm8: Vec<i16> = pkt.payload.iter().map(|b| decode_ulaw(*b)).collect();
             let nb = AudioFrame::new(NARROW_BAND_RATE, pcm8);
             let wb = match upsampler.process(&nb) {
@@ -771,14 +877,24 @@ async fn ngn_to_peer_loop(
                     continue;
                 }
             };
-            let f = MediaFrame {
-                pt: opus_pt,
-                rtp_time: rtp_ts,
-                payload: opus_payload,
-                network_time: std::time::Instant::now(),
-            };
-            rtp_ts = rtp_ts.wrapping_add(OPUS_FRAME_SAMPLES as u32);
-            f
+            (opus_pt, opus_payload)
+        };
+
+        // 共有 egress state から timestamp を払い出して frame ごとに 1 進める。
+        // MediaFrame は SSRC / seq を持たない (str0m が割り当てる) ため、
+        // ここで消費するのは timestamp のみ。 ただし egress state を共有することで
+        // bridge lifetime 中に timestamp 系列が一貫する。
+        let rtp_time = {
+            let mut eg = state.ngn_to_web_egress.lock().await;
+            let (_seq, ts, _ssrc) = eg.next(ts_increment);
+            ts
+        };
+
+        let frame = MediaFrame {
+            pt: pt_out,
+            rtp_time,
+            payload: payload_out,
+            network_time: std::time::Instant::now(),
         };
 
         if let Err(e) = peer.send_media(frame).await {
@@ -832,9 +948,7 @@ async fn peer_to_ngn_loop(
         Some((down, dec))
     };
 
-    let ssrc: u32 = rand::random();
-    let mut seq: u16 = rand::random();
-    let mut ts: u32 = rand::random();
+    // RTP egress 状態は `BridgeState::web_to_ngn_egress` を共有 (Issue #112)。
     let expected_pt = if direct_pcmu_passthrough {
         PAYLOAD_TYPE_ULAW
     } else {
@@ -895,6 +1009,12 @@ async fn peer_to_ngn_loop(
                 continue;
             }
         };
+        // 共有 egress state から SSRC / seq / ts を払い出す。
+        // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
+        let (seq, ts, ssrc) = {
+            let mut eg = state.web_to_ngn_egress.lock().await;
+            eg.next(SAMPLES_PER_FRAME as u32)
+        };
         let out_pkt = RtpPacket {
             payload_type: PAYLOAD_TYPE_ULAW,
             marker: false,
@@ -903,8 +1023,6 @@ async fn peer_to_ngn_loop(
             ssrc,
             payload: ulaw,
         };
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(SAMPLES_PER_FRAME as u32);
 
         if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
             warn!(error=%e, "NGN へ RTP forward 失敗");
@@ -1576,5 +1694,371 @@ mod tests {
             "コーデックチェーン後の RMS が小さすぎる: {}",
             last_rms
         );
+    }
+
+    /// RFC 3550 §5.1 ユニットテスト: `RtpEgressState::next` が
+    /// SSRC を維持しつつ seq +1 / timestamp += increment で連番進行することを確認。
+    #[test]
+    fn rfc3550_5_1_rtp_egress_state_monotonic_seq_and_ts() {
+        // 初期 SSRC / seq / ts を決め打ち (random を避けて検証性を上げる)
+        let mut eg = RtpEgressState {
+            ssrc: 0xABCD_1234,
+            seq: 100,
+            timestamp: 1_000_000,
+        };
+        let (s0, t0, ssrc0) = eg.next(160);
+        let (s1, t1, ssrc1) = eg.next(160);
+        let (s2, t2, ssrc2) = eg.next(160);
+
+        // SSRC は払い出し中ずっと同じ
+        assert_eq!(ssrc0, 0xABCD_1234);
+        assert_eq!(ssrc1, 0xABCD_1234);
+        assert_eq!(ssrc2, 0xABCD_1234);
+
+        // seq は +1 ずつ
+        assert_eq!(s0, 100);
+        assert_eq!(s1, 101);
+        assert_eq!(s2, 102);
+
+        // ts は +160 ずつ (= PCMU 20ms frame)
+        assert_eq!(t0, 1_000_000);
+        assert_eq!(t1, 1_000_160);
+        assert_eq!(t2, 1_000_320);
+
+        // state も更新されている
+        assert_eq!(eg.seq, 103);
+        assert_eq!(eg.timestamp, 1_000_480);
+    }
+
+    /// RFC 3550 §5.1 ユニットテスト: seq / timestamp の wrap (u16 / u32) が
+    /// 正常に折返すこと。
+    #[test]
+    fn rfc3550_5_1_rtp_egress_state_wraps() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xDEAD_BEEF,
+            seq: u16::MAX,
+            timestamp: u32::MAX,
+        };
+        let (s0, t0, ssrc0) = eg.next(1);
+        assert_eq!(s0, u16::MAX);
+        assert_eq!(t0, u32::MAX);
+        assert_eq!(ssrc0, 0xDEAD_BEEF);
+        // wrap
+        assert_eq!(eg.seq, 0);
+        assert_eq!(eg.timestamp, 0);
+    }
+
+    /// Issue #112 / RFC 3550 §5.1: トランスコード経路 (Opus↔PCMU、
+    /// `direct_pcmu_passthrough = false`) で SSRC が flow 中に変わらないこと。
+    ///
+    /// 複数 frame を `WebRtcAudioBridge` の peer→NGN 方向に流し、 NGN socket で
+    /// 受信した RTP 全てが
+    /// - 同じ SSRC を持つ
+    /// - seq が +1 ずつ進む
+    /// - timestamp が SAMPLES_PER_FRAME (= 160) ずつ進む
+    /// - SSRC は bridge 起動後の `peer_to_ngn_ssrc()` と一致
+    /// であることを確認する。
+    ///
+    /// Issue #112 完了条件: "direct_pcmu_passthrough=false 経路 (Opus⇔PCMU) で
+    /// SSRC が flow 中変わらない test"。
+    #[tokio::test]
+    async fn rfc3550_5_1_transcode_ssrc_stable_across_flow_peer_to_ngn() {
+        use std::sync::Arc as SArc;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, _: MediaFrame) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        let (peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(16);
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: Arc::new(NoopPeer),
+            peer_media_rx: peer_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: false,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 起動直後の SSRC を観測 (random 初期化されている)
+        let expected_ssrc = bridge.peer_to_ngn_ssrc().await;
+
+        // 48 kHz 1 kHz トーンを 5 frame 流す
+        let mut enc = OpusEncoder::new().unwrap();
+        let mut samples = Vec::with_capacity(OPUS_FRAME_SAMPLES);
+        for i in 0..OPUS_FRAME_SAMPLES {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+        const N_FRAMES: usize = 5;
+        for i in 0..N_FRAMES {
+            let opus_payload = enc.encode(&frame).unwrap();
+            let media = MediaFrame {
+                pt: DEFAULT_OPUS_PT,
+                rtp_time: (i as u32) * (OPUS_FRAME_SAMPLES as u32),
+                payload: opus_payload,
+                network_time: std::time::Instant::now(),
+            };
+            peer_tx.send(media).await.unwrap();
+        }
+
+        // NGN socket で 5 frame 受信
+        let mut buf = vec![0u8; 1500];
+        let mut received: Vec<RtpPacket> = Vec::with_capacity(N_FRAMES);
+        for _ in 0..N_FRAMES {
+            let (n, _) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+                .await
+                .expect("NGN socket recv timeout")
+                .unwrap();
+            received.push(RtpPacket::from_bytes(&buf[..n]).unwrap());
+        }
+
+        // 全 frame で SSRC が一致 (RFC 3550 §5.1)
+        for (i, pkt) in received.iter().enumerate() {
+            assert_eq!(
+                pkt.ssrc, expected_ssrc,
+                "frame #{}: SSRC が flow 中変わっている (expected {:08x}, got {:08x})",
+                i, expected_ssrc, pkt.ssrc
+            );
+            assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
+        }
+
+        // 起動後の SSRC も同じ (bridge lifetime 中不変)
+        assert_eq!(
+            bridge.peer_to_ngn_ssrc().await,
+            expected_ssrc,
+            "bridge lifetime 中に SSRC が変わっている"
+        );
+
+        // seq が +1 ずつ進む (RFC 3550 §5.1: monotonically increasing per SSRC)
+        let seq0 = received[0].sequence;
+        for (i, pkt) in received.iter().enumerate() {
+            let expected_seq = seq0.wrapping_add(i as u16);
+            assert_eq!(
+                pkt.sequence, expected_seq,
+                "frame #{}: seq が連番でない (expected {}, got {})",
+                i, expected_seq, pkt.sequence
+            );
+        }
+
+        // timestamp が SAMPLES_PER_FRAME ずつ進む (RFC 3551 §4.5.14: PCMU 8kHz)
+        let ts0 = received[0].timestamp;
+        for (i, pkt) in received.iter().enumerate() {
+            let expected_ts = ts0.wrapping_add((i as u32) * (SAMPLES_PER_FRAME as u32));
+            assert_eq!(
+                pkt.timestamp, expected_ts,
+                "frame #{}: timestamp 増分が不正 (expected {}, got {})",
+                i, expected_ts, pkt.timestamp
+            );
+        }
+
+        bridge.stop().await;
+    }
+
+    /// Issue #112 / RFC 3550 §5.1: `TranscodingBridge` の Opus↔PCMU 経路
+    /// (WebRTC→NGN 方向) で SSRC が flow 中に変わらないこと。
+    ///
+    /// `WebRtcAudioBridge` (str0m 経路) と異なり `TranscodingBridge` は両端を
+    /// UDP socket で扱う legacy パスなので、 SSRC 安定性の検証も別途必要。
+    #[tokio::test]
+    async fn rfc3550_5_1_transcode_bridge_ssrc_stable_across_flow_web_to_ngn() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_addr = web_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        let expected_ssrc = bridge.web_to_ngn_ssrc().await;
+
+        // 48 kHz 1 kHz トーンを Opus encode して 5 frame 流す
+        let mut enc = OpusEncoder::new().unwrap();
+        let mut samples = Vec::with_capacity(OPUS_FRAME_SAMPLES);
+        for i in 0..OPUS_FRAME_SAMPLES {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+        const N_FRAMES: usize = 5;
+        for i in 0..N_FRAMES {
+            let pkt = build_opus_rtp_packet(
+                DEFAULT_OPUS_PT,
+                (i as u16) + 1,
+                (i as u32) * (OPUS_FRAME_SAMPLES as u32),
+                0xCCCC_CCCC,
+                &mut enc,
+                &frame,
+            )
+            .unwrap();
+            web_peer.send_to(&pkt, web_addr).await.unwrap();
+        }
+
+        // NGN 側で N_FRAMES 個受信
+        let mut buf = vec![0u8; 1500];
+        let mut received: Vec<RtpPacket> = Vec::with_capacity(N_FRAMES);
+        for _ in 0..N_FRAMES {
+            let (n, _) = timeout(Duration::from_secs(2), ngn_peer.recv_from(&mut buf))
+                .await
+                .expect("NGN 側で frame 不足")
+                .unwrap();
+            received.push(RtpPacket::from_bytes(&buf[..n]).unwrap());
+        }
+
+        // SSRC は全 frame で一致 (Issue #112 完了条件)
+        for (i, pkt) in received.iter().enumerate() {
+            assert_eq!(
+                pkt.ssrc, expected_ssrc,
+                "frame #{}: SSRC が flow 中に変わっている",
+                i
+            );
+            assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
+        }
+
+        // seq +1 連番、 timestamp +160 連番
+        let seq0 = received[0].sequence;
+        let ts0 = received[0].timestamp;
+        for (i, pkt) in received.iter().enumerate() {
+            assert_eq!(
+                pkt.sequence,
+                seq0.wrapping_add(i as u16),
+                "frame #{} seq",
+                i
+            );
+            assert_eq!(
+                pkt.timestamp,
+                ts0.wrapping_add((i as u32) * (SAMPLES_PER_FRAME as u32)),
+                "frame #{} ts",
+                i
+            );
+        }
+
+        bridge.stop().await;
+    }
+
+    /// Issue #112 / RFC 3550 §5.1: `TranscodingBridge` の NGN→WebRTC (Opus) 方向で
+    /// SSRC / seq / ts が flow 中変わらないこと。
+    #[tokio::test]
+    async fn rfc3550_5_1_transcode_bridge_ssrc_stable_across_flow_ngn_to_web() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        let expected_ssrc = bridge.ngn_to_web_ssrc().await;
+
+        // 8 kHz 1 kHz トーンを μ-law 化して 5 frame 流す
+        let mut samples = Vec::with_capacity(NB_FRAME_SAMPLES);
+        for i in 0..NB_FRAME_SAMPLES {
+            let t = i as f32 / NARROW_BAND_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+
+        const N_FRAMES: usize = 5;
+        for i in 0..N_FRAMES {
+            let pkt = build_ulaw_rtp_packet(
+                (i as u16) + 1,
+                (i as u32) * (SAMPLES_PER_FRAME as u32),
+                0xAAAA_AAAA,
+                &samples,
+            );
+            ngn_peer.send_to(&pkt, ngn_addr).await.unwrap();
+        }
+
+        let mut buf = vec![0u8; 1500];
+        let mut received: Vec<RtpPacket> = Vec::with_capacity(N_FRAMES);
+        for _ in 0..N_FRAMES {
+            let (n, _) = timeout(Duration::from_secs(2), web_peer.recv_from(&mut buf))
+                .await
+                .expect("WebRTC 側で frame 不足")
+                .unwrap();
+            received.push(RtpPacket::from_bytes(&buf[..n]).unwrap());
+        }
+
+        // SSRC 全 frame 一致
+        for (i, pkt) in received.iter().enumerate() {
+            assert_eq!(
+                pkt.ssrc, expected_ssrc,
+                "frame #{}: SSRC が flow 中に変わっている",
+                i
+            );
+            assert_eq!(pkt.payload_type, DEFAULT_OPUS_PT);
+        }
+
+        // seq +1 / ts +OPUS_FRAME_SAMPLES (= 960) 連番
+        let seq0 = received[0].sequence;
+        let ts0 = received[0].timestamp;
+        for (i, pkt) in received.iter().enumerate() {
+            assert_eq!(
+                pkt.sequence,
+                seq0.wrapping_add(i as u16),
+                "frame #{} seq",
+                i
+            );
+            assert_eq!(
+                pkt.timestamp,
+                ts0.wrapping_add((i as u32) * (OPUS_FRAME_SAMPLES as u32)),
+                "frame #{} ts (RFC 7587 §4.1: Opus clock 48kHz)",
+                i
+            );
+        }
+
+        bridge.stop().await;
     }
 }

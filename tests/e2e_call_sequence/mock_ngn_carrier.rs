@@ -52,6 +52,11 @@ pub struct InviteOpts {
     pub min_se: Option<u32>,
     /// SDP body (空なら body 無し)。
     pub sdp_offer: Vec<u8>,
+    /// `Supported` ヘッダに `100rel` (RFC 3262 §3) を追加するか。 既定 false
+    /// (= sabiden は non-reliable 180 経路で通常通り 200 OK へ進む)。 true
+    /// にすると reliable 180 Ringing → PRACK → 200 OK PRACK → 200 OK INVITE
+    /// の流れを駆動する (Issue #251 Phase B)。
+    pub advertise_100rel: bool,
 }
 
 impl Default for InviteOpts {
@@ -65,6 +70,7 @@ impl Default for InviteOpts {
             session_expires_refresher: Some("uac"),
             min_se: Some(300),
             sdp_offer: Vec::new(),
+            advertise_100rel: false,
         }
     }
 }
@@ -139,7 +145,16 @@ impl MockNgnCarrier {
             req.headers.set("Min-SE", min_se.to_string());
         }
         // RFC 3261 §20.5 / RFC 3262 / RFC 4028 §3: Supported オプション タグ。
-        req.headers.set("Supported", "timer,100rel");
+        // 100rel (RFC 3262) を opts.advertise_100rel で opt-in にすることで、
+        // 既存通話シーケンス (sabiden が non-reliable 180 → 200 OK で完結) と
+        // 100rel フロー (reliable 180 → PRACK → 200 OK PRACK → 200 OK INVITE)
+        // を選択的に駆動できる (Issue #251 Phase B)。
+        let supported = if opts.advertise_100rel {
+            "timer,100rel"
+        } else {
+            "timer"
+        };
+        req.headers.set("Supported", supported);
         // RFC 3261 §20.5: Allow ヘッダ (実機 NGN 080 着信に倣う)。
         req.headers
             .set("Allow", "INVITE,ACK,BYE,CANCEL,PRACK,UPDATE");
@@ -262,6 +277,70 @@ impl MockNgnCarrier {
             .send_to(&ack.to_bytes(), sabiden_addr)
             .await
             .expect("send ack");
+    }
+
+    /// RFC 3262 §4 (Issue #251 Phase B): sabiden が出した reliable 180 Ringing
+    /// に対する PRACK を送る。 `rseq` は reliable 18x の `RSeq` 値、 `cseq` は
+    /// 元 INVITE の CSeq 番号 (= 通常 1)、 method は INVITE 固定。
+    /// `RAck = "<rseq> <cseq> INVITE"` (RFC 3262 §7.2 ABNF)。
+    pub async fn send_prack(
+        &self,
+        sabiden_addr: SocketAddr,
+        injected: &InjectedInvite,
+        rseq: u32,
+        cseq: u32,
+    ) {
+        let branch = format!("z9hG4bK-prack-{}", rand_hex(8));
+        let mut prack = SipRequest::new(SipMethod::Prack, injected.request_uri.clone());
+        prack.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};rport;branch={}", self.local_addr, branch),
+        );
+        prack.headers.set("Max-Forwards", "70");
+        prack.headers.set(
+            "From",
+            format!("<{}>;tag={}", injected.from_uri, injected.from_tag),
+        );
+        prack
+            .headers
+            .set("To", format!("<{}>", injected.request_uri));
+        prack.headers.set("Call-ID", &injected.call_id);
+        prack.headers.set("CSeq", "2 PRACK");
+        prack
+            .headers
+            .set("RAck", format!("{} {} INVITE", rseq, cseq));
+        self.socket
+            .send_to(&prack.to_bytes(), sabiden_addr)
+            .await
+            .expect("send prack");
+    }
+
+    /// RFC 3262 §3 (Issue #251 Phase B): reliable 180 Ringing が来るまで応答を
+    /// 読み続け、 (RSeq, response) を返す。 `Require: 100rel` と `RSeq` ヘッダの
+    /// 存在も assert する。
+    pub async fn expect_reliable_180_with_rseq(&self) -> (u32, SipResponse) {
+        for _ in 0..8 {
+            let (resp, _) = self
+                .recv_response(Duration::from_secs(3))
+                .await
+                .expect("180 Ringing が来るべき");
+            if resp.status_code == 180 {
+                let require = resp.headers.get("require").unwrap_or("");
+                assert!(
+                    require.to_ascii_lowercase().contains("100rel"),
+                    "RFC 3262 §3: reliable 18x は Require: 100rel MUST: {require:?}"
+                );
+                let rseq: u32 = resp
+                    .headers
+                    .get("rseq")
+                    .expect("RFC 3262 §3 / §7.1: RSeq ヘッダ MUST")
+                    .parse()
+                    .expect("RSeq は u32");
+                return (rseq, resp);
+            }
+            // 100 Trying や他 1xx は skip。
+        }
+        panic!("RFC 3262 §3: reliable 180 Ringing が NGN へ届かない");
     }
 
     /// sabiden へ BYE を送る (dialog teardown、 RFC 3261 §15.1.1)。

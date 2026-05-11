@@ -222,7 +222,8 @@ impl DtlsIceParams {
 /// - セッションレベルにブラウザが期待する属性を補う
 ///   - `a=group:BUNDLE 0` ([RFC 8843 §7.2](https://www.rfc-editor.org/rfc/rfc8843#section-7.2))
 ///   - `a=msid-semantic:WMS *` ([RFC 8830 §2](https://www.rfc-editor.org/rfc/rfc8830#section-2))
-///   - `a=ice-options:trickle` ([RFC 8840 §4](https://www.rfc-editor.org/rfc/rfc8840#section-4))
+///   - `a=ice-options:trickle` ([RFC 8838 §11](https://www.rfc-editor.org/rfc/rfc8838#section-11):
+///     trickle ICE option registration。 RFC 8840 は SIP usage 専用)
 ///   - `a=fingerprint:<fp>` (セッションレベルにも複製)
 ///
 /// JSEP ([RFC 8829 §5.2.1](https://www.rfc-editor.org/rfc/rfc8829#section-5.2.1)) に

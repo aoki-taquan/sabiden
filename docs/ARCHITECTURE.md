@@ -566,8 +566,12 @@ ICE candidate は **host candidate 1 件のみ** (`public_ip` 由来、 STUN/TUR
 場合 ICE candidate gathering の終了タイミングは「host candidate を送出した
 直後」 で確定するため、 sabiden run_loop は host を 1 件送出した直後に
 **空文字列 (`""`) を end-of-candidates marker** として WS シグナリングに流す
-(RFC 8840 §4 / W3C WebRTC §4.4.1.6: end-of-candidates は null candidate /
-empty string で表す)。
+(RFC 8838 §13 (Generating an End-of-Candidates Indication) / W3C WebRTC
+§4.4.1.6: end-of-candidates は null candidate / empty string で表す)。
+
+> **注**: RFC 8840 は **SIP usage 専用** (Trickle ICE over SIP)。 sabiden は
+> WebSocket JSON シグナリング経路なので、 trickle ICE の一般仕様である
+> **RFC 8838** (§13 Generating / §14 Receiving) を主引用とする。
 
 ```
 [sabiden → PWA trickle ICE flow]
@@ -579,7 +583,7 @@ str0m run_loop                          signaling.rs                       PWA
  │                                                                          │
  ├─ host_candidate (typ host, public_ip)  ──► ServerMessage::Ice{candidate} ──►  pc.addIceCandidate({candidate})
  │                                                                          │
- └─ "" (RFC 8840 §4 marker, 同 tick)      ──► ServerMessage::Ice{candidate:""} ──►  pc.addIceCandidate(null)
+ └─ "" (RFC 8838 §13 marker, 同 tick)     ──► ServerMessage::Ice{candidate:""} ──►  pc.addIceCandidate(null)
                                                                             │
                                                                             ▼
                                           ブラウザ: gathering 完了確定。 ICE failure timer
@@ -589,13 +593,15 @@ str0m run_loop                          signaling.rs                       PWA
 ```
 
 PWA → sabiden 方向の end-of-candidates marker (`{type:"ice", candidate:""}` /
-`candidate:"end-of-candidates"`) は `process_client_message::Ice` で silent OK
-受理する (RFC 8840 §4 SHOULD)。 str0m 0.19 / is-0.9.0 は public API として
-「end-of-remote-candidates を `IceAgent` に通知する」 メソッドを提供しない
-(is-0.9.0/src/agent.rs:205 のコメント: "We never end trickle ice")。 そのため
-本 marker は観測ログのみに使われ、 ICE 失敗判定は str0m 内部 timer に委ねる
-(sabiden は ICE-Lite controlled なので、 ブラウザ側の候補列挙完了を待つ必要は
-ない)。
+`candidate:"end-of-candidates"` / `candidate:"a=end-of-candidates"`) は
+`process_client_message::Ice` で silent OK 受理する (RFC 8838 §14 MAY)。
+**比較は trim 後の厳密 equality** で行う (Issue #206: `contains` ベースの
+部分一致は `xxx-end-of-candidates-yyy` 型の擬陽性を生む)。 str0m 0.19 /
+is-0.9.0 は public API として「end-of-remote-candidates を `IceAgent` に通知
+する」 メソッドを提供しない (is-0.9.0/src/agent.rs:205 のコメント: "We never
+end trickle ice")。 そのため本 marker は観測ログのみに使われ、 ICE 失敗
+判定は str0m 内部 timer に委ねる (sabiden は ICE-Lite controlled なので、
+ブラウザ側の候補列挙完了を待つ必要はない)。
 
 ### SDP 変換ヘルパ `convert_avp_to_savpf` / `convert_savpf_to_avp` (Issue #99)
 
@@ -622,7 +628,7 @@ W3C webrtc-pc §5.7 に従い、 ブラウザ `setRemoteDescription()` が受理
 | `a=ssrc:<id> msid:<stream> <track>` | SSRC ⇔ track 二重化 | RFC 5576 §4.1 / W3C unified-plan |
 | `a=group:BUNDLE 0` (session level) | bundling | RFC 8843 §7.2 |
 | `a=msid-semantic:WMS *` (session level) | MediaStream semantic | RFC 8830 §2 |
-| `a=ice-options:trickle` (session level) | trickle ICE | RFC 8840 §4 |
+| `a=ice-options:trickle` (session level) | trickle ICE | RFC 8838 §11 |
 
 SSRC / CNAME / msid は `DtlsIceParams::with_ssrc()` / `with_cname()` /
 `with_msid()` で呼び出し側が指定可能。 未指定なら `o=` の session-id 由来の

@@ -1,10 +1,13 @@
-// Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) /
-// W3C WebRTC §4.4.1.6 (`RTCPeerConnection.addIceCandidate`):
+// Issue #92 / Issue #206 / RFC 8838 §14 (Receiving the End-of-Candidates
+// Indication) / W3C WebRTC §4.4.1.6 (`RTCPeerConnection.addIceCandidate`):
 //
-// `WebRtcCall.addIce()` 経由で empty string / "end-of-candidates" 文字列が
-// 来たとき、 内部で `pc.addIceCandidate(null)` を呼ぶことを確認する。
-// 旧挙動 (空文字列で silent return) は ICE failure 判定の遅延 (chromium で
-// 30 秒以上) を生むため、 本テストは regression 防止用。
+// `WebRtcCall.addIce()` 経由で empty string / "end-of-candidates" /
+// "a=end-of-candidates" 文字列が来たとき、 内部で `pc.addIceCandidate(null)` を
+// 呼ぶことを確認する。 旧挙動 (空文字列で silent return) は ICE failure 判定の
+// 遅延 (chromium で 30 秒以上) を生むため、 本テストは regression 防止用。
+//
+// 注: RFC 8840 は SIP usage 専用 (Trickle ICE over SIP)。 sabiden は WebSocket
+// JSON シグナリングなので、 trickle ICE の一般仕様である RFC 8838 を引用する。
 
 import { describe, expect, it, vi } from "vitest";
 import { WebRtcCall } from "./webrtc";
@@ -80,10 +83,10 @@ function makeSignalingShim(): SignalingClient {
   } as unknown as SignalingClient;
 }
 
-describe("WebRtcCall.addIce (Issue #92, RFC 8840 §4)", () => {
-  // RFC 8840 §4 / W3C WebRTC §4.4.1.6:
+describe("WebRtcCall.addIce (Issue #92 / #206, RFC 8838 §14)", () => {
+  // RFC 8838 §14 / W3C WebRTC §4.4.1.6:
   // empty string は end-of-candidates marker → `pc.addIceCandidate(null)` に翻訳。
-  it("rfc8840_4_translates_empty_string_to_addIceCandidate_null", async () => {
+  it("rfc8838_14_translates_empty_string_to_addIceCandidate_null", async () => {
     const call = new WebRtcCall(makeSignalingShim(), {
       onRemoteTrack: () => {},
       onConnectionState: () => {},
@@ -93,8 +96,8 @@ describe("WebRtcCall.addIce (Issue #92, RFC 8840 §4)", () => {
     expect(pc.calls).toEqual([null]);
   });
 
-  // RFC 8840 §4: `end-of-candidates` 文字列 (W3C 旧式 / 一部実装) も marker。
-  it("rfc8840_4_translates_end_of_candidates_keyword_to_addIceCandidate_null", async () => {
+  // RFC 8838 §14: `end-of-candidates` 文字列 (W3C 旧式 / 一部実装) も marker。
+  it("rfc8838_14_translates_end_of_candidates_keyword_to_addIceCandidate_null", async () => {
     const call = new WebRtcCall(makeSignalingShim(), {
       onRemoteTrack: () => {},
       onConnectionState: () => {},
@@ -104,9 +107,19 @@ describe("WebRtcCall.addIce (Issue #92, RFC 8840 §4)", () => {
     expect(pc.calls).toEqual([null]);
   });
 
-  // RFC 8840 §4: leading whitespace / 大文字小文字違いも実装によっては送られる。
-  // 厳密にトリムして判定する。
-  it("rfc8840_4_translates_whitespace_only_string_to_addIceCandidate_null", async () => {
+  // RFC 8838 §13: SDP attribute フル形式 `a=end-of-candidates` も marker。
+  it("rfc8838_13_translates_a_equals_end_of_candidates_to_addIceCandidate_null", async () => {
+    const call = new WebRtcCall(makeSignalingShim(), {
+      onRemoteTrack: () => {},
+      onConnectionState: () => {},
+    });
+    const pc = FakeRTCPeerConnection.lastInstance!;
+    await call.addIce("a=end-of-candidates");
+    expect(pc.calls).toEqual([null]);
+  });
+
+  // RFC 8838 §14: leading whitespace / trim 後 empty も marker 扱い。
+  it("rfc8838_14_translates_whitespace_only_string_to_addIceCandidate_null", async () => {
     const call = new WebRtcCall(makeSignalingShim(), {
       onRemoteTrack: () => {},
       onConnectionState: () => {},
@@ -114,6 +127,24 @@ describe("WebRtcCall.addIce (Issue #92, RFC 8840 §4)", () => {
     const pc = FakeRTCPeerConnection.lastInstance!;
     await call.addIce("   ");
     expect(pc.calls).toEqual([null]);
+  });
+
+  // Issue #206: `includes("end-of-candidates")` 由来の擬陽性を排除する厳密 equality。
+  // 仮想的に `candidate:xxx-end-of-candidates-yyy` のような文字列が来ても、
+  // 実 candidate (dict 形式) として渡されること。
+  it("issue206_rejects_substring_match_for_end_of_candidates", async () => {
+    const call = new WebRtcCall(makeSignalingShim(), {
+      onRemoteTrack: () => {},
+      onConnectionState: () => {},
+    });
+    const pc = FakeRTCPeerConnection.lastInstance!;
+    const cand = "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host end-of-candidates-suffix";
+    await call.addIce(cand);
+    // dict 形式 (= 実 candidate 扱い) で渡される。 null ではない。
+    expect(pc.calls).toHaveLength(1);
+    expect(pc.calls[0]).not.toBeNull();
+    const first = pc.calls[0] as RTCIceCandidateInit;
+    expect(first.candidate).toBe(cand);
   });
 
   // RFC 8839 §4.2 / W3C: 実 candidate は dict 形式で渡す (sdpMid / sdpMLineIndex 付き)。

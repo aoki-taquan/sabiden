@@ -404,13 +404,16 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(JSON.stringify({ type: "offer", sdp: "v=0..." }))).toBeNull();
   });
 
-  // Issue #92 / RFC 8840 §4 (Trickle ICE end-of-candidates) /
-  // W3C WebRTC §4.4.1.6: 空文字列の `candidate` は end-of-candidates marker。
-  // sabiden server-side (str0m_session.rs::handle_event) は host candidate 直後に
-  // empty string を流すため、 parser は **空文字列を有効な値として保持** する
-  // (skip / null 化してはならない)。 PWA 側 `addIce("")` は別途これを
-  // `pc.addIceCandidate(null)` に翻訳する。
-  it("rfc8840_4_parses_ice_with_empty_candidate_as_end_of_candidates_marker", () => {
+  // Issue #92 / Issue #206 / RFC 8838 §13 (Generating an End-of-Candidates
+  // Indication) / W3C WebRTC §4.4.1.6: 空文字列の `candidate` は end-of-
+  // candidates marker。 sabiden server-side (str0m_session.rs::handle_event) は
+  // host candidate 直後に empty string を流すため、 parser は **空文字列を
+  // 有効な値として保持** する (skip / null 化してはならない)。 PWA 側
+  // `addIce("")` は別途これを `pc.addIceCandidate(null)` に翻訳する。
+  //
+  // 注: RFC 8840 は SIP usage 専用 (Trickle ICE over SIP)。 sabiden は WebSocket
+  // JSON シグナリングなので、 trickle ICE の一般仕様である RFC 8838 を引用する。
+  it("rfc8838_13_parses_ice_with_empty_candidate_as_end_of_candidates_marker", () => {
     expect(parseServerMessage(JSON.stringify({ type: "ice", candidate: "" }))).toEqual({
       type: "ice",
       candidate: "",

@@ -680,12 +680,29 @@ pub async fn run_session(
                 let mut s = sender_clone.lock().await;
                 if s.send(Message::Text(payload)).await.is_err() {
                     debug!("server-push: WS 送信失敗、forwarder 終了");
-                    // Issue #131: `notify_one()` は permit を蓄える (tokio
-                    // `Notify` doc) ので、 受信ループが select! の外 (深い
-                    // await) にいる瞬間でも次の `notified()` 評価で即解放
-                    // される。 `notify_waiters()` は現に awaiting でない
-                    // タスクには届かず、 アイドル撤収が最大数秒遅れていた
-                    // 原因。
+                    // Issue #167 (PR #165 follow-up): WS 送信失敗時点では
+                    // **受信ループ** と **keepalive ループ** の 2 タスクが
+                    // 同時に `shutdown.notified()` を能動 await している
+                    // (受信ループ line 744 / keepalive line 992)。
+                    //
+                    // `tokio::sync::Notify::notify_one()` の仕様 (tokio
+                    // 1.x doc): **最大 1 waiter** を起こす。 active waiter
+                    // が 2 つ居ても 1 つしか拾えず、 残った 1 つは次の
+                    // `notify_one()` まで待ち続ける。 旧コードは 1 回しか
+                    // 呼んでいなかったので、 forwarder 失敗時に **片方の
+                    // ループだけ撤収** し、 もう片方は idle_timeout や
+                    // out_rx.recv()=None 経由で間接的に抜けるまで残留
+                    // していた (= RFC 6455 §7.4.1 abnormal closure 撤収が
+                    // 遅延する原因)。
+                    //
+                    // 修正: 2 回呼んで両 await を起こす。 2 回目は (片方
+                    // 既に起きていれば) permit として蓄えられ、 後続の
+                    // `notified()` で消費される (tokio Notify は permit 上限
+                    // 1 だが、 2 active waiter の同時起床用途では 2 回呼ぶ
+                    // のが推奨イディオム)。 RFC 6455 §5.5.2 Ping path /
+                    // §7.4.1 Close handshake のどちらも、 forwarder 失敗
+                    // (= TCP/TLS 層断) 後は即時撤収するのが正しい。
+                    shutdown_c.notify_one();
                     shutdown_c.notify_one();
                     break;
                 }
@@ -2397,6 +2414,121 @@ mod tests {
             res.is_err(),
             "notify_waiters は permit を蓄えず lost。 Issue #131 で notify_one へ置換した根拠"
         );
+    }
+
+    /// Issue #167 race 検証 (本 PR の主目的): forwarder 失敗経路で
+    /// `notify_one()` を **1 回だけ** 呼ぶと、 同時に `notified()` を能動
+    /// await している 2 タスクのうち **片方しか起きない** ことを直接検証する。
+    ///
+    /// `tokio::sync::Notify` の仕様 (tokio 1.x doc):
+    /// - `notify_one()` は **最大 1 waiter** を起こす (active waiter が居れば
+    ///   その 1 つ、 居なければ permit を 1 つ蓄える)。
+    /// - active waiter が 2 つ居る状態で `notify_one()` を 1 回呼んでも、
+    ///   起きるのは 1 つだけ。 残りは次の `notify_one()` を待つ。
+    ///
+    /// PR #165 の forwarder 経路 (`signaling.rs:683-689` 旧コード) はこれを
+    /// 踏み違え、 `shutdown.notify_one()` を 1 回しか呼んでいなかった。
+    /// その瞬間に **受信ループ** (line 744) と **keepalive ループ** (line 992)
+    /// の両方が `shutdown.notified()` を能動 await しているため、 RFC 6455
+    /// §7.4.1 abnormal closure 撤収が片方のループ分だけ遅延していた。
+    #[tokio::test]
+    async fn rfc6455_notify_one_single_call_wakes_only_one_of_two_awaiters() {
+        let n = Arc::new(Notify::new());
+
+        let n1 = n.clone();
+        let woke1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let woke1_c = woke1.clone();
+        let h1 = tokio::spawn(async move {
+            n1.notified().await;
+            woke1_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let n2 = n.clone();
+        let woke2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let woke2_c = woke2.clone();
+        let h2 = tokio::spawn(async move {
+            n2.notified().await;
+            woke2_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 両 waiter が `notified()` の registration を完了するまで yield 駆動。
+        // tokio::sync::Notify は spawn 直後の poll で waker を登録する仕様
+        // (tokio docs: "Each call to notified() will register a separate
+        // permit")。
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // 1 回だけ notify_one を呼ぶ → どちらか 1 タスクだけ起きる。
+        n.notify_one();
+
+        // 100ms 以内にどちらかが起きていれば notify が処理されたと見なす。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let woke1_v = woke1.load(std::sync::atomic::Ordering::SeqCst);
+        let woke2_v = woke2.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            woke1_v ^ woke2_v,
+            "1 回の notify_one() で起きたタスクは正確に 1 つ (woke1={}, woke2={})",
+            woke1_v,
+            woke2_v
+        );
+
+        // 片付け: もう 1 回 notify して残りを起こす (テスト leak 防止)。
+        n.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(2), h1).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), h2).await;
+    }
+
+    /// Issue #167 修正検証: `notify_one()` を **2 回** 呼ぶと 2 タスク両方が
+    /// 起きる。 これが forwarder 失敗経路の RFC 6455 §7.4.1 即時撤収を担保する。
+    ///
+    /// 本テストは production コード (`run_session::forwarder`) が 1 回呼びに
+    /// 逆戻りしたら fail する (回帰防止)。
+    #[tokio::test]
+    async fn rfc6455_notify_one_twice_wakes_both_keepalive_and_recv_loop_awaiters() {
+        let n = Arc::new(Notify::new());
+
+        // 受信ループ相当の waiter。
+        let n_recv = n.clone();
+        let recv_woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recv_woke_c = recv_woke.clone();
+        let h_recv = tokio::spawn(async move {
+            n_recv.notified().await;
+            recv_woke_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // keepalive ループ相当の waiter。
+        let n_keep = n.clone();
+        let keep_woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keep_woke_c = keep_woke.clone();
+        let h_keep = tokio::spawn(async move {
+            n_keep.notified().await;
+            keep_woke_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 両 waiter が registration を完了するまで yield。
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // forwarder 失敗経路の修正後シーケンス: notify_one を 2 回呼ぶ。
+        n.notify_one();
+        n.notify_one();
+
+        // 両タスクが timeout 内に終わること = 両方起きたことの証明。
+        let r_recv = tokio::time::timeout(Duration::from_secs(2), h_recv).await;
+        let r_keep = tokio::time::timeout(Duration::from_secs(2), h_keep).await;
+        assert!(
+            r_recv.is_ok(),
+            "受信ループ相当の waiter が起きなかった (notify_one 2 回で 2 waiter 起床が崩れている = Issue #167 回帰)"
+        );
+        assert!(
+            r_keep.is_ok(),
+            "keepalive 相当の waiter が起きなかった (notify_one 2 回で 2 waiter 起床が崩れている = Issue #167 回帰)"
+        );
+        assert!(recv_woke.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(keep_woke.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Issue #131: `run_keepalive_loop` が `notify_one` を使うことの間接検証。

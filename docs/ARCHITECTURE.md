@@ -924,8 +924,12 @@ M ビットをそのまま forward する。
   UasEventHandler / NgnInboundHandler
    │ ext_answer = browser SAVPF answer (str0m PCMU only)
    │ pcmu_only = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)
-   │   (Issue #108 / RFC 3264 §6.1: answer m= formats は offer の subset、
-   │    PT 0 必須 / PT 101 は offer 提示時のみ、 PCMU 不在は Err → 502)
+   │   (Issue #108 / #212 / RFC 3264 §6.1: answer m= formats は
+   │    **NGN offer formats ∩ ext_answer formats の真 intersection**。
+   │    NGN offer の出現順を尊重 (RFC 3264 §6.1 "priority order")、
+   │    intersection 空なら Err → 呼出側 502 / 488 相当。
+   │    rtpmap / fmtp 行は intersection PT に対応する行のみ残す、
+   │    WebRTC/ICE/DTLS 由来 attribute は剥がす)
    │ rewritten = rewrite_rtp_endpoint(pcmu_only, sabiden NGN IP, port)
    ▼
   WebRtcAudioBridge::start(WebRtcAudioConfig{

@@ -1179,14 +1179,18 @@ impl NgnInboundHandler {
             // NGN へ返す SDP は browser SDP 由来 (AVP に変換済) → PCMU only に
             // 絞り、 `c=`/`m= port` を sabiden の NGN 側 socket に書き換える。
             //
-            // Issue #108 / RFC 3264 §6.1: answer の `m=` formats は **NGN offer の
-            // formats の subset** でなければならない。 `restrict_answer_to_ngn_offer_subset`
-            // が NGN offer 由来の formats と telephone-event rtpmap を一次情報として
-            // 採用し、 PCMU (PT 0) の有無を必須 / DTMF (PT 101) を offer 提示時のみ
-            // 維持する。 NGN offer に PCMU が無ければ Err になり、 呼出側で
-            // 502 Bad Gateway fallback に流れる (RFC 3264 §6 "no common codec";
-            // 厳密には 488 Not Acceptable Here がより semantic だが、 fallback
-            // 経路の細分化は別 issue)。
+            // Issue #108 / Issue #212 / RFC 3264 §6.1: answer の `m=` formats は
+            // **NGN offer formats ∩ ext_answer formats の真 intersection** で
+            // なければならない。 `restrict_answer_to_ngn_offer_subset` が両側を
+            // 読み、 NGN offer 出現順を維持して intersection を計算する
+            // (PR #209 までの「NGN offer 由来 PT を forcibly synthesize」する
+            // band-aid は Issue #212 で撤去)。 共通 PT が無い (= intersection 空) /
+            // SDP 不正なら Err になり、 呼出側で 502 Bad Gateway fallback に
+            // 流れる (RFC 3264 §6 "no common codec"; 厳密には 488 Not
+            // Acceptable Here がより semantic だが、 fallback 経路の細分化は
+            // 別 issue)。 NGN offer が PCMU only / PCMU+DTMF で来る制約
+            // (CLAUDE.md §5) により、 結果は実質 PCMU only / PCMU+DTMF に
+            // 自然に収束する。
             let pcmu_only = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)?;
             let rewritten =
                 rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;
@@ -1230,13 +1234,14 @@ impl NgnInboundHandler {
 
         // NGN へ返す 200 OK SDP は sabiden の NGN 側ソケットを指すように書き換える。
         //
-        // Issue #108 / RFC 3264 §6.1: answer の `m=` formats は **NGN offer の
-        // formats の subset** に強制する。 内線 200 OK 由来 (ext_answer) の PT を
-        // そのまま転送すると、 NGN がオファしていない codec を answer に乗せて
-        // しまい RFC 3264 §6 違反 (NGN は SDP 不整合で 488/415/BYE を返す、
-        // 実機検証 2026-05-10)。 PR #149 で導入した `offer_has_telephone_event`
-        // 分岐は PT 101 のみ対応していたが、 本処置で `m=` formats 全体を
-        // offer subset に正規化する。
+        // Issue #108 / Issue #212 / RFC 3264 §6.1: answer の `m=` formats は
+        // **NGN offer formats ∩ ext_answer formats の真 intersection** に
+        // 強制する。 内線 200 OK 由来 (ext_answer) の PT をそのまま転送すると、
+        // NGN がオファしていない codec を answer に乗せて RFC 3264 §6 違反
+        // (NGN は SDP 不整合で 488/415/BYE を返す、 実機検証 2026-05-10)。
+        // また Issue #212 で旧「NGN 由来 PT を forcibly synthesize」 band-aid
+        // も撤去 (ext_answer が PCMA only の場合に PCMU を勝手に乗せて確立後
+        // 無音になる事故防止)。 共通 PT 無しは Err → 呼出側 502。
         let pcmu_only = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)?;
         let rewritten =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())?;

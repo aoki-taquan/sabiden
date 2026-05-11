@@ -160,8 +160,11 @@ graph LR
 - **eth0 = LAN 側**: 内線 SIP UA (`uas.bind_addr = 0.0.0.0:5061`) を
   bind し、内線網と NGN 網は L4 で完全分離する。
 - **DSCP 32 (TOS 0x80)**: NGN 側 SIP UDP socket と RTP socket 双方に
-  `IPV6_TCLASS` / `IP_TOS` をセット (`main.rs::set_dscp`,
-  `rtp::set_rtp_dscp`)。
+  `IPV6_TCLASS` (RFC 3542 §6.5) / `IP_TOS` (RFC 791 §3.1) をセット
+  (`main.rs::set_dscp`, `rtp::set_rtp_dscp`)。 dual-stack 対応のため両 API を
+  必ず呼び、 **少なくとも一方が成功すれば Ok**、 両方失敗で初めて Err を返す
+  (Issue #86)。 旧実装は戻り値を捨てていたためサイレント DSCP 喪失の可能性が
+  あり、 NGN QoS 要件 (CLAUDE.md §5) の観測不能違反になっていた。
 - **Cloudflare Tunnel**: 自宅マシンから `cloudflared` で
   `https://signal.<domain>` を Cloudflare に接続。Worker が
   service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`)
@@ -1484,7 +1487,7 @@ P-CSCF (118.177.125.1, NTT 東日本系) の挙動を集約する。
 | **P-Asserted-Identity** | **不要** (上記同) | 同上 |
 | **Privacy** | **削除推奨** (`Privacy: none` は規格的には valid だが、出さない方が NGN 互換) | Asterisk PJSIP の自動生成は `id` のみ |
 | **コンパクトヘッダ受信** | `v/f/t/i/m/l/s/c/k/e` を受け取り正規化必須 | NGN 200 OK で混ざる ([project_ngn_compact_headers.md](memory)) |
-| **DSCP** | TOS 0x80 (DSCP 32) | `IPV6_TCLASS` + `IP_TOS` 両方セット (Issue #37) |
+| **DSCP** | TOS 0x80 (DSCP 32) | `IPV6_TCLASS` (RFC 3542 §6.5) + `IP_TOS` (RFC 791 §3.1) 両方セット。 setsockopt 戻り値を確認し両方失敗で Err (Issue #37 / Issue #86) |
 
 ### 7.2 SDP 要件
 

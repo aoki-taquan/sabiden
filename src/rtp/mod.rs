@@ -89,32 +89,86 @@ pub fn decode_ulaw(byte: u8) -> i16 {
 
 /// RTP/RTCP 送信ソケットに DSCP 32 (TOS 0x80) を設定する。
 ///
-/// NTT ひかり電話 (NGN) は RTP/RTCP に DSCP 32 を要求する。
-/// IPv6 (NGN は IPv6 直結) では `IPV6_TCLASS`、IPv4 では `IP_TOS` を使う。
+/// NTT ひかり電話 (NGN) は RTP/RTCP に DSCP 32 を要求する
+/// (CLAUDE.md §5、 NGN 公開仕様)。
+/// IPv6 (NGN は IPv6 直結) では `IPV6_TCLASS` (RFC 3542 §6.5)、
+/// IPv4 では `IP_TOS` (RFC 791 §3.1) を使う。
+///
+/// # 戻り値の意味 (Issue #86)
+///
+/// dual-stack v4-mapped-v6 ソケット / pure v6 ソケット / pure v4 ソケットの
+/// どれが渡されるか呼出側 (`RtpBridge::start` / `RtpSession::with_depth` /
+/// `TranscodingBridge::start`) は静的に決められないため、
+/// `IPV6_TCLASS` と `IP_TOS` の **両方** を試行し:
+///
+/// - 少なくとも一方が成功 (`setsockopt() == 0`) → `Ok(())`
+/// - 両方失敗 (`setsockopt() < 0`) → `Err` (両方の `errno` を含む)
+///
+/// 旧実装は両方の戻り値を捨てて常に `Ok(())` を返していたため、
+/// IPv6 ソケットで `IPV6_TCLASS` が失敗していてもサイレントに DSCP が
+/// 喪失し、 NGN 公開仕様要件 (DSCP 32) が黙って外れていた。
+/// 呼出側 (bridge.rs / transcoder.rs) は元から `if let Err(e)` で握る
+/// 設計なので、 Err を返しても致命にはならず観測可能性 (warn ログ +
+/// メトリクス) のみが回復する。
 #[cfg(target_os = "linux")]
 pub fn set_rtp_dscp(socket: &tokio::net::UdpSocket, dscp: u32) -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
+    set_dscp_on_fd(socket.as_raw_fd(), dscp)
+}
+
+/// `set_rtp_dscp` の生 fd 版。 `IPV6_TCLASS` と `IP_TOS` を順に試行し、
+/// 両方失敗で初めて Err を返す。 テスト時に `-1` 等の不正 fd を直接
+/// 渡して両方失敗パスを再現するため、 `tokio::net::UdpSocket` の I/O safety
+/// (Rust 1.66+) を経由しない経路として切り出した。
+#[cfg(target_os = "linux")]
+fn set_dscp_on_fd(fd: std::os::unix::io::RawFd, dscp: u32) -> anyhow::Result<()> {
     let tos = (dscp << 2) as libc::c_int;
-    let fd = socket.as_raw_fd();
-    unsafe {
-        // IPv6 socket では IPV6_TCLASS が必要 (NGN 想定)
+    // RFC 3542 §6.5: `IPV6_TCLASS` で IPv6 traffic class (= DSCP<<2 | ECN) を設定。
+    // IPv6 socket であれば成功し、 v4-only socket では `ENOPROTOOPT` (errno 92)
+    // または `EOPNOTSUPP` (errno 95) を返す。
+    let r6 = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_IPV6,
             libc::IPV6_TCLASS,
             &tos as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        // IPv4 用 IP_TOS も保険でセット (失敗しても無視)
+        )
+    };
+    let err6 = if r6 < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // RFC 791 §3.1 + Linux ip(7): `IP_TOS` で IPv4 ToS バイト (= DSCP<<2 | ECN)
+    // を設定。 dual-stack v6 socket でも v4-mapped 宛先送信時に有効になる
+    // カーネルがあるため (`src/main.rs::set_dscp` と同じ方針)、 保険で
+    // 両方呼ぶ。 v6-only socket では `EOPNOTSUPP` (errno 95) を返す。
+    let r4 = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_IP,
             libc::IP_TOS,
             &tos as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    let err4 = if r4 < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // 両方失敗で初めて DSCP が完全に喪失する。 片方が成功していれば
+    // dual-stack v6 / v4-only / v6-only いずれのケースでも実用上 DSCP は
+    // 効くので Ok を返す (`main.rs::set_dscp` と同じ "保険的に両方呼ぶ"
+    // 方針の保全)。
+    match (err6, err4) {
+        (Some(e6), Some(e4)) => Err(anyhow::anyhow!(
+            "setsockopt(IPV6_TCLASS / IP_TOS) both failed for DSCP {dscp}: \
+             IPV6_TCLASS errno={e6}, IP_TOS errno={e4}"
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -359,6 +413,79 @@ mod tests {
             pcmu_packet < 1500,
             "PCMU 20ms ({pcmu_packet} byte) は IP MTU 1500 にも収まる \
              (NGN 117 通話 regression 防止)"
+        );
+    }
+
+    /// Issue #86 / RFC 3542 §6.5 + RFC 791 §3.1: IPv4 ソケットでも `IP_TOS` が
+    /// 成功する限り `set_rtp_dscp` は `Ok(())` を返さなければならない
+    /// (`IPV6_TCLASS` は v4-only socket では `ENOPROTOOPT` で失敗するが、
+    /// それは想定内で、 v4 path の DSCP は IP_TOS 経由で立っている)。
+    /// NGN 直収モード (Issue #37) では v4 path で RTP が流れるため、 ここの
+    /// regression は NGN 公開仕様 DSCP 32 要件 (CLAUDE.md §5) の即時違反を
+    /// 意味する。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn issue86_set_rtp_dscp_ok_on_ipv4_socket() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // IPv4 socket: IP_TOS は成功するはず、 IPV6_TCLASS は ENOPROTOOPT で
+        // 失敗するが、 片方成功で Ok を返す約束。
+        let r = set_rtp_dscp(&socket, 32);
+        assert!(
+            r.is_ok(),
+            "IPv4 socket で IP_TOS 成功にも関わらず Err: {r:?}"
+        );
+    }
+
+    /// Issue #86 / RFC 3542 §6.5: IPv6 ソケット (NGN は IPv6 直結のケースが
+    /// ある、 CLAUDE.md §12.1) では `IPV6_TCLASS` が成功して `Ok(())` を返す。
+    /// `IP_TOS` は v6-only socket では `EOPNOTSUPP` で失敗するが、 片方成功
+    /// で Ok を返す約束により全体は Ok。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn issue86_set_rtp_dscp_ok_on_ipv6_socket() {
+        // `::1` で bind すれば pure v6 socket (Linux `IPV6_V6ONLY` の既定は
+        // 通常 0 だが、 bind アドレスが v6 なら IPV6_TCLASS は確実に効く)。
+        // CI 環境の `::1` 不在に備えて bind 失敗時は skip。
+        let socket = match tokio::net::UdpSocket::bind("[::1]:0").await {
+            Ok(s) => s,
+            Err(_) => return, // IPv6 loopback 不可な CI では skip
+        };
+        let r = set_rtp_dscp(&socket, 32);
+        assert!(
+            r.is_ok(),
+            "IPv6 socket で IPV6_TCLASS 成功にも関わらず Err: {r:?}"
+        );
+    }
+
+    /// Issue #86 regression guard: 両方の setsockopt が失敗する状況を
+    /// `set_dscp_on_fd` に不正 fd (`-1`) を直接渡して再現する。 `-1` は
+    /// 有効な fd ではないため、 `IPV6_TCLASS` / `IP_TOS` ともに `EBADF`
+    /// (errno 9) で失敗し、 関数は Err を返さなければならない。
+    ///
+    /// 旧実装 (`set_rtp_dscp` が `setsockopt` 戻り値を完全に捨てて常に
+    /// `Ok(())` を返す) は本検査で **必ず** Ok を返してしまうため、 本テスト
+    /// が回帰を検出する。 NGN DSCP 32 要件 (CLAUDE.md §5) のサイレント
+    /// 喪失防止。
+    ///
+    /// 不正 fd 直接呼びを採用する理由: `tokio::net::UdpSocket` を閉じた fd
+    /// で再構築する手法は Rust 1.66+ I/O safety (OwnedFd の double-close
+    /// 検出) で abort するため使えない。 production パス (RtpBridge /
+    /// TranscodingBridge / RtpSession) は生きた fd しか渡さないので、
+    /// このテストが踏む `-1` 経路は production では起き得ない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn issue86_set_rtp_dscp_err_when_both_setsockopt_fail() {
+        // -1 は POSIX で「無効な fd」を示す慣用値。 setsockopt は EBADF を返す。
+        let r = set_dscp_on_fd(-1, 32);
+        assert!(
+            r.is_err(),
+            "不正 fd で setsockopt 両方失敗にも関わらず Ok を返している \
+             (Issue #86 regression: NGN DSCP 32 要件が黙って外れる)"
+        );
+        let msg = format!("{}", r.unwrap_err());
+        assert!(
+            msg.contains("IPV6_TCLASS") && msg.contains("IP_TOS"),
+            "Err メッセージに両方の setsockopt 名が含まれていない: {msg}"
         );
     }
 }

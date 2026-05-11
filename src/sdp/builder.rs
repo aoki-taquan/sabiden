@@ -788,10 +788,23 @@ impl SessionDescription {
     /// - `port`: RTP ポート
     /// - `ptime_ms`: パケット間隔 (ミリ秒)。NGN では 20 が一般的。
     pub fn pcmu_offer(addr: IpAddr, port: u16, ptime_ms: u32) -> Self {
-        // RFC 4566 Section 5.2: o= の sess-id は NTP 形式の数値推奨。
-        // RFC 3264 では同一セッションで同じ sess-id を維持し、変更ごとに
-        // sess-version をインクリメントする。ここでは暫定値を入れる。
-        let session_id = 0u64;
+        // RFC 4566 §5.2 (Origin): "<sess-id> is a numeric string such that the
+        // tuple of <username>, <sess-id>, <nettype>, <addrtype>, and
+        // <unicast-address> forms a globally unique identifier for the
+        // session." 即ち、 同一 sabiden プロセスが複数 INVITE を出すケースで
+        // sess-id が全通話で同一になるとセッション識別性を喪う。 RFC 同節
+        // recommends NTP timestamp。 ここでは UNIX epoch 秒を使う
+        // (Asterisk 実機の `o=- 397958033 ...` 風: `docs/asterisk-real-invite.md`
+        // §2、 `rewrite_rtp_endpoint` (本ファイル) と同パターン)。
+        //
+        // RFC 3264 §8 (Modifying the Session): "the version number is
+        // incremented each time the session description is changed." 初回
+        // オファーでは sess-id == sess-version で始め、 後続の SDP rewrite
+        // (e.g. Re-INVITE) で +1 する運用 (Issue #77)。
+        let session_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         SessionDescription {
             version: 0,
             origin: Origin {

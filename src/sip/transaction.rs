@@ -834,6 +834,17 @@ impl ServerTransaction {
                 self.start_completed_timers();
             }
             (ServerState::Proceeding, 100..=199) => {} // 追加 provisional は状態維持
+            // RFC 3261 §17.2.1 / §9.1 (CANCEL race): Completed 状態で再度
+            // final response を載せ替えるパス。 例えば INVITE に対し 486 を
+            // 送った直後に CANCEL が来て 487 を上書きするケース。 ここで
+            // 既存の Timer G タスクは 486 の bytes を snapshot しているので、
+            // `start_completed_timers` を呼び直して `last_response` (= 487)
+            // で新タスクを起動し、 古いタスクは `take().abort()` で停止する。
+            // これをしないと 487 は 1 回 socket.send_to したきりで、
+            // Timer G の自発再送は 486 を送り続けてしまう。
+            (ServerState::Completed, 200..=699) => {
+                self.start_completed_timers();
+            }
             _ => {}
         }
         debug!(?self.id, code, ?self.state, "server tx 応答");
@@ -3554,12 +3565,22 @@ mod tests {
         );
     }
 
-    /// RFC 3261 §17.2.1 figure 7: server INVITE で 2x final response (二重 final)
-    /// を `respond` した場合、 内部タイマタスクは古いものを abort して新しいもの
-    /// を起動する (RFC 6026 と整合; 二重 final は sabiden の `start_completed_timers`
-    /// が `if let Some(h) = self.timer_task.take() { h.abort(); }` で明示的に
-    /// 処理する)。 タスクが leak しないことと、 最後の final が再送される
-    /// ことを確認する境界条件。
+    /// RFC 3261 §17.2.1 figure 7 + §9.1 (CANCEL race): server INVITE で
+    /// Completed 状態のまま二重 final response を `respond` した場合、
+    /// 内部 Timer G タスクは古いものを abort して **新しい final response
+    /// の bytes** で起動し直されなければならない。 古い task の `last_bytes`
+    /// は snapshot されているため、 タスク自体を作り直さない限り Timer G
+    /// は **古い final** を再送し続ける。
+    ///
+    /// 典型シナリオ: INVITE に対し 486 を送った直後に CANCEL が race して
+    /// 487 を上書き。 487 は初送 1 回だけ socket に出るが、 Timer G の
+    /// 自発再送はずっと 486 を送る、 という latent bug の回帰テスト
+    /// (Issue #174)。
+    ///
+    /// 検証:
+    ///   1. 486 / 487 ともに初送される (二重 respond ともに send_to が走る)
+    ///   2. 二重目 respond **以降**の Timer G 再送は 487 のみで、 486 は
+    ///      送られない (古い task が abort され、 新 task が 487 を保持する)
     #[tokio::test(start_paused = true)]
     async fn rfc3261_17_2_1_server_invite_second_respond_replaces_timer_task() {
         let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -3587,7 +3608,7 @@ mod tests {
         stx.respond(resp1).await.unwrap();
         assert_eq!(stx.state(), ServerState::Completed);
 
-        // 少し進めて Timer G で 1 回再送が走るのを観測
+        // 少し進めて Timer G で 1 回再送が走るのを観測 (T1=500ms)
         step_and_yield(Duration::from_millis(600)).await;
 
         // 2 個目 final: 487 (例えば CANCEL から起こる)
@@ -3595,29 +3616,65 @@ mod tests {
         stx.respond(resp2).await.unwrap();
         assert_eq!(stx.state(), ServerState::Completed);
 
-        // 少し進めて再送を観測
-        step_and_yield(Duration::from_millis(600)).await;
+        // 二重 respond 直後の境界。 ここまでの受信を区切って後続を分離する。
+        step_and_yield(Duration::from_millis(0)).await;
+        let pre_split_len = received.lock().await.len();
+
+        // ここから Timer G が新 final (487) で複数回 fire するのを観測する。
+        // 新タスクは Timer G を T1 から再スタート。 32s 内に T1, 2T1, 4T1,
+        // ... T2 cap の指数バックオフで複数回再送が走る。
+        for _ in 0..6 {
+            step_and_yield(Duration::from_secs(5)).await;
+        }
 
         let recv = received.lock().await;
-        // 486 と 487 がそれぞれ少なくとも 1 回 (= 初送) は届いている
-        let has_486 = recv.iter().any(|b| {
-            std::str::from_utf8(b)
-                .ok()
-                .map(|s| s.contains("486"))
-                .unwrap_or(false)
-        });
-        let has_487 = recv.iter().any(|b| {
-            std::str::from_utf8(b)
-                .ok()
-                .map(|s| s.contains("487"))
-                .unwrap_or(false)
-        });
-        assert!(has_486, "1 個目の final (486) が UDP に出ていない");
+        // 初送ぶんの記録 (486 と 487 がそれぞれ少なくとも 1 回は出ている)
+        let has_486_initial = recv[..pre_split_len]
+            .iter()
+            .any(|b| contains_status(b, "486"));
+        let has_487_initial = recv[..pre_split_len]
+            .iter()
+            .any(|b| contains_status(b, "487"));
+        assert!(has_486_initial, "1 個目の final (486) が UDP に出ていない");
         assert!(
-            has_487,
-            "2 個目の final (487) が UDP に出ていない (二重 respond で新タスクに置換されない疑い)"
+            has_487_initial,
+            "2 個目の final (487) が UDP に出ていない (二重 respond で初送が走っていない)"
+        );
+
+        // 二重 respond 後の Timer G fire 分。 ここで 486 が含まれていたら
+        // 古いタスクが abort されず 486 を再送し続けている = bug。
+        let post = &recv[pre_split_len..];
+        let post_486 = post.iter().filter(|b| contains_status(b, "486")).count();
+        let post_487 = post.iter().filter(|b| contains_status(b, "487")).count();
+        assert_eq!(
+            post_486, 0,
+            "二重 respond 後の Timer G 再送に 486 が含まれてはいけない \
+             (古いタスクが abort されず last_bytes=486 を再送している; \
+             post 486={}, 487={})",
+            post_486, post_487
+        );
+        assert!(
+            post_487 >= 1,
+            "二重 respond 後、 Timer G が 487 を最低 1 回は再送するはず \
+             (新タスクが last_bytes=487 で起動されていない疑い; \
+             post 486={}, 487={})",
+            post_486,
+            post_487
         );
         drop(stx);
+    }
+
+    /// SIP status-line に特定の status-code 文字列が出ているか。
+    /// `recv.contains("487")` 直書きだと Call-ID / branch にたまたま
+    /// "487" が混ざる偽陽性が出る (実害は薄いが Test 設計の堅さのため
+    /// status-line 直撃で見る)。
+    fn contains_status(bytes: &[u8], status: &str) -> bool {
+        let s = match std::str::from_utf8(bytes) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let needle = format!("SIP/2.0 {} ", status);
+        s.contains(&needle)
     }
 
     /// RFC 3261 §17.1.3 / §17.2.3: ACK は CSeq method=INVITE のままだが、

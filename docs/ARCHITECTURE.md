@@ -217,19 +217,69 @@ UPDATE 等は 481 で拒否するため Allow には含めない (§20.5 「supp
 ### 着信 (NGN → スマホ)
 
 ```
-NGN ──INVITE──► sabiden(UAC)
+NGN ──INVITE──► sabiden(UAS)
+                    │
+                    │ 100 Trying 即送出 (RFC 3261 §17.2.1)
+NGN ◄──100 Trying── sabiden
+                    │
+                    │ RFC 4028 §10 (Issue #249):
+                    │   INVITE の Session-Expires が sabiden Min-SE (90s) 未満 →
+                    │   422 + Min-SE で打ち切る
+                    │
+                    │ RFC 3261 §13.3.1.4 (Issue #249):
+                    │   フォーク開始と同時に 180 Ringing を送出 (= remote callee
+                    │   is being alerted)。 180 / 200 OK の To-tag は同値必須
+                    │   (RFC 3261 §12.1.1 early == confirmed dialog)。
+NGN ◄──180 Ringing── sabiden
                     │
                     │ 全内線にフォーク
                     ├──INVITE──► スマホ1
                     ├──INVITE──► スマホ2
-                    └──INVITE──► スマホ3
+                    └──INVITE──► スマホ3 / PWA (WS Offer/Answer)
 
-スマホ1 ──200 OK──► sabiden ──200 OK──► NGN
+スマホ1 ──200 OK──► sabiden
+                    │
+                    │ 200 OK 構築 (Issue #249):
+                    │ - RFC 3264 §6.1 a=ptime echo (NGN PCMU = 20ms)
+                    │ - RFC 4028 §7: Session-Expires + refresher=uas + Require: timer
+                    │   (INVITE に Session-Expires 不在なら echo しない)
+                    │
+sabiden ──200 OK──► NGN
 スマホ2 ◄──CANCEL── sabiden
 スマホ3 ◄──CANCEL── sabiden
 
 [RTPブリッジ確立: NGN ⇔ sabiden ⇔ スマホ1]
 ```
+
+#### NGN inbound 200 OK の RFC 整合 (Issue #249)
+
+実機 evidence (`/tmp/sabiden-080-inbound.pcap`、 2026-05-11): 080 携帯からの
+着信で、 旧フロー `100 Trying → 4.1 秒 silent → 200 OK` が NGN carrier IMS
+の call setup timeout を超え、 200 OK の **28ms 後に NGN 側 BYE** で
+打ち切られていた。 NGN INVITE は以下を載せている:
+
+```
+k: timer,100rel              ← Supported: timer, 100rel
+x: 300;refresher=uac          ← Session-Expires: 300; refresher=uac
+Min-SE: 300
+a=ptime:20                    ← PCMU 20ms 固定
+```
+
+これに対する sabiden 旧 200 OK は **Session-Expires 不在** / **Require: timer
+不在** / **a=ptime 不在** で、 RFC 4028 §7 / RFC 3264 §6.1 違反 + 4 秒 silent
+で carrier 側 setup timeout の二重要因が成立。 Issue #249 で:
+
+1. **180 Ringing** (RFC 3261 §13.3.1.4): 100 Trying 直後にフォーク開始と
+   同時送出。 carrier IMS に call setup 進行中を示す。 180 の To-tag を
+   保存し 200 OK で同値を使う (RFC 3261 §12.1.1 dialog ID)。
+2. **Session-Expires echo** (RFC 4028 §7): INVITE の SE 値を `refresher=uas`
+   で 200 OK に echo + `Require: timer` で negotiate 完了を明示。 INVITE が
+   Min-SE 未満 (< 90s) を要求するなら 422 + Min-SE で先に打ち切る (§10)。
+3. **a=ptime echo** (RFC 3264 §6.1): NGN offer の `a=ptime:N` を 200 OK SDP
+   に追加 (内線 answer に既に ptime があれば上書きしない)。
+
+新フロー: `100 Trying → 180 Ringing (即) → 200 OK (内線 pickup)`、 carrier
+IMS は 180 受領で setup 進行中と認識し、 4 秒〜 PWA mic 許可待ちを許容する。
 
 #### PWA 着信拒否 (Issue #107、 RFC 3261 §21.6.2 603 Decline)
 

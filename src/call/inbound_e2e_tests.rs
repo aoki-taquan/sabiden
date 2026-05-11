@@ -166,12 +166,15 @@ async fn mock_ngn_invites_to_extension_full_round_trip() {
     fix.send_invite_with_body(cid, "z9hG4bKngn-rt", offer).await;
 
     // 100 Trying と 200 OK
+    // Issue #249: 100 Trying の後に 180 Ringing も流れるので、 受信ループは
+    // provisional を許容する (RFC 3261 §13.3.1.4)。
     let mut got_100 = false;
     let mut answer_response = None;
-    for _ in 0..5 {
+    for _ in 0..6 {
         match fix.recv_message(Duration::from_secs(3)).await {
             Some(SipMessage::Response(r)) => match r.status_code {
                 100 => got_100 = true,
+                180 => {} // RFC 3261 §13.3.1.4: 180 Ringing (Issue #249)
                 200 => {
                     answer_response = Some(r);
                     break;
@@ -428,6 +431,8 @@ async fn mock_ngn_cancel_during_fork_returns_487() {
                     }
                 }
                 100 => {} // 多重 100 は無視
+                // Issue #249: CANCEL race で 180 Ringing 出力が先行する可能性
+                180 => {}
                 other => panic!("予期しない status {}", other),
             },
             _ => break,
@@ -504,13 +509,14 @@ async fn mock_ngn_invite_to_webrtc_only_binding_uses_browser_answer() {
     fix.send_invite_with_body(cid, "z9hG4bKngn-webrtc", offer)
         .await;
 
-    // 100 → 200 OK の流れ
+    // 100 → 180 → 200 OK の流れ (RFC 3261 §13.3.1.4, Issue #249)
     let mut got_100 = false;
     let mut got_200_body: Option<Vec<u8>> = None;
-    for _ in 0..6 {
+    for _ in 0..7 {
         match fix.recv_message(Duration::from_secs(3)).await {
             Some(SipMessage::Response(r)) => match r.status_code {
                 100 => got_100 = true,
+                180 => {} // RFC 3261 §13.3.1.4 (Issue #249)
                 200 => {
                     got_200_body = Some(r.body);
                     break;
@@ -612,20 +618,21 @@ async fn issue107_pwa_decline_returns_603_to_ngn() {
     fix.send_invite_with_body(cid, "z9hG4bKngn-decline", offer)
         .await;
 
-    // 100 → 603 の流れ
+    // 100 → 180 → 603 の流れ (RFC 3261 §13.3.1.4 / §21.6.2、 Issue #249)
     let mut got_100 = false;
     let mut got_603 = false;
-    for _ in 0..6 {
+    for _ in 0..7 {
         match fix.recv_message(Duration::from_secs(3)).await {
             Some(SipMessage::Response(r)) => match r.status_code {
                 100 => got_100 = true,
+                180 => {} // RFC 3261 §13.3.1.4 (Issue #249)
                 603 => {
                     got_603 = true;
                     break;
                 }
                 // 4xx / 5xx 観測時は明示的に panic させる: テストの目的は 603
                 // 経路の確認なので、 486 / 408 が来ていたら根本問題。
-                other => panic!("予期しない status {} (期待: 100/603)", other),
+                other => panic!("予期しない status {} (期待: 100/180/603)", other),
             },
             _ => break,
         }

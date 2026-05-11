@@ -56,8 +56,9 @@ use super::transcoder::{TranscodeConfig, TranscodingBridge};
 use super::CallId;
 use crate::observability::{InviteResult, Metrics, OutboundDirection};
 use crate::sdp::builder::{
-    convert_savpf_to_avp, restrict_answer_to_ngn_offer_subset, restrict_audio_to_pcmu,
-    restrict_audio_to_pcmu_with_dtmf, rewrite_rtp_endpoint,
+    convert_savpf_to_avp, ensure_ptime_in_answer, extract_ptime_from_offer,
+    restrict_answer_to_ngn_offer_subset, restrict_audio_to_pcmu, restrict_audio_to_pcmu_with_dtmf,
+    rewrite_rtp_endpoint,
 };
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
@@ -789,6 +790,59 @@ impl NgnInboundHandler {
                 tx.respond(trying).await?;
             }
 
+            // RFC 4028 §10 (Issue #249): 初回 INVITE で要求された `Session-Expires`
+            // 値が **sabiden Min-SE 未満** なら 422 Session Interval Too Small を
+            // **Min-SE ヘッダ付き** で返し、 ここで打ち切る。 これにより carrier
+            // (NGN P-CSCF / UAC) は Min-SE 整合値で再 INVITE できる。 §10 は
+            // 「server-side で Min-SE 違反を検出したら 422 + Min-SE が MUST」と
+            // 明記しており、 これを欠くと UAC は再試行手段を失う。
+            //
+            // 検査対象は **新規 INVITE (To-tag 無し)** のみ。 in-dialog Re-INVITE
+            // (To-tag 付き) は §10 では UAS 由来 Min-SE 違反検出経路が無く、
+            // 上流 outbound_forwarder の Min-SE relay 経路 (Issue #138) で扱う。
+            let inbound_timer: Option<InboundSessionTimer> = request
+                .headers
+                .get("session-expires")
+                .and_then(parse_session_expires_header);
+            let inbound_min_se: u32 = request
+                .headers
+                .get("min-se")
+                .and_then(parse_min_se_header)
+                .unwrap_or(crate::sip::uac::MIN_SE);
+            let to_has_tag = request
+                .headers
+                .get("to")
+                .map(crate::sip::utils::has_to_tag)
+                .unwrap_or(false);
+            if !to_has_tag {
+                if let Some(t) = &inbound_timer {
+                    // RFC 4028 §7.1 / §10: SE < Min-SE は 422 で拒否。 sabiden
+                    // 側 Min-SE は `crate::sip::uac::MIN_SE` (= 90 秒、 NGN 既定
+                    // で確認済の閾値)。 INVITE が宣言する Min-SE と sabiden 側
+                    // Min-SE のうち **大きい方** を採用 (= UAS の最小要求と UAC
+                    // 宣言下限の両方を満たす)、 SE がそれ未満なら 422。
+                    let min_se = inbound_min_se.max(crate::sip::uac::MIN_SE);
+                    if t.session_expires < min_se {
+                        warn!(
+                            session_expires = t.session_expires,
+                            min_se, "RFC 4028 §10: 初回 INVITE の SE < Min-SE → 422 + Min-SE"
+                        );
+                        let mut tx = stx.lock().await;
+                        let mut resp = build_response_skeleton(
+                            tx.request(),
+                            422,
+                            "Session Interval Too Small",
+                        );
+                        resp.headers.set("Min-SE", min_se.to_string());
+                        ensure_to_tag(&mut resp);
+                        tx.respond(resp).await?;
+                        drop(tx);
+                        self.pending.lock().await.remove(&call_id);
+                        return Ok(());
+                    }
+                }
+            }
+
             // Issue #138: RFC 3261 §12.2.2 / §14.2 — 受信 INVITE の To に tag
             // が乗っていれば in-dialog request (= Re-INVITE)。 初回 INVITE
             // (新規 dialog) と分岐し、 既存 outbound 通話 (内線→NGN 発信)
@@ -841,6 +895,44 @@ impl NgnInboundHandler {
                 self.metrics.record_invite_ngn(InviteResult::Error);
                 return Ok::<(), anyhow::Error>(());
             }
+
+            // RFC 3261 §13.3.1.4 (Issue #249): UAS が "remote callee is being
+            // alerted" の状態に入ったら **180 Ringing を SHOULD 送出**。 sabiden
+            // の B2BUA は ここで内線フォーク (PWA / SIP 内線) を起動するため、
+            // この時点が "alerted" のセマンティクス境界。 旧実装は 100 Trying
+            // → (4 秒 PWA mic 許可待ち silent) → 200 OK で carrier IMS が
+            // call setup を timeout し、 200 OK 直後 BYE で打ち切る挙動を
+            // 実機 pcap で確認 (`/tmp/sabiden-080-inbound.pcap`、 080 着信)。
+            //
+            // RFC 3261 §12.1.1: dialog ID は (Call-ID, From-tag, To-tag)。 180
+            // と 200 OK の To-tag は **同値必須** (early dialog == 確定 dialog)。
+            // `build_response_skeleton` が non-100 応答に sabiden 生成 tag を
+            // 自動付与するため、 180 の To-tag を取り出して後続 200 OK で
+            // 再利用する (= `dialog_to_tag` で持ち回り)。
+            let dialog_to_tag: Option<String> = {
+                let mut tx = stx.lock().await;
+                let mut ringing = build_response_skeleton(tx.request(), 180, "Ringing");
+                // sabiden の Contact (NGN 側ローカル) を 180 にも載せておく
+                // (RFC 3261 §13.2 / §13.3.1.4: target refresh は 2xx で確定
+                // するが、 180 reliable provisional 経路 (RFC 3262 100rel) に
+                // 備えて早期に Contact を提示しても害は無く、 NGN P-CSCF が
+                // 180 を Record-Route 経由で記録するときの整合性が増す)。
+                let contact_addr = self
+                    .cfg
+                    .ngn_local_addr
+                    .map(Ok)
+                    .unwrap_or_else(|| self.socket.local_addr())?;
+                ringing
+                    .headers
+                    .set("Contact", format!("<sip:sabiden@{}>", contact_addr));
+                // ensure_to_tag は has_to_tag を見て既存があれば二重付与しない。
+                // build_response_skeleton が自動付与した tag をそのまま使う。
+                ensure_to_tag(&mut ringing);
+                let tag = ringing.headers.get("to").and_then(extract_to_tag);
+                tx.respond(ringing).await?;
+                tag
+            };
+            debug!(?dialog_to_tag, "180 Ringing 送出 (RFC 3261 §13.3.1.4)");
 
             // フォーク (内線レッグ): SIP / WebRTC を transport で分岐して並列に呼び出す。
             // NGN から CANCEL が来たら fork を打ち切るため Notify を仕込んで
@@ -952,14 +1044,76 @@ impl NgnInboundHandler {
                         }
                     };
 
+                    // RFC 3264 §6.1 (Issue #249): NGN offer に `a=ptime` があれば
+                    // 200 OK SDP にも echo (PCMU 経路は 20ms 固定だが、 将来 PWA
+                    // 由来 60ms 等にも汎用対応する)。 offer 不在なら追加しない
+                    // (§6.1 "answer は offer の subset"、 offer に無いものを
+                    //  answer に増やさない)。
+                    let body_for_ngn = if !body_for_ngn.is_empty() {
+                        match extract_ptime_from_offer(&request.body) {
+                            Some(ptime) => ensure_ptime_in_answer(&body_for_ngn, ptime),
+                            None => body_for_ngn,
+                        }
+                    } else {
+                        body_for_ngn
+                    };
+
                     let mut tx = stx.lock().await;
                     let mut resp_to_ngn = build_response_skeleton(tx.request(), 200, "OK");
                     if !body_for_ngn.is_empty() {
                         resp_to_ngn.body = body_for_ngn;
                         resp_to_ngn.headers.set("Content-Type", "application/sdp");
                     }
-                    // To に tag を必ず付与 (RFC 3261 §8.2.6.2)
-                    ensure_to_tag(&mut resp_to_ngn);
+                    // RFC 3261 §12.1.1 (Issue #249): 180 Ringing で確立した early
+                    // dialog の To-tag をそのまま 200 OK で再利用する (dialog ID
+                    // が一致しないと NGN UAC は別 dialog と見做し、 早期 dialog
+                    // への BYE を確定 dialog にぶつける実装が存在する)。
+                    //
+                    // `build_response_skeleton` は non-100 応答に対し
+                    // **新しい sabiden-生成 tag を自動付与する** ため、 dialog_to_tag
+                    // を持つ初回 INVITE 経路では 200 OK の To を「INVITE 由来 To
+                    // (= tag 不在) + dialog_to_tag」 に明示的に再構成する。
+                    // INVITE の To に既に tag があるケース (in-dialog Re-INVITE
+                    // 等) では skeleton 側がそれを echo するので dialog_to_tag は
+                    // None になり、 ensure_to_tag 経路へ流れる。
+                    if let Some(tag) = dialog_to_tag.as_deref() {
+                        if let Some(orig_to) = tx.request().headers.get("to") {
+                            // INVITE 由来 To に tag が既に乗っていれば (≒ in-dialog)
+                            // それを尊重し dialog_to_tag は使わない。 初回 INVITE
+                            // (tag 無し) なら orig + dialog_to_tag で再構成。
+                            if crate::sip::utils::has_to_tag(orig_to) {
+                                resp_to_ngn.headers.set("To", orig_to);
+                            } else {
+                                resp_to_ngn
+                                    .headers
+                                    .set("To", format!("{};tag={}", orig_to, tag));
+                            }
+                        }
+                    } else {
+                        // To に tag を必ず付与 (RFC 3261 §8.2.6.2)。 180 が出せて
+                        // いない経路 (= 旧挙動互換) でも 200 OK は MUST tag。
+                        ensure_to_tag(&mut resp_to_ngn);
+                    }
+                    // RFC 4028 §7 (Issue #249): UAS が Session-Timer をサポート
+                    // する場合、 INVITE に Session-Expires が乗っていれば 2xx に
+                    // **Session-Expires + Require: timer を echo MUST**。
+                    // refresher は sabiden (= UAS) が refresher を引き受ける形を
+                    // 推奨 (RFC 4028 §7.4 / §9): NGN UAC が `refresher=uac` を
+                    // 主張していても、 sabiden 側で refresh を担当することで
+                    // 内線 UA への refresh 伝搬を簡略化できる (内線レッグの
+                    //   Re-INVITE 経路は実装済、 outbound forwarder 経由の
+                    //   Min-SE relay と整合する: Issue #138)。
+                    //
+                    // INVITE に Session-Expires が無いケース (§7 後段): 何も
+                    // しない (= UAS が timer をサポートしない応答と等価)。
+                    if let Some(t) = &inbound_timer {
+                        let se_value = t.session_expires.max(crate::sip::uac::MIN_SE);
+                        resp_to_ngn
+                            .headers
+                            .set("Session-Expires", format!("{};refresher=uas", se_value));
+                        // RFC 4028 §7: Require: timer は timer negotiate 完了の明示。
+                        resp_to_ngn.headers.set("Require", "timer");
+                    }
                     // sabiden の Contact (NGN 側ローカル) を載せる。
                     // SIP socket は `0.0.0.0:5060` bind なので `socket.local_addr()`
                     // をそのまま載せると NGN が ACK を `0.0.0.0` 宛に送ろうとして
@@ -1329,6 +1483,113 @@ fn ensure_to_tag(resp: &mut SipResponse) {
             resp.headers.set("To", new);
         }
     }
+}
+
+/// 受信 `To` ヘッダから `tag=<value>` を抽出する (RFC 3261 §20.39 / §7.3.1)。
+///
+/// `build_response_skeleton` が 100 以外で自動付与した sabiden 生成 To-tag を
+/// 後続応答 (180 / 200 OK 等) で **同じ tag** にするために使う。 RFC 3261
+/// §12.1.1: dialog ID = (Call-ID, From-tag, To-tag)。 同 INVITE トランザクション
+/// で複数の non-100 応答を出す場合、 各応答の To-tag は **すべて同値** で
+/// なければならない (早期 dialog == 確定 dialog)。 異なる tag を出すと NGN
+/// 側 UAC は early dialog と confirmed dialog を別 dialog と見做し、 早期
+/// dialog の "保留 / forking" を Confirmed dialog の取消し扱いにする実装が
+/// 存在する (= 即 BYE の素因)。
+///
+/// parameter name は case-insensitive (RFC 3261 §7.3.1)、 値の前後空白は
+/// trim する (RFC 3261 §7.3.1: parameter SHOULD NOT contain whitespace、
+/// 受信側は寛容)。 戻り値は **value 部分** (tag 文字列そのもの)。
+fn extract_to_tag(to_header: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut after_semi = false;
+    let mut start = 0usize;
+    let bytes = to_header.as_bytes();
+    let mut params: Vec<&str> = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b';' if depth == 0 => {
+                if after_semi {
+                    params.push(to_header[start..i].trim());
+                }
+                after_semi = true;
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if after_semi {
+        params.push(to_header[start..].trim());
+    }
+    for p in params {
+        let Some(eq_idx) = p.find('=') else {
+            continue;
+        };
+        let name = &p[..eq_idx];
+        let value = p[eq_idx + 1..].trim();
+        if name.eq_ignore_ascii_case("tag") && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// RFC 4028 §4 / §7 のパース結果: INVITE / Re-INVITE に乗った
+/// `Session-Expires` (full or compact `x:`) と `Min-SE` の値、 および
+/// `Supported: timer` の有無。
+///
+/// `Session-Expires` ヘッダの ABNF (RFC 4028 §3):
+/// ```text
+/// Session-Expires = ("Session-Expires" / "x") HCOLON delta-seconds *(SEMI se-params)
+/// se-params       = refresher-param / generic-param
+/// refresher-param = "refresher" EQUAL ("uas" / "uac")
+/// ```
+///
+/// パースは寛容に行う (`delta-seconds` だけは必須数値、 残りパラメータは
+/// 値を捨てて refresher のみ取り出す)。 不正な数値は `None` を返し、
+/// 呼出側で `Session-Expires` 不在として扱う (= RFC 4028 §7 後段: UAS は
+/// Session-Expires をサポートしていないと判断して echo しなくてよい)。
+#[derive(Debug, Clone, PartialEq)]
+struct InboundSessionTimer {
+    /// `Session-Expires` の delta-seconds (秒)。
+    session_expires: u32,
+    /// refresher param ("uac" / "uas") の生値。 不在なら `None`。
+    refresher: Option<String>,
+}
+
+/// `Session-Expires` ヘッダを parse する (RFC 4028 §4)。 ヘッダ不在 / 値が
+/// 不正なら `None`。 compact form (`x:`) はメッセージパーサ側で既に
+/// `session-expires` に正規化されている前提 (`src/sip/message.rs:309`)。
+fn parse_session_expires_header(value: &str) -> Option<InboundSessionTimer> {
+    let mut parts = value.split(';');
+    let secs_str = parts.next()?.trim();
+    let session_expires: u32 = secs_str.parse().ok()?;
+    let mut refresher: Option<String> = None;
+    for p in parts {
+        let p = p.trim();
+        if let Some(eq_idx) = p.find('=') {
+            let name = &p[..eq_idx];
+            let val = p[eq_idx + 1..].trim();
+            if name.eq_ignore_ascii_case("refresher") && !val.is_empty() {
+                refresher = Some(val.to_ascii_lowercase());
+            }
+        }
+    }
+    Some(InboundSessionTimer {
+        session_expires,
+        refresher,
+    })
+}
+
+/// RFC 4028 §4 / §10: `Min-SE` ヘッダ値を `u32` (秒) にパース。 不在 / 不正なら
+/// `None` (= 呼出側は `MIN_SE` 既定値を採用)。
+fn parse_min_se_header(value: &str) -> Option<u32> {
+    // `Min-SE: 300` のような単純数値前提。 RFC 4028 ABNF も
+    // `Min-SE = "Min-SE" HCOLON delta-seconds *(SEMI generic-param)` で
+    // 第一トークンが delta-seconds。
+    let head = value.split(';').next().unwrap_or("").trim();
+    head.parse().ok()
 }
 
 /// 内線レッグ Re-INVITE の `send_request` 失敗を SIP final response の
@@ -8016,15 +8277,17 @@ mod tests {
 
         // 100 Trying と 502 Bad Gateway (transparent モードかつ WebRTC leg の
         // `0.0.0.0:9` answer は未書換のまま NGN に流せないため) を待つ。
+        // Issue #249: 100 と 502 の間に 180 Ringing (RFC 3261 §13.3.1.4) が流れる。
         let mut buf = vec![0u8; 8192];
         let mut got_100 = false;
         let mut final_status: Option<u16> = None;
-        for _ in 0..5 {
+        for _ in 0..6 {
             match timeout(Duration::from_secs(3), ngn_sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
                     if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
                         match r.status_code {
                             100 => got_100 = true,
+                            180 => {} // RFC 3261 §13.3.1.4 (Issue #249)
                             code => {
                                 final_status = Some(code);
                                 break;
@@ -9216,15 +9479,17 @@ mod tests {
             .unwrap();
 
         // NGN は 100 Trying と 502 Bad Gateway を期待する
+        // Issue #249: 100 と 502 の間に 180 Ringing (RFC 3261 §13.3.1.4) が入る。
         let mut buf = vec![0u8; 8192];
         let mut got_100 = false;
         let mut final_status: Option<u16> = None;
-        for _ in 0..6 {
+        for _ in 0..7 {
             match timeout(Duration::from_secs(3), ngn_sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
                     if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
                         match r.status_code {
                             100 => got_100 = true,
+                            180 => {} // RFC 3261 §13.3.1.4 (Issue #249)
                             code => {
                                 final_status = Some(code);
                                 break;
@@ -11916,5 +12181,483 @@ mod tests {
         );
 
         ngn_task.abort();
+    }
+
+    // ====================================================================
+    // Issue #249: NGN inbound 200 OK で Session-Expires + 180 Ringing + ptime
+    //   RFC 3261 §13.3.1.4 / RFC 4028 §7 / RFC 3264 §6.1
+    // ====================================================================
+
+    /// テスト用ヘルパ: INVITE を投げて N 個の応答を受信する。
+    /// timeout は各 recv 単位。 timeout 内に応答が来なければ Vec を返す。
+    async fn drain_responses(
+        ngn_sock: &UdpSocket,
+        max_count: usize,
+        timeout: Duration,
+    ) -> Vec<SipResponse> {
+        let mut buf = vec![0u8; 8192];
+        let mut out = Vec::new();
+        for _ in 0..max_count {
+            match tokio::time::timeout(timeout, ngn_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                        let status = r.status_code;
+                        out.push(r);
+                        // 200 など最終応答が来たらすぐ抜けても良いが、
+                        // 後段の応答 (リトランスミット等) を測りたい用途もあるので
+                        // ループを継続。 timeout で抜ける。
+                        if status >= 200 {
+                            // 最終応答後に provisional の遅延到着は無いので break
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Issue #249 / RFC 3261 §13.3.1.4: NGN 着信 INVITE で 100 Trying の
+    /// **直後に 180 Ringing** が NGN へ送出される (= "remote callee is being
+    /// alerted" の semantic で、 4 秒 silent → 200 OK の carrier IMS timeout
+    /// 経路を消す)。 実機 evidence: `/tmp/sabiden-080-inbound.pcap` で
+    /// 100 Trying → 4.1 秒 silent → 200 OK → 28ms 後 BYE。 180 を挟むと
+    /// carrier は call setup 進行中と認識する。
+    #[tokio::test]
+    async fn rfc3261_13_3_1_4_inbound_invite_sends_180_ringing() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6101".to_string(),
+                "127.0.0.1:6101".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 内線がすぐ 200 OK を返さないよう、 INVITE delay でフォーク中に
+        // 180 が出ていることを観測しやすくする (= fork timeout までは
+        // ringing 状態が継続)。 ここでは scripted action で OK 即答だが、
+        // 100 → 180 → 200 が一連で届くだけでもよく、 順序検証が肝。
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-13-3-1-4-cid",
+            "z9hG4bK-ring",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20000 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        // 順序検証: 100 が最初、 180 が 100 の後、 200 (or 4xx) が最後の方
+        let codes: Vec<u16> = responses.iter().map(|r| r.status_code).collect();
+        assert!(
+            codes.contains(&100),
+            "RFC 3261 §17.2.1: 100 Trying を送るべき。 codes={codes:?}"
+        );
+        assert!(
+            codes.contains(&180),
+            "RFC 3261 §13.3.1.4: 180 Ringing を送るべき (Issue #249)。 codes={codes:?}"
+        );
+        // 100 → 180 の順序 (どちらも最終応答前)
+        let pos_100 = codes.iter().position(|c| *c == 100).unwrap();
+        let pos_180 = codes.iter().position(|c| *c == 180).unwrap();
+        assert!(
+            pos_100 < pos_180,
+            "100 Trying は 180 Ringing より前。 codes={codes:?}"
+        );
+
+        // 180 と 200 の To-tag が同値 (RFC 3261 §12.1.1: early == confirmed dialog)
+        let r180 = responses
+            .iter()
+            .find(|r| r.status_code == 180)
+            .expect("180 を保持");
+        if let Some(r200) = responses.iter().find(|r| r.status_code == 200) {
+            let to_180 = r180.headers.get("to").expect("180 To");
+            let to_200 = r200.headers.get("to").expect("200 To");
+            let tag_180 = extract_to_tag(to_180).expect("180 に To-tag");
+            let tag_200 = extract_to_tag(to_200).expect("200 に To-tag");
+            assert_eq!(
+                tag_180, tag_200,
+                "RFC 3261 §12.1.1: 180 / 200 の To-tag は同値必須 (early dialog == confirmed dialog)"
+            );
+        }
+    }
+
+    /// Issue #249 / RFC 4028 §7: INVITE が `Session-Expires: 300;refresher=uac`
+    /// と `Supported: timer` を載せたら、 200 OK に **`Session-Expires` + refresher=uas
+    /// + `Require: timer`** を echo する。 実機 evidence:
+    /// `/tmp/sabiden-080-inbound.pcap` で NGN INVITE に `x: 300;refresher=uac`、
+    /// 我々の 200 OK に Session-Expires が無い → 28ms 後 BYE。
+    #[tokio::test]
+    async fn rfc4028_7_session_expires_echoed_in_200_ok_with_refresher_uas() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6102".to_string(),
+                "127.0.0.1:6102".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30003 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc4028-7-cid",
+            "z9hG4bK-se",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20001 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        // RFC 4028 §4: INVITE に Session-Expires / Min-SE / Supported: timer。
+        invite.headers.set("Session-Expires", "300;refresher=uac");
+        invite.headers.set("Min-SE", "300");
+        invite.headers.set("Supported", "timer");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+
+        let se = r200
+            .headers
+            .get("session-expires")
+            .expect("RFC 4028 §7: 200 OK に Session-Expires を echo すべき (Issue #249)");
+        // delta-seconds = 300 (= INVITE 値、 Min-SE 90 以上なので素通し)
+        assert!(
+            se.starts_with("300"),
+            "Session-Expires は 300 を echo すべき: {se}"
+        );
+        // refresher=uas (sabiden が UAS として refresh を引き受ける、 RFC 4028 §7.4 / §9)
+        assert!(
+            se.to_ascii_lowercase().contains("refresher=uas"),
+            "RFC 4028 §7.4: refresher=uas で sabiden が refresh 担当: {se}"
+        );
+        let require = r200
+            .headers
+            .get("require")
+            .expect("RFC 4028 §7: timer negotiate 完了の明示として Require: timer を載せるべき");
+        assert!(
+            require.to_ascii_lowercase().contains("timer"),
+            "Require: timer が含まれるべき: {require}"
+        );
+    }
+
+    /// Issue #249 / RFC 4028 §7 後段: INVITE に `Session-Expires` が **不在**
+    /// なら、 200 OK にも echo してはいけない (UAS が timer をサポートしない
+    /// 応答と等価)。
+    #[tokio::test]
+    async fn rfc4028_7_session_expires_absent_in_invite_not_echoed() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6103".to_string(),
+                "127.0.0.1:6103".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // Session-Expires / Min-SE / Supported: timer は **付けない**
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc4028-7-absent-cid",
+            "z9hG4bK-se-absent",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+
+        assert!(
+            r200.headers.get("session-expires").is_none(),
+            "RFC 4028 §7 後段: INVITE に SE が無いなら 200 OK にも乗せない"
+        );
+        // Require: timer も付けない (negotiate 対象が無いので)
+        let require = r200.headers.get("require").unwrap_or("");
+        assert!(
+            !require.to_ascii_lowercase().contains("timer"),
+            "INVITE が timer を Supported に乗せていないなら Require: timer も不要"
+        );
+    }
+
+    /// Issue #249 / RFC 3264 §6.1: NGN offer に `a=ptime:20` があれば 200 OK
+    /// SDP の `m=audio` に `a=ptime:20` を echo する (NGN PCMU は 20ms 固定、
+    /// pcap evidence)。
+    #[tokio::test]
+    async fn rfc3264_6_1_inbound_answer_echoes_ptime() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6104".to_string(),
+                "127.0.0.1:6104".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 内線 200 OK SDP は ptime 不在 (= sabiden 側 echo 経路を観測する)
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30005 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // INVITE SDP に `a=ptime:20` を明示
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3264-6-1-ptime-cid",
+            "z9hG4bK-ptime",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20003 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+
+        let body = std::str::from_utf8(&r200.body).expect("SDP utf8");
+        assert!(
+            body.contains("a=ptime:20"),
+            "RFC 3264 §6.1: 200 OK SDP に offer 由来 ptime を echo すべき (Issue #249): \n{body}"
+        );
+    }
+
+    /// Issue #249 / RFC 4028 §10: INVITE の Session-Expires が sabiden Min-SE
+    /// (= 90 秒) より小さい (例: 60) なら、 422 Session Interval Too Small を
+    /// **Min-SE ヘッダ付き** で返す。 既存 Re-INVITE 422 経路の回帰防止と、
+    /// 初回 INVITE 経路にも 422 を導入したことの検証。
+    #[tokio::test]
+    async fn rfc4028_min_se_too_small_returns_422() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6105".to_string(),
+                "127.0.0.1:6105".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(b"".to_vec())
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // SE = 60 (sabiden Min-SE = 90 未満)、 Min-SE 60 を主張するが sabiden の
+        // 90 と max を取って 90 以上を要求する。
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc4028-10-422-cid",
+            "z9hG4bK-422",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Session-Expires", "60;refresher=uac");
+        invite.headers.set("Min-SE", "60");
+        invite.headers.set("Supported", "timer");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r422 = responses
+            .iter()
+            .find(|r| r.status_code == 422)
+            .expect("RFC 4028 §10: SE < Min-SE で 422 Session Interval Too Small (Issue #249)");
+        let min_se = r422
+            .headers
+            .get("min-se")
+            .expect("RFC 4028 §10: 422 は Min-SE 必須");
+        let n: u32 = min_se.split(';').next().unwrap().trim().parse().unwrap();
+        assert!(
+            n >= 90,
+            "Min-SE は sabiden の MIN_SE (= 90) 以上を要求すべき: {min_se}"
+        );
+        // 422 後は 200 OK が来ないこと (fork を起動していない)
+        assert!(
+            !responses.iter().any(|r| r.status_code == 200),
+            "422 で打ち切ったので 200 OK は来ない: codes={:?}",
+            responses.iter().map(|r| r.status_code).collect::<Vec<_>>()
+        );
+    }
+
+    /// RFC 4028 §4 ABNF: `Session-Expires` の delta-seconds と refresher param
+    /// のパース正当性。 compact form (`x:`) は SipHeaders 正規化で
+    /// `session-expires` に変換済 (`src/sip/message.rs:309`)。
+    #[test]
+    fn rfc4028_4_parse_session_expires_with_refresher() {
+        let t = parse_session_expires_header("300;refresher=uac").expect("parse ok");
+        assert_eq!(t.session_expires, 300);
+        assert_eq!(t.refresher.as_deref(), Some("uac"));
+
+        let t = parse_session_expires_header("1800").expect("parse ok");
+        assert_eq!(t.session_expires, 1800);
+        assert!(t.refresher.is_none());
+
+        // refresher param は case-insensitive
+        let t = parse_session_expires_header("90;REFRESHER=UAS").expect("parse ok");
+        assert_eq!(t.refresher.as_deref(), Some("uas"));
+
+        // 不正数値は None
+        assert!(parse_session_expires_header("abc").is_none());
+        assert!(parse_session_expires_header("").is_none());
+    }
+
+    /// `extract_to_tag` が name-addr 形式 / addr-spec 形式 / 大文字 tag /
+    /// 山括弧内の偽 tag を正しく扱う (Issue #249 で 180 / 200 OK 同一 tag 保持の
+    /// ために導入)。 RFC 3261 §7.3.1 / §20.39 / §25.1。
+    #[test]
+    fn rfc3261_20_39_extract_to_tag_handles_variants() {
+        assert_eq!(
+            extract_to_tag("<sip:dest@sabiden>;tag=abc123"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            extract_to_tag("sip:dest@sabiden;tag=xyz"),
+            Some("xyz".to_string())
+        );
+        // case-insensitive parameter name
+        assert_eq!(
+            extract_to_tag("<sip:dest@sabiden>;TAG=hex"),
+            Some("hex".to_string())
+        );
+        // tag 不在
+        assert_eq!(extract_to_tag("<sip:dest@sabiden>"), None);
+        // 山括弧内の tag= は無視 (URI userinfo の tag は header param ではない)
+        assert_eq!(extract_to_tag("<sip:dest;tag=fake@sabiden>"), None);
     }
 }

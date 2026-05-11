@@ -508,6 +508,73 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     Ok(sdp.to_string_crlf().into_bytes())
 }
 
+/// RFC 3264 §6.1 / RFC 4566 §6: offer SDP の最初の `m=audio` から
+/// `a=ptime:<n>` 値を抽出する。
+///
+/// `a=ptime` は packetization period (ms) を表すメディアレベル属性で、
+/// answerer は offer の値を **echo するのが推奨** (RFC 3264 §6.1: answer の
+/// attribute は offer の subset)。 NGN は実機キャプチャ (Issue #249,
+/// `/tmp/sabiden-080-inbound.pcap`) で常に `a=ptime:20` を offer に乗せて
+/// 来るが、 PWA/WebRTC 由来 SDP やテスト SDP では別値 (例 30, 60) も
+/// あり得るため、 ハードコードせず offer から拾う。
+///
+/// 戻り値:
+/// - `Some(n)`: `m=audio` 直下のメディア属性に `a=ptime:n` がある
+/// - `None`: 不在 / パース不能 / `n` が u32 範囲外 / `m=audio` 不在
+///
+/// パース不能 SDP は呼出側で 200 OK を素通しさせる経路に従うため `None` で
+/// 良い (= 「ptime echo は best-effort」)。
+pub fn extract_ptime_from_offer(offer_bytes: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(offer_bytes).ok()?;
+    let sdp = SessionDescription::parse(text).ok()?;
+    let audio = sdp.media.iter().find(|m| m.media == "audio")?;
+    for a in &audio.attributes {
+        if let Attribute::Value { key, value } = a {
+            if key == "ptime" {
+                return value.trim().parse::<u32>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// RFC 3264 §6.1 / RFC 4566 §6: answer SDP の最初の `m=audio` に
+/// `a=ptime:<n>` を **無ければ** 追加する。
+///
+/// answer SDP に既に ptime があれば変更しない (内線側が異なる値を主張する
+/// 余地を残す)。 不在の場合のみ、 offer 由来の値を補う。 RFC 3264 §6.1 は
+/// answer の attribute を offer の subset とする推奨であり、 answerer が
+/// 別 ptime を望むなら answerer 値を尊重する (offer 側が次回 re-INVITE で
+/// 調整可能)。
+///
+/// パース不能ならそのまま返す (ベストエフォート、 NGN への 200 OK 全体の
+/// 整合性は呼出側で別途検証する)。
+pub fn ensure_ptime_in_answer(answer_bytes: &[u8], ptime_ms: u32) -> Vec<u8> {
+    let text = match std::str::from_utf8(answer_bytes) {
+        Ok(s) => s,
+        Err(_) => return answer_bytes.to_vec(),
+    };
+    let mut sdp = match SessionDescription::parse(text) {
+        Ok(s) => s,
+        Err(_) => return answer_bytes.to_vec(),
+    };
+    let audio = match sdp.media.iter_mut().find(|m| m.media == "audio") {
+        Some(m) => m,
+        None => return answer_bytes.to_vec(),
+    };
+    let has_ptime = audio
+        .attributes
+        .iter()
+        .any(|a| matches!(a, Attribute::Value { key, .. } if key == "ptime"));
+    if !has_ptime {
+        audio.attributes.push(Attribute::Value {
+            key: "ptime".to_string(),
+            value: ptime_ms.to_string(),
+        });
+    }
+    sdp.to_string_crlf().into_bytes()
+}
+
 /// audio メディアを **G.711 μ-law (payload type 0) のみ** に絞った SDP を返す。
 ///
 /// NTT ひかり電話 (NGN) は PCMU(0) しか受け入れず、Linphone/Zoiper 等が送ってくる
@@ -2056,5 +2123,72 @@ mod tests {
         let params = make_dtls_params();
         assert!(convert_avp_to_savpf(bad, &params).is_err());
         assert!(convert_savpf_to_avp(bad).is_err());
+    }
+
+    /// RFC 3264 §6.1 / RFC 4566 §6 (Issue #249): offer SDP に `a=ptime:20` が
+    /// あれば `extract_ptime_from_offer` は `Some(20)` を返す。 これは NGN
+    /// 着信時に 200 OK SDP へ ptime を echo するための一次情報源。
+    #[test]
+    fn rfc3264_6_1_extract_ptime_from_ngn_offer() {
+        let offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                      c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                      m=audio 13300 RTP/AVP 0\r\n\
+                      a=ptime:20\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n\
+                      a=sendrecv\r\n";
+        assert_eq!(extract_ptime_from_offer(offer), Some(20));
+    }
+
+    /// RFC 3264 §6.1: offer に ptime が無いケース。 `None` で返す
+    /// (= 呼出側で 「ptime は echo しない」 と判断する根拠)。
+    #[test]
+    fn rfc3264_6_1_extract_ptime_absent() {
+        let offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                      c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                      m=audio 13300 RTP/AVP 0\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(extract_ptime_from_offer(offer), None);
+    }
+
+    /// RFC 3264 §6.1 (Issue #249): answer SDP に `a=ptime` が無く offer に
+    /// 20 ms があるなら、 `ensure_ptime_in_answer(answer, 20)` で
+    /// `a=ptime:20` を追加する。
+    #[test]
+    fn rfc3264_6_1_inbound_answer_echoes_ptime() {
+        let answer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\n\
+                       c=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                       m=audio 40000 RTP/AVP 0\r\n\
+                       a=rtpmap:0 PCMU/8000\r\n\
+                       a=sendrecv\r\n";
+        let out = ensure_ptime_in_answer(answer, 20);
+        let s = std::str::from_utf8(&out).expect("utf8");
+        assert!(
+            s.contains("a=ptime:20\r\n"),
+            "answer に ptime:20 が echo されているべき (RFC 3264 §6.1): {s}"
+        );
+        // 既存 attribute は保持
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=sendrecv\r\n"));
+    }
+
+    /// RFC 3264 §6.1: answer に既に ptime があれば上書きせず保持する
+    /// (= answerer の主張を尊重)。
+    #[test]
+    fn rfc3264_6_1_existing_ptime_in_answer_preserved() {
+        let answer = b"v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\n\
+                       c=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                       m=audio 40000 RTP/AVP 0\r\n\
+                       a=rtpmap:0 PCMU/8000\r\n\
+                       a=ptime:30\r\n";
+        let out = ensure_ptime_in_answer(answer, 20);
+        let s = std::str::from_utf8(&out).expect("utf8");
+        assert!(
+            s.contains("a=ptime:30\r\n"),
+            "answer が ptime:30 を主張 → 上書きしない (offer 由来 20 は無視): {s}"
+        );
+        assert!(
+            !s.contains("a=ptime:20\r\n"),
+            "20 は付与してはいけない: {s}"
+        );
     }
 }

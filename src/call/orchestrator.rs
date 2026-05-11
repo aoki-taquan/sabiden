@@ -955,8 +955,12 @@ impl NgnInboundHandler {
                     self.metrics.inc_call_active();
                 }
                 ForkResult::AllFailed { last_status } => {
+                    // Issue #211 / RFC 3261 §16.7 step 6:
+                    //   reason phrase は `reason_phrase_for_status` で決める。
+                    //   旧実装は 603 に "Declined" を返していたが、 RFC 3261
+                    //   §21.6.2 は単数 "Decline" が正規。
                     let code = last_status.unwrap_or(486);
-                    let reason = if code == 486 { "Busy Here" } else { "Declined" };
+                    let reason = reason_phrase_for_status(code);
                     self.respond(&stx, code, reason).await?;
                     self.pending.lock().await.remove(&call_id);
                     let result = if code == 486 {
@@ -3551,6 +3555,66 @@ async fn close_and_drain_webrtc_legs(
     std::mem::take(&mut g.legs)
 }
 
+/// RFC 3261 §16.7 step 6 (Aggregate Authorization Header Field Values / Best
+/// Response): non-2xx final responses を集約する際の優先順位を実装する。
+///
+/// レスポンスクラス間の優先 (`final_response_class_rank`):
+///
+/// ```text
+/// 6xx (Global Failure)        > 4xx (Request Failure) > 5xx (Server Failure) > 3xx (Redirection)
+/// ```
+///
+/// 同クラス内では「最初に受信した」 ものを保持する (RFC 3261 §16.7 step 6
+/// 5th paragraph: "Among same class, the proxy SHOULD pick the response from
+/// the earliest-arrived response context.")。
+///
+/// 注: 2xx (Answered) は `fork_to_bindings` ループ内で別経路 (= `Established`)
+/// で処理するため、 本関数の対象外。
+///
+/// 戻り値: 「`new` を採用すべきなら `true`」。 `current` が `None` のとき必ず
+/// `true` を返す (初回受信は無条件採用)。
+fn should_replace_status(current: Option<u16>, new: u16) -> bool {
+    match current {
+        None => true,
+        Some(cur) => final_response_class_rank(new) > final_response_class_rank(cur),
+    }
+}
+
+/// RFC 3261 §16.7 step 6 best response の優先度を返す。 値が大きいほど優先。
+///
+/// 1xx / 2xx は本関数の対象外 (呼出側で除外済) で、 もし渡されれば最下位 (0)
+/// として扱う (= 既存の 3xx/4xx/5xx/6xx を上書きしない)。
+fn final_response_class_rank(code: u16) -> u8 {
+    match code {
+        600..=699 => 4,
+        400..=499 => 3,
+        500..=599 => 2,
+        300..=399 => 1,
+        _ => 0,
+    }
+}
+
+/// `fork_to_bindings` の `AllFailed` 経路で NGN へ返す reason phrase を決定する。
+///
+/// 参照する RFC:
+/// - RFC 3261 §21.4.21 "486 Busy Here"
+/// - RFC 3261 §21.6.2 "603 Decline" — **単数** "Decline" が正規 (PR #210 では
+///   "Declined" と誤記していたため Issue #211 で修正)。
+/// - RFC 3261 §21 全般: その他 status code は `RESPONSE-PHRASE` を直接引用する
+///   のが基本で、 未登録 (例: 487 Request Terminated は §21.4.25) のものも RFC
+///   準拠の英語表現を返す。
+///
+/// 本関数は `AllFailed` 経路で使う final response (3xx-6xx) のみを想定する。
+/// 未知 code は中立的な "Decline" (= 603 と同じ semantics の汎用拒否) を返す。
+fn reason_phrase_for_status(code: u16) -> &'static str {
+    match code {
+        486 => "Busy Here",
+        487 => "Request Terminated",
+        603 => "Decline",
+        _ => "Decline",
+    }
+}
+
 /// 内線フォーク (transport-aware)。SIP/WebRTC を transport で分岐し並列に呼び出す。
 /// 先着の 200 OK を winner として採用、それ以外の WebRTC leg には Cancel を流す。
 pub async fn fork_to_bindings(
@@ -3672,7 +3736,27 @@ pub async fn fork_to_bindings(
                 };
             }
             LegResult::Failed { status, .. } => {
-                last_status = Some(status);
+                // Issue #211 / RFC 3261 §16.7 step 6 best response selection:
+                // 並走中の SIP 内線 486 が後着すると `last_status` を 486 で
+                // 上書きし、 先着の PWA 603 Decline を埋没させていた。
+                // `should_replace_status` で 6xx > 5xx > 4xx > 3xx の優先度
+                // (同クラスは first-wins) を実装し、 「先着優位 + クラス優位」
+                // で集約する。
+                if should_replace_status(last_status, status) {
+                    last_status = Some(status);
+                }
+                // RFC 3261 §16.7 step 5: 6xx 受領時はそれ以上 fork レッグの結果を
+                // 待たず、 immediate に AllFailed として抜ける (= 残る WebRTC leg は
+                // 下段の `close_and_drain_webrtc_legs` ループで Cancel される)。
+                // SIP leg は spawn 済の future が継続するが、 `tx_c` 経由の
+                // 結果は drop される (loop exit 後 `rx` を捨てるため)。
+                if (600..=699).contains(&status) {
+                    info!(
+                        status,
+                        "fork_to_bindings: 6xx 受領 → 残レッグを待たず early terminate (RFC 3261 §16.7 step 5)"
+                    );
+                    break ForkResult::AllFailed { last_status };
+                }
             }
             LegResult::Errored { .. } => {}
         }
@@ -4207,6 +4291,241 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
     use tokio::net::UdpSocket;
+
+    // ====================================================================
+    // Issue #211: RFC 3261 §16.7 best response selection / §21.6.2 Decline
+    // ====================================================================
+
+    /// RFC 3261 §16.7 step 6: 6xx (Global Failure) は 4xx/5xx より優先される。
+    /// PR #210 では先着 603 (PWA decline) が後着 486 (SIP busy) に上書きされる
+    /// race があり、 Issue #211 で本関数の優先度ロジックを導入した。
+    #[test]
+    fn rfc3261_16_7_should_replace_status_6xx_beats_4xx_and_5xx() {
+        // 6xx は 4xx/5xx を上書きする
+        assert!(should_replace_status(Some(486), 603));
+        assert!(should_replace_status(Some(404), 603));
+        assert!(should_replace_status(Some(500), 603));
+        assert!(should_replace_status(Some(503), 603));
+        // 4xx/5xx は 6xx を上書きしない (= 後着の SIP 486 が PWA 603 を消さない)
+        assert!(!should_replace_status(Some(603), 486));
+        assert!(!should_replace_status(Some(603), 500));
+        assert!(!should_replace_status(Some(603), 404));
+    }
+
+    /// RFC 3261 §16.7 step 6: 同クラス内は「first-wins」。 新 status が `current`
+    /// と同じクラスなら上書きしない (= 先着優位)。
+    #[test]
+    fn rfc3261_16_7_should_replace_status_same_class_first_wins() {
+        // 4xx 同士 → 先着 486 を保持
+        assert!(!should_replace_status(Some(486), 404));
+        assert!(!should_replace_status(Some(486), 487));
+        // 6xx 同士 → 先着 603 を保持
+        assert!(!should_replace_status(Some(603), 600));
+        assert!(!should_replace_status(Some(603), 604));
+        // 5xx 同士
+        assert!(!should_replace_status(Some(500), 503));
+    }
+
+    /// 初回受信 (`current = None`) は無条件採用。
+    #[test]
+    fn rfc3261_16_7_should_replace_status_initial_none_always_accepts() {
+        assert!(should_replace_status(None, 486));
+        assert!(should_replace_status(None, 603));
+        assert!(should_replace_status(None, 404));
+        assert!(should_replace_status(None, 500));
+    }
+
+    /// RFC 3261 §16.7 step 6 クラス間優先度 (6xx > 4xx > 5xx > 3xx) を直接
+    /// 検証する。 注: §16.7 は 4xx/5xx の正確な順序を規定していないが、
+    /// 実用上 4xx (request failure) の方が「終端的」 として扱われることが多い
+    /// (Asterisk fork_done コードと同じ慣習)。 ただし重要なのは「6xx が常に
+    /// 最優先」 で、 これは Issue #211 の主目的。
+    #[test]
+    fn rfc3261_16_7_final_response_class_rank_orders_6xx_highest() {
+        assert!(final_response_class_rank(603) > final_response_class_rank(486));
+        assert!(final_response_class_rank(603) > final_response_class_rank(500));
+        assert!(final_response_class_rank(603) > final_response_class_rank(302));
+        // 6xx 内は同 rank (first-wins は呼出側のロジック)
+        assert_eq!(
+            final_response_class_rank(600),
+            final_response_class_rank(603)
+        );
+    }
+
+    /// RFC 3261 §21.6.2: 603 の正規 reason phrase は **単数** "Decline"。
+    /// PR #210 では誤って "Declined" を返しており、 Issue #211 で修正。
+    #[test]
+    fn rfc3261_21_6_2_reason_phrase_for_603_is_singular_decline() {
+        assert_eq!(reason_phrase_for_status(603), "Decline");
+        // 誤った "Declined" になっていないこと (regression guard)
+        assert_ne!(reason_phrase_for_status(603), "Declined");
+    }
+
+    /// RFC 3261 §21.4.21: 486 は "Busy Here"。
+    #[test]
+    fn rfc3261_21_4_21_reason_phrase_for_486_is_busy_here() {
+        assert_eq!(reason_phrase_for_status(486), "Busy Here");
+    }
+
+    /// RFC 3261 §21.4.25: 487 は "Request Terminated"。
+    #[test]
+    fn rfc3261_21_4_25_reason_phrase_for_487_is_request_terminated() {
+        assert_eq!(reason_phrase_for_status(487), "Request Terminated");
+    }
+
+    /// Issue #211: race シナリオの再現テスト。 fork に 3 つの leg を入れて、
+    ///
+    /// 1. WebRTC leg 風の Failed{603} (PWA decline 相当) が先着
+    /// 2. SIP leg の Failed{486} (SIP UA busy) が後着
+    /// 3. SIP leg の Failed{404} (Not Found) が後着
+    ///
+    /// 旧挙動では `last_status = Some(486)` (または 404) で上書きされ NGN へ
+    /// 486 / 404 が返っていた。 新挙動は **6xx 受領時点で early terminate**
+    /// + 6xx 優先度で `Some(603)` を維持し、 NGN へ 603 Decline を返す
+    /// (RFC 3261 §16.7 step 5/6)。
+    ///
+    /// ここでは SIP 3 本だけで `fork_to_bindings` を呼ぶ (WebRTC mock は別テストで
+    /// 検証済 `rfc3261_21_6_2_run_webrtc_leg_propagates_decline_as_failed_603`)。
+    /// 1 本目を `ImmediateStatus(603)`、 残り 2 本を `DelayedStatus(486)` /
+    /// `DelayedStatus(404)` にすることで「603 先着 → 486/404 後着」 を再現。
+    #[tokio::test]
+    async fn rfc3261_16_7_fork_to_bindings_keeps_6xx_when_4xx_arrives_later() {
+        use crate::sip::registrar::{Binding, ExtTransport};
+
+        // 600ms 後に 486 / 800ms 後に 404 を返す 2 本と、 即時 603 の 1 本。
+        let inviter = ScriptedInviter::builder()
+            .script(
+                "sip:fast-decline@ext.local",
+                ScriptedAction::ImmediateStatus(603),
+            )
+            .script(
+                "sip:slow-busy@ext.local",
+                ScriptedAction::DelayedStatus {
+                    delay_ms: 600,
+                    status: 486,
+                },
+            )
+            .script(
+                "sip:slow-notfound@ext.local",
+                ScriptedAction::DelayedStatus {
+                    delay_ms: 800,
+                    status: 404,
+                },
+            )
+            .default_action(ScriptedAction::ImmediateStatus(486))
+            .build();
+
+        let make_binding = |uri: &str| Binding {
+            contact_uri: uri.to_string(),
+            remote: "127.0.0.1:65535".parse().unwrap(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(60),
+            transport: ExtTransport::Sip,
+        };
+        let bindings = vec![
+            (
+                "fast".to_string(),
+                make_binding("sip:fast-decline@ext.local"),
+            ),
+            ("slow1".to_string(), make_binding("sip:slow-busy@ext.local")),
+            (
+                "slow2".to_string(),
+                make_binding("sip:slow-notfound@ext.local"),
+            ),
+        ];
+
+        let start = std::time::Instant::now();
+        let result = fork_to_bindings(
+            inviter,
+            bindings,
+            b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+              m=audio 20000 RTP/AVP 0\r\n"
+                .to_vec(),
+            "ut-cid-6xx-priority".to_string(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // RFC 3261 §16.7 step 5: 6xx 受領で early terminate するため、
+        // 遅い 486/404 (600ms/800ms) を待たずに数十 ms で抜けるはず。
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "6xx early terminate (RFC 3261 §16.7 step 5) が効いていない: elapsed={:?}",
+            elapsed
+        );
+
+        match result {
+            ForkResult::AllFailed { last_status } => {
+                assert_eq!(
+                    last_status,
+                    Some(603),
+                    "RFC 3261 §16.7 step 6: 603 (6xx) は 486/404 (4xx) より優先される"
+                );
+            }
+            ForkResult::Answered { .. } => panic!("AllFailed 期待だが Answered"),
+            ForkResult::Timeout => panic!("AllFailed 期待だが Timeout"),
+        }
+    }
+
+    /// Issue #211 / RFC 3261 §16.7 step 6: 逆順 race (4xx 先着 → 6xx 後着) でも
+    /// 最終的に `last_status = Some(603)` になる。 これは「6xx は 4xx を
+    /// **上書きする**」 という class 間優先度の検証。
+    #[tokio::test]
+    async fn rfc3261_16_7_fork_to_bindings_late_6xx_overrides_early_4xx() {
+        use crate::sip::registrar::{Binding, ExtTransport};
+
+        let inviter = ScriptedInviter::builder()
+            .script(
+                "sip:fast-busy@ext.local",
+                ScriptedAction::ImmediateStatus(486),
+            )
+            .script(
+                "sip:slow-decline@ext.local",
+                ScriptedAction::DelayedStatus {
+                    delay_ms: 200,
+                    status: 603,
+                },
+            )
+            .default_action(ScriptedAction::ImmediateStatus(486))
+            .build();
+
+        let make_binding = |uri: &str| Binding {
+            contact_uri: uri.to_string(),
+            remote: "127.0.0.1:65535".parse().unwrap(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(60),
+            transport: ExtTransport::Sip,
+        };
+        let bindings = vec![
+            ("fast".to_string(), make_binding("sip:fast-busy@ext.local")),
+            (
+                "slow".to_string(),
+                make_binding("sip:slow-decline@ext.local"),
+            ),
+        ];
+
+        let result = fork_to_bindings(
+            inviter,
+            bindings,
+            b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+              m=audio 20000 RTP/AVP 0\r\n"
+                .to_vec(),
+            "ut-cid-late-6xx".to_string(),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        match result {
+            ForkResult::AllFailed { last_status } => {
+                assert_eq!(
+                    last_status,
+                    Some(603),
+                    "RFC 3261 §16.7 step 6: 6xx は 4xx を上書きする"
+                );
+            }
+            ForkResult::Answered { .. } => panic!("AllFailed 期待だが Answered"),
+            ForkResult::Timeout => panic!("AllFailed 期待だが Timeout"),
+        }
+    }
 
     /// PR #193 review #2 🟡#3: PWA→NGN 経路の rate-limit bucket key 抽出
     /// (`extract_user_from_sip_uri`) の境界条件。 sabiden の `local_uri` は

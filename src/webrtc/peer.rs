@@ -239,8 +239,21 @@ impl PeerSession for StubPeerSession {
 /// する。ただし JSON シグナリングのフォーマット検証としては有効で、
 /// `m=audio <port> <proto> <pt>` を mirror して `a=recvonly` を付ける。
 ///
-/// 実バックエンドが導入されたら本関数は廃止し、PeerConnection から
-/// 生成した answer を返すよう差し替える。
+/// # answer 側の rtpmap (Issue #80)
+///
+/// RFC 3264 §6 (Generating the Answer): answer の各 fmt は offer の対応
+/// する fmt と意味的に一致する codec を表さなければならない。 RFC 4566 §6
+/// (rtpmap) は「静的に割り当てられた PT (RFC 3551 §6) の rtpmap を書く
+/// 場合、 encoding 名は RFC 3551 で登録された名前と一致しなければならない
+/// (MUST)」と定める。 したがって本関数は以下の方針で answer の rtpmap を
+/// 生成する:
+///
+/// 1. 静的 PT (RFC 3551 §6 Table 4 / 5): canonical な名前と clock rate を
+///    返す。 例: PT=0 → `PCMU/8000`、 PT=8 → `PCMA/8000`。
+/// 2. 動的 PT (96..=127): offer の同 PT 行の rtpmap を引き継ぐ。
+///    offer に rtpmap が無いと codec が定義できないのでエラー。
+/// 3. 静的だが未対応な PT: rtpmap 行を出さない (RFC 4566 §6 「静的 PT は
+///    rtpmap 必須ではない」)。
 pub fn build_minimal_answer(offer: &str) -> Result<String> {
     let parsed = SessionDescription::parse(offer)?;
     let m = parsed
@@ -248,10 +261,16 @@ pub fn build_minimal_answer(offer: &str) -> Result<String> {
         .iter()
         .find(|m| m.media == "audio")
         .ok_or_else(|| anyhow!("offer に m=audio がない"))?;
-    let pt = m
+    let pt_str = m
         .formats
         .first()
         .ok_or_else(|| anyhow!("m= に payload type がない"))?;
+    let pt: u8 = pt_str
+        .parse()
+        .map_err(|_| anyhow!("payload type が数値でない: {}", pt_str))?;
+
+    let rtpmap_line = rtpmap_for_answer(&parsed, m, pt)?;
+
     // 透過モード: 同じ PT を返し、connection は 0.0.0.0 (peerless)。
     let answer = format!(
         "v=0\r\n\
@@ -260,12 +279,78 @@ pub fn build_minimal_answer(offer: &str) -> Result<String> {
          c=IN IP4 0.0.0.0\r\n\
          t=0 0\r\n\
          m=audio 0 {proto} {pt}\r\n\
-         a=rtpmap:{pt} OPUS/48000/2\r\n\
+         {rtpmap}\
          a=recvonly\r\n",
         proto = m.protocol,
-        pt = pt
+        pt = pt,
+        rtpmap = rtpmap_line,
     );
     Ok(answer)
+}
+
+/// answer に載せる rtpmap 行 (1 行ぶんの文字列、末尾 `\r\n` 付き、または空)
+/// を組み立てる。
+///
+/// - RFC 3551 §6 Table 4 の静的 PT 0/8 は canonical 名で出力。
+/// - 動的 PT は offer の rtpmap (RFC 3264 §6) を引き継ぐ。
+/// - その他の静的 PT は rtpmap 行を省く (RFC 4566 §6: 静的 PT は rtpmap
+///   省略可能)。
+fn rtpmap_for_answer(
+    parsed: &SessionDescription,
+    media: &crate::sdp::MediaDescription,
+    pt: u8,
+) -> Result<String> {
+    // RFC 3551 §6: PT 0 = PCMU/8000 (1ch), PT 8 = PCMA/8000 (1ch)。
+    // RFC 4566 §6: 静的 PT に rtpmap を書く場合、 encoding 名は登録名と
+    // 一致 (MUST)。 ここでは安全側で canonical 名を出す。
+    match pt {
+        0 => return Ok("a=rtpmap:0 PCMU/8000\r\n".to_string()),
+        8 => return Ok("a=rtpmap:8 PCMA/8000\r\n".to_string()),
+        _ => {}
+    }
+
+    // RFC 4566 §6 / RFC 3551 §6: 動的 PT (96..=127) は offer 側で rtpmap
+    // 定義必須。 まずメディアレベルから探し、 無ければセッションレベルを
+    // フォールバック (RFC 4566 §6 では rtpmap はメディア属性だが、 実装に
+    // よってはセッションレベルに置くため `SessionDescription::find_rtpmap`
+    // を流用する)。
+    let from_media = media.attributes.iter().find_map(|a| {
+        let rm = a.as_rtpmap()?;
+        if rm.payload_type == pt {
+            Some(rm)
+        } else {
+            None
+        }
+    });
+    let rm = from_media.or_else(|| parsed.find_rtpmap(pt));
+    match rm {
+        Some(rm) => {
+            let params = rm
+                .parameters
+                .as_deref()
+                .map(|p| format!("/{p}"))
+                .unwrap_or_default();
+            Ok(format!(
+                "a=rtpmap:{pt} {enc}/{clock}{params}\r\n",
+                pt = rm.payload_type,
+                enc = rm.encoding,
+                clock = rm.clock_rate,
+                params = params,
+            ))
+        }
+        None => {
+            // 静的 PT で未対応 (例: PT=9 G722 等) なら rtpmap 省略。 動的 PT
+            // で rtpmap 無しは offer 不正なので Err。
+            if pt < 96 {
+                Ok(String::new())
+            } else {
+                Err(anyhow!(
+                    "offer の動的 PT {} に対応する rtpmap が見つからない (RFC 4566 §6)",
+                    pt
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +402,138 @@ mod tests {
     fn build_answer_rejects_offer_without_audio() {
         let bad = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=-\r\nc=IN IP4 1.2.3.4\r\nt=0 0\r\n";
         assert!(build_minimal_answer(bad).is_err());
+    }
+
+    /// RFC 3551 §6 Table 4 (Static PT 0 = PCMU/8000): answer 側で PT=0
+    /// の rtpmap を書く場合、 RFC 4566 §6 により encoding 名は registered
+    /// な "PCMU" でなければならない (MUST)。 build_minimal_answer は PT 0
+    /// に対して `OPUS/48000/2` のような捏造マッピングを返してはならない
+    /// (Issue #80)。
+    #[test]
+    fn rfc3551_6_static_pt0_answer_rtpmap_is_pcmu_8000() {
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 UDP/TLS/RTP/SAVPF 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=sendrecv\r\n";
+        let answer = build_minimal_answer(offer).expect("build answer for PT=0");
+        assert!(
+            answer.contains("m=audio 0 UDP/TLS/RTP/SAVPF 0\r\n"),
+            "PT=0 mirror: {}",
+            answer
+        );
+        assert!(
+            answer.contains("a=rtpmap:0 PCMU/8000\r\n"),
+            "PT=0 must map to PCMU/8000 (RFC 3551 §6 / RFC 4566 §6): {}",
+            answer
+        );
+        // 捏造禁止 (Issue #80 の核心バグ): OPUS は PT=0 に許されない。
+        assert!(
+            !answer.contains("OPUS/48000/2"),
+            "PT=0 must NOT advertise OPUS (RFC 4566 §6 violation): {}",
+            answer
+        );
+    }
+
+    /// RFC 3551 §6 Table 4 (Static PT 8 = PCMA/8000): PT 0 と同じ理屈で
+    /// PCMA に固定。
+    #[test]
+    fn rfc3551_6_static_pt8_answer_rtpmap_is_pcma_8000() {
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 RTP/AVP 8\r\n\
+                     a=rtpmap:8 PCMA/8000\r\n\
+                     a=sendrecv\r\n";
+        let answer = build_minimal_answer(offer).expect("build answer for PT=8");
+        assert!(
+            answer.contains("m=audio 0 RTP/AVP 8\r\n"),
+            "PT=8 mirror: {}",
+            answer
+        );
+        assert!(
+            answer.contains("a=rtpmap:8 PCMA/8000\r\n"),
+            "PT=8 must map to PCMA/8000 (RFC 3551 §6 / RFC 4566 §6): {}",
+            answer
+        );
+        assert!(
+            !answer.contains("OPUS"),
+            "PT=8 must NOT advertise OPUS: {}",
+            answer
+        );
+    }
+
+    /// RFC 3264 §6 (Generating the Answer) + RFC 4566 §6 (rtpmap): 動的 PT
+    /// の answer rtpmap は offer の rtpmap を引き継ぐ。 PT=111 で
+    /// `opus/48000/2` を提示するオファに対しては `opus/48000/2` で answer。
+    #[test]
+    fn rfc3264_6_dynamic_pt111_answer_mirrors_offer_rtpmap() {
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
+                     a=rtpmap:111 opus/48000/2\r\n\
+                     a=sendrecv\r\n";
+        let answer = build_minimal_answer(offer).expect("build answer for PT=111");
+        assert!(answer.contains("m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n"));
+        assert!(
+            answer.contains("a=rtpmap:111 opus/48000/2\r\n"),
+            "dynamic PT must mirror offer rtpmap (RFC 3264 §6): {}",
+            answer
+        );
+    }
+
+    /// RFC 4566 §6: 動的 PT (96..=127) の offer が rtpmap 行を持っていない
+    /// 場合、 codec が定義できないので answer 側はエラーを返す。 OPUS を
+    /// 捏造して返してはならない (Issue #80)。
+    #[test]
+    fn rfc4566_6_dynamic_pt_without_rtpmap_errors() {
+        let bad_offer = "v=0\r\n\
+                         o=- 1 1 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         c=IN IP4 192.0.2.1\r\n\
+                         t=0 0\r\n\
+                         m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n\
+                         a=sendrecv\r\n";
+        assert!(
+            build_minimal_answer(bad_offer).is_err(),
+            "動的 PT に対応する rtpmap が無いオファは reject"
+        );
+    }
+
+    /// RFC 4566 §6: 静的 PT で未対応 (例 PT=9 G722) の場合、 静的 PT は
+    /// rtpmap 省略可能 (RFC 4566 §6) なので、 answer 側でも rtpmap を出さない。
+    /// 少なくとも OPUS を捏造してはならない (Issue #80)。
+    #[test]
+    fn rfc4566_6_unknown_static_pt_omits_rtpmap() {
+        // PT=9 = G722/8000 静的だが、 sabiden は未対応。 offer が rtpmap を
+        // 載せていないケース。
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 50000 RTP/AVP 9\r\n\
+                     a=sendrecv\r\n";
+        let answer = build_minimal_answer(offer).expect("build answer for static PT=9");
+        assert!(answer.contains("m=audio 0 RTP/AVP 9\r\n"));
+        assert!(
+            !answer.contains("a=rtpmap:9 OPUS"),
+            "PT=9 に OPUS を割当てるのは違反: {}",
+            answer
+        );
+        assert!(
+            !answer.contains("OPUS/48000/2"),
+            "未対応静的 PT で OPUS を捏造しない: {}",
+            answer
+        );
     }
 
     /// Issue #73: `create_offer` は SAVPF / PCMU を含む SDP を返す

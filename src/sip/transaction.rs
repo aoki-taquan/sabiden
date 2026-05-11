@@ -113,6 +113,7 @@ use super::message::{
     extract_request_skeleton_for_400, parse_message_classified, ParseError, SipHeaders, SipMessage,
     SipMethod, SipRequest, SipResponse,
 };
+use super::utils::has_to_tag;
 use crate::observability::{extract_method_and_call_id, SipTraceWriter, TraceDir};
 
 /// RFC 3261 §17.1.1.1 Timer T1 (RTT 推定値)。デフォルトは 500ms。
@@ -1171,6 +1172,11 @@ impl TransactionLayer {
         // 必要とするので、 best-effort で SipRequest を再構築する (body は
         // 空 = 400 応答に body は不要、 RFC 3261 §21.4.1 reason phrase で
         // 十分)。
+        //
+        // RFC 3261 §8.2.6.2 (Issue #168): UAS は 100 Trying 以外の応答に
+        // To-tag MUST。 stateless 400 path は `headers.set("To", ...)` で
+        // 上書きしないため、 `build_response_skeleton` 内の自動付与
+        // (`status != 100` 分岐) に頼って tag を確実に乗せる。
         let dummy_req = SipRequest {
             method: skel.method.clone(),
             uri: skel.uri.clone(),
@@ -1493,8 +1499,7 @@ fn reason_text(err: &ParseError) -> &'static str {
 /// # コピー対象
 ///
 /// - **Via / From / To / Call-ID / CSeq** (RFC 3261 §8.2.6.2):
-///   UAS が応答を生成する際の **必須** copy 対象。 To には呼出側が後段で
-///   tag を付与する (本関数では付けない: ステータスコードによっては付与禁止)。
+///   UAS が応答を生成する際の **必須** copy 対象。
 /// - **Record-Route** (RFC 3261 §12.1.1):
 ///   > The UAS then constructs the state of the dialog. ... The route set
 ///   > MUST be set to the list of URIs in the Record-Route header field
@@ -1514,6 +1519,25 @@ fn reason_text(err: &ParseError) -> &'static str {
 ///
 ///   RTT 計測に使われる SHOULD 規定。 単一値なので `set` でコピー。
 ///
+/// # To-tag の自動付与 (Issue #168, RFC 3261 §8.2.6.2)
+///
+/// > The UAS MUST add a tag to the To header field in the response (with the
+/// > exception of the 100 (Trying) response, in which a tag MAY be present).
+///
+/// したがって `status != 100` のときは To に tag が無ければ `;tag=sabiden-<random>`
+/// を自動付与する。 既に tag がある場合は再付与しない (二重 tag は
+/// RFC 3261 §12.2.2 違反で内線 UA が ACK を送らず切断する罠がある):
+///
+/// - 受信 request が **in-dialog** (Re-INVITE / BYE / UPDATE) で To-tag を
+///   既に持っていれば、 そのまま echo (= dialog の local tag を保持する、
+///   RFC 3261 §12.1.1 / §12.2.2)。
+/// - 呼出側が後段で `headers.set("To", ...)` で上書きすれば、 そちらが優先される
+///   (例: B2BUA で他レッグの応答 tag を front 側に渡すケース)。
+///
+/// `has_to_tag` を共通ヘルパとして使うことで、 `;TAG=` (case 違い) のような
+/// パラメータも「既存 tag あり」と認識し `;TAG=existing;tag=new` の二重 tag を
+/// 防ぐ (RFC 3261 §7.3.1 / §25.1: parameter name は case-insensitive)。
+///
 /// # 非コピー対象 (意図的)
 ///
 /// - **Contact**: 応答の Contact は UAS の連絡先であり request からコピーしない
@@ -1529,7 +1553,15 @@ pub fn build_response_skeleton(request: &SipRequest, status: u16, reason: &str) 
         headers.set("From", from);
     }
     if let Some(to) = request.headers.get("to") {
-        headers.set("To", to);
+        // RFC 3261 §8.2.6.2: 100 Trying 以外は To-tag MUST。 既存 tag があれば
+        // echo (in-dialog ケース)、 無ければ sabiden 生成 tag を付与する。 呼出側で
+        // 上書きされる可能性は許容する (set で再代入される)。
+        let to_value = if status != 100 && !has_to_tag(to) {
+            format!("{};tag={}", to, new_uas_to_tag())
+        } else {
+            to.to_string()
+        };
+        headers.set("To", to_value);
     }
     if let Some(cid) = request.headers.get("call-id") {
         headers.set("Call-ID", cid);
@@ -1558,6 +1590,24 @@ pub fn build_response_skeleton(request: &SipRequest, status: u16, reason: &str) 
         headers,
         body: Vec::new(),
     }
+}
+
+/// `build_response_skeleton` 内で UAS 側の To-tag を生成する。
+///
+/// RFC 3261 §8.2.6.2: UAS は 100 Trying 以外の応答に To-tag MUST を付与する。
+/// RFC 3261 §19.3: tag は token (cryptographically random unique)。 ここでは
+/// `sabiden-` プレフィックスを付与して、 sabiden が `build_response_skeleton`
+/// 経由で自動付与した tag であることをトレース時に判別可能にする
+/// (= 呼出側が `headers.set("To", ...)` で意図的に上書きした tag や、
+/// in-dialog Re-INVITE の echo tag と区別できる)。
+///
+/// 32 bit のエントロピーは UAS の **応答ライフタイム** 内 (≤ Timer K = 32s)
+/// で衝突しなければよく (同一 (Call-ID, To-tag, From-tag) の三つ組で dialog ID
+/// が一意なため Call-ID もエントロピーに寄与する、 RFC 3261 §12.1.1)、
+/// 既存 [`crate::sip::utils::new_tag`] と同水準のエントロピーで足りる。
+fn new_uas_to_tag() -> String {
+    let r: u32 = rand::random();
+    format!("sabiden-{:08x}", r)
 }
 
 #[cfg(test)]
@@ -1705,6 +1755,134 @@ mod tests {
             resp.headers.get("timestamp"),
             Some("54.3"),
             "Timestamp は値そのままに echo する"
+        );
+    }
+
+    /// RFC 3261 §8.2.6.2 (Issue #168):
+    /// > The UAS MUST add a tag to the To header field in the response (with
+    /// > the exception of the 100 (Trying) response, in which a tag MAY be
+    /// > present).
+    ///
+    /// `build_response_skeleton` は 100 Trying 以外の応答で To-tag を MUST
+    /// 付与する。 stateless 400/403 path (`try_send_400_bad_request` 等) は
+    /// `headers.set("To", ...)` で上書きしないため、 ここの自動付与が無いと
+    /// To-tag 無しの応答を返してしまい RFC 違反になる (UA が ACK を返さず
+    /// transaction が Timer B/F でタイムアウトするまで stuck する)。
+    #[test]
+    fn rfc3261_8_2_6_2_response_skeleton_attaches_to_tag_for_non_100() {
+        // 400 Bad Request (stateless) — try_send_400_bad_request 由来
+        let req = make_invite_request("z9hG4bK400");
+        let resp = build_response_skeleton(&req, 400, "Bad Request");
+        let to = resp.headers.get("to").expect("To ヘッダがコピーされている");
+        assert!(
+            has_to_tag(to),
+            "400 応答の To に tag が無い (RFC 3261 §8.2.6.2 違反): {}",
+            to
+        );
+        assert!(
+            to.contains(";tag=sabiden-"),
+            "sabiden 自動生成 tag (`sabiden-<hex>`) を付与すべき: {}",
+            to
+        );
+
+        // 403 Forbidden — Issue #168 で言及された transaction.rs:1923 周辺の path
+        let resp403 = build_response_skeleton(&req, 403, "Forbidden");
+        let to403 = resp403.headers.get("to").unwrap();
+        assert!(
+            has_to_tag(to403),
+            "403 応答の To に tag が無い (RFC 3261 §8.2.6.2 違反): {}",
+            to403
+        );
+
+        // 200 OK — 既存 callsite (uas.rs / orchestrator.rs) は ensure_to_tag を
+        // 後付け呼んでいるが、 skeleton 側でも MUST を満たすべき。
+        let resp200 = build_response_skeleton(&req, 200, "OK");
+        let to200 = resp200.headers.get("to").unwrap();
+        assert!(has_to_tag(to200), "200 応答にも To-tag が必要: {}", to200);
+    }
+
+    /// RFC 3261 §8.2.6.2: 100 Trying は唯一の例外 (tag MAY)。
+    /// sabiden 側で **自動付与しない** ことで、 stateful UAS transaction が
+    /// Trying と Final で同じ To-tag を返すか否かの設計を呼出側に委ねられる
+    /// (例: provisional は無 tag、 final で初めて tag を付ける挙動)。
+    #[test]
+    fn rfc3261_8_2_6_2_response_skeleton_does_not_attach_to_tag_for_100_trying() {
+        let req = make_invite_request("z9hG4bK100");
+        let resp = build_response_skeleton(&req, 100, "Trying");
+        let to = resp.headers.get("to").unwrap();
+        assert!(
+            !has_to_tag(to),
+            "100 Trying 応答に tag を付けてはならない (RFC 3261 §8.2.6.2 例外): {}",
+            to
+        );
+        // 元 To をそのまま echo する
+        assert_eq!(to, "<sip:bob@ntt-east.ne.jp>");
+    }
+
+    /// RFC 3261 §12.1.1 / §12.2.2: in-dialog request (Re-INVITE / BYE / UPDATE)
+    /// の To には既に dialog の local tag が乗っている。 応答ではそれを
+    /// **そのまま** echo しなければならない (新 tag を末尾追加すると
+    /// `;tag=old;tag=new` の二重 tag になり、 RFC 3261 §12.2.2 違反)。
+    ///
+    /// `has_to_tag` ヘルパを共通化することで `;Tag=` (case 違い) も
+    /// 「既存 tag あり」と判定し、 `;Tag=old;tag=new` 形式の二重 tag を防ぐ。
+    #[test]
+    fn rfc3261_12_2_2_response_skeleton_preserves_existing_to_tag() {
+        let mut req = make_invite_request("z9hG4bKreinvite");
+        // Re-INVITE: 既に dialog の local tag が乗っている
+        req.headers
+            .set("To", "<sip:bob@ntt-east.ne.jp>;tag=existing-uas-tag");
+        let resp = build_response_skeleton(&req, 200, "OK");
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:bob@ntt-east.ne.jp>;tag=existing-uas-tag",
+            "in-dialog 応答は既存 To-tag を **そのまま** echo する (RFC 3261 §12.2.2)"
+        );
+        assert!(
+            !to.contains(";tag=sabiden-"),
+            "sabiden 自動 tag を末尾追加してはならない (二重 tag): {}",
+            to
+        );
+    }
+
+    /// RFC 3261 §7.3.1 / §25.1: header parameter name は token であり
+    /// case-insensitive。 受信 request の To が `;Tag=` (大文字) を含む場合、
+    /// `has_to_tag` で「既存 tag あり」と判定し、 `;Tag=existing;tag=new` の
+    /// 二重 tag になるのを防ぐ。
+    #[test]
+    fn rfc3261_7_3_1_response_skeleton_preserves_case_insensitive_existing_to_tag() {
+        let mut req = make_invite_request("z9hG4bKupcase");
+        req.headers
+            .set("To", "<sip:bob@ntt-east.ne.jp>;Tag=upper-case-tag");
+        let resp = build_response_skeleton(&req, 481, "Call/Transaction Does Not Exist");
+        let to = resp.headers.get("to").unwrap();
+        assert_eq!(
+            to, "<sip:bob@ntt-east.ne.jp>;Tag=upper-case-tag",
+            "case 違い tag も既存扱い (RFC 3261 §7.3.1)"
+        );
+        // 二重 tag になっていないことを念のため明示チェック
+        let lowercase_count = to.to_ascii_lowercase().matches(";tag=").count();
+        assert_eq!(
+            lowercase_count, 1,
+            "二重 tag を末尾追加してはならない: {}",
+            to
+        );
+    }
+
+    /// 連続して呼んだ際に生成される To-tag が **異なる** ことを確認する。
+    /// RFC 3261 §19.3: tag must be globally unique and cryptographically
+    /// random. sabiden は 32-bit rand から hex 文字列を生成するため、
+    /// 連続 2 回の衝突確率は 1/2^32 と十分低い。
+    #[test]
+    fn rfc3261_19_3_uas_to_tags_are_unique_per_response() {
+        let req = make_invite_request("z9hG4bKuniq");
+        let r1 = build_response_skeleton(&req, 400, "Bad Request");
+        let r2 = build_response_skeleton(&req, 400, "Bad Request");
+        let t1 = r1.headers.get("to").unwrap().to_string();
+        let t2 = r2.headers.get("to").unwrap().to_string();
+        assert_ne!(
+            t1, t2,
+            "別 response の To-tag は (極めて高確率で) 別値であるべき"
         );
     }
 

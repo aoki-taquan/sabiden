@@ -103,10 +103,22 @@ src/
   if final response received" を満たす。 transaction 終了時 (`drop_client` /
   Timer D 経過後の absorber) には provisional エントリも一緒に drop される
   ため、 待機中の receiver は `changed()` で `Err` を受け取り NotSent で抜ける。
-- **応答 skeleton header echo の不変条件 (RFC 3261 §8.2.6.2 / §12.1.1 / §20.38, Issue #90)**:
+- **応答 skeleton header echo の不変条件 (RFC 3261 §8.2.6.2 / §12.1.1 / §20.38, Issue #90 / Issue #168)**:
   `src/sip/transaction.rs::build_response_skeleton` は受信 request から
   応答に必須 / 推奨される ヘッダを **過不足なく** コピーする:
   - Via / From / To / Call-ID / CSeq: §8.2.6.2 で MUST copy。
+  - **To-tag 自動付与 (Issue #168)**: §8.2.6.2 "The UAS MUST add a tag to
+    the To header field in the response (with the exception of the 100
+    (Trying) response, in which a tag MAY be present)" に従い、
+    `status != 100` かつ受信 To に tag が無ければ `;tag=sabiden-<random>`
+    を自動付与する。 既存 tag (in-dialog Re-INVITE / BYE / UPDATE) は
+    `has_to_tag` (case-insensitive) で検出して **そのまま echo**
+    (§12.2.2: `;tag=old;tag=new` の二重 tag は dialog ID 不一致で
+    内線 UA が ACK を返さず切断する罠)。 これにより stateless 400 /
+    403 path (`try_send_400_bad_request` 等) で呼出側が
+    `headers.set("To", ...)` を忘れても §8.2.6.2 MUST が満たされる。
+    呼出側で B2BUA の他レッグ応答 tag を上書きしたい場合は
+    `headers.set("To", "<uri>;tag=peer-tag")` で上書き可能 (set で再代入)。
   - **Record-Route**: §12.1.1 で 2xx 応答は MUST copy (順序と多重度を保つ)。
     UAS 側で echo しないと UAC 側 dialog の route set (§12.1.2 で逆順) が
     空になり、 in-dialog BYE / Re-INVITE / UPDATE が proxy 多段経路で
@@ -119,14 +131,18 @@ src/
 ### SIP Dialog Layer (RFC 3261 §12)
 - ダイアログ ID (Call-ID + From-tag + To-tag)
 - CSeq 管理
-- **UAS To-tag 付与の不変条件 (RFC 3261 §8.2.6.2 / Issue #100)**: 内線 UAS
-  (`src/sip/uas.rs::ResponderHandle`) は **100 Trying を除く全応答**
+- **UAS To-tag 付与の不変条件 (RFC 3261 §8.2.6.2 / Issue #100 / Issue #168)**:
+  内線 UAS (`src/sip/uas.rs::ResponderHandle`) は **100 Trying を除く全応答**
   (1xx provisional / 2xx / 3xx / 4xx / 5xx / 6xx) で To に tag を付与する。
-  `respond_with_body` は元から `ensure_to_tag` を通すが、 `quick` も同様に
-  通す (二重付与防止は `has_to_tag` の case-insensitive 比較で in-dialog
-  request の既存 tag を保持)。 100 Trying のみ §8.2.6.2 例外条項に従い tag
-  付与をスキップ。 これにより strict UA (Asterisk pjsip 旧版 / Cisco /
-  Polycom) が tag 無し final 応答を silently drop する経路を遮断する。
+  単一情報源は **`build_response_skeleton` 内の `status != 100` 分岐**
+  (Issue #168)。 これにより `respond_with_body` / `quick` だけでなく、
+  stateless responder (`try_send_400_bad_request`) や transaction.rs
+  経由の全 callsite で MUST が自動的に満たされる。 `uas.rs::ensure_to_tag`
+  は **defensive な二重チェック** (skeleton 後に呼出側で `headers.set("To", ...)`
+  が走るケース) として残るが、 skeleton 側で既に tag が乗るので no-op に
+  なるのが定常パス。 100 Trying のみ §8.2.6.2 例外条項に従い tag 付与を
+  スキップ。 これにより strict UA (Asterisk pjsip 旧版 / Cisco / Polycom)
+  が tag 無し final 応答を silently drop する経路を遮断する。
 - Route Set 管理 (UAC 視点では Record-Route の **逆順**, RFC 3261 §12.1.2)
 - **Next-hop 計算 (RFC 3261 §12.2.1.1, Issue #79 / Issue #133)**: in-dialog
   リクエスト (2xx ACK / BYE / Re-INVITE / その ACK / INFO 等) の **宛先

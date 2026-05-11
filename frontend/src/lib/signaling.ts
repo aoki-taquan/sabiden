@@ -1,8 +1,13 @@
 // sabiden /signal WebSocket クライアント。
 //
 // バックエンドプロトコル (src/webrtc/signaling.rs と同期):
-//   C→S: register / offer / answer{call_id,sdp} / ice / bye
+//   C→S: register / offer / answer{call_id,sdp} / decline{call_id} / ice / bye
 //   S→C: registered / answer / offer{call_id,sdp} / cancel{call_id} / ice / error / bye
+//
+// Issue #107: `decline{call_id}` は ringing 中の着信を browser が拒否すると
+// 送出する (RFC 3261 §21.6.2 603 Decline 相当)。 sabiden は対応する内線フォーク
+// レッグを 603 Decline で集約し、 fork に他レッグが居なければ NGN へ 603 を返す。
+// 「bye」 は WS セッション (=内線登録) ごと閉じる別物。
 //
 // 認証はクエリ `?token=...` (HMAC-SHA256 トークン) を用いる。
 // `Authorization: Bearer` はブラウザ WS API では指定不可のためクエリのみ。
@@ -69,6 +74,17 @@ export type ClientMessage =
    * `call_id` は対応する S→C `offer` のものをそのまま返す。
    */
   | { type: "answer"; call_id: string; sdp: string }
+  /**
+   * sabiden 発の offer (NGN 着信を browser に push) に対する **拒否** (Issue #107)。
+   * ringing 中の着信を browser ユーザが「拒否」ボタンで拒んだことを sabiden に
+   * 伝える。 RFC 3261 §21.6.2 (603 Decline) 相当。 sabiden は対応する fork レッグを
+   * `LegResult::Failed { status: 603 }` に倒し、 fork に他レッグが居なければ
+   * NGN へ 603 Decline を返す。
+   *
+   * `bye` (= WS セッション=内線登録ごと閉じる) とは別物。 個別の進行中着信のみ
+   * 拒否し、 WS / 内線登録は維持する。
+   */
+  | { type: "decline"; call_id: string }
   | { type: "ice"; candidate: string }
   | { type: "bye" };
 

@@ -10,6 +10,7 @@
 //! { "type": "register", "ext_id": "webrtc-alice" }    // 認証は WS 接続時
 //! { "type": "offer", "sdp": "v=0..." }                 // browser 発信 (将来)
 //! { "type": "answer", "call_id": "...", "sdp": "v=0..." }  // sabiden 発の offer に応答
+//! { "type": "decline", "call_id": "..." }              // Issue #107: 着信拒否
 //! { "type": "ice", "candidate": "candidate:..." }
 //! { "type": "bye" }
 //! ```
@@ -102,15 +103,49 @@ impl WsSink {
     }
 }
 
+/// `PendingAnswers::register` の waiter が受け取る結果。
+///
+/// browser からの `Answer` (SDP 文字列) または `Decline` (拒否ステータスコード)
+/// のどちらかが届く。 RFC 3261 §15.1 (BYE) や §21.6.2 (603 Decline) に該当する
+/// 拒否 semantics を、 WS シグナリング層から orchestrator へ伝搬するために使う。
+///
+/// # 設計判断 (Issue #107)
+///
+/// 旧 API は `oneshot::Sender<String>` で SDP のみを運んでいた。 着信拒否
+/// (`ClientMessage::Decline`) を導入するにあたり、 SDP 文字列に sentinel を
+/// 埋めるのは脆い (任意の SDP がぶつかる可能性) ため、 enum で正規に分岐する。
+///
+/// # `Drop` semantics
+///
+/// `oneshot::Sender<AnswerOutcome>` を drop すると `Receiver` 側は
+/// `Err(RecvError)` で目覚める (tokio 1.x docs)。 これは「browser が WS ごと
+/// 切断した」 ケース (Issue #117 `cancel_all`) と区別される: 切断は `Err`、
+/// 明示的な拒否は `Ok(Decline { status })`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// browser が応答ボタンを押して SDP answer を返した (RFC 3264 §6 answerer)。
+    Sdp(String),
+    /// browser が拒否ボタンを押して着信を拒否した (Issue #107)。
+    /// `status` は orchestrator が NGN レッグに返す SIP ステータスコード:
+    /// - 486 Busy Here (RFC 3261 §21.4.21)
+    /// - 603 Decline (RFC 3261 §21.6.2) ← 既定 (= 「ユーザが拒否」 を最も
+    ///   忠実に表現する code)
+    ///
+    /// 487 Request Terminated は CANCEL を受けた INVITE トランザクションが
+    /// 自発的に出す code (RFC 3261 §15.1.1) であり、 UAS 側拒否では使わない。
+    Decline { status: u16 },
+}
+
 /// 1 つの WebRTC バインディングに紐づく実行時状態。
 ///
 /// `ExtTransport::WebRtc` から到達できる `peer` / `ws` に加えて、NGN 着信
 /// 時に sabiden が browser に offer を push したあと、対応する
-/// `ClientMessage::Answer` (call_id 付き) を待ち受ける oneshot のテーブル
-/// を保持する。シグナリング層と orchestrator の双方からアクセスする。
+/// `ClientMessage::Answer` (call_id 付き) または `ClientMessage::Decline`
+/// (call_id 付き) を待ち受ける oneshot のテーブルを保持する。
+/// シグナリング層と orchestrator の双方からアクセスする。
 #[derive(Clone, Default)]
 pub struct PendingAnswers {
-    inner: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    inner: Arc<Mutex<HashMap<String, oneshot::Sender<AnswerOutcome>>>>,
 }
 
 impl PendingAnswers {
@@ -118,8 +153,9 @@ impl PendingAnswers {
         Self::default()
     }
 
-    /// 指定 `call_id` への answer 受信を予約し、待ち受け側の receiver を返す。
-    pub async fn register(&self, call_id: &str) -> oneshot::Receiver<String> {
+    /// 指定 `call_id` への browser 応答 (answer / decline) 受信を予約し、
+    /// 待ち受け側の receiver を返す。
+    pub async fn register(&self, call_id: &str) -> oneshot::Receiver<AnswerOutcome> {
         let (tx, rx) = oneshot::channel();
         self.inner.lock().await.insert(call_id.to_string(), tx);
         rx
@@ -134,7 +170,25 @@ impl PendingAnswers {
     /// waiter が居ない場合は `false` を返す。
     pub async fn deliver(&self, call_id: &str, sdp: String) -> bool {
         if let Some(tx) = self.inner.lock().await.remove(call_id) {
-            tx.send(sdp).is_ok()
+            tx.send(AnswerOutcome::Sdp(sdp)).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// browser から届いた decline を該当 `call_id` の waiter に転送する
+    /// (Issue #107, RFC 3261 §21.6.2 603 Decline)。
+    ///
+    /// orchestrator 側 (`run_webrtc_leg`) は `AnswerOutcome::Decline { status }`
+    /// を `LegResult::Failed { aor, status }` に変換し、 fork 全体が
+    /// `ForkResult::AllFailed { last_status: Some(status) }` で抜けて NGN
+    /// レッグに該当ステータスを返す。
+    ///
+    /// waiter が居ない (=対応する pending offer が無い) 場合は `false` を返す。
+    /// 既に WS 切断で `cancel_all` 済み / `deliver` で消費済みのケース等。
+    pub async fn decline(&self, call_id: &str, status: u16) -> bool {
+        if let Some(tx) = self.inner.lock().await.remove(call_id) {
+            tx.send(AnswerOutcome::Decline { status }).is_ok()
         } else {
             false
         }
@@ -418,6 +472,20 @@ pub enum ClientMessage {
     Answer {
         call_id: String,
         sdp: String,
+    },
+    /// sabiden 発の offer (NGN 着信を browser へ push) に対する **拒否** 通知
+    /// (Issue #107)。 ringing 中の着信を browser ユーザが「拒否」ボタンで
+    /// 拒んだことを sabiden に伝える。 受信した sabiden は対応する
+    /// `PendingAnswers` waiter に `AnswerOutcome::Decline { status: 603 }`
+    /// (RFC 3261 §21.6.2 Decline) を流し、 内線フォーク全体としては
+    /// `LegResult::Failed { status: 603 }` で集約される。 fork に他レッグが
+    /// いなければ NGN へは 603 Decline が返り、 居れば他レッグの応答を待つ
+    /// (Asterisk 風フォーク semantics、 RFC 3261 §16.7)。
+    ///
+    /// `Bye` (= WS セッション = 内線登録ごと終了) とは別物。 こちらは個別の
+    /// 進行中着信を拒否するだけで、 WS / 内線登録は維持される。
+    Decline {
+        call_id: String,
     },
     Ice {
         candidate: String,
@@ -1080,6 +1148,37 @@ pub async fn process_client_message(
                 ))
             }
         }
+        ClientMessage::Decline { call_id } => {
+            // Issue #107: ringing 中の着信を browser ユーザが拒否ボタンで拒んだ。
+            // RFC 3261 §21.6.2 (603 Decline): "the callee's machine ... has been
+            // successful in contacting a human user and the user does not wish
+            // to participate in the session"。 sabiden は対応する pending
+            // waiter に `AnswerOutcome::Decline { status: 603 }` を流し、
+            // orchestrator 側 `run_webrtc_leg` が `LegResult::Failed { status: 603 }`
+            // で fork に集約する。 他フォーク先 (SIP 内線端末) が応答すれば通話
+            // 成立、 全レッグ 603 なら NGN へ 603 Decline を返す
+            // (RFC 3261 §16.7 step 5: best response selection)。
+            //
+            // 603 vs 486: 486 Busy Here (RFC 3261 §21.4.21) は「他で取込中」、
+            // 603 Decline は「ユーザが拒否」 を表す。 PWA UI の「拒否」ボタンは
+            // 後者に対応するので 603 を使う。 487 Request Terminated (§21.4.25)
+            // は CANCEL を受けた INVITE が自発的に出す code (§15.1.1) であり、
+            // UAS 側拒否では使わない (CLAUDE.md §6.2 RFC 引用必須に対応)。
+            if pending_answers.decline(&call_id, 603).await {
+                debug!(%call_id, "PWA decline 受領: PendingAnswers に 603 を流して fork へ伝搬");
+                SessionAction::Continue
+            } else {
+                // pending が無いケース:
+                // (a) 既に WS 切断で `cancel_all` 済み (race)
+                // (b) 既に `deliver` 済み (応答ボタンと拒否ボタンの同時押し race)
+                // (c) browser が知らない / 古い call_id を送ってきた
+                // いずれも fatal ではない。 silent OK で受理する (= browser UI は
+                // 既にローカルで拒否扱い済みなので、 error 返答してもユーザが取れる
+                // 行動はない)。
+                debug!(%call_id, "対応する pending offer が無い decline を受信 (race / unknown call_id)");
+                SessionAction::Continue
+            }
+        }
         ClientMessage::Ice { candidate } => {
             // RFC 8839 §4.2 / RFC 8840 §4 / W3C WebRTC §4.4.1.6: 空文字 /
             // `end-of-candidates` は trickle ICE の終端マーカで candidate ではない。
@@ -1360,7 +1459,7 @@ mod tests {
         .await;
         assert!(matches!(action, SessionAction::Continue));
         let got = waiter.await.unwrap();
-        assert_eq!(got, "v=0 ANSWER");
+        assert_eq!(got, AnswerOutcome::Sdp("v=0 ANSWER".to_string()));
     }
 
     /// 未予約の call_id への answer はエラー応答になる。
@@ -1390,6 +1489,91 @@ mod tests {
                 assert_eq!(code, "unknown_call_id");
             }
             _ => panic!("error 期待"),
+        }
+    }
+
+    /// Issue #107 / RFC 3261 §21.6.2: 予約済 call_id への `Decline` は waiter に
+    /// `AnswerOutcome::Decline { status: 603 }` を流す。 これにより
+    /// orchestrator 側の `run_webrtc_leg` は `LegResult::Failed { status: 603 }` を
+    /// 返し、 fork 全体としては 603 Decline を NGN に伝搬できる。
+    #[tokio::test]
+    async fn rfc3261_21_6_2_decline_delivers_603_to_waiter() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+        // orchestrator 役: pending を先に予約 (`run_webrtc_leg` 相当)
+        let waiter = pending.register("call-decline").await;
+        let action = process_client_message(
+            ClientMessage::Decline {
+                call_id: "call-decline".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        // session は継続 (= WS 切断ではない、 個別着信の拒否のみ)
+        assert!(matches!(action, SessionAction::Continue));
+        // waiter は 603 Decline を観測する
+        let got = waiter.await.expect("decline で起きる");
+        assert_eq!(got, AnswerOutcome::Decline { status: 603 });
+    }
+
+    /// Issue #107: 未予約 / 既消費 / 不明 call_id への `Decline` は silent OK で
+    /// 受理する (= browser UI は既に手元で拒否扱い済みなので error を返しても
+    /// ユーザが取れる行動はない、 process_client_message docstring 参照)。
+    #[tokio::test]
+    async fn decline_with_unknown_call_id_returns_silent_continue() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, collected, _kg) = ws_sink_and_recv();
+        let action = process_client_message(
+            ClientMessage::Decline {
+                call_id: "no-such-call".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(action, SessionAction::Continue));
+        // browser に Error を返していないこと。
+        // (collected は別 task が drain しているので少し待つ)
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let drained = collected.lock().await.clone();
+        assert!(
+            drained.is_empty(),
+            "unknown call_id への Decline は silent: 何も送らないはず: {:?}",
+            drained
+        );
+    }
+
+    /// Issue #107: `ClientMessage::Decline { call_id }` の JSON wire format。
+    /// PWA `frontend/src/lib/signaling.ts` の `ClientMessage` と一致すること。
+    #[test]
+    fn decline_serialization_matches_wire_format() {
+        let m = ClientMessage::Decline {
+            call_id: "abc-123".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(s, r#"{"type":"decline","call_id":"abc-123"}"#);
+        // round trip
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::Decline { call_id } => assert_eq!(call_id, "abc-123"),
+            other => panic!("Decline expected, got {:?}", other),
         }
     }
 
@@ -2774,7 +2958,7 @@ mod tests {
         let ok = pending.deliver("call-x", "v=0 reused".into()).await;
         assert!(ok, "deliver 成功");
         let got = w2.await.expect("w2 が deliver で起きる");
-        assert_eq!(got, "v=0 reused");
+        assert_eq!(got, AnswerOutcome::Sdp("v=0 reused".to_string()));
     }
 
     /// Issue #117 (A): `cancel_all` 後の `deliver` は false を返す
@@ -2789,6 +2973,47 @@ mod tests {
         // late answer は配送先が居ない。
         let delivered = pending.deliver("call-y", "v=0 late".into()).await;
         assert!(!delivered, "cancel_all 後の deliver は false");
+    }
+
+    /// Issue #107: `PendingAnswers::decline` は registered waiter に
+    /// `AnswerOutcome::Decline { status }` を流す。
+    #[tokio::test]
+    async fn issue107_pending_answers_decline_delivers_decline_outcome() {
+        let pending = PendingAnswers::new();
+        let waiter = pending.register("call-d").await;
+        let ok = pending.decline("call-d", 603).await;
+        assert!(ok, "decline は registered waiter に成功");
+        let got = waiter.await.expect("waiter は decline で起きる");
+        assert_eq!(got, AnswerOutcome::Decline { status: 603 });
+        assert!(pending.is_empty().await, "decline 後はテーブルから消える");
+    }
+
+    /// Issue #107: 未予約 / cancel_all 済みの call_id への `decline` は false。
+    #[tokio::test]
+    async fn issue107_decline_without_registration_returns_false() {
+        let pending = PendingAnswers::new();
+        let declined = pending.decline("no-such-call", 603).await;
+        assert!(!declined, "未予約への decline は false");
+    }
+
+    /// Issue #107: `deliver` と `decline` の race。 先勝ち side が waiter を消費し、
+    /// 後 side は false を返す。 これにより「応答ボタンと拒否ボタンを同時押し」
+    /// race でも片方だけが反映されることを保証する。
+    #[tokio::test]
+    async fn issue107_deliver_and_decline_first_wins() {
+        let pending = PendingAnswers::new();
+        let waiter = pending.register("call-race").await;
+        let delivered = pending.deliver("call-race", "v=0".into()).await;
+        assert!(delivered);
+        // 後勝ち decline は失敗する (waiter は既に消費済み)
+        let declined = pending.decline("call-race", 603).await;
+        assert!(
+            !declined,
+            "deliver が先勝ちした後の decline は false (waiter 消費済)"
+        );
+        // waiter は Sdp を観測する
+        let got = waiter.await.unwrap();
+        assert_eq!(got, AnswerOutcome::Sdp("v=0".to_string()));
     }
 
     /// Issue #117 (B): `WsSink` を drop した直後でも、 内部 mpsc は

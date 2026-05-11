@@ -542,3 +542,99 @@ async fn mock_ngn_invite_to_webrtc_only_binding_uses_browser_answer() {
 
     browser_task.await.unwrap();
 }
+
+// =============================================================================
+// 7. PWA Decline (Issue #107): browser が `ClientMessage::Decline` を送って
+//    着信を拒否したとき、 NGN へ 603 Decline が返る (RFC 3261 §21.6.2)。
+// =============================================================================
+
+/// Issue #107: WebRTC のみの fork で browser が拒否 → NGN へ 603 Decline。
+///
+/// `docs/ARCHITECTURE.md` §4.2 着信フローの拒否分岐。 browser PWA の「拒否」
+/// ボタンが `pending.decline(call_id, 603)` 経由で `run_webrtc_leg` の waiter を
+/// `AnswerOutcome::Decline { status: 603 }` で起こし、 `LegResult::Failed { status: 603 }`
+/// → `ForkResult::AllFailed { last_status: Some(603) }` → NGN へ 603 Decline
+/// (RFC 3261 §16.7 best response selection, §21.6.2 603 Decline)。
+///
+/// 旧挙動 (Issue #107 修正前) は browser が何も送らず、 fork_timeout (`leg_timeout`)
+/// が来るまで NGN に応答が無く、 NGN 側 INVITE トランザクションが 30 秒程度
+/// 保留される `407` 等の遅延が発生していた。 本テストは数百 ms で 603 が返る
+/// ことで根本対処を確認する。
+#[tokio::test]
+async fn issue107_pwa_decline_returns_603_to_ngn() {
+    use crate::webrtc::peer::{PeerSession, StubPeerSession};
+    use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
+    use tokio::sync::mpsc;
+
+    let extensions = ExtensionRegistrar::new();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let ws_sink = WsSink::new(out_tx);
+    let pending = PendingAnswers::new();
+    let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+    extensions
+        .register_with_transport(
+            "alice",
+            "sip:alice@webrtc.peer".to_string(),
+            "127.0.0.1:65535".parse().unwrap(),
+            Duration::from_secs(60),
+            ExtTransport::WebRtc {
+                peer: peer.clone(),
+                ws: ws_sink.clone(),
+                pending: pending.clone(),
+            },
+        )
+        .await;
+
+    // SIP 経路は使われないが ExtInviter 引数は必要
+    let inviter = ScriptedInviter::builder().build();
+    let fix = InboundFixture::start(inviter, extensions, NgnInboundConfig::default()).await;
+
+    // browser シミュレーション: Offer 受信 → 同じ call_id で Decline を返す
+    let pending_for_browser = pending.clone();
+    let browser_task = tokio::spawn(async move {
+        let msg = timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("browser へ offer push が来ない")
+            .expect("WS チャネル閉鎖");
+        match msg {
+            ServerMessage::Offer { call_id, sdp: _ } => {
+                // RFC 3261 §21.6.2: 603 Decline = "user does not wish to
+                // participate in the session"。 PWA UI の「拒否」ボタンに対応。
+                let declined = pending_for_browser.decline(&call_id, 603).await;
+                assert!(declined, "PendingAnswers::decline 成功すべき");
+            }
+            other => panic!("offer 以外を受信: {:?}", other),
+        }
+    });
+
+    let offer = fixtures::sdp_pcmu("127.0.0.1:20000".parse().unwrap()).into_bytes();
+    let cid = "ngn-decline-e2e";
+    fix.send_invite_with_body(cid, "z9hG4bKngn-decline", offer)
+        .await;
+
+    // 100 → 603 の流れ
+    let mut got_100 = false;
+    let mut got_603 = false;
+    for _ in 0..6 {
+        match fix.recv_message(Duration::from_secs(3)).await {
+            Some(SipMessage::Response(r)) => match r.status_code {
+                100 => got_100 = true,
+                603 => {
+                    got_603 = true;
+                    break;
+                }
+                // 4xx / 5xx 観測時は明示的に panic させる: テストの目的は 603
+                // 経路の確認なので、 486 / 408 が来ていたら根本問題。
+                other => panic!("予期しない status {} (期待: 100/603)", other),
+            },
+            _ => break,
+        }
+    }
+    assert!(got_100, "100 Trying が NGN 側に届くべき (RFC 3261 §17.2.1)");
+    assert!(
+        got_603,
+        "603 Decline が NGN 側に届くべき (RFC 3261 §21.6.2)"
+    );
+
+    browser_task.await.unwrap();
+}

@@ -208,6 +208,49 @@ NGN ──INVITE──► sabiden(UAC)
 [RTPブリッジ確立: NGN ⇔ sabiden ⇔ スマホ1]
 ```
 
+#### PWA 着信拒否 (Issue #107、 RFC 3261 §21.6.2 603 Decline)
+
+WebRTC 内線 (PWA) は SIP UAS を持たないため、 ringing 中の着信を拒否する
+には専用の WS シグナリングメッセージ `ClientMessage::Decline { call_id }` を
+sabiden に送る。 sabiden は対応する `PendingAnswers` waiter に
+`AnswerOutcome::Decline { status: 603 }` を流し、 `run_webrtc_leg` が
+`LegResult::Failed { status: 603 }` を返す。
+
+```
+NGN ──INVITE──► sabiden(UAS)
+                    │
+                    │ fork_to_bindings
+                    ├──ServerMessage::Offer{call_id, sdp(SAVPF)}──► PWA  (run_webrtc_leg)
+                    └──INVITE────────────────────────────────────► SIP 内線 (居れば並列)
+
+PWA ──ClientMessage::Decline{call_id}──► sabiden
+                                              │ pending.decline(call_id, 603)
+                                              │   → oneshot に AnswerOutcome::Decline { status: 603 }
+                                              ▼
+                                          run_webrtc_leg
+                                              │ LegResult::Failed { status: 603 }
+                                              ▼
+                                          fork_to_bindings
+                                              │ 他レッグ 200 OK 無し
+                                              │ → ForkResult::AllFailed { last_status: Some(603) }
+                                              ▼
+NGN ◄──603 Decline── sabiden                   (RFC 3261 §16.7 best response, §21.6.2)
+```
+
+SIP 内線が並走する fork で先に SIP 側が 200 OK を返した場合は、 PWA の Decline
+は破棄され通話は SIP 側で確立する (Asterisk 風 fork、 RFC 3261 §13.3 / §16.7)。
+fork 確定後に PWA レッグが Cancel される標準パス (`close_and_drain_webrtc_legs`)
+は変更なし。
+
+旧挙動 (Issue #107 修正前): PWA「拒否」 ボタンはローカル UI のみクリアし、
+sabiden へは何も送らなかった。 そのため sabiden は `leg_timeout` (= fork 全体
+タイムアウト) が来るまで待ち、 NGN 側 INVITE が 30 秒程度保留される
+UX 不具合があった。
+
+Decline は WS 接続 (= 内線登録) ごと閉じる `Bye` とは別物。 個別の進行中着信
+のみを拒否し、 WS は維持する。 詳細は `src/webrtc/signaling.rs::ClientMessage`
+docstring。
+
 ### 発信 (スマホ → NGN)
 
 ```

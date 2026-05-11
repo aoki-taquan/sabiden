@@ -276,6 +276,12 @@ pub fn normalize_header_name(name: &str) -> String {
         "o" => "event".into(),
         "r" => "refer-to".into(),
         "u" => "allow-events".into(),
+        // RFC 4028 §10: Session-Expires の compact form は `x`。
+        // NTT NGN 着信 INVITE は `x: 300;refresher=uac` で送出 (実機 pcap
+        // `/tmp/sabiden-080-inbound-v3.pcap` で確認、 2026-05-11)。
+        // これを normalize しないと 200 OK で Session-Expires が echo されず、
+        // carrier IMS が ACK 後即 BYE する (Issue #249 残り、 #250 fix の盲点)。
+        "x" => "session-expires".into(),
         _ => lower,
     }
 }
@@ -1014,6 +1020,30 @@ mod tests {
                 assert!(req.headers.get("contact").is_some(), "m -> contact");
                 // get でも compact form を解決できる
                 assert_eq!(req.headers.get("v"), req.headers.get("via"));
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// RFC 4028 §10: Session-Expires の compact form `x` も long form
+    /// `session-expires` に normalize されること。 実機 NGN INVITE の
+    /// `x: 300;refresher=uac` が `headers.get("session-expires")` で取れる。
+    #[test]
+    fn rfc4028_10_compact_session_expires_x_normalized() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\nv: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\nf: <sip:a@x>;tag=1\r\nt: <sip:b@x>\r\ni: 123@x\r\nCSeq: 1 INVITE\r\nm: <sip:a@x:5060>\r\nx: 300;refresher=uac\r\nMin-SE: 90\r\nl: 0\r\n\r\n";
+        let parsed = parse_message(raw).unwrap();
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(
+                    req.headers.get("session-expires"),
+                    Some("300;refresher=uac"),
+                    "compact form x: は session-expires に展開される (RFC 4028 §10)"
+                );
+                assert_eq!(
+                    req.headers.get("x"),
+                    req.headers.get("session-expires"),
+                    "headers.get で compact と long form が同値"
+                );
             }
             _ => panic!("expected request"),
         }

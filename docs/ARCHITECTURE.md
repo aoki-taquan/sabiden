@@ -737,7 +737,9 @@ packet として NGN へ送出する。
    ▼
   UasEventHandler / NgnInboundHandler
    │ ext_answer = browser SAVPF answer (str0m PCMU only)
-   │ pcmu_only = restrict_audio_to_pcmu[_with_dtmf](ext_answer)  (RFC 3264 §5.1)
+   │ pcmu_only = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)
+   │   (Issue #108 / RFC 3264 §6.1: answer m= formats は offer の subset、
+   │    PT 0 必須 / PT 101 は offer 提示時のみ、 PCMU 不在は Err → 502)
    │ rewritten = rewrite_rtp_endpoint(pcmu_only, sabiden NGN IP, port)
    ▼
   WebRtcAudioBridge::start(WebRtcAudioConfig{

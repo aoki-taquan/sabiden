@@ -992,6 +992,268 @@ pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
     sdp.to_string_crlf().into_bytes()
 }
 
+/// Issue #108 / RFC 3264 §6.1: NGN へ返す **answer の payload type を NGN offer の
+/// subset に強制制限** する。
+///
+/// `restrict_audio_to_pcmu` / `restrict_audio_to_pcmu_with_dtmf` は ext_answer 由来の
+/// PT を `[0]` / `[0, 101]` に絞り込むが、 NGN offer 側がそれらの PT を提示して
+/// いない場合 (例: NGN offer が `m=audio ... RTP/AVP 8` で PCMU 非提示)、
+/// 結果は RFC 3264 §6.1 の subset 規則に違反する:
+///
+/// > RFC 3264 §6.1: "For each "m=" line in the offer, the answerer MUST be prepared
+/// > to receive media that is described by the media format codes listed in the
+/// > offer.  A reasonable answer is to accept a subset of the formats."
+///
+/// `m=` 行の formats は **offer の formats の真部分集合 (= subset)** でなければ
+/// ならない (RFC 3264 §6.1 / §6).
+///
+/// 本関数は **NGN offer (incoming INVITE の body) を一次情報** として PT 集合を
+/// 決定する:
+///
+/// - PCMU (PT 0): NGN offer の `m=audio` formats に **0 が含まれる場合のみ**
+///   answer に乗せる。 含まれない場合は `Err` を返す。 呼出側は bridge 起動
+///   失敗扱いで処理する (現状の `start_bridge_for_inbound` 呼出側は 502 Bad
+///   Gateway で呼を放棄する。 RFC 3261 §13.3.1.2 / RFC 3264 §6 "no common codec"
+///   としては 488 Not Acceptable Here がより semantic に近いが、 呼出側
+///   fallback 経路は別 issue で扱う)。
+/// - telephone-event (PT 101): NGN offer 側が `a=rtpmap:101 telephone-event/...`
+///   と `m=` formats に 101 を **両方** 提示している場合のみ answer に乗せる。
+///   どちらか欠ければ PT 0 のみ。
+///
+/// PT 集合を決めたら、 ext_answer をベースに既存の `restrict_audio_to_pcmu` /
+/// `restrict_audio_to_pcmu_with_dtmf` を適切に呼んで answer を整形する
+/// (ptime / `a=` 属性は ext_answer 由来を活かす、 RFC 3264 §6 の素直な答え方)。
+///
+/// # 引数
+///
+/// - `ngn_offer`: NGN P-CSCF から到着した INVITE の SDP body。 UTF-8 でない場合は
+///   `Err` (RFC 3261 §7.1: SIP body は ASCII / UTF-8 想定)。
+/// - `ext_answer`: 内線 (SIP / WebRTC) が返した 200 OK 由来の SDP body。
+///
+/// # 戻り値
+///
+/// 整形済 answer SDP の byte 列。 PT 0 が NGN offer に無い等で交渉不能なら `Err`。
+pub fn restrict_answer_to_ngn_offer_subset(
+    ngn_offer: &[u8],
+    ext_answer: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let offer_audio = parse_audio_formats_and_rtpmap(ngn_offer)?;
+
+    // RFC 3264 §6.1: answer formats は offer formats の subset。 PCMU (PT 0) が
+    // NGN offer の m=audio formats に無ければ「共通 codec 無し」状態であり、
+    // 呼出側で 488 Not Acceptable Here を返す。 sabiden は NGN 直収で PCMU のみ
+    // サポートする (`docs/asterisk-real-invite.md` §2)。
+    if !offer_audio.formats.contains(&PCMU_PAYLOAD_TYPE.to_string()) {
+        return Err(anyhow::anyhow!(
+            "RFC 3264 §6.1: NGN offer に PCMU (PT {}) が含まれないため answer subset 不能 (formats={:?})",
+            PCMU_PAYLOAD_TYPE,
+            offer_audio.formats
+        ));
+    }
+
+    // telephone-event (PT 101) は NGN offer が m= formats と a=rtpmap:101 の両方で
+    // 提示している場合のみ answer に乗せる (RFC 4733 §2.4.1: rtpmap が dynamic PT の
+    // 意味付け、 RFC 3264 §6.1: subset 規則)。 NGN 実機の Asterisk pcap
+    // (`docs/asterisk-real-invite.md` §3) では `m=audio ... RTP/AVP 0 101` +
+    // `a=rtpmap:101 telephone-event/8000` の両方が乗るので、 通常パスでは PT 101
+    // 維持。
+    let offer_has_dtmf_in_formats = offer_audio.formats.contains(&DTMF_PAYLOAD_TYPE.to_string());
+    let allow_dtmf = offer_has_dtmf_in_formats && offer_audio.has_telephone_event_rtpmap;
+
+    if allow_dtmf {
+        Ok(restrict_audio_to_pcmu_with_dtmf(ext_answer))
+    } else {
+        Ok(restrict_audio_to_pcmu(ext_answer))
+    }
+}
+
+/// G.711 μ-law の静的 RTP payload type 番号 (RFC 3551 §6, AVP profile)。
+const PCMU_PAYLOAD_TYPE: u8 = 0;
+
+/// `parse_audio_formats_and_rtpmap` の戻り値: NGN offer の `m=audio` formats 一覧
+/// と、 `a=rtpmap` 行に `telephone-event` が宣言されているか。
+#[derive(Debug)]
+struct AudioOfferSummary {
+    formats: Vec<String>,
+    has_telephone_event_rtpmap: bool,
+}
+
+/// 受信 SDP の最初の `m=audio` から formats 一覧 + telephone-event rtpmap 有無を
+/// 抽出する。 RFC 3264 §6.1 subset 判定の一次情報源。
+///
+/// パース不能 (UTF-8 / SDP 文法エラー / m=audio 不在) は `Err` を返す。
+fn parse_audio_formats_and_rtpmap(sdp_bytes: &[u8]) -> anyhow::Result<AudioOfferSummary> {
+    let text = std::str::from_utf8(sdp_bytes)
+        .map_err(|e| anyhow::anyhow!("SDP が UTF-8 でない: {}", e))?;
+    let sdp = SessionDescription::parse(text)?;
+    let audio = sdp
+        .media
+        .iter()
+        .find(|m| m.media == "audio")
+        .ok_or_else(|| anyhow::anyhow!("SDP に m=audio 行が無い"))?;
+    let has_telephone_event_rtpmap = audio.attributes.iter().any(|a| match a {
+        Attribute::Value { key, value } => {
+            key == "rtpmap" && value.to_ascii_lowercase().contains("telephone-event")
+        }
+        Attribute::Property(_) => false,
+    });
+    Ok(AudioOfferSummary {
+        formats: audio.formats.clone(),
+        has_telephone_event_rtpmap,
+    })
+}
+
+#[cfg(test)]
+mod restrict_answer_subset_tests {
+    use super::*;
+
+    /// RFC 3264 §6.1: NGN offer = `[0, 101]` + `a=rtpmap:101 telephone-event/8000`、
+    /// ext_answer = `[0, 8, 101]` (PCMA 混在) のとき、 answer は **NGN offer の
+    /// subset** に絞られ `[0, 101]` で出力される (PCMA は破棄、 DTMF は維持)。
+    /// 実機 Asterisk pcap (`docs/asterisk-real-invite.md` §3) と整合する典型形。
+    #[test]
+    fn rfc3264_6_1_offer_pcmu_dtmf_answer_keeps_pcmu_dtmf_subset() {
+        let ngn_offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                          c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                          m=audio 24252 RTP/AVP 0 101\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=rtpmap:101 telephone-event/8000\r\n\
+                          a=fmtp:101 0-15\r\n";
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0 8 101\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n\
+                           a=rtpmap:8 PCMA/8000\r\n\
+                           a=rtpmap:101 telephone-event/8000\r\n\
+                           a=fmtp:101 0-15\r\n";
+
+        let restricted =
+            restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer).expect("subset 計算成功");
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+
+        assert!(
+            s.contains("m=audio 40000 RTP/AVP 0 101\r\n"),
+            "answer は NGN offer subset (= [0, 101]) に絞り込まれる: {s}"
+        );
+        assert!(!s.contains("PCMA"), "PCMA は NGN offer に無いので破棄: {s}");
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+    }
+
+    /// RFC 3264 §6.1: NGN offer = `[0]` のみ (telephone-event 非提示)、
+    /// ext_answer = `[0, 101]` (内線が DTMF 付き) のとき、 answer は **PT 0 のみ**
+    /// に絞られる (PT 101 を offer subset 外として除外する)。
+    /// PR #149 / Issue #149 と同じ挙動を新 helper でも保証する回帰防止。
+    #[test]
+    fn rfc3264_6_1_offer_pcmu_only_answer_drops_dtmf() {
+        let ngn_offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                          c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                          m=audio 24252 RTP/AVP 0\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n";
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0 101\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n\
+                           a=rtpmap:101 telephone-event/8000\r\n\
+                           a=fmtp:101 0-15\r\n";
+
+        let restricted = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)
+            .expect("subset 計算成功 (PCMU 共通)");
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+
+        assert!(
+            s.contains("m=audio 40000 RTP/AVP 0\r\n"),
+            "answer は NGN offer subset (= [0]) に絞り込まれる: {s}"
+        );
+        assert!(
+            !s.to_lowercase().contains("telephone-event"),
+            "PT 101 は NGN offer に無いので破棄 (RFC 3264 §6.1 違反防止): {s}"
+        );
+    }
+
+    /// RFC 3264 §6.1: NGN offer に PCMU (PT 0) が無ければ「共通 codec 無し」状態。
+    /// `Err` を返し、 呼出側で 488 Not Acceptable Here (RFC 3261 §13.3.1.2) を
+    /// 発行する責務とする。 sabiden は NGN 直収で PCMU only を前提
+    /// (`docs/asterisk-real-invite.md` §2)。
+    #[test]
+    fn rfc3264_6_1_offer_without_pcmu_errors() {
+        let ngn_offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                          c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                          m=audio 24252 RTP/AVP 8\r\n\
+                          a=rtpmap:8 PCMA/8000\r\n";
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n";
+
+        let err = restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer)
+            .expect_err("PCMU 非提示は err");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("PCMU") && msg.contains("§6.1"),
+            "エラーは subset 規則違反を示す: {msg}"
+        );
+    }
+
+    /// RFC 3264 §6.1: NGN offer の `m=` formats に PT 101 が並んでいても、
+    /// `a=rtpmap:101 telephone-event/...` が無い (= encoding 不明) なら、
+    /// answer に PT 101 を乗せるのは subset 規則に反する (PT が同じでも
+    /// encoding が違えば別 codec)。 安全側で PT 0 のみに絞る。
+    #[test]
+    fn rfc3264_6_1_offer_pt101_without_telephone_event_rtpmap_drops_dtmf() {
+        // m= には 101 が並ぶが、 rtpmap は別エンコーディング (例: 何かの dynamic)。
+        let ngn_offer = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                          c=IN IP4 118.177.125.1\r\nt=0 0\r\n\
+                          m=audio 24252 RTP/AVP 0 101\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=rtpmap:101 opus/8000\r\n";
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0 101\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n\
+                           a=rtpmap:101 telephone-event/8000\r\n";
+
+        let restricted =
+            restrict_answer_to_ngn_offer_subset(ngn_offer, ext_answer).expect("PCMU は共通");
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+
+        assert!(
+            s.contains("m=audio 40000 RTP/AVP 0\r\n"),
+            "rtpmap が telephone-event でなければ PT 101 を answer に乗せない: {s}"
+        );
+        assert!(
+            !s.to_lowercase().contains("telephone-event"),
+            "answer に telephone-event を残さない: {s}"
+        );
+    }
+
+    /// 不正 UTF-8 NGN offer は `Err`。 呼出側で `restrict_audio_to_pcmu` への
+    /// フォールバック (= 既存挙動) を選ぶか、 488 で蹴るかを判断する。
+    /// 安全側で `Err` を返し、 呼出側が判定する責務にする。
+    #[test]
+    fn ngn_offer_invalid_utf8_returns_err() {
+        let bad_offer: &[u8] = &[0xff, 0xfe, b'b', b'a', b'd'];
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n";
+        assert!(restrict_answer_to_ngn_offer_subset(bad_offer, ext_answer).is_err());
+    }
+
+    /// NGN offer に m=audio が無い (RFC 4566 §5.14 違反) → `Err`。
+    /// 通常 NGN INVITE では起こり得ないが防御的に検証する。
+    #[test]
+    fn ngn_offer_without_audio_media_returns_err() {
+        let no_audio = b"v=0\r\no=- 1 1 IN IP4 118.177.125.1\r\ns=-\r\n\
+                         c=IN IP4 118.177.125.1\r\nt=0 0\r\n";
+        let ext_answer = b"v=0\r\no=- 2 2 IN IP4 192.168.30.10\r\ns=-\r\n\
+                           c=IN IP4 192.168.30.10\r\nt=0 0\r\n\
+                           m=audio 40000 RTP/AVP 0\r\n\
+                           a=rtpmap:0 PCMU/8000\r\n";
+        assert!(restrict_answer_to_ngn_offer_subset(no_audio, ext_answer).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

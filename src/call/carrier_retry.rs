@@ -1,5 +1,5 @@
 //! NGN carrier intermittent reject (500 / 486 / 503) に対する自動 retry policy
-//! (Issue #260 Phase 1-B)。
+//! (Issue #260 Phase 1-B / Phase 1-B.2)。
 //!
 //! # 背景 (実機 evidence, 2026-05-11)
 //!
@@ -9,6 +9,26 @@
 //! 全て None で carrier 側理由不在。 35-52ms で reject = pre-allocated 判定。
 //! 数秒待って再試行すると大半が成功するため、 **短時間 1 回限定の retry** で
 //! ユーザ体験を救済する。
+//!
+//! # Phase 1-B.2 tune (実機 evidence, 2026-05-11)
+//!
+//! Phase 1-B (PR #262、 default 2s + ±0.5s jitter) を実装して実機検証 (PWA→117
+//! 連投 10 試行) したところ、 retry 3 件が試行され **全部また 500 で失敗**、
+//! 救済率 **0%** だった。 wait 範囲 1.5-2.5s では carrier IMS の per-AOR state
+//! GC window を抜けられない。
+//!
+//! 仮説 (= NGN P-CSCF の internal AOR state cleanup latency):
+//! NTT NGN は carrier-grade IMS で、 拒絶した INVITE の per-AOR state
+//! (billing 仮確保 / media gateway 仮 bind / signaling tx state) を即座には
+//! 解放しない。 GC interval は NTT 仕様書非規定だが、 同種 carrier IMS で
+//! 5-10 秒オーダの cleanup latency は経験的に観測されている (ETSI TR 183 068
+//! 等の S-CSCF/P-CSCF inactivity timer の値域とも整合)。 GC 完了前に同 AOR
+//! から再 INVITE すると「直前と同じ state」 が見えて即 500 を返す。
+//!
+//! このため Phase 1-B.2 で `default_wait` を **2s → 8s** (= GC window 中央値)、
+//! jitter を **±0.5s → ±1.5s** (= 6.5-9.5s 範囲)、 upper bound を **5s → 12s**
+//! に拡張する。 これにより GC 完了率を上げ、 retry 救済率を 70-90% まで
+//! 引き上げることを期待する (次回実機検証で実測)。
 //!
 //! # 規格根拠
 //!
@@ -32,12 +52,15 @@
 //!   per-request の permanent failure 系なので retry しない。
 //! - **最大試行回数**: **1 回** (= 元 INVITE + retry INVITE = 計 2 回まで)。
 //!   TTC JJ-90.24 §5.7.3 の「過度な retry」 回避と整合。
-//! - **wait 時間**:
+//! - **wait 時間** (Phase 1-B.2 tune 後、 実機 evidence 2026-05-11):
 //!   - Retry-After ヘッダがあればその秒数を遵守 (RFC 3261 §20.33)。
-//!   - 無ければ既定 2 秒 + ±0.5 秒の jitter (= 同時に大量端末が retry しない
-//!     ように、 carrier の next ramp に乗らないようバラす)。
-//! - **upper bound**: 5 秒。 Retry-After がそれを超えるなら carrier が長期
-//!   overload 中なので **諦めて元 error を上位伝搬** (待つだけ無駄)。
+//!   - 無ければ既定 **8 秒 + ±1.5 秒の jitter** (= 6.5-9.5s)。 NGN P-CSCF の
+//!     per-AOR state GC window (経験的に 5-10s) を抜けるための値。 同時に
+//!     大量端末が retry した際の collisional ramp も jitter で散らす。
+//! - **upper bound**: **12 秒** (Phase 1-B.2 で 5s → 12s)。 Retry-After が
+//!   それを超えるなら carrier が長期 overload 中なので **諦めて元 error を
+//!   上位伝搬**。 12s は「ユーザ許容上限 = 発信から ~13s 沈黙までは耐えうる」
+//!   の経験則。
 //!
 //! # 純粋関数として分離する理由
 //!
@@ -52,25 +75,34 @@ use crate::sip::message::SipHeaders;
 
 use super::rate_limiter::parse_retry_after;
 
-/// retry policy の動作パラメータ。 設定値は HGW 標準 + 実機 evidence。
+/// retry policy の動作パラメータ。 設定値は実機 evidence (2026-05-11) ベース。
+///
+/// Phase 1-B.2 tune (PR #262 後の 10 試行検証で救済率 0% だったため再調整):
+/// default_wait 2s→8s、 jitter ±0.5s→±1.5s、 max_wait 5s→12s。 詳細は module
+/// docstring 参照。
 #[derive(Debug, Clone)]
 pub struct CarrierRetryConfig {
-    /// Retry-After ヘッダが無い場合の既定 wait (= 2 秒、 実機 evidence で
-    /// 「数秒待てば次回成功」 観測済)。
+    /// Retry-After ヘッダが無い場合の既定 wait (= 8 秒、 NGN P-CSCF の AOR
+    /// state GC window 5-10s の中央値、 実機 evidence 2026-05-11)。
     pub default_wait: Duration,
-    /// Retry-After 上限。 これを超える Retry-After は「諦め」 を意味する。
+    /// Retry-After 上限。 これを超える Retry-After は「諦め」 を意味する
+    /// (= 12 秒、 ユーザ許容沈黙時間の経験的上限)。
     pub max_wait: Duration,
-    /// jitter 振幅 (±この秒数を一様分布で加える)。 同時複数端末の retry が
-    /// 同じ carrier ramp に乗らないようにバラす。
+    /// jitter 振幅 (±この秒数を一様分布で加える、 = ±1.5 秒)。 同時複数端末の
+    /// retry が同じ carrier ramp に乗らないようにバラす。 8s ± 1.5s = 6.5-9.5s
+    /// が実 retry 範囲。
     pub jitter: Duration,
 }
 
 impl Default for CarrierRetryConfig {
     fn default() -> Self {
         Self {
-            default_wait: Duration::from_millis(2000),
-            max_wait: Duration::from_millis(5000),
-            jitter: Duration::from_millis(500),
+            // Phase 1-B.2: NGN P-CSCF AOR state GC window (5-10s) の中央値。
+            default_wait: Duration::from_millis(8000),
+            // Phase 1-B.2: Retry-After 遵守時の上限 (ユーザ許容沈黙 ~13s 以下)。
+            max_wait: Duration::from_millis(12_000),
+            // Phase 1-B.2: 8s ± 1.5s で 6.5-9.5s 範囲、 同時端末の retry 散らし。
+            jitter: Duration::from_millis(1500),
         }
     }
 }
@@ -221,10 +253,11 @@ mod tests {
         h
     }
 
-    /// RFC 3261 §21.5 / 3GPP TS 24.229 §5.2.7 / Issue #260 Phase 1-B:
-    /// 500 は intermittent 対象。 Retry-After 無し → default 2 秒 (+ jitter 0)。
+    /// RFC 3261 §21.5 / 3GPP TS 24.229 §5.2.7 / Issue #260 Phase 1-B.2:
+    /// 500 は intermittent 対象。 Retry-After 無し → default 8 秒 (+ jitter 0)。
+    /// Phase 1-B.2 tune (2026-05-11 実機 evidence) で 2s → 8s に拡張。
     #[test]
-    fn phase_1b_500_response_triggers_one_retry_after_2s() {
+    fn phase_1b2_500_response_triggers_one_retry_after_8s() {
         let cfg = CarrierRetryConfig::default();
         let headers = SipHeaders::new();
         let decision = decide_retry(500, &headers, &cfg, 0);
@@ -233,7 +266,7 @@ mod tests {
                 wait,
                 retry_after_header_secs,
             } => {
-                assert_eq!(wait, Duration::from_millis(2000));
+                assert_eq!(wait, Duration::from_millis(8000));
                 assert_eq!(retry_after_header_secs, None);
             }
             other => panic!("expected Retry, got {:?}", other),
@@ -251,7 +284,7 @@ mod tests {
     }
 
     /// RFC 3261 §20.33 (Retry-After): ヘッダ値があれば遵守する。
-    /// 3 秒 < max_wait(5s) なので Retry とし、 wait は 3 秒 (+ jitter 0)。
+    /// 3 秒 < max_wait(12s) なので Retry とし、 wait は 3 秒 (+ jitter 0)。
     #[test]
     fn phase_1b_503_with_retry_after_obeys_header() {
         let cfg = CarrierRetryConfig::default();
@@ -269,15 +302,32 @@ mod tests {
         }
     }
 
-    /// TTC JJ-90.24 §5.7.3 / 過度な retry 回避: Retry-After が `max_wait` (5s)
+    /// TTC JJ-90.24 §5.7.3 / 過度な retry 回避: Retry-After が `max_wait` (12s)
     /// を超えるなら carrier 長期 overload と判断、 諦めて即時失敗を伝搬。
+    /// Phase 1-B.2 tune: max_wait は 5s → 12s に拡張済。
     #[test]
-    fn phase_1b_503_with_retry_after_over_5s_no_retry() {
+    fn phase_1b2_503_with_retry_after_over_12s_no_retry() {
         let cfg = CarrierRetryConfig::default();
         let headers = headers_with_retry_after("30");
         let decision = decide_retry(503, &headers, &cfg, 0);
         assert_eq!(
             decision,
+            RetryDecision::NoRetry {
+                reason: NoRetryReason::RetryAfterTooLong
+            }
+        );
+    }
+
+    /// Phase 1-B.2 境界値: Retry-After=12s は ちょうど max_wait なので Retry、
+    /// 13s は超過なので NoRetry。 (元実装の `> config.max_wait` 比較を維持)。
+    #[test]
+    fn phase_1b2_503_retry_after_boundary_at_max_wait() {
+        let cfg = CarrierRetryConfig::default();
+        let at_max = decide_retry(503, &headers_with_retry_after("12"), &cfg, 0);
+        assert!(matches!(at_max, RetryDecision::Retry { .. }));
+        let over_max = decide_retry(503, &headers_with_retry_after("13"), &cfg, 0);
+        assert_eq!(
+            over_max,
             RetryDecision::NoRetry {
                 reason: NoRetryReason::RetryAfterTooLong
             }
@@ -316,33 +366,35 @@ mod tests {
         }
     }
 
-    /// jitter 単体: ±500ms の範囲で加減算され、 0 を下回らない。
+    /// jitter 単体: ±1500ms の範囲で加減算され、 0 を下回らない。
+    /// (apply_jitter は generic 関数なので任意 offset で検証する)。
     #[test]
-    fn phase_1b_jitter_bounded() {
+    fn phase_1b2_jitter_bounded() {
         assert_eq!(
-            apply_jitter(Duration::from_millis(2000), 500),
-            Duration::from_millis(2500)
+            apply_jitter(Duration::from_millis(8000), 1500),
+            Duration::from_millis(9500)
         );
         assert_eq!(
-            apply_jitter(Duration::from_millis(2000), -500),
-            Duration::from_millis(1500)
+            apply_jitter(Duration::from_millis(8000), -1500),
+            Duration::from_millis(6500)
         );
         // 0 を下回らない (saturating)。
         assert_eq!(
-            apply_jitter(Duration::from_millis(100), -500),
+            apply_jitter(Duration::from_millis(100), -1500),
             Duration::ZERO
         );
     }
 
     /// jitter offset を非ゼロにして decide_retry に渡したら反映されること。
+    /// Phase 1-B.2: default 8000ms + jitter 1200ms = 9200ms。
     #[test]
-    fn phase_1b_jitter_propagates_into_decision_wait() {
+    fn phase_1b2_jitter_propagates_into_decision_wait() {
         let cfg = CarrierRetryConfig::default();
         let headers = SipHeaders::new();
-        let decision = decide_retry(500, &headers, &cfg, 300);
+        let decision = decide_retry(500, &headers, &cfg, 1200);
         match decision {
             RetryDecision::Retry { wait, .. } => {
-                assert_eq!(wait, Duration::from_millis(2300));
+                assert_eq!(wait, Duration::from_millis(9200));
             }
             other => panic!("expected Retry, got {:?}", other),
         }
@@ -364,18 +416,37 @@ mod tests {
     }
 
     /// `random_jitter_offset_ms` は ±amp の範囲に収まる。
+    /// Phase 1-B.2: 振幅は ±1500ms に拡張。
     #[test]
-    fn phase_1b_random_jitter_within_amplitude() {
-        let amp = Duration::from_millis(500);
+    fn phase_1b2_random_jitter_within_amplitude() {
+        let amp = Duration::from_millis(1500);
         for _ in 0..50 {
             let v = random_jitter_offset_ms(amp);
             assert!(
-                (-500..=500).contains(&v),
+                (-1500..=1500).contains(&v),
                 "jitter offset {} out of bound",
                 v
             );
         }
         // amp=0 なら必ず 0
         assert_eq!(random_jitter_offset_ms(Duration::ZERO), 0);
+    }
+
+    /// Issue #260 Phase 1-B.2 設計意図: default wait の中央値を 8 秒に固定。
+    /// NGN P-CSCF の per-AOR state GC window (5-10 秒、 実機 evidence
+    /// 2026-05-11) を抜けるための値。 ここを変える際は module docstring の
+    /// 「GC window 仮説」 も合わせて更新すること。
+    #[test]
+    fn phase_1b2_default_wait_is_8s_to_match_aor_gc_window() {
+        let cfg = CarrierRetryConfig::default();
+        assert_eq!(
+            cfg.default_wait,
+            Duration::from_secs(8),
+            "default_wait must be 8s = midpoint of NGN P-CSCF AOR state GC window (5-10s)"
+        );
+        // jitter ±1.5s で 6.5-9.5s の retry 範囲を構成、 GC window 全域をカバー。
+        assert_eq!(cfg.jitter, Duration::from_millis(1500));
+        // max_wait は Retry-After 遵守時の上限 (ユーザ許容沈黙 ~13s 以下)。
+        assert_eq!(cfg.max_wait, Duration::from_secs(12));
     }
 }

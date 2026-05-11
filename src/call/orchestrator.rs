@@ -3551,9 +3551,16 @@ pub async fn fork_to_bindings(
     // (tokio 1.x) は 2 つの sender が同一 mpsc receiver を共有しているか、
     // すなわち 同一 WS セッション (= 同一 browser tab) を指すかを判定する。
     // `Arc::ptr_eq` 風の ID 一致比較で、 (clone 元と clone 先) は true、
-    // (別 WS セッション) は false。 winner も loser も同じ AOR の WebRTC
-    // binding を共有しうる (1 PWA tab に複数 binding) ため、 `WsSink` は
-    // チャネル ID で同一性比較する必要がある。
+    // (別 WS セッション) は false。
+    //
+    // 構造上 1 WS = 1 `WsSink` + 1 `aor_guard`
+    // (`src/webrtc/signaling.rs:1031` の `aor_guard` は WS セッション固有) で、
+    // winner 確定時に winner の `WsSink` を clone して `winner_ws` に持ち回り、
+    // cleanup snapshot 側の各 leg `WsSink` と `same_channel` 比較する。 別 leg
+    // が同じ WS から作られていれば clone 由来で true (= winner 自身)、 別 WS
+    // (= 別 PWA tab / 別 binding) なら false (= Cancel 対象)。
+    // PR #137 round-2 review で「1 PWA tab に複数 binding」 と書いてあったが
+    // それは誤読で、 実際は WS インスタンス単位での同一性比較である。
     let drained = close_and_drain_webrtc_legs(&webrtc_legs).await;
     for leg in drained {
         if let Some(winner) = &winner_ws {
@@ -3605,6 +3612,27 @@ pub async fn fork_to_bindings(
 ///   側は answer 消費済で宙ぶらりんになる。 そのため `peer.close()` をベスト
 ///   エフォートで呼んで str0m run_loop を畳む (Issue #122 🟡 #3 / W3C WebRTC
 ///   §4.4.1 close semantics) → `Errored` を返す。
+///
+/// # race-condition: register-then-deliver の順序仕様 (Issue #140)
+///
+/// browser answer が `pending.register` 完了より前に届くケース (極めて早い
+/// answer / WS でのフレーム順序入替) は **無効動作** で確定:
+///
+/// 1. WS 受信ハンドラ (`process_client_message` / `src/webrtc/signaling.rs`) が
+///    `pending.deliver(call_id, sdp)` を呼ぶが、 waiter テーブル未登録のため
+///    `false` を返す (= no-op、 SDP は捨てられる)。
+/// 2. その後 `run_webrtc_leg` が `pending.register` → `try_register_webrtc_leg`
+///    と進み、 `try_register_webrtc_leg` も `closed = true` なら `false`
+///    (PR #137 race fix)、 そうでなければ通常パスで Offer push → answer 待ち。
+/// 3. 既に消費された answer は到達しないので、 結果として `leg_timeout` で
+///    `LegResult::Failed { status: 408 }` を返し、 `pending.cancel` で予約を
+///    撤去する。
+///
+/// この no-op 経路は browser 側 UA バグ / シグナリングテスト用 race で発火する
+/// 想定だが、 通常運用 (sabiden が Offer push → browser が answer 返却) では
+/// 順序が **必ず register 先行** となるため到達しない。 現状の動作 (= 黙って
+/// 408 にする) は副作用を出さない安全側で、 RFC 3261 §17.1.1 (INVITE
+/// transaction) の 「timer B 失効 = 408」 semantics と整合する。
 ///
 /// # 注意 (Issue #121 follow-up)
 ///
@@ -8301,20 +8329,29 @@ mod tests {
         assert!(bridge_id.is_some(), "PCMU 通話でブリッジが起動していない");
     }
 
-    /// Review #1 #1 (test rename): 旧テスト名は `..._ngn_bye_propagates_to_webrtc_peer`
-    /// だったが、 実体は **transparent モードで WebRTC leg `0.0.0.0:9` answer が
-    /// `start_bridge_for_inbound` で書換失敗 → 502 fallback** の検証であり、
-    /// NGN BYE → ServerMessage::Bye の本流経路は通っていない。 真の BYE 伝搬
-    /// テストは `rfc3261_15_1_2_handle_bye_pushes_servermsg_bye_to_webrtc_ws`
-    /// (handle_bye 直接呼び unit) で行う。
+    /// RFC 3261 §21.5.2 (502 Bad Gateway): "The server, while acting as a gateway
+    /// or proxy, received an invalid response from the downstream server."
     ///
-    /// このテストは **502 fallback** で:
-    /// - NGN に 502 Bad Gateway が返ること
-    /// - browser (PWA) に `ServerMessage::Cancel` が push されること
-    ///   (Issue #81/#83 review #2: 502 で peer に通知しないと PWA UI が hang する)
-    /// を検証する。
+    /// transparent モード (= `CallManager` 不在の test harness 経路) では WebRTC
+    /// leg が返す 200 OK の SDP `c=` / `m= port` が `0.0.0.0:9` のままで、
+    /// 通常運用なら呼出側の `start_bridge_for_inbound` が `rewrite_rtp_endpoint`
+    /// で sabiden NGN 側 RTP socket に書き換える前提だが、 transparent モードでは
+    /// `CallManager` が無いため書換が走らず handle_invite 側が 502 を返す
+    /// (`run_webrtc_leg` のドキュメント参照: 「start_bridge_for_inbound が失敗
+    /// した場合は 0.0.0.0:9 を NGN に流してはならず、 handle_invite 側で 5xx を
+    /// 返して呼を放棄する」)。
+    ///
+    /// 本テストは Issue #81/#83 review #2 由来の 2 点を担保する:
+    /// - NGN に **502 Bad Gateway** が返ること (上記の transparent モード fallback)
+    /// - browser (PWA) に **`ServerMessage::Cancel`** が push されること
+    ///   (W3C WebRTC §4.4.1: long-running pending state を残さず PWA UI を
+    ///   ringing から解放する)
+    ///
+    /// NGN BYE → `ServerMessage::Bye` の本流伝搬は別 unit
+    /// `rfc3261_15_1_2_handle_bye_pushes_servermsg_bye_to_webrtc_ws` でカバー
+    /// しているため、 本テストでは触らない。
     #[tokio::test]
-    async fn transparent_mode_webrtc_leg_returns_502_with_cancel_to_browser() {
+    async fn rfc3261_21_5_2_transparent_mode_webrtc_leg_returns_502_and_cancels_browser() {
         use crate::sip::message::parse_message;
         use crate::sip::message::SipMessage;
         use crate::sip::registrar::ExtTransport;
@@ -8429,25 +8466,11 @@ mod tests {
             other => panic!("Offer 期待だが {:?}", other),
         };
 
-        // NGN は 100 Trying と最終応答を待つ。 transparent モードなので
-        // WebRTC leg の `0.0.0.0:9` answer は未書換のまま 502 Bad Gateway が
-        // 返るが、 通話確立とは別の論点。 本テストの主眼は **handle_bye** を
-        // 検証することなので、 NGN INVITE 用 ServerTransaction にエントリが
-        // 残った状態 (BYE は別 transaction) で BYE を流して挙動を検証する。
-        //
-        // 502 が返ってくる前に「通話確立」状態に入れたいので、 サーバ側を
-        // 通話確立扱いにするには NgnInboundHandler::active と webrtc_active に
-        // 直接エントリを追加する経路が必要 — ただしハンドラは Arc 越しで private
-        // 状態を晒さない。 そこで本テストは **代替経路** として、 502 までの
-        // 一連を消化したのち、 BYE が NGN→sabiden に送られた状況で
-        // ` webrtc_active` への登録が無くてもクラッシュしないこと、 および
-        // 登録が有る場合は WS に Bye が enqueue されることを別レベルで検証する。
-        //
-        // → 本テストは 200 OK 経路を経ない / 経る両方の検証を厳密にやろうとすると
-        //   `start_bridge_for_inbound` の bridge socket bind 等まで必要になり
-        //   過剰なので、 ここでは Offer push まで成立した時点で Bye を送り、
-        //   `webrtc_active` 登録経路は別 unit (handle_bye 直接呼び) で検証する。
-        let _ = captured_call_id; // (unused) call_id は INVITE Call-ID と一致
+        // captured_call_id は INVITE Call-ID と一致するため未使用 (アサート済の
+        // `delivered` でカバー済)。 BYE 伝搬経路はここでは検証せず、 別 unit
+        // (`rfc3261_15_1_2_handle_bye_pushes_servermsg_bye_to_webrtc_ws`) で
+        // handle_bye を直接呼んでカバーする。
+        let _ = captured_call_id;
 
         // 502 を吸って transaction を完了させる
         let mut buf = vec![0u8; 8192];
@@ -8514,7 +8537,7 @@ mod tests {
     /// PR #76 で `bridged_mode || is_undirected_or_webrtc_placeholder_sdp` の OR
     /// 分岐を追加したが、 `bridged_mode = true` 側を直接ヒットさせる単体テストが
     /// なかった (transparent モード = `call_manager.is_none()` 側だけ
-    /// `transparent_mode_webrtc_leg_returns_502_with_cancel_to_browser` でカバー
+    /// `rfc3261_21_5_2_transparent_mode_webrtc_leg_returns_502_and_cancels_browser` でカバー
     /// していた)。 本テストは SIP 内線 (= WebRTC 経路を経由しない) でも、
     /// 内線 200 OK answer SDP が `extract_rtp_endpoint` で parse 失敗するような
     /// 異常値だった場合、 bridged モードでは透過せず 502 で打ち切ることを担保する。

@@ -222,6 +222,11 @@ NGN ──INVITE──► sabiden(UAS)
                     │ 100 Trying 即送出 (RFC 3261 §17.2.1)
 NGN ◄──100 Trying── sabiden
                     │
+                    │ RFC 3261 §8.2.2.3 (Issue #251 Phase A):
+                    │   INVITE の Require ヘッダの option-tag を検査。 既知
+                    │   (`timer` / `replaces`) 以外があれば 420 Bad Extension
+                    │   + Unsupported ヘッダで reject MUST。
+                    │
                     │ RFC 4028 §10 (Issue #249):
                     │   INVITE の Session-Expires が sabiden Min-SE (90s) 未満 →
                     │   422 + Min-SE で打ち切る
@@ -230,7 +235,12 @@ NGN ◄──100 Trying── sabiden
                     │   フォーク開始と同時に 180 Ringing を送出 (= remote callee
                     │   is being alerted)。 180 / 200 OK の To-tag は同値必須
                     │   (RFC 3261 §12.1.1 early == confirmed dialog)。
-NGN ◄──180 Ringing── sabiden
+                    │ RFC 3261 §20.5 / §20.17 / §20.41 (Issue #251 Phase A):
+                    │   180 / 200 OK 両方に Allow / Supported / Date / Server を
+                    │   常時付与 (Asterisk 実機 §3.1 同等)。 欠落すると carrier
+                    │   IMS が 「機能不足端末」 「時刻同期不能」 「capability
+                    │   negotiate 不可」 判定で即 BYE する経路に入る。
+NGN ◄──180 Ringing── sabiden  (Allow/Supported/Date/Server 付き)
                     │
                     │ 全内線にフォーク
                     ├──INVITE──► スマホ1
@@ -239,10 +249,14 @@ NGN ◄──180 Ringing── sabiden
 
 スマホ1 ──200 OK──► sabiden
                     │
-                    │ 200 OK 構築 (Issue #249):
+                    │ 200 OK 構築 (Issue #249 / #251):
                     │ - RFC 3264 §6.1 a=ptime echo (NGN PCMU = 20ms)
-                    │ - RFC 4028 §7: Session-Expires + refresher=uas + Require: timer
-                    │   (INVITE に Session-Expires 不在なら echo しない)
+                    │ - RFC 4028 §7 / §9: Session-Expires + Require: timer + refresher
+                    │   (UAC 要求 refresher=uac を echo、 不在なら uas にフォールバック)
+                    │ - RFC 3261 §20.5 Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,UPDATE,INFO
+                    │ - RFC 3261 §20.37 Supported: timer, replaces
+                    │ - RFC 3261 §20.17 / RFC 7231 §7.1.1.1 Date: IMF-fixdate
+                    │ - RFC 3261 §20.41 Server: sabiden/<version>
                     │
 sabiden ──200 OK──► NGN
 スマホ2 ◄──CANCEL── sabiden
@@ -251,7 +265,7 @@ sabiden ──200 OK──► NGN
 [RTPブリッジ確立: NGN ⇔ sabiden ⇔ スマホ1]
 ```
 
-#### NGN inbound 200 OK の RFC 整合 (Issue #249)
+#### NGN inbound 200 OK の RFC 整合 (Issue #249 / #251 Phase A)
 
 実機 evidence (`/tmp/sabiden-080-inbound.pcap`、 2026-05-11): 080 携帯からの
 着信で、 旧フロー `100 Trying → 4.1 秒 silent → 200 OK` が NGN carrier IMS
@@ -280,6 +294,14 @@ a=ptime:20                    ← PCMU 20ms 固定
 
 新フロー: `100 Trying → 180 Ringing (即) → 200 OK (内線 pickup)`、 carrier
 IMS は 180 受領で setup 進行中と認識し、 4 秒〜 PWA mic 許可待ちを許容する。
+
+Issue #251 Phase A (2026-05-11、 v4 pcap audit fix): 180 / 200 OK 両方に
+RFC 互換ヘッダ集合 (`Allow` / `Supported` / `Date` / `Server`) を常時付与し、
+`refresher` パラメータは UAC 要求値を echo (RFC 4028 §9)、 受信 `Require` の
+未対応 option-tag は 420 Bad Extension + `Unsupported` で reject MUST
+(RFC 3261 §8.2.2.3)。 これにより 080 inbound `ACK 直後 4ms 切断` の
+top-3 原因 (Allow/Supported/Date 欠落) と #6 (refresher 強制書換) の
+4 つを同時に解消する。 残る Phase B (PRACK / Timer L) は別 PR で対応。
 
 #### PWA 着信拒否 (Issue #107、 RFC 3261 §21.6.2 603 Decline)
 

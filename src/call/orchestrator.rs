@@ -1816,20 +1816,35 @@ impl NgnInboundHandler {
                         // RFC 3261 §12.1.1 UAS dialog 確立: (INVITE, 2xx) ペアと
                         // sabiden 側 contact / sent-by を渡す。 失敗時は dialog 不在
                         // のまま通話成立させる (BYE 経路だけ後で degrade)。
+                        //
+                        // Issue #258 fix: dialog の local_uri / remote_uri は RFC 3261
+                        // §12.1.1 の規定通り「INVITE の To URI / From URI」をそのまま
+                        // 採用する。 旧実装は local_uri に sabiden の Contact URI
+                        // (`sip:sabiden@<eth1>:5060`) を代入していたため、 PWA 切断後の
+                        // BYE が `From: <sip:sabiden@118.177.72.242:5060>;tag=...` で
+                        // 飛び、 carrier 側 dialog state (local-URI = 受信した INVITE の
+                        // To = `<sip:0191349809@ntt-east.ne.jp>`) と一致せず 481
+                        // Call/Transaction Does Not Exist で reject されていた
+                        // (実機 v9 evidence、 2026-05-11 15:13)。
+                        // RFC 3261 §12.1.1: "The UAS then constructs the state of the
+                        // dialog. ... The remote URI MUST be set to the URI in the From
+                        // field, and the local URI MUST be set to the URI in the To
+                        // field."
                         let contact_uri = format!("sip:sabiden@{}", contact_addr);
                         let sent_by = contact_addr.to_string();
-                        // local_uri は内線対 NGN なので NGN 側 From URI から相互変換
-                        // するのが厳密だが、 BYE が UAS-side で投げ返るときの To/From
-                        // は dialog 由来で正規化されるので、 contact_uri で代用する
-                        // (RFC 3261 §12.2.1: in-dialog request 整合は dialog state
-                        // から組み立てる)。
+                        let local_uri = request
+                            .headers
+                            .get("to")
+                            .map(crate::sip::dialog::extract_uri)
+                            .unwrap_or_else(|| contact_uri.clone());
+                        let remote_uri = request
+                            .headers
+                            .get("from")
+                            .map(crate::sip::dialog::extract_uri)
+                            .unwrap_or_else(|| "sip:unknown@unknown".to_string());
                         let dlg_cfg = DialogConfig {
-                            local_uri: contact_uri.clone(),
-                            remote_uri: request
-                                .headers
-                                .get("from")
-                                .map(crate::sip::dialog::extract_uri)
-                                .unwrap_or_else(|| "sip:unknown@unknown".to_string()),
+                            local_uri,
+                            remote_uri,
                             local_contact: contact_uri,
                             sent_by,
                         };

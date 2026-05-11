@@ -1,0 +1,62 @@
+name: Workers CI
+
+# workers/ 配下 (Cloudflare Workers signaling-proxy 等) の vitest を CI で
+# 実行する。 PR #216 で workers/signaling-proxy.test.ts (vitest 11 件) を
+# 追加したが、 既存 workflow (.github/workflows/ci.yml = Rust 用、
+# .github/workflows/pwa-deploy.yml = main push 時 deploy 専用) では
+# `cd workers && npm test` が呼ばれず、 signaling-proxy.ts が壊れても
+# merge できてしまっていた (Issue #217)。
+#
+# 本 workflow は workers/ または本 yml の変更を含む PR / main push で
+# trigger され、 vitest を node 環境で実行する (miniflare/wrangler は
+# 立てない、 workers/vitest.config.ts §1-6 と整合)。
+#
+# 既存 frontend / Rust CI とは独立 job として動かす (失敗影響範囲を
+# workers/ に閉じ込めるため)。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'workers/**'
+      - '.github/workflows/workers-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workers/**'
+      - '.github/workflows/workers-ci.yml'
+
+# 同一 PR の連続 push 時は古い run をキャンセル (pwa-deploy.yml と同方針)。
+concurrency:
+  group: workers-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pwa-deploy.yml と同じ Node 20 LTS で揃える (Cloudflare Workers の
+      # 公式推奨は Node 20 系、 frontend と workers で揃えると cache も
+      # 共有しやすい)。
+      - name: Setup Node.js 20 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: workers/package-lock.json
+
+      - name: Install workers deps
+        working-directory: workers
+        run: npm ci
+
+      # workers/package.json の "test" = "vitest run" (one-shot)。
+      # workers/vitest.config.ts は node 環境で動かす設定 (miniflare 不要)。
+      - name: Run vitest
+        working-directory: workers
+        run: npm test

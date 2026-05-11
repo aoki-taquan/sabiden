@@ -1275,6 +1275,15 @@ impl NgnInboundHandler {
 /// (RFC 3261 §12.2.2 違反; 内線 UA は ACK を送らず切断する)。 内線が
 /// `;TAG=...` 大文字 Re-INVITE を送ってきた場合に 200 OK が壊れていた
 /// 問題 (PR #136 review) の根治。
+fn ensure_to_tag(resp: &mut SipResponse) {
+    if let Some(to) = resp.headers.get("to") {
+        if !crate::sip::utils::has_to_tag(to) {
+            let new = format!("{};tag={}", to, crate::sip::utils::new_tag());
+            resp.headers.set("To", new);
+        }
+    }
+}
+
 /// 内線レッグ Re-INVITE の `send_request` 失敗を SIP final response の
 /// (status_code, reason_phrase) に分類する (RFC 3261 §13.3.1.1 / §13.3.1.2)。
 ///
@@ -1312,15 +1321,6 @@ fn classify_ext_reinvite_send_error(err: &anyhow::Error) -> (u16, &'static str) 
         (408, "Request Timeout")
     } else {
         (500, "Server Internal Error")
-    }
-}
-
-fn ensure_to_tag(resp: &mut SipResponse) {
-    if let Some(to) = resp.headers.get("to") {
-        if !crate::sip::utils::has_to_tag(to) {
-            let new = format!("{};tag={}", to, crate::sip::utils::new_tag());
-            resp.headers.set("To", new);
-        }
     }
 }
 

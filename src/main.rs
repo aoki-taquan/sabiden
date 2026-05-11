@@ -368,6 +368,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // を載せる。 socket bind は `0.0.0.0` なので socket.local_addr() を
             // そのまま使うと NGN が ACK 不能で 10 秒後 CANCEL してくる。
             ngn_local_addr: Some(local_addr_for_hdr),
+            // Issue #139: `webrtc_active` leak sweeper の周期。 既定 30 秒。
+            // browser WS 切断のみ (NGN BYE 未到来) の経路で entry が leak する
+            // のを防ぐ defense-in-depth。
+            webrtc_active_sweep_interval: std::time::Duration::from_secs(30),
         };
         // 着信 NGN→内線 用 CallManager は **outbound 側と同じ Arc**
         // (`shared_call_manager`) を再利用する (Issue #147 review #2 🔴 fix)。

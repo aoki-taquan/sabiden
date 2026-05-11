@@ -104,6 +104,30 @@ pub struct NgnInboundConfig {
     /// (RFC 3261 §8.1.1.8 / §13.3.1.4: in-dialog target は Contact が確定する)。
     /// `None` ならソケット側にフォールバック (テスト互換)。
     pub ngn_local_addr: Option<SocketAddr>,
+    /// `webrtc_active` テーブルの leak sweeper 周期 (Issue #139)。
+    ///
+    /// Issue #81 で導入した `webrtc_active: HashMap<Call-ID, WsSink>` は
+    /// 「NGN BYE 到来時」 にしか entry を消さないため、 以下の経路で leak する:
+    ///
+    /// 1. **browser WS 切断のみ** (`ClientMessage::Bye` 未送出): PWA が
+    ///    UI を閉じただけで NGN BYE が一切来ないケース。 `WsSink::is_closed`
+    ///    は `true` になるが entry は HashMap に居残る。
+    /// 2. **5xx 応答経路で winner WS が残るケース**: line 847 の `insert` は
+    ///    200 OK 成功後にのみ走るため現状はこのリスクは無いが、 将来 5xx
+    ///    分岐が追加されたときの defense-in-depth として sweeper で拾う。
+    /// 3. **誤って入った無関係エントリ**: outbound 経路で `webrtc_active` を
+    ///    触ることは現在無いが、 将来の refactor で混入しても sweeper が
+    ///    `is_closed` で除去する (= テーブル正規化のラストリゾート)。
+    ///
+    /// 設計選択: `WsSink::is_closed` は `tokio::sync::mpsc::UnboundedSender::is_closed`
+    /// を反映するため、 「receiver が drop された = WS forwarder タスクが
+    /// 抜けた = browser 切断 (RFC 6455 §7)」 と等価。 これを 30 秒周期で
+    /// 走査して該当 entry を `remove` する (= `WsSink` の最後の参照を drop)。
+    ///
+    /// なぜ周期: NGN は無音通話を 5 分超まで保持し得るため (TTC JJ-90.24)、
+    /// 通話あたり数十秒の leak window は許容範囲。 過剰に短いと不要な
+    /// Mutex 競合が増える。
+    pub webrtc_active_sweep_interval: Duration,
 }
 
 impl Default for NgnInboundConfig {
@@ -114,6 +138,7 @@ impl Default for NgnInboundConfig {
             bridge_ngn_bind_ip: None,
             bridge_ext_bind_ip: None,
             ngn_local_addr: None,
+            webrtc_active_sweep_interval: Duration::from_secs(30),
         }
     }
 }
@@ -414,7 +439,21 @@ impl NgnInboundHandler {
     }
 
     /// `inbound_rx` を駆動するループを spawn する。
+    ///
+    /// 同時に `webrtc_active` leak sweeper も spawn する (Issue #139)。
+    /// sweeper は `cfg.webrtc_active_sweep_interval` 周期で
+    /// `sweep_webrtc_active` を呼び、 WS が閉じた (= browser 切断済) entry を
+    /// 取り除く。 inbound loop が終了 (= channel close) しても sweeper だけが
+    /// 走り続ける事故を避けるため、 `Arc::downgrade` で弱参照に切り替え、
+    /// `NgnInboundHandler` 自体が drop されたら sweeper も自動終了する。
     pub fn spawn(self: Arc<Self>, mut inbound_rx: mpsc::UnboundedReceiver<InboundRequest>) {
+        // Issue #139: webrtc_active leak sweeper を起動 (弱参照)。
+        // ハンドラ本体が dropped されたら自動で抜ける。
+        Self::spawn_webrtc_active_sweeper(
+            Arc::downgrade(&self),
+            self.cfg.webrtc_active_sweep_interval,
+        );
+
         tokio::spawn(async move {
             while let Some(inbound) = inbound_rx.recv().await {
                 let me = self.clone();
@@ -427,6 +466,74 @@ impl NgnInboundHandler {
             }
             debug!("NGN inbound loop 終了");
         });
+    }
+
+    /// Issue #139: `webrtc_active` テーブルから WS が閉じた entry を除去する
+    /// 周期タスクを spawn する。
+    ///
+    /// # 経路と RFC 根拠
+    ///
+    /// `webrtc_active` は NGN→WebRTC 着信通話の WS ハンドルを Call-ID で
+    /// 保持し、 NGN BYE 受信時に `ServerMessage::Bye` を browser に push
+    /// するために使う (RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework:
+    /// B2BUA は片側 dialog 終了をもう片側へ伝搬する責務を負う)。
+    ///
+    /// しかし以下の経路では NGN BYE が来ず entry が leak する:
+    ///
+    /// - browser が **WS を切断したのみ** (= `ClientMessage::Bye` 未送出)。
+    ///   RFC 6455 §7.4 の close handshake で WS forwarder 受信側 mpsc receiver
+    ///   が drop され、 `WsSink::is_closed` が true になる。 NGN は依然
+    ///   dialog confirmed のまま無音通話を続けるため、 BYE 経由の `remove`
+    ///   は走らない。
+    /// - 将来追加され得る 5xx 経路 / 内部 outbound 混入 (defense-in-depth)。
+    ///
+    /// 本タスクは `interval` 周期で全 entry を走査し、 `WsSink::is_closed`
+    /// 一致 entry を `remove` する。 `Arc::strong_count` が落ちれば
+    /// (= `NgnInboundHandler` 自体が dropped) sweeper も即座に終了する
+    /// (`Weak::upgrade` が `None` を返す)。
+    fn spawn_webrtc_active_sweeper(weak_self: std::sync::Weak<Self>, interval: Duration) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // 初回 tick は即時発火するので 1 回読み飛ばす (= 起動直後の空 sweep を避ける)。
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(strong) = weak_self.upgrade() else {
+                    debug!("webrtc_active sweeper: ハンドラが dropped されたので終了");
+                    return;
+                };
+                let removed = strong.sweep_webrtc_active().await;
+                if removed > 0 {
+                    debug!(
+                        removed,
+                        "webrtc_active sweeper: 閉じた WS の entry を除去 (Issue #139)"
+                    );
+                }
+            }
+        });
+    }
+
+    /// `webrtc_active` を走査し、 `WsSink::is_closed` が true (= browser が
+    /// WS を切断済) の entry を全て remove する。 戻り値は除去件数。
+    ///
+    /// RFC 6455 §7.4 (Closing Handshake): WebSocket は close frame を交換した
+    /// 段階で peer 接続を終了する。 sabiden の WS forwarder タスクはここで
+    /// 終了し、 `mpsc::UnboundedReceiver` を drop する。 これにより `WsSink`
+    /// 内の `UnboundedSender::is_closed` が true を返すようになる
+    /// (tokio 1.x mpsc docs)。
+    ///
+    /// 本 sweeper は orchestrator 内 lock を一時的に取るが、 走査は in-memory
+    /// HashMap の線形時間で短時間しか保持しないため (entry 数は同時通話数程度)、
+    /// 既存 BYE 経路 (`handle_bye` line 976) や winner insert 経路
+    /// (line 847) との競合は ms オーダー以下で済む。
+    ///
+    /// `HashMap::retain` で 1 段で remove する (`extract_if` でもよいが、
+    /// remove 値を一旦集める必要がないので retain が簡潔)。
+    async fn sweep_webrtc_active(&self) -> usize {
+        let mut tbl = self.webrtc_active.lock().await;
+        let before = tbl.len();
+        tbl.retain(|_, ws| !ws.is_closed());
+        before - tbl.len()
     }
 
     async fn handle_inbound(&self, inbound: InboundRequest) -> Result<()> {
@@ -8883,6 +8990,221 @@ mod tests {
                 .is_none(),
             "BYE 処理後は webrtc_active から消えているべき"
         );
+    }
+
+    /// Issue #139 unit: `sweep_webrtc_active` が **WS 切断済 entry** のみを
+    /// remove し、 生きている entry は保持することを直接検証する。
+    ///
+    /// 背景 (Issue #139):
+    /// `webrtc_active` は NGN BYE 受信時にしか消されない設計 (Issue #81)。
+    /// browser が `ClientMessage::Bye` を送らずに WS だけ切った場合 (= RFC 6455
+    /// §7.4 close handshake のみ) は NGN BYE が永久に来ないため entry が leak
+    /// する。 sweeper は `WsSink::is_closed` (= `mpsc::UnboundedSender::is_closed`
+    /// が `true`、 = receiver drop 済) を判定して該当 entry を除去する。
+    #[tokio::test]
+    async fn issue139_sweep_webrtc_active_removes_closed_ws_only() {
+        use crate::webrtc::signaling::WsSink;
+        use tokio::sync::mpsc;
+
+        // ハンドラ (CallManager / outbound forwarder 不要、 sweeper 単体テスト)。
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let extensions = ExtensionRegistrar::new();
+        let handler = NgnInboundHandler::new(
+            sabiden_sock,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // 生きている WS と切断済 WS を 1 つずつ作る。
+        let (tx_alive, _rx_alive) = mpsc::unbounded_channel();
+        let alive = WsSink::new(tx_alive);
+
+        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
+        let dead = WsSink::new(tx_dead);
+        drop(rx_dead); // receiver を drop すると WsSink::is_closed が true になる
+
+        assert!(!alive.is_closed(), "前提: alive は閉じていない");
+        assert!(
+            dead.is_closed(),
+            "前提: dead は閉じている (receiver drop 済)"
+        );
+
+        // webrtc_active に 2 entry 挿入。
+        const ALIVE_CID: &str = "issue139-alive";
+        const DEAD_CID: &str = "issue139-dead";
+        {
+            let mut tbl = handler.webrtc_active.lock().await;
+            tbl.insert(ALIVE_CID.to_string(), alive);
+            tbl.insert(DEAD_CID.to_string(), dead);
+        }
+
+        // sweep を 1 回実行。
+        let removed = handler.sweep_webrtc_active().await;
+        assert_eq!(removed, 1, "1 件 (dead) のみ remove されるはず");
+
+        let tbl = handler.webrtc_active.lock().await;
+        assert!(tbl.contains_key(ALIVE_CID), "alive 側は保持されるべき");
+        assert!(!tbl.contains_key(DEAD_CID), "dead 側は除去されるべき");
+        assert_eq!(tbl.len(), 1);
+    }
+
+    /// Issue #139 unit: 空テーブル / 全部生きている / 全部死んでいる の 3 ケースを
+    /// `sweep_webrtc_active` の冪等性として検証する。
+    #[tokio::test]
+    async fn issue139_sweep_webrtc_active_idempotent_edge_cases() {
+        use crate::webrtc::signaling::WsSink;
+        use tokio::sync::mpsc;
+
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let handler = NgnInboundHandler::new(
+            sabiden_sock,
+            inviter,
+            ExtensionRegistrar::new(),
+            NgnInboundConfig::default(),
+        );
+
+        // (a) 空テーブル → 0 件除去、 サイズ 0 のまま。
+        assert_eq!(handler.sweep_webrtc_active().await, 0);
+        assert_eq!(handler.webrtc_active.lock().await.len(), 0);
+
+        // (b) 全部生きている → 0 件除去、 全部残る。
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        {
+            let mut tbl = handler.webrtc_active.lock().await;
+            tbl.insert("alive-1".to_string(), WsSink::new(tx1));
+            tbl.insert("alive-2".to_string(), WsSink::new(tx2));
+        }
+        assert_eq!(handler.sweep_webrtc_active().await, 0);
+        assert_eq!(handler.webrtc_active.lock().await.len(), 2);
+
+        // (c) 全部死亡 → 全件除去。
+        {
+            let mut tbl = handler.webrtc_active.lock().await;
+            tbl.clear();
+            for i in 0..3 {
+                let (tx, rx) = mpsc::unbounded_channel();
+                drop(rx);
+                tbl.insert(format!("dead-{}", i), WsSink::new(tx));
+            }
+        }
+        assert_eq!(handler.sweep_webrtc_active().await, 3);
+        assert_eq!(handler.webrtc_active.lock().await.len(), 0);
+
+        // (d) 2 回目の sweep は no-op (idempotent)。
+        assert_eq!(handler.sweep_webrtc_active().await, 0);
+    }
+
+    /// Issue #139 race: NGN BYE 経路 (`handle_bye` line 976 の `remove`) と
+    /// sweeper の `retain` が並走しても、 二重削除 / panic を起こさないことを
+    /// 検証する。 `WebRTC peer drop + NGN BYE 到着` が時間的にぶつかった
+    /// 場合の defense-in-depth。
+    ///
+    /// 検証は in-memory のみ (lock を取り合うだけ): `tokio::join!` で BYE
+    /// path 模擬 (= 直接 `webrtc_active.lock().await.remove`) と sweeper を
+    /// 同時実行し、 最終的にテーブルが空であることだけを確認する。
+    #[tokio::test]
+    async fn issue139_sweep_and_bye_remove_race_is_safe() {
+        use crate::webrtc::signaling::WsSink;
+        use tokio::sync::mpsc;
+
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let handler = NgnInboundHandler::new(
+            sabiden_sock,
+            inviter,
+            ExtensionRegistrar::new(),
+            NgnInboundConfig::default(),
+        );
+
+        // dead WS (sweeper が拾う対象) を 1 件入れる。
+        const RACE_CID: &str = "issue139-race";
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let ws = WsSink::new(tx);
+        handler
+            .webrtc_active
+            .lock()
+            .await
+            .insert(RACE_CID.to_string(), ws);
+
+        // sweeper と BYE 経路を同時に発火する。 どちらが先に remove しても
+        // 結果は同じ (= テーブル空、 panic なし)。
+        let handler_a = handler.clone();
+        let handler_b = handler.clone();
+        let (swept, byed) = tokio::join!(
+            async move { handler_a.sweep_webrtc_active().await },
+            async move {
+                // BYE path の `webrtc_active.remove(&cid)` 部分のみを模擬。
+                let removed = handler_b.webrtc_active.lock().await.remove(RACE_CID);
+                removed.is_some()
+            },
+        );
+
+        // どちらかが先勝で remove。 二重 remove はない (HashMap::remove は
+        // 1 回目で Some、 2 回目で None を返す)。
+        assert!(
+            swept + (byed as usize) >= 1,
+            "sweeper か BYE のどちらかは entry を見るはず"
+        );
+        assert_eq!(
+            handler.webrtc_active.lock().await.len(),
+            0,
+            "race 後はテーブル空 (二重削除 / panic なし)"
+        );
+    }
+
+    /// Issue #139 lifecycle: `NgnInboundHandler` の `Arc` が drop されたら
+    /// sweeper タスクも自動終了することを確認する (= 弱参照経由設計)。
+    ///
+    /// 確認方法: 短い sweep interval で起動 → ハンドラを drop → 数 tick 待つ →
+    /// テストが hang せず終了。 `Weak::upgrade` が `None` を返すと sweeper は
+    /// 即 return する。
+    #[tokio::test]
+    async fn issue139_sweeper_terminates_on_handler_drop() {
+        use std::time::Instant;
+
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let cfg = NgnInboundConfig {
+            webrtc_active_sweep_interval: Duration::from_millis(50),
+            ..NgnInboundConfig::default()
+        };
+        let handler = NgnInboundHandler::new(sabiden_sock, inviter, ExtensionRegistrar::new(), cfg);
+
+        // 弱参照を別途取り、 sweeper を起動する。
+        let weak = Arc::downgrade(&handler);
+        NgnInboundHandler::spawn_webrtc_active_sweeper(weak.clone(), Duration::from_millis(50));
+
+        // 数 tick 動かす。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(weak.upgrade().is_some(), "前提: ハンドラはまだ生存");
+
+        // ハンドラ Arc を drop すると strong_count が 0 になる。
+        drop(handler);
+        // sweeper は次の tick で `Weak::upgrade` が None を返して終了する
+        // (interval=50ms、 200ms 待てば十分)。
+        let start = Instant::now();
+        loop {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("sweeper がハンドラ drop 後も Arc を保持し続けている (Issue #139)");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Issue #83: `fork_to_bindings` が `Timeout` で抜けたとき、 走っていた

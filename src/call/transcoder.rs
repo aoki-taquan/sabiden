@@ -93,6 +93,28 @@ const JITTER_DEPTH: usize = DEFAULT_DEPTH;
 /// の `T_rr_interval` 計算) と randomization (0.5x〜1.5x) への移行を検討する。
 const RTCP_SR_INTERVAL: Duration = Duration::from_secs(5);
 
+/// ingress seq gap の clamp 上限 (RFC 3550 §A.1 reference impl `MAX_DROPOUT` 由来)。
+///
+/// RFC 3550 §A.1 (`init_seq` / `update_seq`) は受信側 sequence 追跡で、
+/// 「`MAX_DROPOUT = 3000`」を超える前進 gap を **reset (out-of-range)** と扱う。
+/// 同じく `MAX_MISORDER = 100` を超える後方 gap は misorder 範囲外として扱う。
+///
+/// sabiden transcoder の ingress→egress seq propagation (Issue #182 (b)) では、
+/// gap が極端に大きい (例: wrap-around 直後の偽 gap、 reorder で生じる負方向 wrap、
+/// あるいは長時間 silence 後の resync) ケースで「output seq を thousands skip」
+/// しないよう **`MAX_INGRESS_GAP = 100`** で clamp する。
+///
+/// 100 を選んだ根拠:
+/// - PCMU/Opus 20 ms frame で 100 packet ≒ 2 秒の連続 loss に相当。 これ超の
+///   gap は実用的には「stream restart」 と読むべきで、 受信側 jitter buffer も
+///   `MAX_DROPOUT` 相当でリセットする。
+/// - RFC 3550 §A.1 の `MAX_MISORDER = 100` と同じ値を採用することで、 reorder
+///   と loss の境界判定を仕様 reference 実装と揃える。
+///
+/// gap = 0 (duplicate) も `gap = 1` (= skip なし) に clamp する。 これにより
+/// 同 seq の retransmit / NIC duplication が egress 連番を乱さない。
+const MAX_INGRESS_GAP: u32 = 100;
+
 /// Opus ペイロード PT。WebRTC SDP では動的 PT (96-127) を使うのが一般的。
 /// SDP で受け取った値を渡せるようにし、デフォルトは 111 (Chromium 互換)。
 pub const DEFAULT_OPUS_PT: u8 = 111;
@@ -210,6 +232,19 @@ struct RtpEgressState {
     /// 確定させない (RFC 3550 §6.4.1 「NTP timestamp ↔ RTP timestamp」 相関は
     /// 実際に wire に出した packet を基準にすべき)。
     anchor: Option<(NtpTimestamp, u32)>,
+    /// 直近 ingress packet の RTP sequence number。 ingress→egress の loss
+    /// propagation (Issue #182 (b)) に使う。
+    ///
+    /// RFC 3550 §5.1 / §A.1 reference impl: 受信側は seq の monotonic 連番性で
+    /// loss を観測する。 sabiden transcoder は出力 seq を独立 random から +1 連番
+    /// で進めるため、 入力 (NGN / WebRTC peer) で生じた loss が出力に伝わらず
+    /// 受信側 jitter buffer が adaptive 制御を行えない。 `note_ingress_seq` で
+    /// 入力 seq の gap を観測し、 出力 seq を **同じだけスキップ** することで
+    /// ingress loss を egress に伝搬する。
+    ///
+    /// `None` は本 egress に対する ingress packet を一度も観測していない
+    /// 初期状態。 初回 ingress は `gap = 1` (= skip なし) として扱う。
+    last_ingress_seq: Option<u16>,
 }
 
 impl RtpEgressState {
@@ -229,7 +264,72 @@ impl RtpEgressState {
             sent_octets: 0,
             sample_rate_hz,
             anchor: None,
+            last_ingress_seq: None,
         }
+    }
+
+    /// ingress packet の RTP sequence number を観測し、 直前 ingress からの gap を
+    /// 出力 seq に伝搬する (Issue #182 (b))。 上位 loop は ingress packet を受信して
+    /// payload validation を通過した直後、 出力 packet を組み立てる前 (= `next` /
+    /// `next_with_marker` を呼ぶ前) に本メソッドを 1 回呼ぶ。 1 ingress packet が
+    /// 複数 egress chunk を生む経路 (例: Opus 60 ms → PCMU 3 chunk) でも、 ingress
+    /// 由来の gap propagation は **最初の egress chunk にだけ反映** され、 後続
+    /// chunk は通常通り `next` の +1 連番で進む (= ingress 1 packet ロスは egress
+    /// で seq を +(gap) 進める一回限りの skip として表現される)。
+    ///
+    /// # アルゴリズム (RFC 3550 §A.1 reference impl の `update_seq` を簡略化)
+    ///
+    /// - 初回 (`last_ingress_seq = None`): `gap = 1` 扱い (= skip 0)。
+    /// - `wrapping_sub(ingress_seq, prev)` で 16-bit wrap-around を吸収する。
+    /// - `raw_gap == 0`: duplicate / retransmit。 `gap = 1` に clamp (= skip 0)。
+    /// - `raw_gap > MAX_INGRESS_GAP`: reorder / wrap 後の偽 gap、 もしくは長時間
+    ///   silence 後の resync 等。 出力 seq を thousands skip しないよう
+    ///   [`MAX_INGRESS_GAP`] に clamp する (RFC 3550 §A.1 `MAX_DROPOUT` / `MAX_MISORDER`
+    ///   相当の防衛措置)。
+    /// - それ以外: `gap = raw_gap`。
+    ///
+    /// gap を観測した後:
+    /// 1. `last_ingress_seq = Some(ingress_seq)` で更新。
+    /// 2. `self.seq` を `gap - 1` だけ前進 (wrapping_add) → 次の `next` 呼び出しで
+    ///    さらに +1 されて、 結果として出力 seq は ingress と同 gap 分進む。
+    ///
+    /// # Reorder 対応
+    ///
+    /// 上位 ingress 経路は `JitterBuffer::pull` (`src/rtp/jitter.rs`) を経由してから
+    /// 本メソッドを呼ぶことを想定する (= reorder は jitter buffer で吸収済、 ingress
+    /// は forward-only)。 ただし jitter buffer を経由しない経路でも、
+    /// `wrapping_sub` と `MAX_INGRESS_GAP` clamp により負方向 wrap が大きな gap と
+    /// 誤認されない設計になっている。
+    ///
+    /// # 戻り値
+    ///
+    /// 観測した gap (= 出力 seq を進める量、 `1..=MAX_INGRESS_GAP`)。
+    /// 呼び出し側は metrics やトレース用に使える。
+    fn note_ingress_seq(&mut self, ingress_seq: u16) -> u32 {
+        let gap = match self.last_ingress_seq {
+            None => 1,
+            Some(prev) => {
+                let raw_gap = ingress_seq.wrapping_sub(prev) as u32;
+                if raw_gap == 0 {
+                    // 同 seq の duplicate / retransmit (RFC 3550 §A.1: `bad_seq` 経路)。
+                    1
+                } else if raw_gap > MAX_INGRESS_GAP {
+                    // TODO(本流対応): RFC 3550 §A.1 `update_seq` の完全実装 (= probation /
+                    // bad_seq state machine) は将来 RtpSession 統合 (Issue #105 / Phase R3)
+                    // で導入する。 現状は MAX_DROPOUT/MAX_MISORDER 相当の clamp のみ。
+                    MAX_INGRESS_GAP
+                } else {
+                    raw_gap
+                }
+            }
+        };
+        self.last_ingress_seq = Some(ingress_seq);
+        // gap - 1 だけ前進: 次回 `next` が +1 してくれるので、 合計で gap 進む。
+        let extra_skip = gap.saturating_sub(1);
+        // u32 → u16 wrap: extra_skip <= MAX_INGRESS_GAP - 1 < u16::MAX なので
+        // `as u16` で truncate しても情報は失われない。
+        self.seq = self.seq.wrapping_add(extra_skip as u16);
+        gap
     }
 
     /// 現在の (seq, timestamp, ssrc) を返し、 次回送信用に
@@ -818,8 +918,16 @@ async fn ngn_to_web_loop(
                 // Issue #112: bridge lifetime 中 SSRC 不変 + flow 中の seq / ts 連番を保証。
                 // Issue #84: jitter buffer pull が間遠 (silence / DTX 復帰直後) の場合に
                 //   talkspurt 境界として M=1 を立てる。
+                //
+                // RFC 3550 §5.1 / §A.1 / Issue #182 (b): ingress (NGN μ-law) で観測した
+                // seq gap を egress (Opus) に伝搬する。 `note_ingress_seq` は jitter
+                // buffer pull 後 (= reorder 吸収後) の seq を読み、 直前 pull との gap
+                // 分 egress seq を前進させてから `next_with_marker` で +1 する。 これにより
+                // ingress 1 packet loss は egress でも seq を 2 進める (= 受信側が
+                // 真の loss を観測可能)。
                 let (seq, ts, ssrc, marker) = {
                     let mut eg = state.ngn_to_web_egress.lock().await;
+                    eg.note_ingress_seq(pkt.sequence);
                     eg.next_with_marker(OPUS_FRAME_SAMPLES as u32, Instant::now())
                 };
 
@@ -1096,6 +1204,17 @@ async fn web_to_ngn_loop(
                     trace!("Opus decode が空サンプルを返した → drop");
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+
+                // RFC 3550 §5.1 / §A.1 / Issue #182 (b): ingress (WebRTC Opus) で観測した
+                // seq を **必ず note_ingress_seq に渡す**。 短尺フレーム (2.5/5/10 ms) で
+                // accum 経由の場合、 ingress 2 個で 1 chunk emit という関係になるが、
+                // ingress 連続性 (gap=1) は note を呼び続けることで維持される (gap=2 と
+                // 誤認しないため)。 emit が起きない経路 (chunk が空) では egress seq は
+                // 進めず、 last_ingress_seq だけ更新する (= 短尺 accum 自体は loss ではない)。
+                {
+                    let mut eg = state.web_to_ngn_egress.lock().await;
+                    eg.note_ingress_seq(pkt.sequence);
                 }
 
                 // 累積 → 20 ms 境界が満ちるたびに μ-law chunk を取り出す。
@@ -1666,8 +1785,14 @@ async fn ngn_to_peer_loop(
         // MediaFrame は SSRC / seq を持たない (str0m が割り当てる) ため、
         // ここで消費するのは timestamp のみ。 ただし egress state を共有することで
         // bridge lifetime 中に timestamp 系列が一貫する。
+        //
+        // RFC 3550 §5.1 / §A.1 / Issue #182 (b): ingress seq を観測して egress seq を
+        // gap 分進める。 本経路 (WebRtcAudioBridge: NGN→peer) は MediaFrame 経由なので
+        // egress seq は wire に出ない (str0m が SSRC/seq を割当) が、 egress state の
+        // 一貫性と観測性 (test / log) のため他経路と同じく note_ingress_seq を呼ぶ。
         let rtp_time = {
             let mut eg = state.ngn_to_web_egress.lock().await;
+            eg.note_ingress_seq(pkt.sequence);
             let (_seq, ts, _ssrc) = eg.next(ts_increment);
             ts
         };
@@ -3035,6 +3160,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         let (s0, t0, ssrc0) = eg.next(160);
         let (s1, t1, ssrc1) = eg.next(160);
@@ -3073,6 +3199,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         let (s0, t0, ssrc0) = eg.next(1);
         assert_eq!(s0, u16::MAX);
@@ -3102,6 +3229,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         let t0 = Instant::now();
         // 1 個目: 初回送信
@@ -3140,6 +3268,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         let t0 = Instant::now();
         assert!(eg.last_send_time.is_none(), "前提: 未送信は None");
@@ -3252,6 +3381,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         let t0 = Instant::now();
         let _ = eg.next_with_marker(160, t0);
@@ -3291,6 +3421,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         // ingress SSRC ≠ egress SSRC → rotate 不要
         let rotated = eg.check_and_rotate_on_collision(0xCCCC_DDDD);
@@ -3316,6 +3447,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         // ingress SSRC == egress SSRC → 衝突 → rotate
         let rotated = eg.check_and_rotate_on_collision(old_ssrc);
@@ -3350,6 +3482,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
             anchor: None,
+            last_ingress_seq: None,
         };
         // 1 回目: 衝突 → rotate
         assert!(eg.check_and_rotate_on_collision(old_ssrc));
@@ -4178,6 +4311,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000,
             anchor: None,
+            last_ingress_seq: None,
         };
         // 3 packet を別 payload 長で記録 (実 wire に出した想定)。
         // 初回 record_sent で anchor が (now_ntp, 1_000_000) で確定 (Issue #182 (d))。
@@ -4256,6 +4390,7 @@ mod tests {
             sent_octets: 160,
             sample_rate_hz,
             anchor: Some((anchor_ntp, anchor_rtp)),
+            last_ingress_seq: None,
         };
 
         let sr = eg.build_sr();
@@ -4377,6 +4512,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000,
             anchor: None,
+            last_ingress_seq: None,
         };
         // 旧 SSRC で 2 packet 送ったていで record_sent
         eg.record_sent(160, 0);
@@ -4437,6 +4573,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz,
             anchor: Some((anchor_ntp, anchor_rtp)),
+            last_ingress_seq: None,
         };
 
         // 5 秒経過した NTP wall clock
@@ -4499,6 +4636,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 8000,
             anchor: None,
+            last_ingress_seq: None,
         };
         assert!(eg.anchor.is_none(), "前提: 未送信は anchor None");
 
@@ -4568,6 +4706,7 @@ mod tests {
             sent_octets: 0,
             sample_rate_hz: 48_000, // Opus (RFC 7587 §4.1)
             anchor: None,
+            last_ingress_seq: None,
         };
 
         // 初回 packet 払い出し + wire 送出成功で anchor 確定
@@ -4594,5 +4733,324 @@ mod tests {
             rtp_before, rtp_after,
             "同一 wall clock 瞬間に対する RTP ts は rotate 前後で不変"
         );
+    }
+
+    /// RFC 3550 §5.1 / Issue #182 (b): ingress seq が連続 (1, 2, 3, 4) で来た
+    /// 通常パスでは、 `note_ingress_seq` は egress seq を skip させず、 `next`
+    /// 由来の +1 連番だけが出力 seq を進める (= N, N+1, N+2, N+3)。
+    ///
+    /// 「ingress loss なしなら egress seq も連続」という性質を unit で確認する。
+    #[test]
+    fn rfc3550_5_1_normal_no_loss_no_skip() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xAAAA_0001,
+            seq: 1000,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
+            last_ingress_seq: None,
+        };
+        // ingress 1 → egress N (= 1000)
+        let gap0 = eg.note_ingress_seq(1);
+        assert_eq!(gap0, 1, "初回 ingress は gap=1 (skip 0)");
+        let (s0, _, _) = eg.next(160);
+        assert_eq!(s0, 1000, "初回 egress seq は初期値そのまま");
+
+        // ingress 2 → gap=1 (skip 0) → egress N+1
+        let gap1 = eg.note_ingress_seq(2);
+        assert_eq!(gap1, 1, "連続 ingress は gap=1");
+        let (s1, _, _) = eg.next(160);
+        assert_eq!(s1, 1001, "連続 ingress は egress も連続 (N+1)");
+
+        // ingress 3 → gap=1 → egress N+2
+        let gap2 = eg.note_ingress_seq(3);
+        assert_eq!(gap2, 1);
+        let (s2, _, _) = eg.next(160);
+        assert_eq!(s2, 1002, "連続 ingress は egress も連続 (N+2)");
+
+        // ingress 4 → gap=1 → egress N+3
+        let gap3 = eg.note_ingress_seq(4);
+        assert_eq!(gap3, 1);
+        let (s3, _, _) = eg.next(160);
+        assert_eq!(s3, 1003, "連続 ingress は egress も連続 (N+3)");
+    }
+
+    /// RFC 3550 §5.1 / §A.1 / Issue #182 (b): ingress で 1 packet loss が
+    /// 起きると (seq 1, 2, 4)、 egress seq も同じ gap だけ skip する
+    /// (= N, N+1, N+3)。 これにより受信側 jitter buffer は ingress loss を
+    /// 観測可能になり、 adaptive 制御 (PLC / depth 調整) が機能する。
+    #[test]
+    fn rfc3550_5_1_ingress_loss_propagates_to_egress() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xBBBB_0002,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
+            last_ingress_seq: None,
+        };
+        // ingress 1 → egress 0 (初回)
+        eg.note_ingress_seq(1);
+        let (s0, _, _) = eg.next(160);
+        assert_eq!(s0, 0, "初回 egress");
+
+        // ingress 2 → gap=1 → egress 1
+        eg.note_ingress_seq(2);
+        let (s1, _, _) = eg.next(160);
+        assert_eq!(s1, 1, "連続 ingress → egress +1");
+
+        // ingress 4 (seq=3 が失われた) → gap=2 → egress seq 3 (= 1 + 1 skip + 1 next)
+        let gap = eg.note_ingress_seq(4);
+        assert_eq!(gap, 2, "ingress seq=3 がロスしたので gap=2");
+        let (s2, _, _) = eg.next(160);
+        assert_eq!(
+            s2, 3,
+            "ingress loss 分 egress seq も skip すべき (N=1 → N+gap=3, RFC 3550 §5.1)"
+        );
+    }
+
+    /// RFC 3550 §5.1 / Issue #182 (b): ingress seq の 16-bit wrap-around を
+    /// `wrapping_sub` で吸収する。 ingress (65534, 65535, 0, 1) は連続なので
+    /// gap=1 ずつ (= skip なし)、 egress も連続 N, N+1, N+2, N+3 で進む。
+    ///
+    /// `wrapping_sub` を使わず raw subtraction だと u16::MAX - 1 のような巨大な
+    /// gap が出るので、 wrap 越境点で出力 seq が全く崩れないことが本テストの
+    /// 主眼。
+    #[test]
+    fn rfc3550_5_1_ingress_wrap_around_handled() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xCCCC_0003,
+            seq: 100,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
+            last_ingress_seq: None,
+        };
+        // 65534 → 65535 → 0 → 1 (16-bit wrap)
+        for (ingress_seq, expected_gap, expected_egress) in [
+            (65534u16, 1u32, 100u16), // 初回
+            (65535, 1, 101),
+            (0, 1, 102),
+            (1, 1, 103),
+        ] {
+            let gap = eg.note_ingress_seq(ingress_seq);
+            assert_eq!(
+                gap, expected_gap,
+                "ingress wrap-around を gap=1 で吸収すべき (RFC 3550 §5.1: wrapping_sub)"
+            );
+            let (s, _, _) = eg.next(160);
+            assert_eq!(s, expected_egress, "wrap 越境で egress seq が崩れないこと");
+        }
+    }
+
+    /// RFC 3550 §A.1 / Issue #182 (b): ingress gap が極端に大きい (=
+    /// `MAX_INGRESS_GAP` 超過) ケースで、 egress seq を thousands skip
+    /// させないよう clamp する。 RFC 3550 §A.1 reference impl の
+    /// `MAX_DROPOUT = 3000` / `MAX_MISORDER = 100` 相当の防衛措置。
+    ///
+    /// 初期 seq=0、 ingress (1, 200) の流れ:
+    /// - `note(1)` → gap=1 (初回)、 extra_skip=0、 seq=0。
+    /// - `next` → snapshot=0、 seq→1。 出力 seq=0。
+    /// - `note(200)` → raw_gap=199 だが MAX_INGRESS_GAP=100 で clamp、
+    ///   extra_skip=99、 seq=1+99=100。
+    /// - `next` → snapshot=100、 seq→101。 出力 seq=100。
+    ///
+    /// = 1 emit ⇒ 次 emit の seq diff = 100 (= MAX_INGRESS_GAP の clamp 値そのもの)。
+    #[test]
+    fn rfc3550_5_1_large_gap_clamped() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xDDDD_0004,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
+            last_ingress_seq: None,
+        };
+        // 初回
+        let gap0 = eg.note_ingress_seq(1);
+        assert_eq!(gap0, 1, "初回 ingress は gap=1");
+        let (s0, _, _) = eg.next(160);
+        assert_eq!(s0, 0, "初回 egress seq は初期値");
+
+        // 巨大 gap (=199) → MAX_INGRESS_GAP (=100) で clamp
+        let gap1 = eg.note_ingress_seq(200);
+        assert_eq!(
+            gap1, MAX_INGRESS_GAP,
+            "raw_gap=199 は MAX_INGRESS_GAP (=100) で clamp すべき (RFC 3550 §A.1)"
+        );
+        let (s1, _, _) = eg.next(160);
+        // diff = s1 - s0 = MAX_INGRESS_GAP (= clamp 後の gap そのもの)
+        assert_eq!(
+            s1.wrapping_sub(s0),
+            MAX_INGRESS_GAP as u16,
+            "clamp 後の egress seq diff は MAX_INGRESS_GAP に等しいべき (RFC 3550 §A.1)"
+        );
+        // 次の次の next で +1
+        let (s2, _, _) = eg.next(160);
+        assert_eq!(
+            s2.wrapping_sub(s1),
+            1,
+            "clamp 直後 1 回目の追加 next は +1 連番"
+        );
+    }
+
+    /// RFC 3550 §A.1 / Issue #182 (b): ingress duplicate (同 seq 再到来) は
+    /// `gap = 0` で観測されるが、 これを `gap = 1` に clamp して egress seq を
+    /// skip しない (= duplicate ingress は egress に 1 packet 出すだけ)。
+    ///
+    /// 厳密には ingress duplicate は jitter buffer や ingress 側で dedupe される
+    /// べきだが、 transcoder の `note_ingress_seq` レベルでも防衛的に clamp する。
+    #[test]
+    fn rfc3550_a_1_ingress_duplicate_seq_does_not_skip_egress() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xEEEE_0005,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
+            last_ingress_seq: None,
+        };
+        eg.note_ingress_seq(42);
+        let (s0, _, _) = eg.next(160);
+        assert_eq!(s0, 0);
+
+        // 同 seq 再到来 (duplicate) → gap=1 に clamp、 egress も +1 連番
+        let gap = eg.note_ingress_seq(42);
+        assert_eq!(
+            gap, 1,
+            "duplicate ingress seq は gap=1 に clamp (RFC 3550 §A.1 bad_seq)"
+        );
+        let (s1, _, _) = eg.next(160);
+        assert_eq!(s1, 1, "duplicate ingress 後の egress seq は +1 連番");
+    }
+
+    /// RFC 3550 §5.1 / Issue #182 (b): ingress→egress loss propagation の
+    /// **end-to-end integration test**。
+    ///
+    /// シナリオ: `TranscodingBridge` を起動し、 NGN→WebRTC 方向に PCMU RTP を
+    /// 連続 ingress seq で多数流し、 途中で 1 つだけ意図的に抜く (= 12 を skip)。
+    /// jitter buffer は depth=4 でロス検出 (= 期待 seq が missing なら待つが、
+    /// buffer が depth*2 = 8 で強制 pull) するので、 ingress 多数を密に push して
+    /// overflow による forward 確定 pull を発火させる。
+    ///
+    /// 出力 Opus RTP の seq diff を観測し、 「seq 12 の skip を跨ぐペアだけ
+    /// diff = 2、 その他は diff = 1」 を確認する。 これにより ingress 1 packet
+    /// loss が egress seq に伝搬していることが検証される。
+    #[tokio::test]
+    async fn rfc3550_5_1_e2e_ingress_loss_propagates_to_egress_seq() {
+        // 受信側 socket = 出力 Opus RTP を観測する
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_addr = ngn_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        // ingress seq 10..20 から 12 を抜く: (10, 11, 13, 14, 15, 16, 17, 18, 19, 20)
+        // 10 packet 投入 → jitter depth=4 → 6 個目以降は overflow で強制 pull され、
+        // seq=12 の不在が confirmed loss として egress に伝搬する。
+        let ingress_seqs: &[u16] = &[10, 11, 13, 14, 15, 16, 17, 18, 19, 20];
+        // PCMU 20 ms 無音 PCM (= 0) を 160 samples 投入。 `build_ulaw_rtp_packet` が
+        // PCM → μ-law encode (encode_ulaw(0) = 0xFF) してくれる。
+        let silence_pcm: Vec<i16> = vec![0; SAMPLES_PER_FRAME];
+        for &seq in ingress_seqs {
+            let pkt_bytes = build_ulaw_rtp_packet(
+                seq,
+                seq as u32 * SAMPLES_PER_FRAME as u32,
+                0xAAAA_BBBB,
+                &silence_pcm,
+            );
+            ngn_peer.send_to(&pkt_bytes, ngn_addr).await.unwrap();
+        }
+
+        // WebRTC peer 側で全 10 packet 受信を試みる (jitter buffer 20 ms × 10 + α)。
+        // ingress 10 packet 投入 → jitter overflow で full 排出される。
+        let expected = ingress_seqs.len();
+        let mut received_seqs = Vec::with_capacity(expected);
+        for i in 0..expected {
+            let mut buf = vec![0u8; 1500];
+            let (n, _) = timeout(Duration::from_secs(3), web_peer.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "WebRTC 側で {} 個目の RTP を受信できない (期待 {}, 受信済 {:?})",
+                        i + 1,
+                        expected,
+                        received_seqs
+                    )
+                })
+                .unwrap();
+            let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            received_seqs.push(recv.sequence);
+        }
+
+        // egress は monotonically increasing で expected 個
+        assert_eq!(received_seqs.len(), expected);
+
+        // jitter buffer は ingress 順序で pull する。 ingress 10 packet 投入時、
+        // pull 順は forward-only (10, 11, 13, 14, ..., 20)。 buffer 内で 12 が
+        // 不在のため、 11 → 13 の pull は overflow を待つが、 残り 8 packet を
+        // 順次 push → buffer が depth*2 を超えた瞬間 12 が lost 確定。
+        //
+        // egress diff の総和 = ingress 最終 seq (20) - ingress 初回 seq (10) = 10。
+        // = (10 - 1) +1 = 9 (windows.len() = expected - 1)。 直前との diff が大きい
+        // = ingress gap が大きい。 12 を跨ぐペア 1 箇所が diff=2、 残りは diff=1。
+        let diffs: Vec<u16> = received_seqs
+            .windows(2)
+            .map(|w| w[1].wrapping_sub(w[0]))
+            .collect();
+        let total_skip: u16 = diffs.iter().sum();
+        // 11 - 1 = 9 が "no loss" baseline、 +1 lost = 10。 windows(2) の総和 = 10。
+        let expected_total = ingress_seqs.last().unwrap() - ingress_seqs.first().unwrap();
+        assert_eq!(
+            total_skip, expected_total,
+            "ingress 全体の seq span ({}) と egress 全体の seq span ({}) が一致すべき \
+             (= ingress 12 のロスが egress に伝搬, RFC 3550 §5.1) — diffs: {:?}",
+            expected_total, total_skip, diffs
+        );
+        // diff = 2 の箇所が **ちょうど 1 箇所** (= ingress 12 の loss propagation)
+        let n_gaps = diffs.iter().filter(|&&d| d == 2).count();
+        assert_eq!(
+            n_gaps, 1,
+            "egress diff=2 (= 1 packet loss propagation) が 1 箇所だけ出るべき — diffs: {:?}",
+            diffs
+        );
+        // それ以外は diff=1
+        let n_continuous = diffs.iter().filter(|&&d| d == 1).count();
+        assert_eq!(
+            n_continuous,
+            diffs.len() - 1,
+            "ingress loss 以外は egress も連続 diff=1 — diffs: {:?}",
+            diffs
+        );
+
+        bridge.stop().await;
     }
 }

@@ -140,6 +140,34 @@ struct LegState {
 ///   [`OPUS_FRAME_SAMPLES`] (= 960) 進む (RFC 7587 §4.1)。
 /// - Web→NGN (Opus→μ-law) では出力 clock = 8 kHz なので 1 frame ごとに
 ///   [`SAMPLES_PER_FRAME`] (= 160) 進む (RFC 3551 §4.5.14)。
+///
+/// # NTP/RTP timestamp anchor (RFC 3550 §6.4.1) — Issue #182 (d)
+///
+/// RFC 3550 §6.4.1 (Sender Report) は SR の `NTP timestamp` と `RTP timestamp`
+/// が **同じ wall-clock 瞬間** を指し、 受信側がこの 2 値を見て送信レート /
+/// lip-sync / 再生レート補正を導出することを規定する:
+///
+/// > NTP timestamp: 32 bits / 32 bits. Indicates the wallclock time when this
+/// > report was sent so that it may be used in combination with timestamps
+/// > returned in reception reports from other receivers to measure round-trip
+/// > propagation to those receivers. [...]
+/// > RTP timestamp: 32 bits. Corresponds to the same time as the NTP timestamp
+/// > (above), but in the same units and with the same random offset as the RTP
+/// > timestamps in data packets.
+///
+/// 旧実装 (PR #242) は SR 生成時に `self.timestamp` (= 次回送信予定の RTP ts)
+/// をそのまま返していたため、 SR 生成と最終 RTP 送信の間に frame 境界の
+/// 余り誤差 (最大 1 frame = 20 ms 分) があり、 受信側の NTP↔RTP 線形回帰が
+/// 微小にずれる。
+///
+/// `anchor` は **初回 `record_sent` 呼び出し時点** の (wall clock NTP, 対応 RTP ts)
+/// を 1 度だけ確定する。 SR 生成時は anchor からの NTP 経過秒に `sample_rate_hz`
+/// を乗じて「**この SR 送出瞬間に対応する正確な RTP timestamp**」を計算する。
+/// これにより:
+/// - SR の (NTP, RTP) ペアは **常に同一 wall-clock 瞬間** を指す。
+/// - frame 境界余り誤差は累積せず、 long-running 通話でも線形性が維持される。
+/// - SSRC rotate (RFC 3550 §8.2 / PR #239) は anchor に影響しない (anchor は
+///   wall-clock との関係性であり、 SSRC とは独立)。
 #[derive(Debug)]
 struct RtpEgressState {
     ssrc: u32,
@@ -152,17 +180,46 @@ struct RtpEgressState {
     /// 累積送信 RTP packet 数。 RFC 3550 §6.4.1 SR の `sender's packet count`。
     /// `record_sent` で +1 する (= `next` / `next_with_marker` で payload を
     /// 払い出した後、 上位 loop が `to_socket.send_to` 成功時に呼ぶ)。
-    /// Issue #182 (f) / #112 で SR 送出のために導入。
+    /// Issue #182 (f) / #112 で SR 送出のために導入 (PR #242)。
     sent_packets: u64,
     /// 累積送信 payload octet 数 (RTP header 含まず)。 RFC 3550 §6.4.1 SR の
-    /// `sender's octet count`。 `record_sent(payload_len)` で加算する。
+    /// `sender's octet count`。 `record_sent(payload_len, ...)` で加算する。
     sent_octets: u64,
+    /// RTP timestamp の刻みに対応する sample clock (Hz)。
+    ///
+    /// NGN→Web (Opus): [`OPUS_SAMPLE_RATE`] = 48000 (RFC 7587 §4.1)。
+    /// Web→NGN (PCMU): [`NARROW_BAND_RATE`] = 8000 (RFC 3551 §4.5.14)。
+    ///
+    /// `anchor` 確定時 (= 初回 wire 送出成功時) に `(NtpTimestamp::now,
+    /// sent_rtp_ts)` を保持し、 以降 `build_sr` 生成で
+    /// 「NTP 経過秒 × sample_rate_hz = RTP timestamp 経過」 を線形に計算する
+    /// (RFC 3550 §6.4.1)。
+    sample_rate_hz: u32,
+    /// NTP wall clock と RTP timestamp の対応 anchor (RFC 3550 §6.4.1)。
+    ///
+    /// `None`: まだ 1 packet も wire に出していない。 `build_sr` も
+    /// packet_count=0 のため呼ばれない方針 (PR #242)。
+    ///
+    /// `Some((ntp, rtp))`: `ntp` 時点で wire に送出した最初の RTP packet の
+    /// timestamp が `rtp` だったことを意味する。 以降の SR では
+    /// `rtp_timestamp = rtp + (now_ntp - ntp) * sample_rate_hz` で
+    /// 「**SR 送出瞬間に対応する RTP ts**」を線形補間する。
+    ///
+    /// anchor は `record_sent` (= wire 送出成功時) で 1 度だけ確定する。
+    /// `next` 払い出し時点では送出失敗の可能性が残るため anchor を
+    /// 確定させない (RFC 3550 §6.4.1 「NTP timestamp ↔ RTP timestamp」 相関は
+    /// 実際に wire に出した packet を基準にすべき)。
+    anchor: Option<(NtpTimestamp, u32)>,
 }
 
 impl RtpEgressState {
     /// RFC 3550 §5.1 に従い SSRC / seq / timestamp を random に初期化する。
     /// 起動 1 回だけ呼び、 同一 bridge 上の同一方向では使い回す。
-    fn new_random() -> Self {
+    ///
+    /// `sample_rate_hz` は方向 / コーデックごとの RTP timestamp clock (Hz)。
+    /// NGN→Web (Opus) は 48000 (RFC 7587 §4.1)、 Web→NGN (PCMU) は 8000
+    /// (RFC 3551 §4.5.14)。 NTP/RTP anchor の計算で使う (RFC 3550 §6.4.1)。
+    fn new_random(sample_rate_hz: u32) -> Self {
         Self {
             ssrc: rand::random(),
             seq: rand::random(),
@@ -170,17 +227,65 @@ impl RtpEgressState {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz,
+            anchor: None,
         }
     }
 
     /// 現在の (seq, timestamp, ssrc) を返し、 次回送信用に
     /// seq +1 / timestamp += `ts_increment` を加算する。
     /// timestamp 加算量はコーデックの sample clock 単位で 1 frame 分。
+    ///
+    /// **NTP/RTP anchor 確定は `record_sent` 側** (RFC 3550 §6.4.1)。
+    /// 本メソッドは payload 払い出しのみ行い、 wire 送出失敗時に anchor が
+    /// 確定してしまう (= NTP/RTP 線形性が 1 frame ずれる) のを避ける。
     fn next(&mut self, ts_increment: u32) -> (u16, u32, u32) {
         let snapshot = (self.seq, self.timestamp, self.ssrc);
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(ts_increment);
         snapshot
+    }
+
+    /// RFC 3550 §6.4.1 (Issue #182 (d)): 指定 NTP wall clock 瞬間に **対応する
+    /// RTP timestamp** を線形補間で返す。
+    ///
+    /// 受信側は SR の `(NTP timestamp, RTP timestamp)` ペアから「sabiden が
+    /// この wall-clock 瞬間に送出していた RTP ts」を読み取り、
+    /// - 平均送信レート (`Δ RTP / Δ NTP`) で送信側のクロックドリフトを推定、
+    /// - lip-sync (= 別 SSRC の同 SR ペアと突き合わせ)、
+    /// - jitter buffer の adaptive resize、
+    ///
+    /// 等を行う。 したがって SR を生成する瞬間ごとに「**そのときの RTP ts**」
+    /// を正確に返す必要がある。
+    ///
+    /// 計算式:
+    /// ```text
+    /// rtp_at_now = anchor_rtp + round( (now_ntp - anchor_ntp) * sample_rate_hz )
+    /// ```
+    ///
+    /// - `anchor` が未確定 (= まだ 1 packet も送っていない) のときは `None`。
+    ///   PR #242 docstring に従い、 packet_count=0 の空 SR は wire に出さない
+    ///   方針なので呼出側はこの `None` で SR 送出を skip する。
+    /// - `now_ntp < anchor_ntp` (時計が逆走) のときは負の経過を 0 に saturate
+    ///   して anchor_rtp を返す (RTP ts が後退するのは RFC 3550 §5.1
+    ///   "monotonically increasing" 違反のため)。
+    /// - `u32` への変換は `wrapping_add` で wrap-around を許容する
+    ///   (RFC 3550 §5.1: RTP timestamp は 32-bit modular)。
+    ///
+    /// `build_sr` (PR #242 で導入された RTCP SR 生成) は本メソッドを呼んで
+    /// 「**SR 送出瞬間に対応する RTP timestamp**」 を埋め込む。 `anchor` が
+    /// 未確定 (= まだ 1 packet も wire に出していない) のときは `None` を返し、
+    /// `build_sr` 側は `self.timestamp` (次回送信予定の値) に fallback する。
+    /// 実運用では `record_sent` が呼ばれて anchor 確定済の状態でしか SR を
+    /// 出さないため、 `None` fallback は通常通過しない。
+    fn rtp_timestamp_at(&self, now_ntp: NtpTimestamp) -> Option<u32> {
+        let (anchor_ntp, anchor_rtp) = self.anchor?;
+        let elapsed_seconds = now_ntp.elapsed_from(anchor_ntp).max(0.0);
+        let elapsed_samples = (elapsed_seconds * self.sample_rate_hz as f64).round();
+        // f64 → u32 で巨大な値も含めて modular な振る舞いをさせるため、
+        // 一旦 u64 (mod 2^32) を経由してから wrapping_add。
+        let increment = (elapsed_samples as u64 & 0xFFFF_FFFF) as u32;
+        Some(anchor_rtp.wrapping_add(increment))
     }
 
     /// `next` と同じく (seq, ts, ssrc) を払い出しつつ、 RFC 3551 §4.1 /
@@ -248,9 +353,19 @@ impl RtpEgressState {
     /// RFC 3550 §6.4.1 SR 用に「送信した 1 packet + payload octet」を記録する。
     /// 上位 loop が `to_socket.send_to(...).await` 成功直後に呼ぶ。 send 失敗時は
     /// **呼ばない** (= 実 wire に出ていない packet を SR にカウントしないため)。
-    fn record_sent(&mut self, payload_len: usize) {
+    ///
+    /// `sent_rtp_ts` は `next` / `next_with_marker` が払い出した RTP timestamp
+    /// (= wire に出した packet の ts) を渡す。 初回 (anchor 未確定) のみ
+    /// `(NtpTimestamp::now(), sent_rtp_ts)` を anchor として確定する
+    /// (RFC 3550 §6.4.1: NTP/RTP anchor は実際に wire に出した packet の
+    /// 関係性を基準にすべきため、 `next` 払い出し時点ではなく `record_sent`
+    /// で確定する)。
+    fn record_sent(&mut self, payload_len: usize, sent_rtp_ts: u32) {
         self.sent_packets = self.sent_packets.saturating_add(1);
         self.sent_octets = self.sent_octets.saturating_add(payload_len as u64);
+        if self.anchor.is_none() {
+            self.anchor = Some((NtpTimestamp::now(), sent_rtp_ts));
+        }
     }
 
     /// RFC 3550 §6.4.1 (Sender Report) を本 egress 状態のスナップショットから組む。
@@ -265,21 +380,25 @@ impl RtpEgressState {
     /// - `ntp`: 現在の wall clock を NTP 形式で取る。 [`NtpTimestamp::now`]
     ///   (`src/rtp/rtcp.rs`) は `SystemTime::now()` + 1900 epoch 補正。 RFC 3550
     ///   §6.4.1 の "NTP timestamp" フィールド (64-bit) に書く。
-    /// - `rtp_timestamp`: 現在の `self.timestamp` (= 次回送信予定の値)。 厳密には
-    ///   RFC 3550 §6.4.1 では「同 SR で報告する NTP 時点に対応する RTP timestamp」
-    ///   が要求されるが、 transcoder は frame 境界で `next` 払い出し → send を
-    ///   同期実行するため、 「直近送信した RTP の **次の** ts ≒ 現在の wall
-    ///   clock 時点の RTP ts」 として近似する。 (d) (timestamp NTP 基準
-    ///   の厳密同期、 Issue #182 残) は別 PR で扱う。
+    /// - `rtp_timestamp`: `rtp_timestamp_at(now_ntp)` で「**この SR の NTP 時点に
+    ///   対応する RTP timestamp**」 を線形補間で計算する (RFC 3550 §6.4.1 厳密)。
+    ///   Issue #182 (d) で解消: 旧実装は `self.timestamp` (次回送信予定 = 払い出し済
+    ///   累計) を返していたため、 SR 生成と次回 send の間に最大 1 frame の境界余り
+    ///   誤差があり受信側の lip-sync / clock-drift 推定が微小にずれていた。
+    ///   anchor 未確定 (= 1 packet も送出していない) 場合は `self.timestamp` に
+    ///   fallback するが、 実運用では `record_sent` 後にしか SR を出さないため
+    ///   通常通過しない。
     /// - `packet_count` / `octet_count`: `record_sent` で累積した値。
     /// - `reports`: 本 egress は受信側 jitter buffer を共有しない (transcoder は
     ///   入力レッグと出力レッグで SSRC を切り替えるため受信 stats は別系統)。
     ///   よって RR ブロックは空配列 (`SR with RC=0`、 §6.4.1 で許可)。
     fn build_sr(&self) -> SenderReport {
+        let now_ntp = NtpTimestamp::now();
+        let rtp_at_now = self.rtp_timestamp_at(now_ntp).unwrap_or(self.timestamp);
         SenderReport {
             ssrc: self.ssrc,
-            ntp: NtpTimestamp::now(),
-            rtp_timestamp: self.timestamp,
+            ntp: now_ntp,
+            rtp_timestamp: rtp_at_now,
             // u64 → u32: RFC 3550 §6.4.1 (sender's packet/octet count は 32-bit)。
             // 5 秒間隔 × u32 packet limit ≒ 4G packets / 20 ms = 2700 年 over なので
             // wrap は実害なし。 NGN 直収 117 通話の最長セッション (60 分) でも
@@ -335,14 +454,25 @@ struct BridgeState {
     web_to_ngn_egress: Arc<Mutex<RtpEgressState>>,
 }
 
-impl Default for BridgeState {
-    fn default() -> Self {
+impl BridgeState {
+    /// RFC 3550 §6.4.1 (Issue #182 (d)): 方向別に RTP sample clock を渡して
+    /// egress state を初期化する。 NTP/RTP anchor の精度に必要 (= 旧 `Default`
+    /// 経由だと sample_rate が分からず anchor が成立しない)。
+    ///
+    /// - `ngn_to_web_hz`: NGN→WebRTC 方向の RTP timestamp clock。
+    ///   - PCMU 直送モード (`WebRtcAudioBridge { direct_pcmu_passthrough: true }`)
+    ///     では 8 kHz (RFC 3551 §4.5.14)。
+    ///   - Opus 変換モード (`TranscodingBridge` / `WebRtcAudioBridge`
+    ///     `direct_pcmu_passthrough: false`) では 48 kHz (RFC 7587 §4.1)。
+    /// - `web_to_ngn_hz`: WebRTC→NGN 方向の RTP timestamp clock。 出力 RTP は
+    ///   常に PCMU なので 8 kHz (RFC 3551 §4.5.14)。
+    fn with_sample_rates(ngn_to_web_hz: u32, web_to_ngn_hz: u32) -> Self {
         Self {
             ngn_to_web_packets: std::sync::atomic::AtomicU64::new(0),
             web_to_ngn_packets: std::sync::atomic::AtomicU64::new(0),
             transcode_errors: std::sync::atomic::AtomicU64::new(0),
-            ngn_to_web_egress: Arc::new(Mutex::new(RtpEgressState::new_random())),
-            web_to_ngn_egress: Arc::new(Mutex::new(RtpEgressState::new_random())),
+            ngn_to_web_egress: Arc::new(Mutex::new(RtpEgressState::new_random(ngn_to_web_hz))),
+            web_to_ngn_egress: Arc::new(Mutex::new(RtpEgressState::new_random(web_to_ngn_hz))),
         }
     }
 }
@@ -369,7 +499,14 @@ impl TranscodingBridge {
         let web_state = Arc::new(LegState {
             peer: Mutex::new(web_peer),
         });
-        let state = Arc::new(BridgeState::default());
+        // RFC 3550 §6.4.1 / Issue #182 (d): TranscodingBridge は NGN→Web 方向
+        // で Opus 48 kHz (RFC 7587 §4.1)、 Web→NGN 方向で PCMU 8 kHz
+        // (RFC 3551 §4.5.14) を出力するため、 anchor 計算に必要な sample clock
+        // を方向別に与える。
+        let state = Arc::new(BridgeState::with_sample_rates(
+            OPUS_SAMPLE_RATE,
+            NARROW_BAND_RATE,
+        ));
 
         // NGN → WebRTC: μ-law デコード → 8k PCM → アップサンプル → 48k PCM → Opus
         let ngn_to_web = tokio::spawn(ngn_to_web_loop(
@@ -702,10 +839,11 @@ async fn ngn_to_web_loop(
                 }
                 // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire に
                 // 出した packet のみ集計する。 send 失敗時は record_sent しない。
-                // Issue #182 (f) / #112。
+                // Issue #182 (f) / #112。 anchor (NTP/RTP relationship) も
+                // wire 送出成功時に初回確定する (Issue #182 (d))。
                 {
                     let mut eg = state.ngn_to_web_egress.lock().await;
-                    eg.record_sent(payload_len);
+                    eg.record_sent(payload_len, ts);
                 }
                 state.ngn_to_web_packets.fetch_add(1, Ordering::Relaxed);
                 if let Some(m) = metrics.as_ref() {
@@ -1021,10 +1159,11 @@ async fn web_to_ngn_loop(
                         break;
                     }
                     // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire
-                    // に出した分のみ集計 (Issue #182 (f) / #112)。
+                    // に出した分のみ集計 (Issue #182 (f) / #112)。 anchor も
+                    // wire 送出成功時に初回確定する (Issue #182 (d))。
                     {
                         let mut eg = state.web_to_ngn_egress.lock().await;
-                        eg.record_sent(payload_len);
+                        eg.record_sent(payload_len, ts);
                     }
                     state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
                     if let Some(m) = metrics.as_ref() {
@@ -1257,7 +1396,18 @@ impl WebRtcAudioBridge {
         let ngn_state = Arc::new(LegState {
             peer: Mutex::new(ngn_peer),
         });
-        let state = Arc::new(BridgeState::default());
+        // RFC 3550 §6.4.1 / Issue #182 (d): NGN→peer 方向は PCMU 直送モード
+        // なら 8 kHz (RFC 3551 §4.5.14)、 Opus 変換モードなら 48 kHz
+        // (RFC 7587 §4.1)。 peer→NGN 方向は常に PCMU 8 kHz で NGN へ出す。
+        let ngn_to_peer_hz = if direct_pcmu_passthrough {
+            NARROW_BAND_RATE
+        } else {
+            OPUS_SAMPLE_RATE
+        };
+        let state = Arc::new(BridgeState::with_sample_rates(
+            ngn_to_peer_hz,
+            NARROW_BAND_RATE,
+        ));
 
         // NGN → peer: μ-law → 8k PCM → 48k PCM → Opus → peer.send_media
         // (direct_pcmu_passthrough = true なら μ-law をそのまま PT 0 で peer へ素通し)
@@ -1700,10 +1850,11 @@ async fn peer_to_ngn_loop(
                 break;
             }
             // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire に
-            // 出した分のみ集計 (Issue #182 (f) / #112)。
+            // 出した分のみ集計 (Issue #182 (f) / #112)。 anchor も wire 送出
+            // 成功時に初回確定する (Issue #182 (d))。
             {
                 let mut eg = state.web_to_ngn_egress.lock().await;
-                eg.record_sent(payload_len);
+                eg.record_sent(payload_len, ts);
             }
             state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = metrics.as_ref() {
@@ -2882,6 +3033,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         let (s0, t0, ssrc0) = eg.next(160);
         let (s1, t1, ssrc1) = eg.next(160);
@@ -2918,6 +3071,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         let (s0, t0, ssrc0) = eg.next(1);
         assert_eq!(s0, u16::MAX);
@@ -2945,6 +3100,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         let t0 = Instant::now();
         // 1 個目: 初回送信
@@ -2981,6 +3138,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         let t0 = Instant::now();
         assert!(eg.last_send_time.is_none(), "前提: 未送信は None");
@@ -3091,6 +3250,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         let t0 = Instant::now();
         let _ = eg.next_with_marker(160, t0);
@@ -3128,6 +3289,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         // ingress SSRC ≠ egress SSRC → rotate 不要
         let rotated = eg.check_and_rotate_on_collision(0xCCCC_DDDD);
@@ -3151,6 +3314,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         // ingress SSRC == egress SSRC → 衝突 → rotate
         let rotated = eg.check_and_rotate_on_collision(old_ssrc);
@@ -3183,6 +3348,8 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000, // PCMU clock (RFC 3551 §4.5.14)
+            anchor: None,
         };
         // 1 回目: 衝突 → rotate
         assert!(eg.check_and_rotate_on_collision(old_ssrc));
@@ -3991,10 +4158,13 @@ mod tests {
     /// count / octet count / RTP timestamp) が、 直近の `record_sent` で集計
     /// された値と一致することを確認する。
     ///
-    /// シナリオ: SSRC=固定、 3 packet を payload_len=160 / 100 / 40 で記録 →
-    /// `build_sr` の `packet_count = 3` / `octet_count = 300` / `ssrc = 0xABCD_1234`
-    /// が観測される。 `rtp_timestamp` は現在の egress timestamp (= 払い出しを
-    /// していなければ初期値そのまま)。
+    /// シナリオ: SSRC=固定、 3 packet を payload_len=160 / 100 / 40 で
+    /// 同一 sent_rtp_ts で記録 → `build_sr` の `packet_count = 3` /
+    /// `octet_count = 300` / `ssrc = 0xABCD_1234` が観測される。
+    /// `rtp_timestamp` は anchor 確定後 `rtp_timestamp_at(now_ntp)` 経由 (Issue
+    /// #182 (d)) なので、 anchor の RTP ts (= 初回 `record_sent` で固定) を
+    /// 起点に NTP 経過時間分だけ進む。 本テストは経過時間がほぼ 0 なので
+    /// anchor_rtp ± 数サンプルになる。
     ///
     /// Issue #182 (f) 必要要件 (a): "build_sr_emits_correct_header"。
     #[test]
@@ -4006,11 +4176,15 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000,
+            anchor: None,
         };
-        // 3 packet を別 payload 長で記録 (実 wire に出した想定)
-        eg.record_sent(160);
-        eg.record_sent(100);
-        eg.record_sent(40);
+        // 3 packet を別 payload 長で記録 (実 wire に出した想定)。
+        // 初回 record_sent で anchor が (now_ntp, 1_000_000) で確定 (Issue #182 (d))。
+        let anchor_rtp = 1_000_000_u32;
+        eg.record_sent(160, anchor_rtp);
+        eg.record_sent(100, anchor_rtp.wrapping_add(160));
+        eg.record_sent(40, anchor_rtp.wrapping_add(320));
 
         let sr = eg.build_sr();
 
@@ -4024,11 +4198,17 @@ mod tests {
             sr.octet_count, 300,
             "SR sender's octet count が record_sent payload 合計と不一致 (160+100+40)"
         );
-        // RFC 3550 §6.4.1: RTP timestamp は SR 生成時点の RTP 時計値。
-        // 本実装は egress.timestamp (= 次回送信予定の RTP ts) を読む。
-        assert_eq!(
-            sr.rtp_timestamp, 1_000_000,
-            "SR RTP timestamp が現在の egress.timestamp と不一致"
+        // RFC 3550 §6.4.1: RTP timestamp は SR 生成 NTP 時点に対応する RTP ts。
+        // 本実装は `rtp_timestamp_at(now_ntp)` で anchor からの線形補間値を返す
+        // (Issue #182 (d))。 anchor 確定 ~ build_sr の経過時間はほぼ 0 なので、
+        // anchor_rtp に対して数サンプル以内の差に収まる (8 kHz × 数 ms 程度)。
+        let drift = (sr.rtp_timestamp as i64 - anchor_rtp as i64).abs();
+        assert!(
+            drift < 8000, // 1 秒分 = 8000 samples 未満で十分 (実測 0〜数 ms)
+            "SR RTP timestamp が anchor から大きく外れた: anchor={} sr={} drift={}",
+            anchor_rtp,
+            sr.rtp_timestamp,
+            drift
         );
         // RC=0 (transcoder egress は受信側 jitter buffer 統計を持たないため)
         assert!(
@@ -4041,6 +4221,61 @@ mod tests {
         assert_eq!(peek_packet_type(&bytes), Some(PT_SR));
         // RC=0 の SR は 28 bytes 固定 (RFC 3550 §6.4.1)
         assert_eq!(bytes.len(), 28, "RC=0 SR は 28 bytes ちょうど");
+    }
+
+    /// RFC 3550 §6.4.1 / Issue #182 (d): `build_sr` は `rtp_timestamp_at` を
+    /// 呼んで anchor からの線形補間値を埋め込む (= `self.timestamp` 直返しでは
+    /// ない)。 anchor を意図的に過去の NTP 時刻に置けば、 build_sr が返す
+    /// `rtp_timestamp` は anchor_rtp + 経過秒 × sample_rate_hz になることで
+    /// 配線が確認できる。
+    ///
+    /// シナリオ:
+    /// - sample_rate_hz = 8000 (PCMU)
+    /// - anchor = (now - 5秒相当, anchor_rtp = 1_000_000)
+    /// - build_sr の rtp_timestamp が anchor_rtp + 5 * 8000 = 1_040_000 近傍。
+    ///   実時間で SR を組む瞬間まで数 ms 経つので ±100 sample の許容。
+    #[test]
+    fn rfc3550_6_4_1_build_sr_uses_rtp_timestamp_at() {
+        let sample_rate_hz: u32 = 8000;
+        let anchor_rtp: u32 = 1_000_000;
+        // anchor NTP を「現在から 5 秒前」に置く。
+        let now = NtpTimestamp::now();
+        let anchor_ntp = NtpTimestamp {
+            seconds: now.seconds.saturating_sub(5),
+            fraction: now.fraction,
+        };
+        let eg = RtpEgressState {
+            ssrc: 0xC0DE_F00D,
+            seq: 0,
+            // self.timestamp は「次回送信予定」 = anchor から既に大量に進んだ値。
+            // build_sr が self.timestamp を直返ししているなら本値が返る → fail。
+            // rtp_timestamp_at 経由なら anchor + 5秒分 ≒ 1_040_000 が返る。
+            timestamp: anchor_rtp.wrapping_add(123_456_789),
+            last_send_time: None,
+            sent_packets: 1,
+            sent_octets: 160,
+            sample_rate_hz,
+            anchor: Some((anchor_ntp, anchor_rtp)),
+        };
+
+        let sr = eg.build_sr();
+        let expected_rtp = anchor_rtp.wrapping_add(5 * sample_rate_hz);
+        let diff = (sr.rtp_timestamp as i64 - expected_rtp as i64).abs();
+        assert!(
+            diff < 1000,
+            "build_sr の rtp_timestamp が anchor 線形補間値からずれている: \
+             expected≒{} got={} diff={} (anchor 経由なら ±数百以内、 \
+             self.timestamp 直返しなら {} になるはず)",
+            expected_rtp,
+            sr.rtp_timestamp,
+            diff,
+            eg.timestamp
+        );
+        // self.timestamp 直返しの旧バグでないことを直接確認
+        assert_ne!(
+            sr.rtp_timestamp, eg.timestamp,
+            "build_sr が self.timestamp を直返しに退行している (Issue #182 (d) 配線漏れ)"
+        );
     }
 
     /// RFC 3550 §6.2 (Transmission Interval) / RFC 5761 §3.3 (RTP/RTCP mux):
@@ -4140,10 +4375,12 @@ mod tests {
             last_send_time: None,
             sent_packets: 0,
             sent_octets: 0,
+            sample_rate_hz: 8000,
+            anchor: None,
         };
         // 旧 SSRC で 2 packet 送ったていで record_sent
-        eg.record_sent(160);
-        eg.record_sent(160);
+        eg.record_sent(160, 0);
+        eg.record_sent(160, 160);
         let sr_before = eg.build_sr();
         assert_eq!(sr_before.ssrc, 0x0000_AAAA);
         assert_eq!(sr_before.packet_count, 2);
@@ -4154,7 +4391,7 @@ mod tests {
         eg.ssrc = 0xFFFF_BBBB;
 
         // rotate 後の send をさらに 1 件記録
-        eg.record_sent(160);
+        eg.record_sent(160, 320);
 
         let sr_after = eg.build_sr();
         // 新 SSRC で SR が組まれる (= SR タスクが spawn 時のキャッシュではなく
@@ -4170,5 +4407,192 @@ mod tests {
             "record_sent counter は rotate を跨いで累積される"
         );
         assert_eq!(sr_after.octet_count, 160 * 3);
+    }
+
+    /// RFC 3550 §6.4.1 / Issue #182 (d): SR の RTP timestamp は anchor からの
+    /// NTP 経過秒 × sample_rate_hz で線形に計算され、 SR 送出瞬間の wall clock
+    /// と対応する。 5 秒後に問い合わせた `rtp_timestamp_at` が `anchor_rtp + 5
+    /// * sample_rate_hz` 近似であることを検証する。
+    ///
+    /// 本テストは f64 経由の丸めを許容するため `±2` サンプルの許容範囲を取る
+    /// (`f64::round` の最近接整数丸めと u32 への cast の組合せで ±1 サンプル
+    /// 程度の誤差が出る場合がある)。 5 秒 × 8000 Hz = 40000 サンプルに対し
+    /// ±2 は 0.005% 以下で、 RFC 3550 §6.4.1 が想定する受信側の線形回帰精度
+    /// (typically 1 packet 周期 ≒ 160 サンプル) には十分小さい。
+    #[test]
+    fn rfc3550_6_4_1_build_sr_ntp_rtp_relationship() {
+        let sample_rate_hz: u32 = 8000; // PCMU (RFC 3551 §4.5.14)
+        let anchor_rtp: u32 = 1_000_000;
+        // anchor の NTP wall clock を 100 秒目で固定
+        let anchor_ntp = NtpTimestamp {
+            seconds: 3_900_000_000, // NTP epoch 上の任意の値
+            fraction: 0,
+        };
+        let eg = RtpEgressState {
+            ssrc: 0xCAFE_F00D,
+            seq: 0,
+            timestamp: anchor_rtp.wrapping_add(sample_rate_hz),
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz,
+            anchor: Some((anchor_ntp, anchor_rtp)),
+        };
+
+        // 5 秒経過した NTP wall clock
+        let now_ntp = NtpTimestamp {
+            seconds: anchor_ntp.seconds + 5,
+            fraction: anchor_ntp.fraction,
+        };
+        let rtp_now = eg
+            .rtp_timestamp_at(now_ntp)
+            .expect("anchor が確定済なら Some を返すはず");
+
+        // 5 秒 * 8000 Hz = 40000 サンプル
+        let expected = anchor_rtp.wrapping_add(5 * sample_rate_hz);
+        let diff = (rtp_now as i64 - expected as i64).abs();
+        assert!(
+            diff <= 2,
+            "5 秒経過の RTP ts は anchor + 5 * 8000 = {} ± 2 (got {}, diff {})",
+            expected,
+            rtp_now,
+            diff
+        );
+
+        // 同 anchor + 100 ms 経過 (= 800 サンプル) も線形に伸びる
+        let now_ntp_100ms = NtpTimestamp {
+            seconds: anchor_ntp.seconds,
+            fraction: (0.1_f64 * (u32::MAX as f64 + 1.0)) as u32,
+        };
+        let rtp_100ms = eg.rtp_timestamp_at(now_ntp_100ms).unwrap();
+        let expected_100ms = anchor_rtp.wrapping_add(800);
+        let diff_100ms = (rtp_100ms as i64 - expected_100ms as i64).abs();
+        assert!(
+            diff_100ms <= 2,
+            "100 ms 経過の RTP ts は anchor + 800 ± 2 (got {}, diff {})",
+            rtp_100ms,
+            diff_100ms
+        );
+    }
+
+    /// RFC 3550 §6.4.1 / Issue #182 (d): `record_sent` の **初回呼び出し** で
+    /// anchor が確定する (`anchor` が `None` → `Some`)。 anchor の RTP 部は
+    /// 初回 wire 送出 packet に乗った RTP ts (= caller が渡す `sent_rtp_ts`) と
+    /// 一致する。
+    ///
+    /// 2 回目以降の `record_sent` で anchor は **維持** され、 上書きされない。
+    /// これにより wall clock と RTP timestamp の relationship が長時間通話で
+    /// 累積誤差なく保持される (旧 PR #242 の `self.timestamp` 直返しが抱えていた
+    /// frame 境界余り誤差の問題が解消される)。
+    ///
+    /// **`next` 払い出し時点では anchor を確定させない**: wire 送出失敗
+    /// (`to_socket.send_to` Err) 時に anchor だけ確定して RTP/NTP 線形性が
+    /// 1 frame ずれるのを防ぐ。
+    #[test]
+    fn rfc3550_6_4_1_anchor_set_on_first_send() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xABCD_0001,
+            seq: 100,
+            timestamp: 50_000,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 8000,
+            anchor: None,
+        };
+        assert!(eg.anchor.is_none(), "前提: 未送信は anchor None");
+
+        // `next` だけでは anchor は確定しない (wire 送出失敗を考慮)
+        let (_seq0, ts0, _ssrc0) = eg.next(160);
+        assert_eq!(ts0, 50_000, "1 packet 目の払い出し snapshot");
+        assert!(
+            eg.anchor.is_none(),
+            "next 単独では anchor 確定しない (wire 送出成功時のみ)"
+        );
+
+        // 初回 `record_sent` で anchor が確定する
+        eg.record_sent(160, ts0);
+        let (anchor_ntp0, anchor_rtp0) = eg
+            .anchor
+            .expect("初回 record_sent 後は anchor が Some になっているはず");
+        assert_eq!(
+            anchor_rtp0, 50_000,
+            "anchor の RTP ts は 1 packet 目の wire 送出 ts と一致"
+        );
+
+        // 2 回目以降の `record_sent` で anchor が **維持** される (上書きされない)
+        let (_seq1, ts1, _ssrc1) = eg.next(160);
+        assert_eq!(ts1, 50_160);
+        eg.record_sent(160, ts1);
+        let (anchor_ntp1, anchor_rtp1) = eg.anchor.unwrap();
+        assert_eq!(
+            anchor_ntp1, anchor_ntp0,
+            "2 回目 record_sent で anchor NTP が変わらない (Issue #182 (d))"
+        );
+        assert_eq!(
+            anchor_rtp1, anchor_rtp0,
+            "2 回目 record_sent で anchor RTP が変わらない (Issue #182 (d))"
+        );
+
+        // 3 回目もしかり
+        let (_, ts2, _) = eg.next(160);
+        eg.record_sent(160, ts2);
+        assert_eq!(
+            eg.anchor.unwrap(),
+            (anchor_ntp0, anchor_rtp0),
+            "N 回目 record_sent でも anchor は不変"
+        );
+    }
+
+    /// RFC 3550 §6.4.1 / §8.2 (PR #239 SSRC rotate との整合) / Issue #182 (d):
+    /// `check_and_rotate_on_collision` で SSRC が rotate されても、 anchor は
+    /// **維持される**。
+    ///
+    /// 根拠: anchor は「wall clock と RTP timestamp の relationship」 であって
+    /// SSRC とは独立した量。 SSRC rotate は受信側からは "新しい source" に
+    /// 見えるが、 sabiden の egress 視点では同一の wall clock 起点の RTP
+    /// stream を継続出力しており、 線形性を破壊する理由がない。
+    ///
+    /// この性質により、 SSRC rotate と SR 周期送出が同時に走っても rtp/ntp
+    /// 相関は崩れない (= rotate 直後の SR でも anchor 経由で正しい RTP ts が
+    /// 計算される)。
+    #[test]
+    fn rfc3550_6_4_1_build_sr_anchor_survives_ssrc_rotation() {
+        let old_ssrc: u32 = 0x1111_2222;
+        let mut eg = RtpEgressState {
+            ssrc: old_ssrc,
+            seq: 0,
+            timestamp: 7_000_000,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+            sample_rate_hz: 48_000, // Opus (RFC 7587 §4.1)
+            anchor: None,
+        };
+
+        // 初回 packet 払い出し + wire 送出成功で anchor 確定
+        let (_, ts0, _) = eg.next(960);
+        eg.record_sent(160, ts0);
+        let anchor_before = eg.anchor.expect("anchor 確定");
+        let rtp_before = eg.rtp_timestamp_at(anchor_before.0).unwrap();
+
+        // SSRC 衝突を検出 → rotate
+        let rotated = eg.check_and_rotate_on_collision(old_ssrc);
+        assert!(rotated, "前提: 衝突検出で rotate される (RFC 3550 §8.2)");
+        assert_ne!(eg.ssrc, old_ssrc, "前提: SSRC が新規値に切替");
+
+        // anchor は維持される
+        assert_eq!(
+            eg.anchor,
+            Some(anchor_before),
+            "rotate 後も anchor は保持される (Issue #182 (d): NTP/RTP relationship は SSRC と独立)"
+        );
+
+        // anchor 経由の RTP ts 計算は rotate 前後で同じ wall clock では同じ値
+        let rtp_after = eg.rtp_timestamp_at(anchor_before.0).unwrap();
+        assert_eq!(
+            rtp_before, rtp_after,
+            "同一 wall clock 瞬間に対する RTP ts は rotate 前後で不変"
+        );
     }
 }

@@ -974,7 +974,8 @@ RFC 3550 §6.4.1 は「自送信中の participant は周期的に Sender Report
 を用いて lip-sync (= RTP timestamp と wall clock の同期) と RTT 推定を行う。
 
 transcoder の 3 egress 経路に対し、 5 秒間隔で SR を送出するタスクを
-`rtcp_sr_sender_loop` (`src/call/transcoder.rs`) として spawn する。
+`rtcp_sr_sender_loop` (`src/call/transcoder.rs`) として spawn する (PR #242 で
+導入)。
 
 | egress 経路 | コード | SR 送出先 socket | SR 宛先 |
 |---|---|---|---|
@@ -992,23 +993,47 @@ WebRTC レッグの RTCP は str0m 自身が SAVPF 経路 (RFC 8108 / RFC 8835) 
 | RTP/RTCP mux | 有効 (= 同 UDP socket / 同 port で SR を送出) | RFC 5761 §3.3。 NGN P-CSCF は port+1 への inbound 許可が不確実 (`docs/asterisk-real-invite.md` §5.2 で確証なし) のため mux を採用 |
 | MissedTickBehavior | `Skip` | tick lag (上位 task busy 等) で複数 tick が溜まっても RFC 3550 §6.2 minimum interval = 5 秒を破らない |
 | 初回 SR 送出 | bridge 起動から **5 秒後** | 起動直後の `interval.tick()` (immediate) を 1 回消費して 5 秒待つ。 packet_count=0 の空 SR を wire に出さない実装 |
-| 送信統計 | `RtpEgressState.sent_packets` / `sent_octets` | 上位 loop が `to_socket.send_to` 成功時に `record_sent(payload_len)` を呼ぶ。 send 失敗時は集計しない (wire に出ていない packet を SR にカウントしないため) |
+| 送信統計 | `RtpEgressState.sent_packets` / `sent_octets` | 上位 loop が `to_socket.send_to` 成功時に `record_sent(payload_len, sent_rtp_ts)` を呼ぶ。 send 失敗時は集計しない (wire に出ていない packet を SR にカウントしないため) |
 | RC (report count) | 0 | transcoder egress は受信側 jitter buffer 統計を共有しないため (入力レッグの SSRC ≠ 出力レッグの SSRC)。 入力 RR/SR の集計は別 PR で対応 |
 | Peer 学習 | `LegState::peer` (late-binding) を周期 snapshot | 学習未了なら scheduling skip (次 tick で再判定)。 SDP 事前学習済なら最初の tick から送出 |
 | シャットダウン | bridge Drop で `JoinHandle::abort` | 他 loop と同ライフサイクル管理 (`tokio::spawn` の慣用パターン) |
 | 観測カウンタ | `Metrics::rtcp_sr_sent` (Prometheus `sabiden_rtcp_sr_sent_total`) | 全方向で集計 (将来 label 化で方向別に分解可) |
 
+##### NTP/RTP timestamp anchor (Issue #182 (d))
+
+`build_sr` が出す SR の `rtp_timestamp` は `RtpEgressState::rtp_timestamp_at`
+(本 PR で配線) によって anchor からの線形補間値を返す。 RFC 3550 §6.4.1
+要件「NTP timestamp と RTP timestamp が **同じ wall-clock 瞬間** を指す」を
+満たす:
+
+| 方向 | sample_rate_hz | 初期化 | 根拠 |
+|---|---|---|---|
+| `TranscodingBridge::ngn_to_web_egress` | 48000 | `BridgeState::with_sample_rates(OPUS_SAMPLE_RATE, NARROW_BAND_RATE)` | RFC 7587 §4.1 (Opus 48 kHz) |
+| `TranscodingBridge::web_to_ngn_egress` | 8000 | 同上 | RFC 3551 §4.5.14 (PCMU 8 kHz) |
+| `WebRtcAudioBridge::ngn_to_web_egress` (PCMU 直送) | 8000 | `direct_pcmu_passthrough=true` で 8 k / 8 k | NGN→peer も PCMU 8 kHz そのまま |
+| `WebRtcAudioBridge::ngn_to_web_egress` (Opus 変換) | 48000 | `direct_pcmu_passthrough=false` で 48 k / 8 k | str0m に Opus を渡すモード (将来) |
+| `WebRtcAudioBridge::web_to_ngn_egress` | 8000 | 常に | peer→NGN 出力は常に PCMU |
+
+anchor の semantics:
+- **初回 `record_sent` 呼び出し** (= wire 送出成功時) で `anchor = Some((NtpTimestamp::now(), sent_rtp_ts))` を確定する。 caller (3 つの送信 loop) は `next` が返した RTP ts (= wire に乗せた packet の ts) を渡す。
+- `next` (払い出し) 時点ではなく `record_sent` (wire 送出成功) で anchor を確定するのは、 wire 送出失敗時 (`to_socket.send_to` Err) に anchor だけ確定して NTP/RTP 線形性が 1 frame ずれる事故を避けるため (RFC 3550 §6.4.1 「NTP timestamp ↔ RTP timestamp の対応」 は実際に wire に出した packet を基準にすべき)。
+- 2 回目以降の `record_sent` 呼び出しでは anchor は **不変** (上書きしない)。 これにより wall clock と RTP timestamp の relationship が long-running 通話でも線形に保持される。
+- SSRC rotate (RFC 3550 §8.2 / PR #239 `check_and_rotate_on_collision`) は anchor を **保持** する。 anchor は wall clock と RTP ts の関係であり、 SSRC とは独立した量だから。
+- `rtp_timestamp_at(now_ntp)` は anchor から線形補間で「now_ntp 瞬間に対応する RTP ts」を返す:
+
+  ```text
+  rtp_at_now = anchor_rtp + round( (now_ntp - anchor_ntp) * sample_rate_hz )
+  ```
+
+  `build_sr` 内で `let now_ntp = NtpTimestamp::now(); rtp_timestamp_at(now_ntp).unwrap_or(self.timestamp)` を呼んで埋め込む。 anchor 未確定 (= 1 packet も wire に出していない) の場合は `self.timestamp` fallback だが、 実運用では `record_sent` 後にしか SR を出さないため通常通過しない。
+
 ##### 未実装 (Issue #182 残)
 
 - **(b) loss/reorder propagation** (RFC 3550 §6.4.1): 出力 seq は transcoder
   内で内部生成のため入力 seq の loss/reorder を伝播していない。 別 PR。
-- **(d) timestamp NTP 基準**: 出力 timestamp 初期値が random で NTP 同期計算
-  の基準が不安定。 本 SR 送出は近似 (現在の egress.timestamp = 次回送信予定値
-  を SR の `rtp_timestamp` に使う) で動くが、 厳密な (NTP_now ↔ RTP_at_NTP_now)
-  対応は別 PR。
-- **(e) SSRC collision detection** (RFC 3550 §8.2): PR #239 で並行進行中。
+- **(e) SSRC collision detection** (RFC 3550 §8.2): PR #239 で merge 済。
   `build_sr` は SR 生成時に `self.ssrc` を読むため、 rotate 後の新 SSRC で
-  自動的に SR が出る (本 PR と #239 のマージ順は独立)。
+  自動的に SR が出る。 anchor は rotate を跨いで保持される。
 
 #### orchestrator 配線
 

@@ -1072,4 +1072,218 @@ mod tests {
         let to = bye.headers.get("to").unwrap();
         assert!(to.contains("tag=ext-side"), "to: {}", to);
     }
+
+    /// RFC 3261 §15.1.1 / §12.2.1.1 + Issue #258:
+    /// NGN inbound 通話 (anonymous caller、 carrier の P-CSCF が Record-Route 付与)
+    /// で sabiden が UAS として 200 OK を返した後、 PWA disconnect で UAS dialog
+    /// から BYE を組み立てたとき、 各ヘッダが carrier 側 dialog state と整合する
+    /// ことを検証する。
+    ///
+    /// 実機 v9 evidence (2026-05-11 15:13、 /tmp/sabiden-dev/trace/...) で観測した
+    /// INVITE / PRACK ヘッダ値をそのまま fixture にしている。 旧実装は dialog の
+    /// `local_uri` に sabiden Contact (`sip:sabiden@<eth1>:5060`) を入れていたため
+    /// BYE の From URI が carrier dialog state と不整合になり 481 Call/Transaction
+    /// Does Not Exist で reject された。 RFC 3261 §12.1.1 通り「INVITE To URI =
+    /// local_uri」「INVITE From URI = remote_uri」 を採用すれば carrier 側 dialog
+    /// state と完全一致する。
+    #[test]
+    fn rfc3261_15_1_1_inbound_dialog_pwa_disconnect_sends_valid_bye() {
+        // === 受信した NGN INVITE (実機 v9 trace そのまま) ===
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0191349809@118.177.72.242:5060");
+        invite.headers.set(
+            "Via",
+            "SIP/2.0/UDP 118.177.125.1:5060;branch=z9hG4bKb34bbaf50bbc",
+        );
+        invite
+            .headers
+            .set("From", "<sip:anonymous@anonymous.invalid>;tag=gK0c32863e");
+        invite.headers.set("To", "<sip:0191349809@ntt-east.ne.jp>");
+        invite
+            .headers
+            .set("Call-ID", "e23f5e55d7eb391ccb8e6cec36db275d@ntt-east.ne.jp");
+        invite.headers.set("CSeq", "778972 INVITE");
+        invite.headers.set("Contact", "<sip:118.177.125.1:5060>");
+        invite
+            .headers
+            .set("Record-Route", "<sip:118.177.125.1:5060;lr>");
+
+        // === sabiden が返した 200 OK (To-tag を付与) ===
+        let mut headers = SipHeaders::new();
+        headers.set(
+            "Via",
+            "SIP/2.0/UDP 118.177.125.1:5060;branch=z9hG4bKb34bbaf50bbc",
+        );
+        headers.set("From", "<sip:anonymous@anonymous.invalid>;tag=gK0c32863e");
+        headers.set("To", "<sip:0191349809@ntt-east.ne.jp>;tag=sabiden-26e58533");
+        headers.set("Call-ID", "e23f5e55d7eb391ccb8e6cec36db275d@ntt-east.ne.jp");
+        headers.set("CSeq", "778972 INVITE");
+        headers.set("Contact", "<sip:sabiden@118.177.72.242:5060>");
+        let response = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: Vec::new(),
+        };
+
+        // === orchestrator が build する DialogConfig (Issue #258 修正後) ===
+        // RFC 3261 §12.1.1: local_uri = INVITE To URI, remote_uri = INVITE From URI
+        let cfg = DialogConfig {
+            local_uri: "sip:0191349809@ntt-east.ne.jp".to_string(),
+            remote_uri: "sip:anonymous@anonymous.invalid".to_string(),
+            local_contact: "sip:sabiden@118.177.72.242:5060".to_string(),
+            sent_by: "118.177.72.242:5060".to_string(),
+        };
+        let dlg = Dialog::from_uas_invite(&invite, &response, cfg).unwrap();
+        assert_eq!(dlg.state(), DialogState::Confirmed);
+
+        // === UAS dialog state assertions (RFC 3261 §12.1.1) ===
+        assert_eq!(
+            dlg.id().call_id,
+            "e23f5e55d7eb391ccb8e6cec36db275d@ntt-east.ne.jp"
+        );
+        // local_tag = 200 OK の To-tag (sabiden が付けた)
+        assert_eq!(dlg.id().local_tag, "sabiden-26e58533");
+        // remote_tag = INVITE の From-tag (carrier が付けた)
+        assert_eq!(dlg.id().remote_tag, "gK0c32863e");
+        // remote_target = INVITE Contact (= carrier の P-CSCF)
+        assert_eq!(dlg.remote_target(), "sip:118.177.125.1:5060");
+        // route_set は INVITE Record-Route そのまま (UAS は順序保持、 §12.1.1)
+        assert_eq!(
+            dlg.route_set(),
+            &["<sip:118.177.125.1:5060;lr>".to_string()]
+        );
+
+        // === build_bye() の各ヘッダを検証 (RFC 3261 §15.1.1 / §12.2.1.1) ===
+        let bye = dlg.build_bye();
+        assert_eq!(bye.method, SipMethod::Bye);
+
+        // Request-URI: loose routing なので remote_target (P-CSCF Contact)
+        assert_eq!(bye.uri, "sip:118.177.125.1:5060");
+
+        // From: local_uri (INVITE To URI) + local_tag (sabiden の 200 OK To-tag)
+        // ★ Issue #258 の核心: ここが carrier 視点の remote-URI と一致しないと 481
+        let from = bye.headers.get("from").unwrap();
+        assert!(
+            from.contains("<sip:0191349809@ntt-east.ne.jp>"),
+            "BYE From URI が INVITE To URI と一致していない: {}",
+            from
+        );
+        assert!(
+            from.contains("tag=sabiden-26e58533"),
+            "BYE From tag が 200 OK の To-tag (= sabiden 採番) と一致していない: {}",
+            from
+        );
+
+        // To: remote_uri (INVITE From URI) + remote_tag (INVITE From-tag)
+        let to = bye.headers.get("to").unwrap();
+        assert!(
+            to.contains("<sip:anonymous@anonymous.invalid>"),
+            "BYE To URI が INVITE From URI と一致していない: {}",
+            to
+        );
+        assert!(
+            to.contains("tag=gK0c32863e"),
+            "BYE To tag が INVITE From-tag と一致していない: {}",
+            to
+        );
+
+        // Call-ID: INVITE と同じ
+        assert_eq!(
+            bye.headers.get("call-id").unwrap(),
+            "e23f5e55d7eb391ccb8e6cec36db275d@ntt-east.ne.jp"
+        );
+
+        // CSeq: UAS direction は INVITE と独立、 1 から開始 (RFC 3261 §12.2.1.1)
+        assert_eq!(bye.headers.get("cseq").unwrap(), "1 BYE");
+
+        // Route: Record-Route 単一エントリ (UAS は順序保持なので reverse 不要)
+        let route_headers = bye.headers.get_all("route");
+        assert_eq!(route_headers.len(), 1);
+        assert!(
+            route_headers[0].contains("sip:118.177.125.1:5060;lr"),
+            "BYE Route が Record-Route と一致していない: {}",
+            route_headers[0]
+        );
+
+        // Max-Forwards: 70 (RFC 3261 §8.1.1.6 推奨初期値)
+        assert_eq!(bye.headers.get("max-forwards").unwrap(), "70");
+
+        // Via: 新規 branch (sent_by は sabiden eth1)
+        let via = bye.headers.get("via").unwrap();
+        assert!(
+            via.contains("SIP/2.0/UDP 118.177.72.242:5060"),
+            "via: {}",
+            via
+        );
+        assert!(
+            via.contains("branch=z9hG4bK"),
+            "via must have new branch: {}",
+            via
+        );
+    }
+
+    /// Regression: Issue #258 の bug が再導入されていないことを直接 assert する。
+    /// 旧実装 (`local_uri = sabiden Contact URI`) の場合に BYE が
+    /// `From: <sip:sabiden@...>;tag=...` で組み立てられて carrier 視点で 481
+    /// 拒否される、 という挙動を「**そういう** dialog state は作っちゃいけない」
+    /// で検出する。 build_ext_dialog_cfg (内線方向) と同じ規約 (`local_uri =
+    /// INVITE To URI`) を NGN inbound 方向でも守ることを契約として明示する。
+    #[test]
+    fn rfc3261_12_1_1_inbound_dialog_local_uri_must_be_invite_to_uri() {
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0191349809@118.177.72.242:5060");
+        invite.headers.set(
+            "Via",
+            "SIP/2.0/UDP 118.177.125.1:5060;branch=z9hG4bKregression258",
+        );
+        invite
+            .headers
+            .set("From", "<sip:anonymous@anonymous.invalid>;tag=carrier1");
+        invite.headers.set("To", "<sip:0191349809@ntt-east.ne.jp>");
+        invite
+            .headers
+            .set("Call-ID", "regression-258@ntt-east.ne.jp");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Contact", "<sip:118.177.125.1:5060>");
+
+        let mut headers = SipHeaders::new();
+        headers.set(
+            "Via",
+            "SIP/2.0/UDP 118.177.125.1:5060;branch=z9hG4bKregression258",
+        );
+        headers.set("From", "<sip:anonymous@anonymous.invalid>;tag=carrier1");
+        headers.set("To", "<sip:0191349809@ntt-east.ne.jp>;tag=sabiden-tag-xyz");
+        headers.set("Call-ID", "regression-258@ntt-east.ne.jp");
+        headers.set("CSeq", "1 INVITE");
+        headers.set("Contact", "<sip:sabiden@118.177.72.242:5060>");
+        let response = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: Vec::new(),
+        };
+
+        // 正しい cfg (RFC 3261 §12.1.1 準拠)
+        let cfg = DialogConfig {
+            local_uri: "sip:0191349809@ntt-east.ne.jp".to_string(),
+            remote_uri: "sip:anonymous@anonymous.invalid".to_string(),
+            local_contact: "sip:sabiden@118.177.72.242:5060".to_string(),
+            sent_by: "118.177.72.242:5060".to_string(),
+        };
+        let dlg = Dialog::from_uas_invite(&invite, &response, cfg).unwrap();
+        let bye = dlg.build_bye();
+        let from = bye.headers.get("from").unwrap();
+
+        // From URI には sabiden Contact が含まれていてはならない (旧バグの兆候)
+        assert!(
+            !from.contains("sip:sabiden@"),
+            "Issue #258 regression: BYE From URI に sabiden Contact が混入している (carrier が 481 で reject する): {}",
+            from
+        );
+        // From URI には INVITE To URI (= 自局番号 @ ntt-east.ne.jp) が含まれているべき
+        assert!(
+            from.contains("0191349809@ntt-east.ne.jp"),
+            "BYE From URI に INVITE To URI が含まれていない: {}",
+            from
+        );
+    }
 }

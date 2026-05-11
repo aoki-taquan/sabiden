@@ -475,6 +475,21 @@ NGN→WebRTC 着信成立時、 `NgnInboundHandler::handle_invite` は winner We
 | `layer: Option<Arc<TransactionLayer>>` | BYE 送信に使う NGN 側 TransactionLayer。 |
 | `fallback_peer: SocketAddr` | dialog next-hop URI 解決失敗時の fallback (= 受信 INVITE の `remote`)。 |
 
+`DialogConfig` の組み立て規約 (RFC 3261 §12.1.1、 Issue #258 で確立):
+
+- `local_uri` = **INVITE の To URI そのまま** (例: `<sip:0191349809@ntt-east.ne.jp>`)。
+  sabiden Contact URI (`sip:sabiden@<eth1>:5060`) を入れてはならない。
+- `remote_uri` = **INVITE の From URI** (例: `<sip:anonymous@anonymous.invalid>`)。
+- `local_contact` = sabiden が 200 OK で返した Contact URI (= eth1 IP)。
+- `sent_by` = sabiden の Via sent-by (eth1 IP + 5060)。
+
+このうち最重要は `local_uri`。 sabiden が UAC として in-dialog request (BYE) を
+組み立てるとき `From: <local_uri>;tag=<local_tag>` が carrier 視点の
+**dialog の remote (= sabiden side) URI** と完全一致する必要がある (RFC 3261
+§12.2.1.1 / §15.1.1)。 旧実装は local_uri に sabiden Contact URI を入れていた
+ため、 PWA disconnect 経路の BYE が 481 Call/Transaction Does Not Exist で
+reject された (実機 v9 evidence、 2026-05-11)。
+
 双方向 BYE 経路 (RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog 終了を
 もう片側へ伝搬する責務):
 

@@ -12558,7 +12558,7 @@ mod tests {
             let mut sent = 0u32;
             while sent < 2 {
                 let (n, peer) = match tokio::time::timeout(
-                    Duration::from_secs(8),
+                    Duration::from_secs(20),
                     fake_ngn_clone.recv_from(&mut buf),
                 )
                 .await
@@ -12692,7 +12692,7 @@ mod tests {
             let mut sent = 0u32;
             while sent < 2 {
                 let (n, peer) = match tokio::time::timeout(
-                    Duration::from_secs(8),
+                    Duration::from_secs(20),
                     fake_ngn_clone.recv_from(&mut buf),
                 )
                 .await

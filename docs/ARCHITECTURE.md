@@ -251,6 +251,34 @@ Decline は WS 接続 (= 内線登録) ごと閉じる `Bye` とは別物。 個
 のみを拒否し、 WS は維持する。 詳細は `src/webrtc/signaling.rs::ClientMessage`
 docstring。
 
+#### `webrtc_active` leak sweeper (Issue #81 / #139)
+
+NGN→WebRTC 着信成立時、 `NgnInboundHandler::handle_invite` は winner WebRTC
+レッグの `WsSink` を `webrtc_active: HashMap<Call-ID, WsSink>` に保持する。
+NGN BYE 受信時に `handle_bye` がこのテーブルから WS を引いて
+`ServerMessage::Bye` を browser に push する (RFC 3261 §15.1.2 /
+RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog 終了をもう片側へ伝搬)。
+
+しかし以下の経路では NGN BYE が来ず entry が leak する (Issue #139):
+
+1. **browser が WS のみ切断**: PWA UI を閉じただけで `ClientMessage::Bye`
+   未送出。 RFC 6455 §7.4 の close handshake で WS forwarder の mpsc
+   receiver が drop され、 `WsSink::is_closed` は true になるが、 NGN は
+   無音通話を保持し続けるため BYE 経由の `remove` は走らない。
+2. **将来の 5xx 経路 / outbound 混入** (defense-in-depth): 現状の `insert`
+   は 200 OK 成功後にのみ走るが、 リファクタで分岐が増えたとき安全網が要る。
+
+対処: `NgnInboundHandler::spawn_webrtc_active_sweeper` が
+`webrtc_active_sweep_interval` 周期 (既定 30 秒) で全 entry を走査し、
+`WsSink::is_closed` 一致 entry を `HashMap::retain` で除去する。
+sweeper は `Arc::downgrade` の弱参照で動くため、 `NgnInboundHandler` が
+drop されたら次の tick で `Weak::upgrade` が `None` を返して自動終了する
+(= テスト / shutdown で task leak しない)。
+
+`handle_bye` 経路の `remove` と sweeper の `retain` は同じ `Mutex` で逐次化
+されるため、 並走しても二重 remove / panic を起こさない (`HashMap::remove`
+は 1 回目で `Some`、 2 回目で `None`)。
+
 ### 発信 (スマホ → NGN)
 
 ```

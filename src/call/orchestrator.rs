@@ -86,6 +86,15 @@ use crate::webrtc::signaling::{
 /// 「a list of methods that the UA implementing this header supports」)。
 const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
 
+/// `webrtc_active` leak sweeper の最小 / フォールバック周期 (Issue #218)。
+///
+/// `tokio::time::interval(Duration::ZERO)` は事前条件違反で panic するため、
+/// `NgnInboundConfig.webrtc_active_sweep_interval` に 0 が流入したときの
+/// 安全フォールバックとして使う。 値は [`NgnInboundConfig::default()`] の
+/// 30 秒と揃える (struct field docstring の根拠: NGN 無音保持 5 分超
+/// TTC JJ-90.24 / Mutex 競合トレードオフ)。
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// NGN 着信処理の動作パラメータ。
 #[derive(Debug, Clone)]
 pub struct NgnInboundConfig {
@@ -491,7 +500,36 @@ impl NgnInboundHandler {
     /// 一致 entry を `remove` する。 `Arc::strong_count` が落ちれば
     /// (= `NgnInboundHandler` 自体が dropped) sweeper も即座に終了する
     /// (`Weak::upgrade` が `None` を返す)。
+    ///
+    /// # `Duration::ZERO` 防御 (Issue #218)
+    ///
+    /// `tokio::time::interval(Duration::ZERO)` は事前条件違反で panic する
+    /// (tokio docs: "panics if `period` is zero")。 現状 `NgnInboundConfig`
+    /// の TOML deserialize 経路は無く `main.rs` の hard-code 30s だけが
+    /// 実投入されるが、 将来 config 化 / テスト fixture / `Default` 派生
+    /// ミスでゼロが流入する static fragility がある (CLAUDE.md §6.5
+    /// panic 禁止)。 同種の panic 経路を `WebRtcConfig::default()` で
+    /// 既に修正している (Issue #166 / `src/config/mod.rs:218`)。
+    ///
+    /// ここでは sweeper 入口で `Duration::ZERO` を [`MIN_SWEEP_INTERVAL`]
+    /// (= 既定 30s と同値) に clamp し、 `warn!` で誤投入を可視化する。
+    /// 値の選択根拠は struct field docstring:
+    /// NGN は無音通話を 5 分超まで保持し得るため (TTC JJ-90.24)、 通話
+    /// あたり数十秒の leak window は許容範囲、 過剰短は不要 Mutex 競合を
+    /// 増やす。 そのため fallback は 0 や 1ms ではなく既定値 30s と揃える。
     fn spawn_webrtc_active_sweeper(weak_self: std::sync::Weak<Self>, interval: Duration) {
+        // Issue #218: `Duration::ZERO` を `tokio::time::interval` に渡すと
+        // panic する (`interval` 事前条件)。 production config から 0 が
+        // 流入しても sweeper が落ちないよう、 ここで弾く (defense-in-depth)。
+        let interval = if interval.is_zero() {
+            warn!(
+                fallback_secs = MIN_SWEEP_INTERVAL.as_secs(),
+                "webrtc_active sweeper: interval=0 は tokio::time::interval を panic させるため既定値にフォールバック (Issue #218)"
+            );
+            MIN_SWEEP_INTERVAL
+        } else {
+            interval
+        };
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // 初回 tick は即時発火するので 1 回読み飛ばす (= 起動直後の空 sweep を避ける)。
@@ -9076,6 +9114,80 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Issue #218: `spawn_webrtc_active_sweeper` に `Duration::ZERO` を渡しても
+    /// caller スレッドで panic せず、 sweeper が正常起動・終了できることを検証する。
+    ///
+    /// 背景: `tokio::time::interval(Duration::ZERO)` は事前条件違反で panic
+    /// する (tokio docs: "panics if `period` is zero")。 同種の panic を
+    /// `WebRtcConfig::default()` 経路で既に塞いだ事例あり (Issue #166 /
+    /// `src/config/mod.rs:218`)。 `NgnInboundConfig` も同種の static fragility
+    /// (Default 派生ミス / 将来の config TOML 化) を抱えるため、 sweeper 入口
+    /// で `Duration::ZERO` → [`MIN_SWEEP_INTERVAL`] に clamp する (CLAUDE.md
+    /// §6.5: production code で panic / unwrap 禁止)。
+    ///
+    /// 検証方針:
+    /// - clamp が無いと spawn 内の `interval(ZERO)` で panic し task は即抜ける。
+    ///   tokio runtime はそれを caller には伝播しないが、 spawn 直後に
+    ///   `Weak::upgrade().is_some()` 確認をすることで「呼び出し自体が unwind
+    ///   していない」ことを保証する (panic は caller に届かない)。
+    /// - clamp が効いていれば task は 30s 周期 ticker を持って待機する。
+    ///   handler drop 後は `Weak` しか持たないため、 strong_count=0 になる。
+    #[tokio::test]
+    async fn issue218_zero_duration_does_not_panic() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let handler = NgnInboundHandler::new(
+            sabiden_sock,
+            inviter,
+            ExtensionRegistrar::new(),
+            NgnInboundConfig::default(),
+        );
+
+        // ZERO で sweeper を起動。 clamp が漏れていればこの呼び出しは
+        // tokio::spawn の中で interval(ZERO) panic を起こすが、 caller スレッド
+        // からは catch できない。 ここでは clamp 経路が走り、 panic せず
+        // task が立ち上がることを期待する。
+        let weak = Arc::downgrade(&handler);
+        NgnInboundHandler::spawn_webrtc_active_sweeper(weak.clone(), Duration::ZERO);
+
+        // sweeper 起動が caller スレッドを unwind していないことを確認。
+        assert!(weak.upgrade().is_some(), "ハンドラ Arc はまだ生存");
+
+        // ハンドラ drop → strong_count=0。 sweeper task は Weak しか持たない
+        // ため、 panic 有無に関わらず upgrade は None を返す。
+        drop(handler);
+        assert!(
+            weak.upgrade().is_none(),
+            "ハンドラ drop 後は強参照ゼロ (sweeper task は Weak しか持たない)"
+        );
+    }
+
+    /// Issue #218: clamp 後の interval が [`MIN_SWEEP_INTERVAL`] (= 30s) と
+    /// 一致することを確認する semantics test。 値変更時の回帰防止 + docstring
+    /// との二重チェック。 [`NgnInboundConfig::default()`] と揃わないと
+    /// 「ZERO 投入時だけ sweep が遅くなる / 早くなる」 という驚き挙動になる。
+    #[test]
+    fn issue218_min_sweep_interval_matches_default() {
+        assert_eq!(
+            MIN_SWEEP_INTERVAL,
+            Duration::from_secs(30),
+            "MIN_SWEEP_INTERVAL は struct field docstring の 30s と一致させる"
+        );
+        assert_eq!(
+            MIN_SWEEP_INTERVAL,
+            NgnInboundConfig::default().webrtc_active_sweep_interval,
+            "MIN_SWEEP_INTERVAL は NgnInboundConfig::default() と揃える (clamp 後の挙動が既定と等価になる)"
+        );
+        // Duration::ZERO.is_zero() の semantics 文書化 (clamp 条件の前提)。
+        // 同 pattern: src/config/mod.rs:874 の Issue #166 既存テスト。
+        assert!(
+            Duration::ZERO.is_zero(),
+            "Duration::ZERO は is_zero() が true を返す (clamp 条件の前提)"
+        );
     }
 
     /// Issue #83: `fork_to_bindings` が `Timeout` で抜けたとき、 走っていた

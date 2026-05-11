@@ -160,7 +160,7 @@ struct LegState {
 /// 余り誤差 (最大 1 frame = 20 ms 分) があり、 受信側の NTP↔RTP 線形回帰が
 /// 微小にずれる。
 ///
-/// `anchor` は **初回 `next` 呼び出し時点** の (wall clock NTP, 対応 RTP ts)
+/// `anchor` は **初回 `record_sent` 呼び出し時点** の (wall clock NTP, 対応 RTP ts)
 /// を 1 度だけ確定する。 SR 生成時は anchor からの NTP 経過秒に `sample_rate_hz`
 /// を乗じて「**この SR 送出瞬間に対応する正確な RTP timestamp**」を計算する。
 /// これにより:

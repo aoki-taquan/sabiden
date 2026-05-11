@@ -2197,29 +2197,39 @@ mod tests {
         let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
 
         // INVITE を別タスクで送出 (transaction が table に登録される)。
-        // `create_client` まで実行されるのを待つため、 transaction layer に
-        // 登録される前 (= provisional_watch が None を返す前) に
-        // cancel_pending が走らないよう、 INVITE 登録完了を notify で同期する。
+        // `send_request` は INVITE 最終応答まで返らないので、 ここでは
+        // fire-and-forget で spawn し、 親タスクは別経路で「INVITE 登録完了」
+        // を待つ。
         let layer_for_invite = uac.layer.clone();
         let server_addr_invite = uac.server_addr;
         let plan_for_invite = plan.clone();
-        let invite_started = Arc::new(tokio::sync::Notify::new());
-        let invite_started_signal = invite_started.clone();
         let invite_task = tokio::spawn(async move {
-            // create_client は send_request 内で実行されるが、 spawn の境界で
-            // 必ず実行が始まるとは限らない。 ここで明示的に layer.create_client
-            // を先に呼んで registration を保証する: send_request は内部で
-            // create_client を呼ぶので、 同等の registration が走る。
             let _ = layer_for_invite
                 .send_request(plan_for_invite.request, server_addr_invite)
                 .await;
-            invite_started_signal.notify_one();
         });
 
-        // INVITE が transaction table に登録されるまで短く待つ
-        // (オーケストレーター実機経路では handle_ext_cancel が呼ばれる時点で
-        // 必ず INVITE 送信済なので、 実機 race ではなくテスト同期のため)。
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // RFC 3261 §17.1.3 で identify される transaction id を先に算出し、
+        // `provisional_watch` が Some を返す = `create_client` が table に
+        // 登録完了、 を deterministic に観測する。
+        // 旧実装は `sleep(20ms)` で「たぶん終わってるだろう」と同期していたが、
+        // CI 負荷で 20ms 内に registration が完了しないと flake する。
+        // 本テストは production API の watch が登場した時点で確定なので、
+        // `tokio::task::yield_now` で polling する: registration は同一プロセス
+        // 内のロック取得 1 回で済むので待ち時間は実質ゼロ。
+        let invite_id =
+            crate::sip::transaction::TransactionId::from_request(&plan.request).unwrap();
+        let registration = async {
+            loop {
+                if uac.layer.provisional_watch(&invite_id).await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), registration)
+            .await
+            .expect("INVITE が transaction table に登録されない (test bug)");
 
         // 1xx 受信前に cancel_pending を呼ぶ (= server 側はまだ 150ms 寝てる)。
         // 100 Trying 到達まで cancel_pending が **待つ** ことを確認する。
@@ -2313,8 +2323,36 @@ mod tests {
                 .await;
         });
 
-        // 486 が dispatch されるのを待ってから cancel_pending を呼ぶ。
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 486 が dispatch されて transaction layer 内部状態が
+        // `InviteResponseProgress::Final` に遷移するまで watch で deterministic
+        // に待つ。 旧実装は `sleep(100ms)` で「たぶん 486 は届いてるだろう」と
+        // 同期していたが、 CI 負荷で 100ms 内に dispatch が間に合わないと
+        // 「Pending のままで cancel_pending を呼んで Pending を観測 →
+        // 1xx 待機経路 → 32s 後 timeout」 となり flake する。
+        // production API の watch を購読することで、 final 観測 = 確定同期。
+        let invite_id =
+            crate::sip::transaction::TransactionId::from_request(&plan.request).unwrap();
+        // registration 完了まで poll (create_client は同一プロセス内のロック
+        // 取得 1 回で完了するので実質待ち時間ゼロ)。
+        let mut rx = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(rx) = uac.layer.provisional_watch(&invite_id).await {
+                    break rx;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("INVITE registration timeout (test bug)");
+        // RFC 3261 §9.1 後半: 486 → Final 遷移を観測。
+        // watch::Receiver::wait_for は値が predicate を満たすまで block。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rx.wait_for(|v| matches!(v, InviteResponseProgress::Final)),
+        )
+        .await
+        .expect("486 が transaction layer に届かない (test bug)")
+        .expect("provisional watch sender が drop された (test bug)");
 
         // RFC 3261 §9.1 後半: 最終応答後の CANCEL は no-op = NotSent。
         let outcome = uac.cancel_pending(&plan).await.expect("cancel_pending err");

@@ -256,6 +256,13 @@ export const App: Component = () => {
             signaling = null;
             teardownCall();
             clearToken();
+            // Issue #219: 旧 session 由来の rate-limited deadline をリセット。
+            // auth エラーで強制ログアウトされた後に別ユーザ (別 ext_id) が
+            // login し直したとき、 前 session の deadline が UI に残ると
+            // 「context 不明の待機中」 UX バグになる。 NGN bucket は AOR 共有
+            // なので backend 的には継続中だが、 UI は新 session 開始時点で
+            // 一旦クリアし、 次の `rate_limited` error 受信で正しく再構成する。
+            setRateLimitedUntil(null);
             // Issue #142: Login コンポーネントに理由を伝えて画面に表示する。
             setView({ kind: "login", reason: "auth" });
             break;
@@ -267,6 +274,9 @@ export const App: Component = () => {
             // 後にユーザが明示的にログインし直す方が安全 (古い token で
             // 即再接続して 401 ループを再発させるリスク回避)。
             clearToken();
+            // Issue #219: 同上。 reconnect 上限到達で session が終了したので
+            // UI side の rate-limited deadline もリセットする。
+            setRateLimitedUntil(null);
             // Issue #142: Login コンポーネントに理由を伝えて画面に表示する。
             setView({ kind: "login", reason: "exhausted" });
             break;
@@ -342,6 +352,12 @@ export const App: Component = () => {
     clearToken();
     setStatus("未接続");
     setStatusOk(false);
+    // Issue #219: ユーザ明示ログアウト時に rate-limited deadline をリセット。
+    // 別ユーザ (別 ext_id) が同 PWA で続けて login したとき、 前ユーザの
+    // 抑制カウントダウンが残ると UI が「context 不明な待機中」 になる。
+    // backend bucket は AOR 共有なので再 INVITE 即時には再 rate_limited が
+    // 返ってくる可能性が高いが、 そのときは正規の error 受信経路で再構築する。
+    setRateLimitedUntil(null);
     setView({ kind: "login" });
   };
 

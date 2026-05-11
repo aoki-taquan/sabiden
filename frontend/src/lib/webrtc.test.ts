@@ -161,4 +161,56 @@ describe("WebRtcCall.addIce (Issue #92 / #206, RFC 8838 §14)", () => {
     expect(first).not.toBeNull();
     expect(first.candidate).toBe(cand);
   });
+
+  // Bug A2 fix (実機 v7 inbound): sabiden が offerer のとき remoteDescription の
+  // m-line に乗る `a=mid:<tag>` (例 `J9e`) を抽出して addIceCandidate に渡す。
+  // 旧実装はハードコードの `sdpMid:"0"` だったため chromium 124+ で
+  // `Cannot set ICE candidate for level=0 mid=0: No such transceiver` が出ていた。
+  it("rfc8838_14_uses_actual_mid_from_remote_sdp_when_available", async () => {
+    const call = new WebRtcCall(makeSignalingShim(), {
+      onRemoteTrack: () => {},
+      onConnectionState: () => {},
+    });
+    const pc = FakeRTCPeerConnection.lastInstance!;
+    // setRemoteDescription 後の SDP を模擬。 str0m offerer 由来 mid は ASCII 3 文字。
+    (pc as unknown as { remoteDescription: RTCSessionDescriptionInit }).remoteDescription = {
+      type: "offer",
+      sdp:
+        "v=0\r\n" +
+        "o=- 1 1 IN IP4 0.0.0.0\r\n" +
+        "s=-\r\n" +
+        "t=0 0\r\n" +
+        "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n" +
+        "c=IN IP4 0.0.0.0\r\n" +
+        "a=mid:J9e\r\n" +
+        "a=rtpmap:0 PCMU/8000\r\n",
+    };
+    const cand = "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host";
+    await call.addIce(cand);
+    expect(pc.calls).toHaveLength(1);
+    const first = pc.calls[0] as RTCIceCandidateInit;
+    expect(first).not.toBeNull();
+    expect(first.candidate).toBe(cand);
+    expect(first.sdpMid).toBe("J9e");
+    expect(first.sdpMLineIndex).toBe(0);
+  });
+
+  // remoteDescription 未設定 (setRemoteDescription 前): sdpMLineIndex フォールバック。
+  // RFC 8838 §14: sdpMid / sdpMLineIndex のいずれかがあれば良い。
+  it("rfc8838_14_falls_back_to_sdp_mline_index_when_remote_description_missing", async () => {
+    const call = new WebRtcCall(makeSignalingShim(), {
+      onRemoteTrack: () => {},
+      onConnectionState: () => {},
+    });
+    const pc = FakeRTCPeerConnection.lastInstance!;
+    // remoteDescription を意図的に設定しない。
+    const cand = "candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host";
+    await call.addIce(cand);
+    expect(pc.calls).toHaveLength(1);
+    const first = pc.calls[0] as RTCIceCandidateInit;
+    expect(first).not.toBeNull();
+    expect(first.candidate).toBe(cand);
+    expect(first.sdpMid).toBeUndefined();
+    expect(first.sdpMLineIndex).toBe(0);
+  });
 });

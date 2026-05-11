@@ -70,8 +70,8 @@ use crate::sip::uac::{CancelOutcome, EstablishedCall, InviteOutcome, InvitePlan,
 use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
 use crate::webrtc::signaling::{
-    PendingAnswers, PwaOutboundCloser, PwaOutboundHandler, PwaOutboundOutcome, ServerMessage,
-    WsSink,
+    PendingAnswers, PwaInboundCloser, PwaOutboundCloser, PwaOutboundHandler, PwaOutboundOutcome,
+    ServerMessage, WsSink,
 };
 
 /// RFC 3261 §8.2.1 / §20.5: 405 / 489 / 481 等の拒否応答に必ず添える
@@ -600,6 +600,105 @@ pub struct WebRtcOutboundEntry {
 /// どちらの方向 (NGN→PWA / PWA→NGN) からも引ける。
 pub type WebRtcOutboundActive = Arc<Mutex<HashMap<String, Arc<WebRtcOutboundEntry>>>>;
 
+/// NGN→PWA **着信** 通話の双方向 BYE 連動エントリ (実機 v7 Bug B / Issue #268)。
+///
+/// 既存 `webrtc_active: HashMap<String, WsSink>` (Issue #81) は NGN→PWA BYE
+/// 伝搬 (NGN BYE 受信 → browser に `ServerMessage::Bye` push) しか担っておらず、
+/// **逆向き**(= PWA WS close → NGN へ BYE 送出) は未実装だった。 そのため:
+///
+/// - PWA がタブ閉じ / ネットワーク断 / Cloudflare Tunnel idle 切断したとき、
+///   sabiden は NGN へ何も通知せず、 NGN は dialog confirmed のまま 5-10 秒
+///   タイムアウトで BYE を投げ返してくる (実機 v7 で `recv BYE` まで 6 秒の
+///   ギャップ観測)。 その間 RTP ブリッジは生きており、 PWA への送出は失敗
+///   ログで埋まる。
+///
+/// 本エントリは `WebRtcOutboundEntry` (PR #154 PWA→NGN 発信) の inbound 対称形:
+///
+/// - `uas_dialog`: 受信 INVITE と sabiden が返した 200 OK から構築した
+///   [`Dialog::from_uas_invite`] 結果。 BYE を組み立てるのに必要 (RFC 3261
+///   §15.1.1 / §12.2.1: in-dialog request は dialog state から組み立てる)。
+/// - `invite_cseq`: 受信 INVITE の CSeq 番号。 BYE の CSeq とは独立だが、
+///   観測用 (Re-INVITE 連番衝突防止の参考)。
+/// - `layer`: BYE 送信に使う `TransactionLayer`。
+/// - `fallback_peer`: dialog next-hop URI が解決不能のとき (FQDN 未解決 等)
+///   の最終フォールバック。 sabiden に届いた INVITE の `remote` (= P-CSCF)
+///   をそのまま渡す。 RFC 3263 完全 DNS 解決は将来 Issue。
+/// - `ws`: PWA WS 接続。 NGN BYE 受信時に `ServerMessage::Bye` を push する用。
+/// - `bridge_call_id`: RTP ブリッジ ID (transparent モードでは `None`)。
+///   BYE 時に `CallManager::terminate` で停止する。
+///
+/// RFC 3261 §15.1.2 / RFC 5853 §3.2.2 (SBC framework): B2BUA は片側 dialog
+/// 終了をもう片側へ伝搬する責務を負う。 outbound (Issue #147) と inbound
+/// (本エントリ) を両方持って初めて、 PWA 切断 → NGN 即時 BYE という対称な
+/// hangup シーケンスが成立する。
+pub struct WebRtcInboundEntry {
+    /// 受信 INVITE / 200 OK から組み立てた UAS dialog state。
+    ///
+    /// `Option` で包む理由: degraded 経路 (旧 fixture / test で `layer` が
+    /// 注入されていない経路) では dialog を構築しても BYE は送れないため、
+    /// `None` で保留する。 production (= `wire_ngn_inbound_with_*_layer_*` 経由)
+    /// では常に `Some` (BYE 送出が機能する完全 entry)。
+    ///
+    /// `tokio::sync::Mutex` を使う理由: BYE 送信時に `layer.send_request`
+    /// で I/O await するため (`std::sync::Mutex` だと async boundary 越しに
+    /// guard を保持できない)。 短期ロックで競合は実害なし。
+    pub uas_dialog: Option<Mutex<Dialog>>,
+    /// BYE 送信用の SIP TransactionLayer。 `uas_dialog` と同じ理由で `Option`。
+    pub layer: Option<Arc<TransactionLayer>>,
+    /// dialog next-hop URI 解決失敗時のフォールバック宛先 (P-CSCF)。
+    pub fallback_peer: SocketAddr,
+    /// PWA WS 接続。 NGN BYE 受信時の `ServerMessage::Bye` push 用。
+    /// `close_pwa_inbound_for_ws` が同 WS の全 entry を抽出する判定キー。
+    pub ws: WsSink,
+}
+
+impl WebRtcInboundEntry {
+    /// `WsSink` のみを持つ degraded エントリを作る。 test fixture / 旧経路
+    /// (layer 不在) で使う。 production は `wire_ngn_inbound_with_layer_*`
+    /// 経由で完全 entry が作られる。
+    #[cfg(test)]
+    pub fn ws_only_for_test(ws: WsSink) -> Arc<Self> {
+        Arc::new(Self {
+            uas_dialog: None,
+            layer: None,
+            fallback_peer: "127.0.0.1:5060".parse().unwrap(),
+            ws,
+        })
+    }
+
+    /// BYE を組み立てて NGN へ送出する (RFC 3261 §15.1.1)。
+    ///
+    /// 宛先は dialog next-hop (RFC 3261 §12.2.1.1) で決まり、 解決不能のときは
+    /// `fallback_peer` (= 受信 INVITE の `remote` = 通常 P-CSCF) を使う。
+    /// `UacDialog::send_bye` と同じ二段解決を `Dialog` 直接利用で再現する
+    /// (本エントリは UAS dialog なので `UacDialog` ラッパは流用できない)。
+    ///
+    /// 戻り値:
+    /// - `Ok(Some(resp))`: NGN から最終応答を受信 (典型的に 200 OK)。
+    /// - `Ok(None)`: degraded entry (dialog/layer 不足) のため BYE を送らず skip。
+    ///   旧 fixture / test 経路、 production では発生しない。
+    /// - `Err(...)`: NGN unreachable / transaction timeout 等。 呼出側は
+    ///   エラーでも sabiden 側 cleanup を続ける (best-effort)。
+    pub async fn send_bye(&self) -> Result<Option<SipResponse>> {
+        let (Some(dialog_lock), Some(layer)) = (self.uas_dialog.as_ref(), self.layer.as_ref())
+        else {
+            debug!("WebRtcInboundEntry::send_bye: degraded entry (dialog/layer 不足) → skip");
+            return Ok(None);
+        };
+        let mut dlg = dialog_lock.lock().await;
+        let bye = dlg.build_bye();
+        let peer = dlg.next_hop_socket(self.fallback_peer);
+        let resp = layer.send_request(bye, peer).await?;
+        dlg.terminate();
+        Ok(Some(resp))
+    }
+}
+
+/// NGN→PWA 着信通話の双方向 BYE 連動テーブル (Bug B / Issue #268)。
+///
+/// キーは受信 INVITE の Call-ID。 詳細は [`WebRtcInboundEntry`]。
+pub type WebRtcInboundActive = Arc<Mutex<HashMap<String, Arc<WebRtcInboundEntry>>>>;
+
 /// 内線レッグの answer SDP が「WebRTC peer から戻ったまま未書換のプレースホルダ」
 /// かを推定する。
 ///
@@ -639,6 +738,19 @@ fn is_undirected_or_webrtc_placeholder_sdp(body: &[u8]) -> bool {
 /// NGN 着信ハンドラ。`TransactionLayer::spawn` の `inbound_rx` を消費する。
 pub struct NgnInboundHandler {
     socket: Arc<UdpSocket>,
+    /// NGN 側 SIP TransactionLayer (Bug B / Issue #268 で必要)。
+    ///
+    /// 用途: WS close 経路で PWA→NGN BYE を撃つときに `send_request` で使う。
+    /// 旧実装 (Issue #81 まで) は inbound 側で BYE 送出を必要としなかったため
+    /// `wire_ngn_inbound` の `_layer` 引数は未使用だった。 本フィールド導入で
+    /// inbound 側からも UAC として in-dialog request を送れるようになる
+    /// (RFC 3261 §12.2.1 / §15.1.1)。
+    ///
+    /// `Option` で包む理由: 旧 `with_*` constructor (test fixture / legacy 経路)
+    /// は layer なしで呼び出されており、 後方互換のため `None` も許す。
+    /// None 時は WS close → NGN BYE 経路が無効化される (旧挙動 = 5-10 秒
+    /// NGN タイムアウト BYE 待ち) だけで他機能には影響しない (defense-in-depth)。
+    layer: Option<Arc<TransactionLayer>>,
     inviter: ExtInviter,
     extensions: Arc<ExtensionRegistrar>,
     cfg: NgnInboundConfig,
@@ -647,15 +759,22 @@ pub struct NgnInboundHandler {
     /// 確立済み通話の Call-ID → `Option<CallId>` 対応。BYE 時にブリッジ停止に使う。
     /// `None` の値は「確立済みだが RTP ブリッジ未起動 (透過モード)」を意味する。
     active: Arc<Mutex<HashMap<String, Option<CallId>>>>,
-    /// 確立済み WebRTC 内線通話の Call-ID → WS ハンドル対応 (Issue #81)。
+    /// 確立済み WebRTC 内線通話の Call-ID → 通話 state エントリ (Issue #81 + Bug B 拡張)。
     ///
-    /// NGN BYE 受信時に該当する WebRTC peer の WS に `ServerMessage::Bye` を
-    /// push する。 SIP 内線レッグは UAS 側のダイアログから build_bye で
-    /// 同様に内線へ送るのが既存設計だが、 WebRTC レッグは独立した SIP
-    /// dialog を持たない (= 専用 WS シグナリング経路) ため別テーブルで
-    /// 紐づける。 RFC 3261 §15.1.2 / RFC 5853 §3.2.2 SBC framework: B2BUA
-    /// は片側の dialog 終了をもう片側へ伝搬する責務を負う。
-    webrtc_active: Arc<Mutex<HashMap<String, WsSink>>>,
+    /// NGN→PWA 方向 (NGN BYE 受信): 該当する WebRTC peer の WS に
+    /// `ServerMessage::Bye` を push する (Issue #81)。
+    ///
+    /// PWA→NGN 方向 (WS close): PWA がタブ閉じ / ネットワーク断したとき、
+    /// `close_pwa_inbound_for_ws` が同 WS 一致 entry を全抽出し、 各 entry
+    /// の `send_bye()` で NGN へ BYE を撃って bridge / metrics を cleanup する
+    /// (Bug B、 実機 v7 で PWA 切断後 6 秒 NGN BYE 待ちを観測 / 解消)。
+    ///
+    /// SIP 内線レッグは UAS 側のダイアログから build_bye で同様に内線へ送るのが
+    /// 既存設計だが、 WebRTC レッグは独立した SIP dialog を持たない (= 専用 WS
+    /// シグナリング経路) ため別テーブルで紐づける。 RFC 3261 §15.1.2 /
+    /// RFC 5853 §3.2.2 SBC framework: B2BUA は片側の dialog 終了をもう片側へ
+    /// 伝搬する責務を負う。
+    webrtc_active: WebRtcInboundActive,
     /// PWA→NGN 発信通話の双方向 BYE 連動テーブル (Issue #147)。
     /// `UasEventHandler` と同じ Arc を共有することで、 NGN→PWA / PWA→NGN
     /// 両方向の BYE が同じエントリを引ける。 詳細は [`WebRtcOutboundEntry`]。
@@ -705,6 +824,7 @@ impl NgnInboundHandler {
     ) -> Arc<Self> {
         Arc::new(Self {
             socket,
+            layer: None,
             inviter,
             extensions,
             cfg,
@@ -749,6 +869,7 @@ impl NgnInboundHandler {
     ) -> Arc<Self> {
         Arc::new(Self {
             socket,
+            layer: None,
             inviter,
             extensions,
             cfg,
@@ -778,6 +899,40 @@ impl NgnInboundHandler {
     ) -> Arc<Self> {
         Arc::new(Self {
             socket,
+            layer: None,
+            inviter,
+            extensions,
+            cfg,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            webrtc_active: Arc::new(Mutex::new(HashMap::new())),
+            webrtc_outbound_active,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
+            call_manager: Some(call_manager),
+            outbound_forwarder: Mutex::new(None),
+            metrics,
+        })
+    }
+
+    /// `with_call_manager_metrics_and_outbound_table` + `TransactionLayer` 連結版 (Bug B / Issue #268)。
+    ///
+    /// PWA WS close → NGN BYE 経路を有効化するために `TransactionLayer` を保持する。
+    /// inbound 通話エントリは BYE 送信時に layer 経由でリクエストを発行する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_layer_call_manager_metrics_and_outbound_table(
+        layer: Arc<TransactionLayer>,
+        socket: Arc<UdpSocket>,
+        inviter: ExtInviter,
+        extensions: Arc<ExtensionRegistrar>,
+        cfg: NgnInboundConfig,
+        call_manager: Arc<CallManager>,
+        metrics: Arc<Metrics>,
+        webrtc_outbound_active: WebRtcOutboundActive,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            socket,
+            layer: Some(layer),
             inviter,
             extensions,
             cfg,
@@ -797,6 +952,13 @@ impl NgnInboundHandler {
     /// テーブルを共有したい外部ハンドラに渡すための accessor (Issue #147)。
     pub fn webrtc_outbound_active(&self) -> WebRtcOutboundActive {
         self.webrtc_outbound_active.clone()
+    }
+
+    /// `webrtc_active` (NGN→PWA 着信通話の double BYE 連動テーブル) の Arc を
+    /// 返す (Bug B / Issue #268)。 シグナリング層が `PwaInboundCloser` 経由で
+    /// WS close 時に同 WS 一致 entry を抽出するために使う。
+    pub fn webrtc_inbound_active(&self) -> WebRtcInboundActive {
+        self.webrtc_active.clone()
     }
 
     /// 内線→NGN 発信通話の BYE を内線レッグへ伝搬するためのフォワーダを差し込む。
@@ -926,9 +1088,14 @@ impl NgnInboundHandler {
     /// `HashMap::retain` で 1 段で remove する (`extract_if` でもよいが、
     /// remove 値を一旦集める必要がないので retain が簡潔)。
     async fn sweep_webrtc_active(&self) -> usize {
+        // Bug B (Issue #268): エントリは `Arc<WebRtcInboundEntry>` に変わったので
+        // `ws.is_closed()` ではなく `entry.ws.is_closed()` で判定する。
+        // sweeper の意義 (Issue #139) は不変: 旧経路で BYE 不到来のまま leak した
+        // entry を周期的に除去する safety net。 close_pwa_inbound_for_ws が PR で
+        // BYE を撃つようになったため leak window は短いが、 防衛的に残す。
         let mut tbl = self.webrtc_active.lock().await;
         let before = tbl.len();
-        tbl.retain(|_, ws| !ws.is_closed());
+        tbl.retain(|_, entry| !entry.ws.is_closed());
         before - tbl.len()
     }
 
@@ -1640,6 +1807,49 @@ impl NgnInboundHandler {
                     resp_to_ngn
                         .headers
                         .set("Contact", format!("<sip:sabiden@{}>", contact_addr));
+                    // Bug B / Issue #268: 200 OK 送出前に UAS dialog state を採取する。
+                    // `tx.respond` 後は `resp_to_ngn` が consume されるため、 構築は
+                    // ここで行う必要がある。 SIP 内線 winner では `webrtc_ws` が None
+                    // なので dialog 構築自体スキップする (transparent モードで
+                    // 上流が処理する経路と整合)。
+                    let inbound_dialog = if webrtc_ws.is_some() {
+                        // RFC 3261 §12.1.1 UAS dialog 確立: (INVITE, 2xx) ペアと
+                        // sabiden 側 contact / sent-by を渡す。 失敗時は dialog 不在
+                        // のまま通話成立させる (BYE 経路だけ後で degrade)。
+                        let contact_uri = format!("sip:sabiden@{}", contact_addr);
+                        let sent_by = contact_addr.to_string();
+                        // local_uri は内線対 NGN なので NGN 側 From URI から相互変換
+                        // するのが厳密だが、 BYE が UAS-side で投げ返るときの To/From
+                        // は dialog 由来で正規化されるので、 contact_uri で代用する
+                        // (RFC 3261 §12.2.1: in-dialog request 整合は dialog state
+                        // から組み立てる)。
+                        let dlg_cfg = DialogConfig {
+                            local_uri: contact_uri.clone(),
+                            remote_uri: request
+                                .headers
+                                .get("from")
+                                .map(crate::sip::dialog::extract_uri)
+                                .unwrap_or_else(|| "sip:unknown@unknown".to_string()),
+                            local_contact: contact_uri,
+                            sent_by,
+                        };
+                        match Dialog::from_uas_invite(&request, &resp_to_ngn, dlg_cfg) {
+                            Ok(d) => Some(d),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    %call_id,
+                                    "Bug B / RFC 3261 §12.1.1: UAS dialog 構築失敗 \
+                                     (PWA disconnect 時 BYE 送出が degrade): WebRTC \
+                                     winner 通話自体は成立させる"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     tx.respond(resp_to_ngn).await?;
                     // 観測: NGN レッグも内線レッグも応答済みとして記録
                     self.metrics.record_invite_ngn(InviteResult::Answered);
@@ -1649,13 +1859,31 @@ impl NgnInboundHandler {
                         let mut active = self.active.lock().await;
                         active.entry(call_id.clone()).or_insert(None);
                     }
-                    // Issue #81: WebRTC レッグが winner なら NGN BYE 伝搬用に
-                    // WS ハンドルを Call-ID で保持する。 NGN → sabiden BYE 受信
-                    // 時に `handle_bye` が引いて `ServerMessage::Bye` を push し、
-                    // PWA の `App.tsx` 側 `case "bye"` ハンドラが `teardownCall()`
-                    // で UI を解放する (RFC 3261 §15.1.2)。
+                    // Issue #81 + Bug B 拡張: WebRTC レッグが winner なら双方向 BYE
+                    // 連動用エントリを Call-ID で保持する。
+                    //
+                    // - NGN → sabiden BYE 受信 (`handle_bye`): entry の `ws` で
+                    //   `ServerMessage::Bye` を push (RFC 3261 §15.1.2)。 既存
+                    //   Issue #81 経路。
+                    // - PWA WS close (`close_pwa_inbound_for_ws`): entry の
+                    //   `send_bye` で NGN へ BYE 送出 (Bug B、 RFC 5853 §3.2.2)。
+                    //
+                    // `layer` と `inbound_dialog` 両方揃った production 経路では
+                    // 完全 entry を作って双方向 BYE が機能する。 旧 fixture / test
+                    // 経路 (layer None) では degraded entry (BYE 送出 disabled)
+                    // を作るが、 NGN→PWA BYE push 経路は引き続き機能する。
                     if let Some(ws) = webrtc_ws {
-                        self.webrtc_active.lock().await.insert(call_id.clone(), ws);
+                        let _ = invite_cseq_num; // BYE は dialog 独立 CSeq なので未使用 (観測用に取得済)
+                        let entry = Arc::new(WebRtcInboundEntry {
+                            uas_dialog: inbound_dialog.map(Mutex::new),
+                            layer: self.layer.clone(),
+                            fallback_peer: remote,
+                            ws,
+                        });
+                        self.webrtc_active
+                            .lock()
+                            .await
+                            .insert(call_id.clone(), entry);
                     }
                     self.metrics.inc_call_active();
                 }
@@ -1951,12 +2179,22 @@ impl NgnInboundHandler {
         // dialog を持たないため、 専用 WS シグナリング (`ServerMessage::Bye`)
         // で通知する。 PWA 側 `App.tsx` の `case "bye"` ハンドラが
         // `teardownCall()` で UI を解放する。
-        let webrtc_ws = self.webrtc_active.lock().await.remove(&cid);
-        if let Some(ws) = webrtc_ws {
-            if let Err(e) = ws.send(ServerMessage::Bye) {
+        // Bug B (Issue #268): entry が `Arc<WebRtcInboundEntry>` に変わったので
+        // `entry.ws` 経由で push する。 NGN→PWA BYE 経路は既存 (Issue #81) と
+        // 同じ意味論。 ここで remove することで close_pwa_inbound_for_ws との
+        // 二重発火を idempotent に防ぐ (NGN BYE 経路で先に removed → WS close
+        // 経路は entries.is_empty() で early return)。
+        let webrtc_entry = self.webrtc_active.lock().await.remove(&cid);
+        if let Some(entry) = webrtc_entry {
+            if let Err(e) = entry.ws.send(ServerMessage::Bye) {
                 debug!(call_id=%cid, error=%e, "WebRTC BYE push 失敗 (browser 切断済?)");
             } else {
                 debug!(call_id=%cid, "WebRTC peer に BYE を push (NGN→PWA 伝搬)");
+            }
+            // NGN dialog は NGN BYE を受信して 200 OK を返した直後なので
+            // Terminated にしておく (RFC 3261 §15.1.1)。 idempotent。
+            if let Some(dlg) = entry.uas_dialog.as_ref() {
+                dlg.lock().await.terminate();
             }
         }
         Ok(())
@@ -4306,6 +4544,95 @@ impl PwaOutboundCloser for UasEventHandler {
     }
 }
 
+/// Bug B / Issue #268: PWA WS の close 受信時に呼ばれる、 NGN→PWA 着信通話
+/// の cleanup 経路 ([`PwaOutboundCloser`] の inbound 対称形)。
+///
+/// `webrtc_active` テーブルを線形にスキャンし、 同一 WS セッション
+/// (`WsSink::same_channel` 一致) のエントリを全て取り出して:
+///
+/// 1. NGN レッグへ `WebRtcInboundEntry::send_bye()` で BYE を撃つ
+///    (RFC 3261 §15.1.1)。 NGN が 5-10 秒タイムアウトまで dialog を保持して
+///    BYE を送り返してくる現象 (実機 v7 で観測) を即時解消する。
+/// 2. `CallManager::terminate(bridge_call_id)` で RTP ブリッジを停止。
+///    `webrtc_active` の `start_bridge_for_inbound` で `self.active` に
+///    `Some(bridge_call_id)` が入っているため、 そこから引いて停止する
+///    (新規 `bridge_call_id` フィールドは entry 内に保存しない: 旧 `self.active`
+///    との二重保管を避けるため)。
+/// 3. `metrics.dec_call_active()` で観測値を 1 減らす。
+/// 4. `self.pending` / `self.active` の Call-ID エントリも cleanup する
+///    (NGN BYE 経路の `handle_bye` と等価な後処理)。
+///
+/// `extract_if` で先に remove するため、 NGN→PWA BYE (`handle_bye`) と
+/// PWA→NGN BYE (本パス) が同時に発火しても先勝で他方は no-op (idempotent)。
+#[async_trait::async_trait]
+impl PwaInboundCloser for NgnInboundHandler {
+    async fn close_pwa_inbound_for_ws(&self, ws: &WsSink) -> usize {
+        // (1) WS が一致する entry を 1 段スキャンで一気に取り出す。
+        //     ロック保持中に send_bye を await すると NGN BYE 経路 (handle_bye)
+        //     が同 Mutex で詰まるので、 remove と外部 I/O は分離する。
+        let entries: Vec<(String, Arc<WebRtcInboundEntry>)> = {
+            let mut tbl = self.webrtc_active.lock().await;
+            tbl.extract_if(|_, e| e.ws.same_channel(ws)).collect()
+        };
+
+        let count = entries.len();
+        if count == 0 {
+            return 0;
+        }
+
+        // (2) 各 entry に対し NGN BYE → bridge terminate → metrics dec → pending/
+        //     active cleanup を実施。 send_bye は best-effort: NGN 到達不能でも
+        //     sabiden 側 cleanup は続ける (= 旧挙動より degrade しない)。
+        for (cid, entry) in entries {
+            match entry.send_bye().await {
+                Ok(Some(resp)) => {
+                    debug!(
+                        call_id = %cid,
+                        status = resp.status_code,
+                        "PWA disconnect → NGN BYE 送出完了 (Bug B / RFC 3261 §15.1.1)"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        call_id = %cid,
+                        "PWA disconnect → NGN BYE skip (degraded entry: dialog/layer 不足)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        call_id = %cid,
+                        "PWA disconnect → NGN BYE 送出失敗 (NGN unreachable?)"
+                    );
+                }
+            }
+
+            // bridge 停止 (`start_bridge_for_inbound` が `self.active` に
+            // `Some(bridge_call_id)` を入れている場合)。 transparent モード
+            // (`None`) や bridge 未起動経路では skip。
+            let bridge_id = { self.active.lock().await.remove(&cid) };
+            if let (Some(Some(bridge_call_id)), Some(mgr)) = (bridge_id, self.call_manager.as_ref())
+            {
+                if let Err(e) = mgr.terminate(bridge_call_id).await {
+                    warn!(
+                        error = %e,
+                        call_id = %cid,
+                        "PWA disconnect: bridge terminate 失敗"
+                    );
+                }
+            }
+            // pending 側も cleanup (NGN BYE 経路の `handle_bye` と等価)。
+            self.pending.lock().await.remove(&cid);
+            // call_active は (`webrtc_active` removed) で 1 回だけ減らす
+            // (NGN BYE 経路と二重発火しない idempotent ガード: 先に webrtc_active
+            // から抜けた側が dec を担当する)。
+            self.metrics.dec_call_active();
+        }
+
+        count
+    }
+}
+
 /// PWA→NGN 発信 target の defense-in-depth 検証 (signaling 層と同義語、
 /// PR #146 review #1 🔴#1)。 production と test 双方の経路で違反入力を NGN
 /// レッグまで運ばないよう、 trait 実装側でも assert する。
@@ -5251,7 +5578,7 @@ pub fn wire_ngn_inbound_with_manager_and_metrics(
 /// PWA→NGN 発信通話の双方向 BYE 連動 (NGN→PWA / PWA→NGN) が成立する。
 #[allow(clippy::too_many_arguments)]
 pub fn wire_ngn_inbound_with_manager_metrics_and_outbound_table(
-    _layer: Arc<TransactionLayer>,
+    layer: Arc<TransactionLayer>,
     socket: Arc<UdpSocket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
     inviter: ExtInviter,
@@ -5261,7 +5588,13 @@ pub fn wire_ngn_inbound_with_manager_metrics_and_outbound_table(
     metrics: Arc<Metrics>,
     webrtc_outbound_active: WebRtcOutboundActive,
 ) -> Arc<NgnInboundHandler> {
-    let handler = NgnInboundHandler::with_call_manager_metrics_and_outbound_table(
+    // Bug B / Issue #268: layer を `NgnInboundHandler` に渡して PWA WS close →
+    // NGN BYE 経路を有効化する。 旧経路 (`_layer` 未使用) は inbound 側で
+    // BYE を発射する必要が無かったため layer を握っていなかったが、 本 PR で
+    // `webrtc_active` を `WebRtcInboundEntry` 化し UAS dialog から BYE を組み
+    // 立てる経路を追加したため layer 必須となる (RFC 3261 §15.1.1)。
+    let handler = NgnInboundHandler::with_layer_call_manager_metrics_and_outbound_table(
+        layer,
         socket,
         inviter,
         extensions,
@@ -10230,13 +10563,15 @@ mod tests {
 
         // webrtc_active に直接エントリを入れる (内部 API は private なので
         // handler.webrtc_active を Arc 経由で触る代わりに、 同じ Mutex の
-        // ロック経由で書き込む)。
+        // ロック経由で書き込む)。 Bug B (Issue #268) で entry が
+        // `Arc<WebRtcInboundEntry>` に変わったので、 test fixture では
+        // `ws_only_for_test` で degraded entry を作って入れる (NGN→PWA BYE
+        // 経路のみ機能、 WS close → NGN BYE 経路は本テスト対象外)。
         const TEST_CALL_ID: &str = "rfc3261-15-1-2-cid";
-        handler
-            .webrtc_active
-            .lock()
-            .await
-            .insert(TEST_CALL_ID.to_string(), ws_sink.clone());
+        handler.webrtc_active.lock().await.insert(
+            TEST_CALL_ID.to_string(),
+            WebRtcInboundEntry::ws_only_for_test(ws_sink.clone()),
+        );
 
         // mock NGN から BYE を送る
         let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -10332,13 +10667,19 @@ mod tests {
             "前提: dead は閉じている (receiver drop 済)"
         );
 
-        // webrtc_active に 2 entry 挿入。
+        // webrtc_active に 2 entry 挿入 (Bug B 後 `Arc<WebRtcInboundEntry>` に変更)。
         const ALIVE_CID: &str = "issue139-alive";
         const DEAD_CID: &str = "issue139-dead";
         {
             let mut tbl = handler.webrtc_active.lock().await;
-            tbl.insert(ALIVE_CID.to_string(), alive);
-            tbl.insert(DEAD_CID.to_string(), dead);
+            tbl.insert(
+                ALIVE_CID.to_string(),
+                WebRtcInboundEntry::ws_only_for_test(alive),
+            );
+            tbl.insert(
+                DEAD_CID.to_string(),
+                WebRtcInboundEntry::ws_only_for_test(dead),
+            );
         }
 
         // sweep を 1 回実行。
@@ -10378,8 +10719,14 @@ mod tests {
         let (tx2, _rx2) = mpsc::unbounded_channel();
         {
             let mut tbl = handler.webrtc_active.lock().await;
-            tbl.insert("alive-1".to_string(), WsSink::new(tx1));
-            tbl.insert("alive-2".to_string(), WsSink::new(tx2));
+            tbl.insert(
+                "alive-1".to_string(),
+                WebRtcInboundEntry::ws_only_for_test(WsSink::new(tx1)),
+            );
+            tbl.insert(
+                "alive-2".to_string(),
+                WebRtcInboundEntry::ws_only_for_test(WsSink::new(tx2)),
+            );
         }
         assert_eq!(handler.sweep_webrtc_active().await, 0);
         assert_eq!(handler.webrtc_active.lock().await.len(), 2);
@@ -10391,7 +10738,10 @@ mod tests {
             for i in 0..3 {
                 let (tx, rx) = mpsc::unbounded_channel();
                 drop(rx);
-                tbl.insert(format!("dead-{}", i), WsSink::new(tx));
+                tbl.insert(
+                    format!("dead-{}", i),
+                    WebRtcInboundEntry::ws_only_for_test(WsSink::new(tx)),
+                );
             }
         }
         assert_eq!(handler.sweep_webrtc_active().await, 3);
@@ -10425,16 +10775,15 @@ mod tests {
             NgnInboundConfig::default(),
         );
 
-        // dead WS (sweeper が拾う対象) を 1 件入れる。
+        // dead WS (sweeper が拾う対象) を 1 件入れる (Bug B 後 entry 型変更)。
         const RACE_CID: &str = "issue139-race";
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         let ws = WsSink::new(tx);
-        handler
-            .webrtc_active
-            .lock()
-            .await
-            .insert(RACE_CID.to_string(), ws);
+        handler.webrtc_active.lock().await.insert(
+            RACE_CID.to_string(),
+            WebRtcInboundEntry::ws_only_for_test(ws),
+        );
 
         // sweeper と BYE 経路を同時に発火する。 どちらが先に remove しても
         // 結果は同じ (= テーブル空、 panic なし)。
@@ -10554,6 +10903,190 @@ mod tests {
             weak.upgrade().is_none(),
             "ハンドラ drop 後は強参照ゼロ (sweeper task は Weak しか持たない)"
         );
+    }
+
+    /// Bug B / Issue #268: PWA WS close 時に `close_pwa_inbound_for_ws` が
+    /// `webrtc_active` から該当 WS の entry を抽出して NGN BYE を撃つことを
+    /// 検証する (RFC 3261 §15.1.1 / §15.1.2)。
+    ///
+    /// 旧実装 (Bug B 修正前) は inbound 通話で PWA disconnect が起きても
+    /// sabiden→NGN BYE が出ず、 NGN 側が 5-10 秒タイムアウトで BYE を投げ返す
+    /// まで dialog が宙ぶらりんだった (実機 v7 で 6 秒待ち観測)。
+    ///
+    /// 検証方針:
+    /// 1. fake NGN socket (BYE 受信スパイ) を bind し、 そこを fallback_peer と
+    ///    する `WebRtcInboundEntry` を作って `webrtc_active` に挿入。
+    /// 2. `close_pwa_inbound_for_ws` を呼び、 fake NGN socket に BYE が到達する
+    ///    こと、 戻り値が 1 であること、 entry が remove されることを確認。
+    /// 3. 同 WS で 2 度目を呼ぶと idempotent (= 0 件、 no-op) であること。
+    #[tokio::test]
+    async fn bug_b_close_pwa_inbound_sends_bye_to_ngn() {
+        use crate::sip::dialog::DialogConfig;
+        use crate::sip::message::{parse_message, SipMessage};
+        use crate::webrtc::signaling::{PwaInboundCloser, ServerMessage, WsSink};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::sync::mpsc;
+        use tokio::time::timeout;
+
+        // (1) fake NGN socket: BYE が来たら 200 OK を返し、 カウンタを上げる。
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let bye_count = Arc::new(AtomicU32::new(0));
+        let bye_count_inner = bye_count.clone();
+        let fake_ngn_clone = fake_ngn.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let (n, peer) = match fake_ngn_clone.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n]) {
+                    if matches!(req.method, SipMethod::Bye) {
+                        bye_count_inner.fetch_add(1, Ordering::SeqCst);
+                        // 200 OK を返す
+                        let mut ok = build_response_skeleton(&req, 200, "OK");
+                        ok.headers.set("Content-Length", "0");
+                        let _ = fake_ngn_clone.send_to(&ok.to_bytes(), peer).await;
+                    }
+                }
+            }
+        });
+
+        // (2) sabiden 側 NGN socket + TransactionLayer + NgnInboundHandler。
+        let sabiden_ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (sabiden_layer, sabiden_inbound_rx) = TransactionLayer::spawn(sabiden_ngn_sock.clone());
+
+        let inviter: ExtInviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::busy())
+            .build();
+        let extensions = ExtensionRegistrar::new();
+        let webrtc_outbound_active: WebRtcOutboundActive = Arc::new(Mutex::new(HashMap::new()));
+        let metrics = Metrics::new();
+        // call_manager は test 簡略化のため省略 (bridge 経路は別 test)。
+        // production layout を再現したいので with_layer_call_manager_metrics_and_outbound_table
+        // ではなく with_metrics_then_layer 相当を直接構築する: layer を Some にした
+        // handler を作るため `with_metrics` を起点に手で組み立てる。
+        let handler = Arc::new(NgnInboundHandler {
+            socket: sabiden_ngn_sock.clone(),
+            layer: Some(sabiden_layer.clone()),
+            inviter,
+            extensions,
+            cfg: NgnInboundConfig::default(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            webrtc_active: Arc::new(Mutex::new(HashMap::new())),
+            webrtc_outbound_active,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
+            call_manager: None,
+            outbound_forwarder: Mutex::new(None),
+            metrics: metrics.clone(),
+        });
+        // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
+        drop(sabiden_inbound_rx);
+
+        // (3) WS と WebRtcInboundEntry を作って webrtc_active に挿入。
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let ws = WsSink::new(out_tx);
+
+        // 受信 INVITE と 200 OK を擬似的に作って Dialog::from_uas_invite に渡す。
+        const TEST_CALL_ID: &str = "bug-b-cid";
+        let mut invite = SipRequest::new(SipMethod::Invite, format!("sip:117@{}", fake_ngn_addr));
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKtest", fake_ngn_addr),
+        );
+        invite
+            .headers
+            .set("From", "<sip:caller@ntt-east.ne.jp>;tag=ngn-caller");
+        invite
+            .headers
+            .set("To", format!("<sip:117@{}>", fake_ngn_addr));
+        invite.headers.set("Call-ID", TEST_CALL_ID);
+        invite.headers.set("CSeq", "1 INVITE");
+        invite
+            .headers
+            .set("Contact", format!("<sip:caller@{}>", fake_ngn_addr));
+
+        let mut ok = build_response_skeleton(&invite, 200, "OK");
+        ok.headers
+            .set("To", format!("<sip:117@{}>;tag=sabiden-tag", fake_ngn_addr));
+        let dlg_cfg = DialogConfig {
+            local_uri: format!("sip:sabiden@{}", sabiden_ngn_sock.local_addr().unwrap()),
+            remote_uri: "sip:caller@ntt-east.ne.jp".to_string(),
+            local_contact: format!("sip:sabiden@{}", sabiden_ngn_sock.local_addr().unwrap()),
+            sent_by: sabiden_ngn_sock.local_addr().unwrap().to_string(),
+        };
+        let dialog = Dialog::from_uas_invite(&invite, &ok, dlg_cfg).expect("dialog 構築成功");
+
+        let entry = Arc::new(WebRtcInboundEntry {
+            uas_dialog: Some(Mutex::new(dialog)),
+            layer: Some(sabiden_layer.clone()),
+            fallback_peer: fake_ngn_addr,
+            ws: ws.clone(),
+        });
+        handler
+            .webrtc_active
+            .lock()
+            .await
+            .insert(TEST_CALL_ID.to_string(), entry);
+        // call_active=1 (handle_invite が呼んだ inc 相当)。
+        metrics.inc_call_active();
+
+        // (4) close_pwa_inbound_for_ws を呼んで結果を観測。
+        let n = handler.close_pwa_inbound_for_ws(&ws).await;
+        assert_eq!(n, 1, "1 entry が閉じられるべき");
+
+        // fake NGN socket で BYE 1 件受信を待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while bye_count.load(Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() >= deadline {
+                panic!("PWA disconnect → NGN BYE が fake NGN socket に到達していない (Bug B 再発)");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            bye_count.load(Ordering::SeqCst),
+            1,
+            "BYE は 1 件のみ送出されるべき"
+        );
+
+        // webrtc_active から entry は消えている (idempotent gate)。
+        assert!(
+            handler.webrtc_active.lock().await.is_empty(),
+            "close 後は webrtc_active から削除されているべき"
+        );
+
+        // (5) 二度目の close は no-op (idempotent)。
+        let n2 = timeout(
+            std::time::Duration::from_secs(1),
+            handler.close_pwa_inbound_for_ws(&ws),
+        )
+        .await
+        .expect("idempotent 二回目で hang してはいけない");
+        assert_eq!(n2, 0, "二回目の close は 0 件 (idempotent)");
+        // BYE 件数は 1 のまま (= 二重 BYE 送出していない)。
+        assert_eq!(bye_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Bug B / Issue #268: `WebRtcInboundEntry::send_bye()` の `Ok(None)` 経路。
+    /// degraded entry (dialog / layer 不足) に対して send_bye を呼ぶと、 BYE は
+    /// 送らず skip して Ok(None) を返す (= 旧経路互換、 production では起きない)。
+    #[tokio::test]
+    async fn bug_b_degraded_entry_send_bye_returns_none_without_panic() {
+        use crate::webrtc::signaling::{ServerMessage, WsSink};
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let ws = WsSink::new(tx);
+        let entry = WebRtcInboundEntry::ws_only_for_test(ws);
+
+        let resp = entry
+            .send_bye()
+            .await
+            .expect("Ok 戻りであるべき (panic 禁止)");
+        assert!(resp.is_none(), "degraded entry では None を返すべき");
     }
 
     /// Issue #218: clamp 後の interval が [`MIN_SWEEP_INTERVAL`] (= 30s) と

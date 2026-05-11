@@ -325,6 +325,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     let uas_handler_for_pwa_closer: Arc<dyn webrtc::signaling::PwaOutboundCloser> =
         uas_handler.clone();
 
+    // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup ハンドラを
+    // SignalingState (`with_pwa_inbound_closer`) に渡すため、 `ngn_handler` を
+    // 外側スコープで保持する。 内線無し構成では `None` (= cleanup 経路無効)。
+    let mut ngn_inbound_handler_for_signaling: Option<Arc<call::orchestrator::NgnInboundHandler>> =
+        None;
+
     if let (Some(ext_registrar), Some(ext_send_sock), Some(inbound_call_manager)) = (
         ext_registrar.clone(),
         ext_socket_for_forker,
@@ -394,6 +400,9 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         ngn_handler
             .set_outbound_forwarder(uas_handler_for_forwarder)
             .await;
+        // Bug B (Issue #268): SignalingState から PwaInboundCloser として参照できるよう
+        // ハンドラを保持する。
+        ngn_inbound_handler_for_signaling = Some(ngn_handler.clone());
         info!(
             bridge_ngn_ip = %bridge_ngn_ip,
             bridge_ext_ip = %bridge_ext_ip,
@@ -444,6 +453,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         .with_keepalive(keepalive_interval, idle_timeout)
                         .with_pwa_outbound(uas_handler_for_pwa_outbound.clone())
                         .with_pwa_outbound_closer(uas_handler_for_pwa_closer.clone());
+                    // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup を
+                    // 結線する (`NgnInboundHandler` が `PwaInboundCloser` を実装)。
+                    if let Some(h) = ngn_inbound_handler_for_signaling.clone() {
+                        let closer: Arc<dyn webrtc::signaling::PwaInboundCloser> = h;
+                        state = state.with_pwa_inbound_closer(closer);
+                    }
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {
                             Ok(s_cfg) => {

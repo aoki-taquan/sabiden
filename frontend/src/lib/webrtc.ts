@@ -232,16 +232,66 @@ export class WebRtcCall {
       return;
     }
     log(this.elapsed(), "addIce", { candidate });
+    // Bug A2 fix (実機 v7): sabiden inbound 経路では sabiden が offerer なので
+    // m-line の mid は str0m 由来のランダム ASCII id (例 `J9e`, `LNo`)。 旧実装は
+    // `sdpMid: "0"` をハードコードしていたため、 PWA 側 setRemoteDescription
+    // 完了後に `Cannot set ICE candidate for level=0 mid=0: No such transceiver`
+    // が発生し、 catch フォールバックの `addIceCandidate({ candidate })` も
+    // `TypeError: Cannot add a candidate without specifying either sdpMid or
+    // sdpMLineIndex` で reject される (chromium 124+ の RFC 8838 §14 厳格化)。
+    //
+    // RFC 8838 §14: trickle ICE candidate は (sdpMid OR sdpMLineIndex) の **どちらか**
+    // 必須。 setRemoteDescription 完了後は `pc.remoteDescription` の m-line から
+    // 実際の mid が引ける (W3C webrtc-pc §4.4.1.6 `RTCIceCandidateInit`)。
+    // 第一 audio m-line の mid を抽出して使う (sabiden は BUNDLE 1 本構成なので
+    // candidate は全部同じ transceiver 宛て)。 mid 抽出不能なら sdpMLineIndex=0 で
+    // フォールバック (RFC 8838 §14: 「sdpMLineIndex はオプションだが mid なしなら
+    // 利用可」)。
+    const sdpMid = this.firstAudioMidFromRemote();
+    const init: RTCIceCandidateInit = sdpMid !== null
+      ? { candidate, sdpMid, sdpMLineIndex: 0 }
+      : { candidate, sdpMLineIndex: 0 };
     try {
-      await this.pc.addIceCandidate({ candidate, sdpMid: "0", sdpMLineIndex: 0 });
+      await this.pc.addIceCandidate(init);
     } catch (e) {
-      // sdpMid が一致しない場合のフォールバック (Trickle ICE 半端実装対策)
+      // 実装差分のフォールバック: sdpMid 不一致 / 空 m-line 等の極端ケース。
+      // sdpMLineIndex 単独で再試行する (RFC 8838 §14 互換)。
       try {
-        await this.pc.addIceCandidate({ candidate });
+        await this.pc.addIceCandidate({ candidate, sdpMLineIndex: 0 });
       } catch (e2) {
         warn("addIceCandidate failed", e, e2);
       }
     }
+  }
+
+  /**
+   * `pc.remoteDescription` の SDP から最初の `a=mid:...` 値を抜き出す。
+   *
+   * RFC 4566 §5.7 / RFC 5888 §4 (`a=mid:<identification-tag>`): 各 m-line に
+   * 1 行付与される識別子。 BUNDLE 構成では candidate を mid に紐づけて配送する。
+   *
+   * 戻り値:
+   * - setRemoteDescription 前 (= remoteDescription 未設定): `null`
+   * - SDP に audio m-line が存在し `a=mid:<tag>` が見つかれば `<tag>` (例 "J9e")
+   * - audio m-line / a=mid 不在: `null`
+   *
+   * 呼出側は `null` の場合 sdpMLineIndex のみで `addIceCandidate` を呼ぶ。
+   */
+  private firstAudioMidFromRemote(): string | null {
+    const sdp = this.pc.remoteDescription?.sdp ?? "";
+    if (!sdp) return null;
+    const lines = sdp.split(/\r?\n/);
+    let inAudioMline = false;
+    for (const line of lines) {
+      if (line.startsWith("m=")) {
+        inAudioMline = line.startsWith("m=audio");
+        continue;
+      }
+      if (inAudioMline && line.startsWith("a=mid:")) {
+        return line.slice("a=mid:".length).trim();
+      }
+    }
+    return null;
   }
 
   /** マイクのミュートを切り替える。返り値は新しい mute 状態。 */

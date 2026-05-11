@@ -518,7 +518,10 @@ impl Dialog {
 
 /// `name-addr` 形式 ("Display" <sip:...;param>) または `addr-spec` から
 /// URI 部 (`sip:user@host;params`) を取り出す。`?` 等の追加パラメータは保持。
-fn extract_uri(value: &str) -> String {
+///
+/// `pub(crate)`: orchestrator の inbound BYE 経路 (Bug B / Issue #268) で
+/// `Dialog::from_uas_invite` 用 `remote_uri` 構築に利用する。
+pub(crate) fn extract_uri(value: &str) -> String {
     let trimmed = value.trim();
     if let Some(start) = trimmed.find('<') {
         if let Some(end) = trimmed[start + 1..].find('>') {

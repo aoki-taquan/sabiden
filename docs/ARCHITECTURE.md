@@ -461,33 +461,53 @@ skip し、 自前で Cancel を送って終了する (`close_and_drain_webrtc_l
 snapshot に含まれない経路)。 このため上表「走っている全 WebRTC legs」 は
 「Offer push 完了済または try_register 失敗で自前 Cancel した legs」 を含む。
 
-#### `webrtc_active` leak sweeper (Issue #81 / #139)
+#### `webrtc_active` 双方向 BYE 連動 + leak sweeper (Issue #81 / #139 / #268)
 
 NGN→WebRTC 着信成立時、 `NgnInboundHandler::handle_invite` は winner WebRTC
-レッグの `WsSink` を `webrtc_active: HashMap<Call-ID, WsSink>` に保持する。
-NGN BYE 受信時に `handle_bye` がこのテーブルから WS を引いて
-`ServerMessage::Bye` を browser に push する (RFC 3261 §15.1.2 /
-RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog 終了をもう片側へ伝搬)。
+レッグの `WsSink` + UAS dialog state を
+`webrtc_active: HashMap<Call-ID, Arc<WebRtcInboundEntry>>` に保持する
+(Issue #81 + Bug B 拡張)。 `WebRtcInboundEntry` は以下を持つ:
 
-しかし以下の経路では NGN BYE が来ず entry が leak する (Issue #139):
+| フィールド | 役割 |
+|---|---|
+| `ws: WsSink` | NGN→PWA BYE 通知用 (RFC 3261 §15.1.2)。 Issue #81 経路。 |
+| `uas_dialog: Option<Mutex<Dialog>>` | PWA→NGN BYE 送出用の RFC 3261 §12.1.1 UAS dialog state (受信 INVITE + 200 OK から `Dialog::from_uas_invite` で構築)。 |
+| `layer: Option<Arc<TransactionLayer>>` | BYE 送信に使う NGN 側 TransactionLayer。 |
+| `fallback_peer: SocketAddr` | dialog next-hop URI 解決失敗時の fallback (= 受信 INVITE の `remote`)。 |
 
-1. **browser が WS のみ切断**: PWA UI を閉じただけで `ClientMessage::Bye`
-   未送出。 RFC 6455 §7.4 の close handshake で WS forwarder の mpsc
-   receiver が drop され、 `WsSink::is_closed` は true になるが、 NGN は
-   無音通話を保持し続けるため BYE 経由の `remove` は走らない。
-2. **将来の 5xx 経路 / outbound 混入** (defense-in-depth): 現状の `insert`
-   は 200 OK 成功後にのみ走るが、 リファクタで分岐が増えたとき安全網が要る。
+双方向 BYE 経路 (RFC 5853 §3.2.2 SBC framework: B2BUA は片側 dialog 終了を
+もう片側へ伝搬する責務):
 
-対処: `NgnInboundHandler::spawn_webrtc_active_sweeper` が
-`webrtc_active_sweep_interval` 周期 (既定 30 秒) で全 entry を走査し、
-`WsSink::is_closed` 一致 entry を `HashMap::retain` で除去する。
-sweeper は `Arc::downgrade` の弱参照で動くため、 `NgnInboundHandler` が
-drop されたら次の tick で `Weak::upgrade` が `None` を返して自動終了する
-(= テスト / shutdown で task leak しない)。
+```
+NGN → sabiden BYE → handle_bye → entry.ws.send(ServerMessage::Bye)        (Issue #81)
+                              → entry.uas_dialog.terminate()
+                              → webrtc_active.remove                       (idempotent gate)
 
-`handle_bye` 経路の `remove` と sweeper の `retain` は同じ `Mutex` で逐次化
-されるため、 並走しても二重 remove / panic を起こさない (`HashMap::remove`
-は 1 回目で `Some`、 2 回目で `None`)。
+PWA WS close → close_pwa_inbound_for_ws (PwaInboundCloser trait)           (Bug B / Issue #268)
+            → webrtc_active.extract_if(ws.same_channel)                    (idempotent gate)
+            → entry.send_bye() = build_bye + layer.send_request            (RFC 3261 §15.1.1)
+            → entry.uas_dialog.terminate()
+            → CallManager::terminate(self.active[call_id])                 (bridge 停止)
+            → metrics.dec_call_active
+```
+
+旧実装 (Bug B 修正前) は PWA WS close 時に何も送らず、 NGN が 5-10 秒の
+タイムアウトで BYE を投げ返してくるまで `self.active` の bridge が生きた
+まま放置されていた (実機 v7 で 6 秒 `recv BYE` 待ち観測)。 本修正で sabiden
+は WS close を検知した瞬間に NGN へ BYE を撃ち、 bridge / metrics を
+即時 cleanup する。 signaling 層は `PwaInboundCloser` trait 経由でしか
+内部テーブルに触らない (依存方向: signaling → orchestrator)。
+
+leak sweeper (Issue #139) は依然として安全網として残す: BYE 経由の `remove`
+を逃した entry (= 古い `close_pwa_inbound_for_ws` 不在経路 / 旧 fixture)
+を `webrtc_active_sweep_interval` 周期 (既定 30 秒) で `WsSink::is_closed`
+一致 entry を `HashMap::retain` で除去する。 sweeper は `Arc::downgrade` の
+弱参照で動くため、 `NgnInboundHandler` が drop されたら次の tick で
+`Weak::upgrade` が `None` を返して自動終了する。
+
+各経路 (NGN BYE / WS close / sweeper) は同じ `Mutex` で逐次化されるため、
+並走しても二重 remove / panic を起こさない (`HashMap::remove` /
+`extract_if` は 1 回目以降は no-op、 idempotent)。
 
 `Duration::ZERO` 防御 (Issue #218): `tokio::time::interval(Duration::ZERO)` は
 panic するため、 `spawn_webrtc_active_sweeper` 入口で `is_zero()` をチェック
@@ -897,6 +917,43 @@ RFC 5853 §3.2)。 通話中の音声バイトは `MediaBridge::WebRtcAudio`
 で **トランスコード無し**にパススルーする想定 (`webrtc/str0m_session.rs` 行内
 コメント抜粋: "NGN ↔ ブラウザの間を G.711 μ-law でパススルーする想定。 Opus
 は本パスでは使わない")。
+
+#### offerer 経路の audio_mid 先取り設定 (Bug A / Issue #268)
+
+`Str0mPeerSession::create_offer` (= sabiden が **offerer**、 NGN→PWA 着信時に
+使う) は str0m 0.19 の `change/sdp.rs:1180` の挙動により `Event::MediaAdded`
+が **発火しない**:
+
+```rust
+// str0m 0.19 change/sdp.rs:1180
+media.need_open_event = is_offer && !is_rejected;
+```
+
+ここで `is_offer` は **「リモートが offer を送ってきたか」** (= sabiden が
+answerer のとき true)。 sabiden が **offerer** で remote answer を `apply_answer`
+する経路では `is_offer=false` となり `need_open_event=false`。 そのため
+`poll_event` が `MediaAdded` を fire せず、 run_loop の `audio_mid` は `None`
+のままになる。 結果として `write_media` は「audio mid 未確定 → media drop」
+で全 RTP を破棄する (実機 v7 で 60 秒 PWA `track.muted=true` 観測)。
+
+対処 (`fn create_offer` の戻り値変更): `sdp_api().add_media(...)` が返す `Mid`
+を呼出側 (run_loop の `Command::CreateOffer` 分岐) で取り出し、 `RunCtx.audio_mid`
+に **即時セット**する。 `Event::MediaAdded` への依存を断つことで offerer 経路
+でも `write_media` が writer を取得できる。 RFC 3264 §5 (offerer
+responsibility): offerer は自身が出した m-line の状態を answer 受領前から
+把握しており、 mid は自分で割り当てた値を使う。
+
+回帰テスト: `webrtc::str0m_session::tests::rfc3264_5_send_media_works_when_
+sabiden_is_offerer` (sabiden offerer + mock-browser answerer の loopback
+ラウンドトリップで `Event::MediaData` が browser 側に届くまでを検証)。 既存
+`rfc8825_send_media_after_connected_delivers_media_data` (sabiden answerer 経路)
+と対称形なので、 二方向のレッグを両方守る。
+
+副次的に PWA 側 `frontend/src/lib/webrtc.ts::addIce` も hardcode の
+`sdpMid: "0"` から `remoteDescription` の `a=mid:<tag>` 抽出に修正した
+(str0m offerer の mid は ASCII 3 文字のランダム ID `J9e` 等で固定 `"0"` と
+合わないため、 chromium 124+ が `Cannot set ICE candidate for level=0 mid=0`
+で reject していた)。 RFC 8838 §14 (sdpMid OR sdpMLineIndex 必須) 準拠。
 
 これは band-aid ではなく、 NGN 側コーデックが PCMU only に確定 (CLAUDE.md §5、
 `docs/asterisk-real-invite.md` §2) しているため:

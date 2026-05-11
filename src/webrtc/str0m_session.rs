@@ -410,8 +410,24 @@ async fn run_loop(mut ctx: RunCtx) {
                         let _ = reply.send(r);
                     }
                     Some(Command::CreateOffer { reply }) => {
+                        // Bug A fix (実機 v7 NGN inbound 音声不通): str0m 0.19 では
+                        // offerer 経路で `Event::MediaAdded` が発火しない
+                        // (str0m `change/sdp.rs:1180` `need_open_event = is_offer && ...`
+                        // が answer 適用時に false になる)。 そのため `audio_mid` は
+                        // `create_offer` 側で `add_media` の戻り値から先取りでセットする。
+                        // 詳細は `fn create_offer` の docstring。
                         let r = create_offer(&mut ctx.rtc, &mut ctx.pending_offer);
-                        let _ = reply.send(r);
+                        let sdp_reply: Result<String> = match r {
+                            Ok((sdp, mid)) => {
+                                if ctx.audio_mid.is_none() {
+                                    debug!(?mid, "str0m: audio_mid を offerer 経路で即時設定 (Bug A fix)");
+                                    ctx.audio_mid = Some(mid);
+                                }
+                                Ok(sdp)
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(sdp_reply);
                     }
                     Some(Command::AcceptAnswer { sdp, reply }) => {
                         let r = accept_answer(&mut ctx.rtc, &mut ctx.pending_offer, &sdp);
@@ -489,22 +505,42 @@ fn accept_offer(rtc: &mut Rtc, sdp: &str) -> Result<String> {
 /// `pending` には消費前の保留オファを保存する。既存の保留オファがある場合は
 /// 上書きせずエラーを返す (ブラウザに二重 offer が出ると state machine が
 /// 壊れる)。
+///
+/// # Bug A fix (実機 v7 inbound 音声不通)
+///
+/// 戻り値の 2 番目は `add_media` が割り当てた audio Mid。 呼出側の
+/// `RunCtx.audio_mid` にここで先取りで保存する必要がある。
+///
+/// 理由 (str0m 0.19 の挙動): str0m は m-line を **answer 適用後** に
+/// `Media::from_remote_media_line` で session に登録するが、 そのとき
+/// `need_open_event = is_offer && !is_rejected` (`change/sdp.rs:1180`)
+/// と評価する。 sabiden が offerer のとき `is_offer=false` (= "リモートは
+/// **answer** を送ってきた") なので `need_open_event = false` となり、
+/// **`Event::MediaAdded` が発火しない**。 既存実装 (`handle_event` の
+/// `Event::MediaAdded` 分岐) は audio_mid を `None` のまま放置し、
+/// `write_media` が「audio mid 未確定 → media drop」 で全 RTP を破棄する
+/// (実機 v7 で 60 秒間 PWA track.muted=true で観測)。
+///
+/// RFC 3264 §5 (offerer responsibility): offerer は自身が出した m-line
+/// の状態を answer 受領前から把握しており、 mid は自分で割り当てた値を
+/// そのまま使う。 本関数は `add_media` 戻り値で取得した Mid を呼出側に
+/// 返し、 `Event::MediaAdded` への依存を断つ。
 fn create_offer(
     rtc: &mut Rtc,
     pending: &mut Option<str0m::change::SdpPendingOffer>,
-) -> Result<String> {
+) -> Result<(String, Mid)> {
     if pending.is_some() {
         return Err(anyhow!(
             "create_offer: 既に保留オファあり (accept_answer 待ち)"
         ));
     }
     let mut api = rtc.sdp_api();
-    api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let audio_mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
     let (offer, p) = api
         .apply()
         .ok_or_else(|| anyhow!("create_offer: 変更が空 (codec 設定漏れ?)"))?;
     *pending = Some(p);
-    Ok(offer.to_sdp_string())
+    Ok((offer.to_sdp_string(), audio_mid))
 }
 
 /// 保留中の offer に対するブラウザ answer を str0m に渡す。
@@ -1382,6 +1418,20 @@ mod tests {
                 .map_err(|e| anyhow!("test browser: accept_answer: {}", e))?;
             Ok(())
         }
+
+        /// RFC 8829 §5.6 / §5.7: 受領した offer SDP を accept し answer SDP を返す。
+        /// 本ヘルパは `Str0mPeerSession` 側が **offerer** のときの "browser =
+        /// answerer" 経路を test 内で再現するために使う (Bug A 仮説検証)。
+        fn accept_offer_and_build_answer(&mut self, offer_sdp: &str) -> Result<String> {
+            let offer = SdpOffer::from_sdp_string(offer_sdp)
+                .map_err(|e| anyhow!("test browser: offer parse: {}", e))?;
+            let answer = self
+                .rtc
+                .sdp_api()
+                .accept_offer(offer)
+                .map_err(|e| anyhow!("test browser: accept_offer: {}", e))?;
+            Ok(answer.to_sdp_string())
+        }
     }
 
     /// `TestBrowserPeer` 用の単方向 progress: poll_output を 1 回回し、
@@ -1638,6 +1688,94 @@ mod tests {
         })
         .await;
         assert!(saw_media, "MediaData 不到達 (events: {})", events.len());
+
+        let _ = session.close().await;
+    }
+
+    /// RFC 3264 §5 / §6 + Bug A regression: sabiden が **offerer** として
+    /// `create_offer` で PCMU SAVPF offer を生成し、 mock-browser が answerer
+    /// として受理した経路でも、 `send_media(PCMU PT 0)` が browser 側に
+    /// `Event::MediaData` として届くことを検証する。
+    ///
+    /// 実機 v7 (`/tmp/sabiden-080-inbound-v7.pcap`) の症状再現用テスト:
+    /// - sabiden ⇔ NGN PCMU RTP は双方向に流れている (pcap 確認済)
+    /// - sabiden → PWA は browser 側 `MediaStreamTrack.muted = true` のまま 60s
+    /// - PWA → sabiden → NGN は `peer_media_rx` 経由で正常 (`peer_to_ngn_loop`)
+    ///
+    /// 既存 `rfc8825_send_media_after_connected_delivers_media_data` は
+    /// sabiden = **answerer** の経路を試験するので、 offerer 経路を別途検証する。
+    /// 両者は str0m 内部の `remote_pts` 確定タイミング / m-line 順序 / mid
+    /// 割当てに違いがあり、 一方が通っても他方が通るとは限らない (Bug A の
+    /// 直接的な再現条件)。
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc3264_5_send_media_works_when_sabiden_is_offerer() {
+        let cfg = Str0mConfig {
+            public_ip: "127.0.0.1".parse().unwrap(),
+            port_range: (63000, 63999),
+            ice_servers: vec![],
+        };
+        let session = Str0mPeerSession::new(cfg).await.expect("session new");
+        let mut browser = TestBrowserPeer::new().await.expect("browser new");
+
+        // (1) sabiden が offer を生成 (NGN 着信 → run_webrtc_leg 相当)
+        let offer_sdp = session.create_offer().await.expect("offer 生成");
+
+        // (2) browser が offer を受理して answer を返す
+        let answer_sdp = browser
+            .accept_offer_and_build_answer(&offer_sdp)
+            .expect("answer 生成");
+
+        // (3) sabiden が answer を受理 → DTLS / ICE 開始
+        session
+            .accept_answer(&answer_sdp)
+            .await
+            .expect("answer 受理");
+
+        // (4) Connected 到達まで browser を駆動
+        let mut events: Vec<Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        let connected = drive_browser_until(&mut browser, &mut events, deadline, |evs| {
+            evs.iter().any(|e| matches!(e, Event::Connected))
+        })
+        .await;
+        assert!(
+            connected,
+            "Connected に到達しなかった (events: {:?})",
+            events
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>()
+        );
+
+        // sabiden 側 audio_mid 確定の余地を作る (Event::MediaAdded を run_loop が拾うため)
+        let pause_until = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
+        let _ = drive_browser_until(&mut browser, &mut events, pause_until, |_| false).await;
+
+        // (5) sabiden → browser に PCMU PT 0 1 frame を流し込む
+        let frame = MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: vec![0xff; 160],
+            network_time: std::time::Instant::now(),
+        };
+        session.send_media(frame).await.expect("send_media 受理");
+
+        // (6) browser 側で MediaData を観測 (Bug A regression guard)。
+        //     audio_mid を offerer 経路で先取りセットしていない場合、 ここで
+        //     timeout する (実機 v7 inbound 音声不通の根本症状)。
+        let deadline2 = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let saw_media = drive_browser_until(&mut browser, &mut events, deadline2, |evs| {
+            evs.iter().any(|e| matches!(e, Event::MediaData(_)))
+        })
+        .await;
+        assert!(
+            saw_media,
+            "sabiden offerer → browser answerer 経路で MediaData が届かない (Bug A 再発): \
+             create_offer 経由で audio_mid を先取りセットしていないと str0m は \
+             Event::MediaAdded を発火せず write_media が全 RTP を drop する \
+             (offer={offer_sdp}\nanswer={answer_sdp}, events={})",
+            events.len()
+        );
 
         let _ = session.close().await;
     }

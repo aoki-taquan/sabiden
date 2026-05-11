@@ -295,6 +295,31 @@ Decline は WS 接続 (= 内線登録) ごと閉じる `Bye` とは別物。 個
 のみを拒否し、 WS は維持する。 詳細は `src/webrtc/signaling.rs::ClientMessage`
 docstring。
 
+##### Fork lifecycle: 全 `ForkResult` で WebRTC レッグへ Cancel 通知 (Issue #83)
+
+`fork_to_bindings` の `ForkResult` は 3 種 (`Answered` / `Timeout` / `AllFailed`)
+だが、 走り出している WebRTC レッグ (= browser に `ServerMessage::Offer` を
+push 済) は **どの結果で抜けても** `close_and_drain_webrtc_legs` 経由で
+`ServerMessage::Cancel { call_id }` を受け取る。
+
+| `ForkResult` | Cancel 送出対象 | 期待される PWA 側挙動 |
+|---|---|---|
+| `Answered` | winner 以外の losing legs (winner は `WsSink::same_channel` で除外) | losing legs: `App.tsx::cancel` で ended 遷移。 winner: 確立通話継続 |
+| `Timeout` | 走っている全 WebRTC legs | 全 leg: ringing UI を ended に閉じる |
+| `AllFailed` | 走っている全 WebRTC legs (Failed/Errored 経路含む) | 全 leg: ringing UI を ended に閉じる |
+
+旧実装 (PR #137 以前) は `Answered` のときだけ losing legs を Cancel しており、
+`Timeout` / `AllFailed` では browser がオファ送出後ハングする (= 永続 ringing /
+内線登録解放不能) 不具合があった。 W3C webrtc-pc §4.4.1 (UA は long-running
+pending state を放置すべきでない) / RFC 3261 §9.1 (CANCEL semantics、 ただし
+WebRTC レッグ向けは WS 層の通知形) に従い、 一括 Cancel に変更した。
+
+スロー競合 (Issue #140 race): `peer.create_offer` 完了が winner 確定より遅い
+レッグは `try_register_webrtc_leg` が `closed=true` を観測して Offer push を
+skip し、 自前で Cancel を送って終了する (`close_and_drain_webrtc_legs` の
+snapshot に含まれない経路)。 このため上表「走っている全 WebRTC legs」 は
+「Offer push 完了済または try_register 失敗で自前 Cancel した legs」 を含む。
+
 #### `webrtc_active` leak sweeper (Issue #81 / #139)
 
 NGN→WebRTC 着信成立時、 `NgnInboundHandler::handle_invite` は winner WebRTC

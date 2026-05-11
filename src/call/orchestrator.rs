@@ -9974,6 +9974,192 @@ mod tests {
         let _ = call_id; // 使わないが pin
     }
 
+    /// Issue #83 regression: 複数 WebRTC レッグの fork で先着 200 OK (Answered)
+    /// が成立した際、 winner 以外の **losing legs** に `ServerMessage::Cancel` が
+    /// 確実に送出されることを検証する。
+    ///
+    /// 旧実装 (PR #137 以前) でも Answered 経路では losing leg に Cancel を流して
+    /// いたため、 本テストは「Issue #83 で Timeout/AllFailed まで cleanup を拡大
+    /// しても Answered の cleanup が壊れていない」 ことを担保する regression
+    /// guard (CLAUDE.md §13 既存通話パス regression なし要件)。
+    ///
+    /// 参照: RFC 3261 §9.1 (CANCEL semantics) / §16.7 step 7 (fork で 2xx 確定後の
+    /// 残レッグキャンセル) / W3C WebRTC §4.4.1 (pending state を放置しない)。
+    #[tokio::test]
+    async fn issue83_fork_answered_sends_cancel_to_losing_webrtc_legs() {
+        use crate::sip::registrar::Binding;
+        use crate::webrtc::peer::{PeerSession, StubPeerSession};
+        use crate::webrtc::signaling::{PendingAnswers, ServerMessage, WsSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// `create_offer` を僅かに遅延させる loser 用 mock。 winner が先に
+        /// Established を返して fork を確定させるためのスケジュール調整。
+        /// 遅延は短く保ち、 fork 確定後の `try_register_webrtc_leg` race 経路
+        /// (= `race_late_create_offer_after_winner_sends_cancel_not_offer` で
+        /// カバー済) ではなく、 通常の cleanup loop (close_and_drain) 経由で
+        /// Cancel が届くことを確認する。
+        struct SilentLoserPeer {
+            offer_sdp: String,
+            create_calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl PeerSession for SilentLoserPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!("unused"))
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                self.create_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.offer_sdp.clone())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                panic!("loser に answer は来ないので呼ばれてはいけない");
+            }
+            async fn add_ice_candidate(&self, _candidate: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let winner_peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let (ws_winner_tx, mut ws_winner_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+        let ws_winner = WsSink::new(ws_winner_tx);
+        let pending_winner = PendingAnswers::new();
+
+        let loser_peer_inner = Arc::new(SilentLoserPeer {
+            offer_sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                        t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                        a=ice-ufrag:srvuf\r\na=ice-pwd:srvpasswordsrvpassword\r\n\
+                        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+                        a=setup:actpass\r\na=mid:0\r\na=rtcp-mux\r\na=sendrecv\r\n"
+                .to_string(),
+            create_calls: AtomicUsize::new(0),
+        });
+        let loser_peer: Arc<dyn PeerSession> = loser_peer_inner.clone();
+        let (ws_loser_tx, mut ws_loser_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+        let ws_loser = WsSink::new(ws_loser_tx);
+        let pending_loser = PendingAnswers::new();
+
+        let browser_answer = "v=0\r\no=mozilla 9 9 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\n\
+                              t=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n\
+                              a=ice-ufrag:browser\r\na=ice-pwd:browserpwdbrowserpwdbrowserpwd\r\n\
+                              a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+                              a=setup:active\r\na=mid:0\r\na=rtcp-mux\r\na=sendrecv\r\n"
+            .to_string();
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
+        let bindings = vec![
+            (
+                "winner".to_string(),
+                Binding {
+                    contact_uri: "sip:winner@webrtc.peer".to_string(),
+                    remote: "127.0.0.1:65535".parse().unwrap(),
+                    expires_at: std::time::Instant::now() + Duration::from_secs(60),
+                    transport: ExtTransport::WebRtc {
+                        peer: winner_peer.clone(),
+                        ws: ws_winner.clone(),
+                        pending: pending_winner.clone(),
+                    },
+                },
+            ),
+            (
+                "loser".to_string(),
+                Binding {
+                    contact_uri: "sip:loser@webrtc.peer".to_string(),
+                    remote: "127.0.0.1:65534".parse().unwrap(),
+                    expires_at: std::time::Instant::now() + Duration::from_secs(60),
+                    transport: ExtTransport::WebRtc {
+                        peer: loser_peer.clone(),
+                        ws: ws_loser.clone(),
+                        pending: pending_loser.clone(),
+                    },
+                },
+            ),
+        ];
+        let pending_winner_for_browser = pending_winner.clone();
+        let fork_handle = tokio::spawn(async move {
+            fork_to_bindings(
+                inviter,
+                bindings,
+                b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                  m=audio 20000 RTP/AVP 0\r\n"
+                    .to_vec(),
+                "issue83-loser-cid".to_string(),
+                Duration::from_secs(3),
+            )
+            .await
+        });
+
+        // winner: Offer 受信 → answer deliver → fork が Answered で抜ける。
+        let first_winner = tokio::time::timeout(Duration::from_secs(2), ws_winner_rx.recv())
+            .await
+            .expect("winner Offer push 不在")
+            .expect("winner ws_rx 閉鎖");
+        match first_winner {
+            ServerMessage::Offer { call_id, .. } => {
+                pending_winner_for_browser
+                    .deliver(&call_id, browser_answer.clone())
+                    .await;
+            }
+            other => panic!("winner: Offer 期待だが {:?}", other),
+        }
+
+        let result = fork_handle.await.unwrap();
+        match result {
+            ForkResult::Answered { .. } => {}
+            other => panic!("Answered 期待だが {:?}", std::mem::discriminant(&other)),
+        }
+
+        // loser: Offer push → その後 Cancel が cleanup loop 経由で届くべき。
+        let mut got_loser_offer = false;
+        let mut got_loser_cancel = false;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(2), ws_loser_rx.recv()).await {
+                Ok(Some(ServerMessage::Offer { call_id, .. })) => {
+                    assert_eq!(call_id, "issue83-loser-cid");
+                    got_loser_offer = true;
+                }
+                Ok(Some(ServerMessage::Cancel { call_id })) => {
+                    assert_eq!(call_id, "issue83-loser-cid");
+                    got_loser_cancel = true;
+                    break;
+                }
+                Ok(Some(other)) => panic!("Offer/Cancel 期待だが {:?}", other),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_loser_offer,
+            "loser には Offer push が届いているべき (Answered 確定前に Offer 完了)"
+        );
+        assert!(
+            got_loser_cancel,
+            "Issue #83 regression: Answered 確定後、 losing WebRTC leg に Cancel が届くべき"
+        );
+        assert_eq!(loser_peer_inner.create_calls.load(Ordering::SeqCst), 1);
+
+        // winner WS には Cancel が来てはいけない (Issue #81 で winner は確立済み
+        // 通話として維持される)。
+        let after_winner =
+            tokio::time::timeout(Duration::from_millis(300), ws_winner_rx.recv()).await;
+        match after_winner {
+            Err(_) | Ok(None) => {}
+            Ok(Some(ServerMessage::Cancel { call_id })) => panic!(
+                "winner WebRTC leg に Cancel が送られた: call_id={}",
+                call_id
+            ),
+            Ok(Some(other)) => {
+                // Cancel 以外 (例: ICE candidate notify) は当面許容するが、 本テストでは想定しない
+                panic!("winner 側に予想外メッセージ: {:?}", other);
+            }
+        }
+    }
+
     /// Review #1 #1 (race fix): `peer.create_offer` 中に他レッグが winner 確定
     /// した場合、 遅い leg は **Offer push せず** に browser へ自前 Cancel を
     /// 送って終了することを検証する。

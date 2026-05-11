@@ -317,6 +317,29 @@ mod tests {
         assert_eq!(reparsed.find_rtpmap(0).unwrap().encoding, "PCMU");
     }
 
+    /// RFC 4566 §5.2 (Origin): "<sess-id> is a numeric string such that the
+    /// tuple of <username>, <sess-id>, <nettype>, <addrtype>, and
+    /// <unicast-address> forms a globally unique identifier for the session."
+    ///
+    /// `pcmu_offer` が sess-id=0 固定だと、 同一 sabiden プロセスから複数の
+    /// INVITE を出した際に GU 性を失う。 Issue #78 で UNIX epoch 秒ベースに
+    /// 変更したので、 (1) sess-id が 0 でないこと、 (2) sess-id == sess-version
+    /// (RFC 3264 §8: 初回オファーは同値、 後続変更で sess-version を回す) を
+    /// 検証する。
+    #[test]
+    fn rfc4566_5_2_pcmu_offer_session_id_nonzero_and_matches_version() {
+        let addr: IpAddr = "192.0.2.1".parse().unwrap();
+        let offer = SessionDescription::pcmu_offer(addr, 30000, 20);
+        assert_ne!(
+            offer.origin.session_id, 0,
+            "sess-id must be a unique numeric value, not the fixed 0 (RFC 4566 §5.2)"
+        );
+        assert_eq!(
+            offer.origin.session_id, offer.origin.session_version,
+            "initial offer should have sess-id == sess-version (RFC 3264 §8)"
+        );
+    }
+
     /// rtpmap でチャンネル付き (例: opus/48000/2) のパース。
     #[test]
     fn rtpmap_with_channels() {

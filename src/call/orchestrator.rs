@@ -2561,6 +2561,83 @@ fn classify_ext_reinvite_send_error(err: &anyhow::Error) -> (u16, &'static str) 
     }
 }
 
+/// Issue #260 Phase 1-A: NGN 5xx 応答から carrier 由来 header を抽出した
+/// 構造化ビュー。 純粋値型なので呼び出し側で `Debug` 表示するだけで `warn!`
+/// の構造化フィールドに展開できる (`tracing` の `?expr` syntax)。
+///
+/// 各 field は受信応答に該当 header が無ければ `None`。
+///
+/// - `reason` (RFC 3326): 終端理由 (例 `Q.850;cause=16;text="Normal call clearing"`)
+/// - `retry_after` (RFC 3261 §20.33): 次回試行までの秒数
+/// - `server` (RFC 3261 §20.35): carrier 識別 (例 `NEC IP-PBX 6.0`)
+/// - `warning` (RFC 3261 §20.43): warn-code + warn-agent + warn-text
+/// - `via_received` / `via_rport` (RFC 3581 §4): NAT 越し観測値
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Ngn5xxHeaderView {
+    pub reason: Option<String>,
+    pub retry_after: Option<String>,
+    pub server: Option<String>,
+    pub warning: Option<String>,
+    pub via_received: Option<String>,
+    pub via_rport: Option<String>,
+}
+
+/// Issue #260 Phase 1-A: 受信 5xx 応答から carrier 由来 header を抽出する。
+///
+/// `received` / `rport` は Via ヘッダ第一行のパラメータから抜き取る
+/// (RFC 3581 §4: VPN/NAT 越え時に UAS が観測した送信元 IP/port を
+/// Via の `;received=` / `;rport=` で返却する)。
+///
+/// 純粋関数 (`SipHeaders -> Ngn5xxHeaderView`)、 副作用なし。 ロギング呼び出し
+/// 側で `?` 展開して `tracing::warn!` の構造化フィールドへ転送する。
+pub(crate) fn extract_ngn_5xx_header_view(headers: &SipHeaders) -> Ngn5xxHeaderView {
+    let reason = headers.get("reason").map(|s| s.to_string());
+    let retry_after = headers.get("retry-after").map(|s| s.to_string());
+    let server = headers.get("server").map(|s| s.to_string());
+    let warning = headers.get("warning").map(|s| s.to_string());
+    let (via_received, via_rport) = headers
+        .get("via")
+        .map(extract_via_received_rport)
+        .unwrap_or((None, None));
+    Ngn5xxHeaderView {
+        reason,
+        retry_after,
+        server,
+        warning,
+        via_received,
+        via_rport,
+    }
+}
+
+/// RFC 3581 §4: `Via` ヘッダの `received=<ip>` / `rport=<port>` を抜き出す。
+///
+/// `;` でパラメータに分割し、 大文字小文字を無視して `received` / `rport` を
+/// 検索する (RFC 3261 §7.3.1: パラメータ名は大文字小文字無視)。 値が無い
+/// 単独の `rport` (= 要求としての `;rport` フラグ) は `None` を返す
+/// (= 観測済み port が記載されていないので意味なし)。
+///
+/// 複数 Via が `,` で連結されている場合は最先頭のみ調べる (RFC 3261 §18:
+/// UAS 応答経路では最上段 Via が UAC を指す)。
+fn extract_via_received_rport(via: &str) -> (Option<String>, Option<String>) {
+    let first = via.split(',').next().unwrap_or(via);
+    let mut received = None;
+    let mut rport = None;
+    for raw_param in first.split(';').skip(1) {
+        let param = raw_param.trim();
+        if let Some((k, v)) = param.split_once('=') {
+            let key = k.trim();
+            let value = v.trim().to_string();
+            if key.eq_ignore_ascii_case("received") && received.is_none() {
+                received = Some(value);
+            } else if key.eq_ignore_ascii_case("rport") && rport.is_none() {
+                rport = Some(value);
+            }
+        }
+        // 値なしの単独 `rport` フラグは観測値ではないので無視 (= None)。
+    }
+    (received, rport)
+}
+
 /// 内線→NGN 発信通話の B2BUA ステートを保持するレジストリ。
 ///
 /// 1 通話には 2 つの SIP ダイアログがある (内線レッグ / NGN レッグ) ため、
@@ -3105,6 +3182,9 @@ impl UasEventHandler {
                 self.registry.insert_pending(pending.clone()).await;
             }
 
+            // Issue #260 Phase 1-A: INVITE 送出から 5xx 受信までの経過 ms を
+            // 構造化ログに載せるため、 invite await 開始直前で計測開始する。
+            let invite_started_at = std::time::Instant::now();
             let outcome = self.ngn_uac.invite(plan, sdp_for_ngn).await;
 
             // 結果を処理する前に pending を取り除く (CANCEL されている場合は
@@ -3207,7 +3287,38 @@ impl UasEventHandler {
                     Ok(())
                 }
                 Ok(InviteOutcome::Failed { response }) => {
-                    warn!(code = response.status_code, "NGN 側 INVITE 失敗");
+                    // Issue #260 Phase 1-A: 5xx 受信時は carrier 由来 header
+                    // (Reason RFC 3326 / Retry-After RFC 3261 §20.33 /
+                    // Server §20.35 / Warning §20.43) を warn! で構造化展開し、
+                    // carrier intermittent (per-AOR cooldown / DoS / 内部
+                    // race) の根本原因解析を可能にする。 3GPP TS 24.229 §5.2.7:
+                    // P-CSCF の 500 は per-INVITE 失敗、 503 は overload を意味する。
+                    // RFC 3261 §21.5 5xx 全般。
+                    if response.status_code >= 500 && response.status_code < 600 {
+                        let hv = extract_ngn_5xx_header_view(&response.headers);
+                        let elapsed_ms = invite_started_at.elapsed().as_millis() as u64;
+                        let cseq = request.headers.get("cseq").unwrap_or("");
+                        let to_h = request.headers.get("to").unwrap_or("");
+                        warn!(
+                            status = response.status_code,
+                            method = "INVITE",
+                            call_id = %call_id,
+                            aor = %from_aor,
+                            to = %to_h,
+                            cseq = %cseq,
+                            reason = ?hv.reason,
+                            retry_after = ?hv.retry_after,
+                            server = ?hv.server,
+                            warning = ?hv.warning,
+                            via_received = ?hv.via_received,
+                            via_rport = ?hv.via_rport,
+                            elapsed_since_invite_ms = elapsed_ms,
+                            "NGN 5xx 応答受信 (Issue #260 carrier intermittent 観測、 RFC 3326 / RFC 3261 §20.33/§20.35/§20.43/§21.5)"
+                        );
+                        self.metrics.record_ngn_5xx(response.status_code);
+                    } else {
+                        warn!(code = response.status_code, "NGN 側 INVITE 失敗");
+                    }
                     let result = if response.status_code == 486 {
                         InviteResult::Busy
                     } else {
@@ -4292,6 +4403,26 @@ impl PwaOutboundHandler for UasEventHandler {
         let completion = tokio::spawn(
             async move {
                 let plan = ngn_uac.build_invite(&target_uri, Some(&sdp_for_ngn), None);
+                // Issue #260 Phase 1-A: 5xx warn 構造化ログ用に Call-ID / CSeq /
+                // Request-URI を `plan.request` (= 実際に送出する INVITE) から
+                // 取り出して保持する。 plan は `invite()` の引数として move されるため
+                // 結果側の警告ログ生成時には参照できない。
+                let plan_call_id = plan
+                    .request
+                    .headers
+                    .get("call-id")
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let plan_cseq = plan
+                    .request
+                    .headers
+                    .get("cseq")
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let plan_target = plan.target_uri.clone();
+                // Issue #260 Phase 1-A: PWA→NGN 経路でも 5xx 受信時の経過 ms
+                // を構造化ログに載せるため、 invite await 開始直前で計測開始する。
+                let invite_started_at = std::time::Instant::now();
                 let outcome = ngn_uac.invite(plan, Some(sdp_for_ngn.clone())).await;
 
                 match outcome {
@@ -4428,7 +4559,33 @@ impl PwaOutboundHandler for UasEventHandler {
                         Ok(())
                     }
                     Ok(InviteOutcome::Failed { response }) => {
-                        warn!(code = response.status_code, "NGN INVITE 失敗");
+                        // Issue #260 Phase 1-A: PWA→NGN 経路の 5xx も同じ構造化
+                        // ログを出す (Reason RFC 3326 / Retry-After §20.33 /
+                        // Server §20.35 / Warning §20.43 / Via received/rport
+                        // RFC 3581 §4)。 3GPP TS 24.229 §5.2.7 / RFC 3261 §21.5。
+                        if response.status_code >= 500 && response.status_code < 600 {
+                            let hv = extract_ngn_5xx_header_view(&response.headers);
+                            let elapsed_ms = invite_started_at.elapsed().as_millis() as u64;
+                            warn!(
+                                status = response.status_code,
+                                method = "INVITE",
+                                call_id = %plan_call_id,
+                                aor = %rate_aor_owned,
+                                to = %plan_target,
+                                cseq = %plan_cseq,
+                                reason = ?hv.reason,
+                                retry_after = ?hv.retry_after,
+                                server = ?hv.server,
+                                warning = ?hv.warning,
+                                via_received = ?hv.via_received,
+                                via_rport = ?hv.via_rport,
+                                elapsed_since_invite_ms = elapsed_ms,
+                                "NGN 5xx 応答受信 (PWA outbound、 Issue #260、 RFC 3326 / RFC 3261 §20.33/§20.35/§20.43/§21.5)"
+                            );
+                            metrics.record_ngn_5xx(response.status_code);
+                        } else {
+                            warn!(code = response.status_code, "NGN INVITE 失敗");
+                        }
                         let result = if response.status_code == 486 {
                             InviteResult::Busy
                         } else {
@@ -15351,5 +15508,138 @@ mod tests {
             got_200_invite,
             "RFC 3262 §3: PRACK 受信後に INVITE 側 200 OK が出る。 observed={observed:?}"
         );
+    }
+
+    // ====================================================================
+    // Issue #260 Phase 1-A: NGN 5xx 応答受信時の header 構造化抽出
+    //   RFC 3261 §20.33 (Retry-After) / §20.35 (Server) / §20.43 (Warning) /
+    //   §21.5 (5xx Server Failure) / RFC 3326 §3-4 (Reason) /
+    //   RFC 3581 §4 (Via received / rport)
+    // ====================================================================
+
+    /// RFC 3261 §21.5 5xx Server Failure 応答から carrier 由来 header を
+    /// 抽出できることを検証する。 Reason / Retry-After / Server / Warning /
+    /// Via received/rport の全項目を 1 件の SipResponse で網羅。
+    #[test]
+    fn rfc3261_21_5_5xx_response_logging_extracts_reason_retry_after() {
+        let mut headers = SipHeaders::new();
+        headers.set("Call-ID", "ngn-500-cid@118.177.72.242");
+        headers.set("CSeq", "1 INVITE");
+        // RFC 3261 §20.33: Retry-After は delta-seconds (整数秒)
+        headers.set("Retry-After", "30");
+        // RFC 3326 §3: Reason ヘッダは SIP/Q.850 protocol-name + protocol-cause
+        headers.set("Reason", r#"Q.850;cause=16;text="Normal call clearing""#);
+        // RFC 3261 §20.35: Server は UAS 識別文字列
+        headers.set("Server", "NEC IP-PBX 6.0");
+        // RFC 3261 §20.43: Warning = warn-code SP warn-agent SP warn-text
+        headers.set("Warning", r#"399 ngn.ne.jp "Temporary congestion""#);
+        // RFC 3581 §4: Via に sent-by + received= + rport= が乗る
+        headers.set(
+            "Via",
+            "SIP/2.0/UDP 118.177.72.242:5060;branch=z9hG4bK-xyz;received=118.177.72.242;rport=5060",
+        );
+
+        let view = extract_ngn_5xx_header_view(&headers);
+        assert_eq!(view.retry_after.as_deref(), Some("30"));
+        assert_eq!(view.server.as_deref(), Some("NEC IP-PBX 6.0"));
+        assert!(
+            view.warning
+                .as_deref()
+                .map(|w| w.contains("399") && w.contains("Temporary congestion"))
+                .unwrap_or(false),
+            "Warning 全文が保持される: {:?}",
+            view.warning
+        );
+        assert!(
+            view.reason
+                .as_deref()
+                .map(|r| r.contains("Q.850") && r.contains("cause=16"))
+                .unwrap_or(false),
+            "Reason の protocol-name + protocol-cause が保持される: {:?}",
+            view.reason
+        );
+        assert_eq!(view.via_received.as_deref(), Some("118.177.72.242"));
+        assert_eq!(view.via_rport.as_deref(), Some("5060"));
+    }
+
+    /// RFC 3326 §4: Reason header は Q.850 cause code text を含み、 sabiden は
+    /// パースせず全文を warn ログに転送する (carrier 解析時に手で読みたいため)。
+    /// Retry-After が無いケースで `None` が返ることも合わせて検証。
+    #[test]
+    fn rfc3326_4_reason_header_q850_cause_extracted() {
+        let mut headers = SipHeaders::new();
+        headers.set("Reason", r#"Q.850;cause=41;text="Temporary failure""#);
+        // Retry-After / Server / Warning / Via を意図的に省略する
+        let view = extract_ngn_5xx_header_view(&headers);
+        assert!(
+            view.reason
+                .as_deref()
+                .map(|r| r.contains("cause=41") && r.contains("Temporary failure"))
+                .unwrap_or(false),
+            "Q.850 cause=41 を含む Reason ヘッダが取り出される: {:?}",
+            view.reason
+        );
+        assert!(view.retry_after.is_none());
+        assert!(view.server.is_none());
+        assert!(view.warning.is_none());
+        assert!(view.via_received.is_none());
+        assert!(view.via_rport.is_none());
+    }
+
+    /// RFC 3581 §4: Via に `;rport` フラグだけ (= 値なし) が付いている場合は、
+    /// UAS が観測した port が記載されていないので `None` を返す。 `received=`
+    /// は値ありなので抽出される。 大文字小文字混在も `eq_ignore_ascii_case`
+    /// で対応 (RFC 3261 §7.3.1)。
+    #[test]
+    fn rfc3581_4_via_received_rport_case_insensitive() {
+        let mut headers = SipHeaders::new();
+        headers.set(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-abc;RECEIVED=203.0.113.5;rport",
+        );
+        let view = extract_ngn_5xx_header_view(&headers);
+        assert_eq!(view.via_received.as_deref(), Some("203.0.113.5"));
+        // 値なしの `;rport` は観測値ではないので None
+        assert_eq!(view.via_rport, None);
+    }
+
+    /// `Metrics::record_ngn_5xx` は status code 別に独立 atomic を加算する
+    /// (3GPP TS 24.229 §5.2.7: 500 = per-INVITE failure / 503 = overload を
+    /// 観測時に区別したいため)。
+    #[test]
+    fn rfc3261_21_5_record_ngn_5xx_increments_per_status() {
+        let metrics = crate::observability::Metrics::new();
+        metrics.record_ngn_5xx(500);
+        metrics.record_ngn_5xx(500);
+        metrics.record_ngn_5xx(503);
+        metrics.record_ngn_5xx(504);
+        // 4xx は 5xx 観測対象外 (= 加算しない)
+        metrics.record_ngn_5xx(486);
+
+        assert_eq!(
+            metrics
+                .ngn_5xx_500
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics
+                .ngn_5xx_503
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .ngn_5xx_other
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "500/503 以外の 5xx は other ラベルに集約される"
+        );
+
+        // Prometheus exposition format に 3 ラベル全部出ること
+        let rendered = metrics.render_prometheus(false);
+        assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"500\"} 2"));
+        assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"503\"} 1"));
+        assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"other\"} 1"));
     }
 }

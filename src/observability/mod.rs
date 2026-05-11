@@ -101,6 +101,13 @@ pub struct Metrics {
     /// RTCP Sender Report 累計。 1 通話 5 秒間隔で送出するので、 60 秒通話で
     /// 各方向 12 件、 60 分通話で 720 件のオーダ。
     pub rtcp_sr_sent: AtomicU64,
+    /// Issue #260 Phase 1-A: NGN P-CSCF から受信した 5xx 応答の累計
+    /// (3GPP TS 24.229 §5.2.7 / RFC 3261 §21.5)。 既存 `invite_ngn_error`
+    /// は 4xx/5xx 双方を含むため、 5xx 散発現象の観測には不適。
+    /// 状態コードごと (500 / 503 / その他 5xx) に独立 atomic で持つ。
+    pub ngn_5xx_500: AtomicU64,
+    pub ngn_5xx_503: AtomicU64,
+    pub ngn_5xx_other: AtomicU64,
 }
 
 impl Metrics {
@@ -217,6 +224,23 @@ impl Metrics {
     /// として観測する。 方向別に分解したくなった場合は将来 label 化を検討)。
     pub fn add_rtcp_sr_sent(&self, n: u64) {
         self.rtcp_sr_sent.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Issue #260 Phase 1-A: NGN P-CSCF から 5xx 応答を 1 件受信した時に呼ぶ。
+    ///
+    /// 3GPP TS 24.229 §5.2.7 は 503 = overload / 500 = per-INVITE 内部失敗
+    /// と意味分けを規定するため、 状態コード毎に独立カウンタで記録し
+    /// Prometheus へ `status` ラベルで公開する (RFC 3261 §21.5)。
+    /// `invite_ngn_error` (4xx + 5xx 合算) とは別軸で 5xx 散発の頻度を観測する。
+    pub fn record_ngn_5xx(&self, status_code: u16) {
+        let counter = match status_code {
+            500 => &self.ngn_5xx_500,
+            503 => &self.ngn_5xx_503,
+            // 4xx 等を弾いた残り 5xx を `other` に集約 (501/502/504-599)。
+            501 | 502 | 504..=599 => &self.ngn_5xx_other,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format で全メトリクスを書き出す。
@@ -368,6 +392,27 @@ impl Metrics {
         out.push_str(&format!(
             "sabiden_rtcp_sr_sent_total {}\n",
             self.rtcp_sr_sent.load(Ordering::Relaxed)
+        ));
+
+        // Issue #260 Phase 1-A / 3GPP TS 24.229 §5.2.7 / RFC 3261 §21.5:
+        // NGN P-CSCF からの 5xx 応答を status コード別に公開する。 既存
+        // `invite_ngn_error` は 4xx と 5xx を合算するので、 5xx 散発現象の
+        // 頻度観測には別軸として本系列が必要。
+        out.push_str(
+            "# HELP sabiden_ngn_5xx_total NGN P-CSCF から受信した 5xx 応答累計 (3GPP TS 24.229 §5.2.7 / RFC 3261 §21.5)\n",
+        );
+        out.push_str("# TYPE sabiden_ngn_5xx_total counter\n");
+        out.push_str(&format!(
+            "sabiden_ngn_5xx_total{{status=\"500\"}} {}\n",
+            self.ngn_5xx_500.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_ngn_5xx_total{{status=\"503\"}} {}\n",
+            self.ngn_5xx_503.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_ngn_5xx_total{{status=\"other\"}} {}\n",
+            self.ngn_5xx_other.load(Ordering::Relaxed)
         ));
 
         out

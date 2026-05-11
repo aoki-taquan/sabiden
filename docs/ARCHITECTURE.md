@@ -589,6 +589,13 @@ struct OutboundRateLimiter {
 - `sabiden_sip_invite_blocked_by_rate_limit_total{direction=...}` — rate limiter で
   503 拒否した INVITE 累計 (TTC §5.7.1 適用回数)。
 - `sabiden_sip_invite_interval_seconds_{sum,count}` — 連続 outbound INVITE 発射間隔の summary。
+- `sabiden_ngn_5xx_total{status="500"|"503"|"other"}` — NGN P-CSCF から受信した
+  5xx 応答累計 (Issue #260 Phase 1-A、 3GPP TS 24.229 §5.2.7: 500 = per-INVITE 失敗
+  / 503 = overload を区別観測)。 既存 `sabiden_sip_invite_total{direction="ngn",result="error"}`
+  は 4xx と 5xx を合算するので別軸として導入 (RFC 3261 §21.5)。 同時に 5xx 受信時は
+  `Reason` (RFC 3326) / `Retry-After` (§20.33) / `Server` (§20.35) / `Warning` (§20.43) /
+  Via `received` / `rport` (RFC 3581 §4) を `warn!` 構造化フィールドで dump し、
+  carrier intermittent 解析の手がかりにする。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

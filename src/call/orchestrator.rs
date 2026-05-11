@@ -762,12 +762,13 @@ impl NgnInboundHandler {
             // refresher=uac で送るため稀だが、 RFC 4028 §7.4 で UAS への
             // refresh 委譲は許容されており、 透過処理は必須。
             //
-            // 該当 outbound 通話が無い場合は初回 INVITE 経路にフォールバック
-            // する: NGN 直収では初回 INVITE 自体は To-tag 無しが期待されるが、
-            // 一部の SIP UA は無関係な To-tag を載せて初回送出するケースも
-            // ある (RFC 3261 §8.1.1.2 では新規 dialog の To は tag 無しを
-            // 推奨だが MUST ではない)。 そのため tag 有りでも registry に
-            // 該当が無ければ 481 ではなく通常 fork に進む安全側挙動とする。
+            // To に tag が乗っているにも関わらず registry に該当 outbound 通話が
+            // 無い場合は **RFC 3261 §12.2.2 に従い 481 を返す** (Call/Transaction
+            // Does Not Exist)。 §12.2.2 は in-dialog (= 既存 dialog 識別子付き)
+            // request が dialog に紐づかなければ 481 で応答することを要求しており、
+            // RFC 3261 §8.1.1.2 で新規 dialog 用 To は tag 無しを推奨している以上、
+            // 初回 INVITE 経路へフォールスルーさせると `lookup_by_ngn` 不整合や
+            // 二重フォークの原因になる。 forwarder 未注入も含めて 481 で統一する。
             if let Some(to) = request.headers.get("to") {
                 if crate::sip::utils::has_to_tag(to) {
                     let fw = self.outbound_forwarder.lock().await.clone();
@@ -783,9 +784,7 @@ impl NgnInboundHandler {
                         }
                     }
                     // forwarder 未注入 or 該当無し → 481 を返す (RFC 3261 §12.2.2)。
-                    // 初回 INVITE のはずなのに To-tag 付いていたケースで、
-                    // 既存 dialog 無し: 受信側 UAS は 481 が安全 (= NGN UAC は
-                    // ACK + 新規 Call-ID で再試行する)。
+                    // NGN UAC は ACK + 新規 Call-ID で再試行する (RFC 3261 §12.2.1.2)。
                     warn!(%call_id, "NGN in-dialog INVITE で該当 outbound 通話無し → 481");
                     self.respond(&stx, 481, "Call/Transaction Does Not Exist")
                         .await?;
@@ -1276,6 +1275,46 @@ impl NgnInboundHandler {
 /// (RFC 3261 §12.2.2 違反; 内線 UA は ACK を送らず切断する)。 内線が
 /// `;TAG=...` 大文字 Re-INVITE を送ってきた場合に 200 OK が壊れていた
 /// 問題 (PR #136 review) の根治。
+/// 内線レッグ Re-INVITE の `send_request` 失敗を SIP final response の
+/// (status_code, reason_phrase) に分類する (RFC 3261 §13.3.1.1 / §13.3.1.2)。
+///
+/// - **408 Request Timeout** (§13.3.1.1): 内線 UAS が Timer B / F (= 64 * T1)
+///   満了まで応答しない場合。 RFC 3261 §13.3.1.1 で「UAS callee がリーズナブル
+///   時間内に応答しない場合 408 を返してよい」とされ、 B2BUA UAS としても
+///   内線 callee 側の応答不在を Timer B/F 失敗で検知した場合は同じ意味論で
+///   408 を NGN 側 UAC へ伝搬する。
+/// - **500 Server Internal Error** (§13.3.1.2): 上記以外の内線レッグ通信失敗
+///   (UDP `send_to` の I/O 失敗、 トランザクション層停止、 oneshot 中断、
+///   ヘッダ欠落による `create_client` 失敗 等)。 §13.3.1.2 は UAS が「unexpected
+///   condition により request 履行不能」と判断した場合の正当な応答として 500
+///   を挙げている。
+///
+/// 判定は `anyhow::Error` の文字列表現を見る:
+///
+/// - `TransactionLayer::send_request` 配下の `ClientTransaction::run` は
+///   Timer B/F 満了で `anyhow!("transaction timeout")` を返す
+///   (`src/sip/transaction.rs` Timer B/F ブランチ)。
+/// - 他は I/O / 内部チャネル系の異なるメッセージで上がる。
+///
+/// `anyhow::Error` は構造化型を持たないため、 安定 ID として上記固定文字列を
+/// 突き合わせる。 `src/sip/transaction.rs` 側でこの文字列を変えると classifier
+/// も追従する必要があるため、 単体テスト (`classifies_timer_bf_as_408_per_rfc3261_13_3_1_1`)
+/// で文字列契約を担保する。
+fn classify_ext_reinvite_send_error(err: &anyhow::Error) -> (u16, &'static str) {
+    // anyhow::Error の `Display` は最外殻 context だけを返すので、 source chain
+    // を辿って "transaction timeout" を探す。 これにより上位で `.context(...)`
+    // が追加されても (将来の transaction.rs 側のエラー記述拡充に追従)、
+    // 元の Timer B/F 由来は 408 に分類され続ける。
+    let chain_has_timeout = err
+        .chain()
+        .any(|e| e.to_string().contains("transaction timeout"));
+    if chain_has_timeout {
+        (408, "Request Timeout")
+    } else {
+        (500, "Server Internal Error")
+    }
+}
+
 fn ensure_to_tag(resp: &mut SipResponse) {
     if let Some(to) = resp.headers.get("to") {
         if !crate::sip::utils::has_to_tag(to) {
@@ -2602,12 +2641,19 @@ impl UasEventHandler {
                 tx.respond(to_ngn).await
             }
             Err(e) => {
-                warn!(error=%e, "内線 Re-INVITE トランスポート失敗 → NGN へ 408");
-                // RFC 3261 §13.3.1.1: 内線 UA が応答しないなら 408 Request Timeout
-                // を NGN へ返す (Timer F 相当の上位扱い)。 NGN→sabiden Re-INVITE
-                // を失敗扱いとし、 NGN 側 UAC は ACK + BYE で dialog を畳む選択を
-                // 取ることになる。
-                let mut to_ngn = build_response_skeleton(tx.request(), 408, "Request Timeout");
+                // 内線レッグ送出失敗の semantic 分類 (RFC 3261 §13.3.1.1 / §13.3.1.2):
+                // - Timer B/F 満了 (内線 UAS 応答不在) → 408 Request Timeout
+                // - UDP send / 内部 channel / header parse 失敗 → 500 Server Internal Error
+                //
+                // §13.3.1.1 は「callee が timely に応答しなかった」場合の 408 を
+                // 認めており、 §13.3.1.2 は「unexpected condition で履行不能」の
+                // 5xx を認めている。 transport failure を一律 408 で総括していた
+                // PR #205 の振る舞いは、 NGN 側 UAC に対して「内線 callee の沈黙」
+                // と「内線レッグ自体の通信路断絶」を区別不能にしており、
+                // §13.3.1.2 の意味論上正しくない。
+                let (code, reason) = classify_ext_reinvite_send_error(&e);
+                warn!(error=%e, code, reason, "内線 Re-INVITE 失敗 → NGN へ転送");
+                let mut to_ngn = build_response_skeleton(tx.request(), code, reason);
                 ensure_to_tag(&mut to_ngn);
                 tx.respond(to_ngn).await
             }
@@ -4225,6 +4271,72 @@ mod tests {
         assert_eq!(
             extract_user_from_sip_uri("sip:user:pw@example.com"),
             Some("user:pw".to_string())
+        );
+    }
+
+    /// Issue #207 / PR #205 follow-up 🟡#3: `classify_ext_reinvite_send_error`
+    /// は内線レッグ `send_request` 失敗を RFC 3261 §13.3.1.1 (408) / §13.3.1.2
+    /// (500) の正しい意味論に振り分けることを保証する。
+    ///
+    /// Timer B/F (= 64 * T1) 満了の場合 ClientTransaction::run は
+    /// `anyhow!("transaction timeout")` を返す。 §13.3.1.1 はこの「callee 応答
+    /// 不在」を 408 Request Timeout で表現することを認めており、 sabiden は
+    /// B2BUA UAS として同 semantic を NGN 側 UAC に伝搬する。
+    #[test]
+    fn classifies_timer_bf_as_408_per_rfc3261_13_3_1_1() {
+        let err = anyhow::anyhow!("transaction timeout");
+        assert_eq!(
+            classify_ext_reinvite_send_error(&err),
+            (408, "Request Timeout"),
+        );
+    }
+
+    /// Timer B/F 以外の `send_request` 失敗 (= UDP I/O 失敗、 channel 停止、
+    /// header parse 失敗) は RFC 3261 §13.3.1.2 「unexpected condition で
+    /// request 履行不能」に該当するため 500 Server Internal Error を返す。
+    #[test]
+    fn classifies_transport_error_as_500_per_rfc3261_13_3_1_2() {
+        // (a) UDP send_to の I/O 失敗をシミュレートする anyhow 例
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "ECONNREFUSED");
+        let any_io: anyhow::Error = anyhow::Error::new(io_err);
+        assert_eq!(
+            classify_ext_reinvite_send_error(&any_io),
+            (500, "Server Internal Error"),
+        );
+
+        // (b) transaction layer 停止 (rx チャネル close) を表す文字列
+        let layer_down = anyhow::anyhow!("transaction layer が停止した");
+        assert_eq!(
+            classify_ext_reinvite_send_error(&layer_down),
+            (500, "Server Internal Error"),
+        );
+
+        // (c) oneshot 中断 (= client transaction が中断された)
+        let oneshot_abort = anyhow::anyhow!("client transaction が中断された");
+        assert_eq!(
+            classify_ext_reinvite_send_error(&oneshot_abort),
+            (500, "Server Internal Error"),
+        );
+
+        // (d) create_client のヘッダ欠落
+        let no_via = anyhow::anyhow!("Via ヘッダがない");
+        assert_eq!(
+            classify_ext_reinvite_send_error(&no_via),
+            (500, "Server Internal Error"),
+        );
+    }
+
+    /// "transaction timeout" 文字列を context に含めた wrap 形式 (今後
+    /// transaction.rs 側で context を追加された場合に備えた契約) でも 408
+    /// に振れることを確認する。 `format!("{err}")` が anyhow の chain を辿る
+    /// ことに依存するため、 wrap 後でも一致することを念のため担保する。
+    #[test]
+    fn classifies_wrapped_timeout_as_408() {
+        let inner = anyhow::anyhow!("transaction timeout");
+        let wrapped = inner.context("ext leg Re-INVITE failed");
+        assert_eq!(
+            classify_ext_reinvite_send_error(&wrapped),
+            (408, "Request Timeout"),
         );
     }
 

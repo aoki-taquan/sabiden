@@ -979,6 +979,19 @@ NGN ──ACK──► sabiden
 該当 outbound 通話が registry に無ければ 481 Call/Transaction Does Not Exist
 を返す (RFC 3261 §12.2.2)。
 
+内線レッグ Re-INVITE の `send_request` が失敗した場合は失敗種別を分類して
+NGN へ伝搬する (Issue #207):
+
+- **408 Request Timeout** (RFC 3261 §13.3.1.1) — 内線 UAS が Timer B/F (= 64 * T1
+  = 32s) 満了まで応答しない場合 (= callee silence semantic)。
+- **500 Server Internal Error** (RFC 3261 §13.3.1.2) — UDP `send_to` の I/O
+  失敗、 トランザクション層停止、 oneshot 中断、 ヘッダ欠落による
+  `create_client` 失敗 等の「unexpected condition により request 履行不能」
+  系統。
+
+分類は `classify_ext_reinvite_send_error` ヘルパが anyhow error chain を辿って
+"transaction timeout" を検出するか否かで行う。
+
 **既知の制限** (Phase R3 で改善):
 
 - RTP ブリッジ媒介時の Re-INVITE SDP 書換 (sabiden 側 RTP port 差替) は

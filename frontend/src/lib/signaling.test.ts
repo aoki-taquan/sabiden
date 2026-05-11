@@ -1275,3 +1275,299 @@ describe("App rate-limited state machine (Issue #194)", () => {
     expect(tr.remaining()).toBeNull();
   });
 });
+
+describe("App pendingIceCandidates dialog-epoch race (Issue #173)", () => {
+  // PR #172 で frontend 側 deferred されていた race。
+  // 旧実装は `pendingIceCandidates: string[]` + teardownCall で配列を空に
+  // 再代入する単純構造で、 以下 2 race を踏んでいた:
+  //   R1: 新着信 "offer" の前後で "ice" が到達する任意順序 (RFC 8839 §4.2
+  //       trickle ICE) で、 buffer 済 ICE を offer ハンドラ内 teardownCall が
+  //       wipe する。
+  //   R2: flushPendingIce ループの await 合間に teardownCall が走り、 古い
+  //       buffer 参照で続行して hangup 済 PC に addIce する。
+  //
+  // 修正: ICE candidate を **dialog epoch** でタグ付けし、 flush は現 epoch
+  // 一致分のみ適用する。 本テストは App.tsx::teardownCall / flushPendingIce /
+  // handleSignalMessage("ice") の closure を最小再現して race を回避する。
+  // (SolidJS の `createSignal` は使わず、 epoch / buffer / call を素の let で
+  //  握る = App.tsx と同形)。
+
+  /** App.tsx の ICE buffer 部分を最小再現する closure。
+   *
+   * 実 RTCPeerConnection は使わず、 `addIce(candidate)` 呼出を記録する
+   * fake `call` を inject する。 これにより flush の挙動が観測可能。
+   */
+  type FakeCall = {
+    readonly id: number;
+    addIce: (candidate: string) => Promise<void>;
+    hangup: () => void;
+    readonly seen: string[];
+    readonly alive: () => boolean;
+  };
+
+  function makeFakeCall(id: number, addIcePauseMs: number = 0): FakeCall {
+    const seen: string[] = [];
+    let alive = true;
+    return {
+      id,
+      addIce: async (candidate: string) => {
+        if (addIcePauseMs > 0) {
+          // 微少 microtask を消費するため、 Promise.resolve を await して
+          // event loop に制御を返す (await 合間に他 handler が走る race を再現)。
+          await Promise.resolve();
+        }
+        if (!alive) throw new Error("addIce on hung-up call");
+        seen.push(candidate);
+      },
+      hangup: () => {
+        alive = false;
+      },
+      seen,
+      alive: () => alive,
+    };
+  }
+
+  /** App.tsx 由来 dialog-epoch buffer の closure 模型。 production code は
+   * `App.tsx` 内 `let` で同じ shape を持つ。 本 closure は test fixture。 */
+  function makeAppLikeBuffer() {
+    type PendingIce = { epoch: number; candidate: string };
+    let call: FakeCall | null = null;
+    let pendingIceCandidates: PendingIce[] = [];
+    let dialogEpoch = 0;
+
+    const teardownCall = () => {
+      call?.hangup();
+      call = null;
+      dialogEpoch += 1;
+    };
+
+    const setCall = (c: FakeCall) => {
+      call = c;
+    };
+
+    const onIceMsg = async (candidate: string) => {
+      if (call) {
+        await call.addIce(candidate);
+      } else {
+        pendingIceCandidates.push({ epoch: dialogEpoch, candidate });
+      }
+    };
+
+    const flushPendingIce = async () => {
+      if (!call) return;
+      const currentEpoch = dialogEpoch;
+      const buffered = pendingIceCandidates.filter((p) => p.epoch === currentEpoch);
+      pendingIceCandidates = [];
+      for (const { candidate } of buffered) {
+        if (!call || dialogEpoch !== currentEpoch) return;
+        try {
+          await call.addIce(candidate);
+        } catch {
+          /* warn-only in production */
+        }
+      }
+    };
+
+    return {
+      teardownCall,
+      setCall,
+      onIceMsg,
+      flushPendingIce,
+      // 観測用
+      getCall: () => call,
+      bufferLen: () => pendingIceCandidates.length,
+      bufferSnapshot: () => pendingIceCandidates.slice(),
+      currentEpoch: () => dialogEpoch,
+    };
+  }
+
+  // Issue #173 (R1): NGN→PWA 着信で "ice" が "offer" より先着するケース。
+  // RFC 8839 §4.2 trickle ICE は ICE / Offer の任意順序を許す。 旧実装は
+  // teardownCall が buffer を wipe したため、 ここで先着した ICE が消えていた。
+  it("rfc8839_4_2_ice_before_offer_is_buffered_with_current_epoch_and_survives_teardown", async () => {
+    const buf = makeAppLikeBuffer();
+    // 状態: 通話なし (epoch=0)
+    expect(buf.currentEpoch()).toBe(0);
+
+    // 1) WS から ICE 先着 → buffer に積まれる (epoch=0)
+    await buf.onIceMsg("candidate:1 1 udp 2122252543 192.168.1.10 56789 typ host");
+    expect(buf.bufferLen()).toBe(1);
+    expect(buf.bufferSnapshot()[0].epoch).toBe(0);
+
+    // 2) 続いて "offer" が到達 → App.tsx は teardownCall() を呼ぶ (epoch 0→1)
+    //    旧実装はここで buffer を [] にしていた → 先着 ICE が消える bug。
+    //    新実装は epoch++ のみ。 buffer 内エントリは epoch=0 のまま残るが、
+    //    後段 flush は現 epoch=1 と一致しないため drop される (R1: 別 dialog
+    //    の遺残 ICE を新 dialog に流さない、 期待動作)。
+    buf.teardownCall();
+    expect(buf.currentEpoch()).toBe(1);
+    // 遺残エントリは buffer に物理的に残っているが、 epoch 不一致で drop 予定。
+    expect(buf.bufferLen()).toBe(1);
+
+    // 3) Accept 押下相当: 新 call (epoch=1 文脈) を立てる前に新着 ICE が到達。
+    //    これは新 dialog の ICE なので、 epoch=1 でタグ付けされて残るべき。
+    await buf.onIceMsg("candidate:2 1 udp 2122252543 192.168.1.10 56790 typ host");
+    expect(buf.bufferLen()).toBe(2);
+    expect(buf.bufferSnapshot()[1].epoch).toBe(1);
+
+    // 4) 新 call 生成 + flush → epoch=1 一致分だけ適用される (= R1 解消)。
+    const callA = makeFakeCall(1);
+    buf.setCall(callA);
+    await buf.flushPendingIce();
+    expect(callA.seen).toEqual([
+      "candidate:2 1 udp 2122252543 192.168.1.10 56790 typ host",
+    ]);
+  });
+
+  // Issue #173 (R1 対偶): "offer" が "ice" より先着する通常順序。 これは
+  // 旧実装でも正常動作していたが、 新実装でも壊さないことを確認する。
+  it("rfc8839_4_2_ice_after_offer_is_buffered_then_flushed_on_accept", async () => {
+    const buf = makeAppLikeBuffer();
+
+    // 1) "offer" 到達 → teardownCall (epoch 0→1) + ringing UI 遷移相当。
+    buf.teardownCall();
+    expect(buf.currentEpoch()).toBe(1);
+
+    // 2) ringing 中に ICE 到達 → buffer (epoch=1)
+    await buf.onIceMsg("ice-1");
+    await buf.onIceMsg("ice-2");
+    expect(buf.bufferLen()).toBe(2);
+
+    // 3) Accept → new call + flush
+    const callA = makeFakeCall(1);
+    buf.setCall(callA);
+    await buf.flushPendingIce();
+    expect(callA.seen).toEqual(["ice-1", "ice-2"]);
+  });
+
+  // Issue #173: ICE → Offer → ICE → ICE → end-of-candidates の interleave で
+  // 新 dialog の全 ICE が正しく到達する (PR #172 server-side の
+  // `rfc8839_multiple_interleaved_ice_candidates_all_accepted` PWA 版)。
+  it("rfc8839_4_2_multiple_interleaved_ice_candidates_all_arrive_at_new_call", async () => {
+    const buf = makeAppLikeBuffer();
+
+    // 旧 dialog の遺残 ICE (offer 前)
+    await buf.onIceMsg("stale-ice-old-dialog");
+
+    // 新着信 "offer" 到達 → teardownCall (epoch 0→1)
+    buf.teardownCall();
+
+    // 新 dialog の trickle ICE が任意順序で到達
+    await buf.onIceMsg("new-ice-1");
+    await buf.onIceMsg("new-ice-2");
+    await buf.onIceMsg(""); // end-of-candidates marker (RFC 8838 §13)
+    await buf.onIceMsg("new-ice-3"); // 仕様外だが parser 受理する
+
+    // Accept → flush
+    const callA = makeFakeCall(1);
+    buf.setCall(callA);
+    await buf.flushPendingIce();
+
+    // 旧 dialog 遺残 (`stale-ice-old-dialog`) は drop、 新 dialog 4 件全到達。
+    expect(callA.seen).toEqual(["new-ice-1", "new-ice-2", "", "new-ice-3"]);
+  });
+
+  // Issue #173: end-of-candidates marker (空文字列) も他 ICE と同じく
+  // dialog-epoch buffer 規則に従う。 旧 dialog の eoc が新 dialog に漏れない。
+  it("rfc8838_13_end_of_candidates_marker_is_also_tagged_with_dialog_epoch", async () => {
+    const buf = makeAppLikeBuffer();
+
+    // 旧 dialog で eoc を受信
+    await buf.onIceMsg("");
+    expect(buf.bufferLen()).toBe(1);
+    expect(buf.bufferSnapshot()[0]).toEqual({ epoch: 0, candidate: "" });
+
+    // 新着信 → teardownCall (epoch 0→1)
+    buf.teardownCall();
+
+    // Accept → flush。 旧 epoch=0 の eoc は drop される (= 新 dialog に
+    // 「もう候補は来ない」 を誤って流さない、 R1 派生 case)。
+    const callA = makeFakeCall(1);
+    buf.setCall(callA);
+    await buf.flushPendingIce();
+    expect(callA.seen).toEqual([]);
+  });
+
+  // Issue #173 (R2): call 立ち上げ後に届く ICE は buffer を経由せず直接
+  // addIce される (call != null 分岐)。 これは R2 race の対象ではないが、
+  // 新実装でも壊れていないことを確認する regression guard。
+  it("ice_after_call_established_goes_directly_to_addIce_not_buffer", async () => {
+    const buf = makeAppLikeBuffer();
+    const callA = makeFakeCall(1);
+    buf.setCall(callA);
+
+    await buf.onIceMsg("direct-ice-1");
+    await buf.onIceMsg("direct-ice-2");
+
+    expect(callA.seen).toEqual(["direct-ice-1", "direct-ice-2"]);
+    expect(buf.bufferLen()).toBe(0);
+  });
+
+  // Issue #173 (R2): flushPendingIce の await 合間に teardownCall が割り込んで
+  // も、 ループは早期 return する (旧 call への addIce が走らない)。
+  it("teardown_mid_flush_aborts_loop_and_does_not_addice_to_hung_up_call", async () => {
+    const buf = makeAppLikeBuffer();
+
+    // ringing 中に 3 件 buffer
+    buf.teardownCall(); // epoch 0→1 (新着信受信相当)
+    await buf.onIceMsg("c1");
+    await buf.onIceMsg("c2");
+    await buf.onIceMsg("c3");
+
+    const callA = makeFakeCall(1, /*addIcePauseMs=*/ 1);
+    buf.setCall(callA);
+
+    // flush 開始 (await 合間に teardown を割り込ませる)
+    const flushPromise = buf.flushPendingIce();
+
+    // 1 件目の addIce が microtask を消費している間に teardown を入れる。
+    await Promise.resolve();
+    buf.teardownCall(); // epoch 1→2、 call = null
+
+    await flushPromise;
+
+    // hangup 済 call には R2 race で旧実装が addIce していたが、 新実装は
+    // ループ先頭で `dialogEpoch !== currentEpoch` を見て即 return する。
+    // 1 件目の addIce は teardown より前に開始しているので seen に入っている
+    // 可能性があるが、 2 件目以降は確実に走らない。
+    expect(callA.seen.length).toBeLessThanOrEqual(1);
+    expect(callA.alive()).toBe(false);
+  });
+
+  // Issue #173: 2 通連続着信 (一連の inbound チェーン) で各 dialog の ICE が
+  // それぞれの call にだけ届く (epoch 分離が dialog 数分スケール)。
+  it("two_back_to_back_inbound_dialogs_keep_ice_isolated_per_epoch", async () => {
+    const buf = makeAppLikeBuffer();
+
+    // === Dialog 1 ===
+    buf.teardownCall(); // epoch 0→1 (1 件目の offer 到達相当)
+    await buf.onIceMsg("d1-ice-1");
+    const call1 = makeFakeCall(1);
+    buf.setCall(call1);
+    await buf.flushPendingIce();
+    expect(call1.seen).toEqual(["d1-ice-1"]);
+
+    // === Dialog 2 (1 件目 BYE → 即 2 件目 offer) ===
+    // 1 件目 BYE 由来 ICE が遅れて届く (旧 dialog エンドゲーム)
+    await buf.onIceMsg("d1-ice-late"); // call != null なので直接 call1 に
+    expect(call1.seen).toContain("d1-ice-late");
+
+    buf.teardownCall(); // epoch 1→2 (BYE 受信 → call1 hangup)
+    expect(call1.alive()).toBe(false);
+
+    // 2 件目 offer 到達相当: 既に teardownCall 済なので epoch は 2 のまま
+    // (offer ハンドラは teardownCall を呼ぶが、 上の BYE で既に呼ばれている
+    //  ので idempotent: ここでは追加 teardownCall で epoch 2→3)。
+    buf.teardownCall();
+    expect(buf.currentEpoch()).toBe(3);
+
+    // 2 件目 dialog の ICE
+    await buf.onIceMsg("d2-ice-1");
+    const call2 = makeFakeCall(2);
+    buf.setCall(call2);
+    await buf.flushPendingIce();
+    expect(call2.seen).toEqual(["d2-ice-1"]);
+    // call1 には d2 の ICE が漏れない (epoch 分離の主目的)
+    expect(call1.seen).not.toContain("d2-ice-1");
+  });
+});

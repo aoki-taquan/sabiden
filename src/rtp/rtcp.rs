@@ -47,6 +47,27 @@ impl NtpTimestamp {
         // 上位 16 bits of seconds + 上位 16 bits of fraction
         ((self.seconds & 0xFFFF) << 16) | (self.fraction >> 16)
     }
+
+    /// `earlier` から self までの経過秒数 (浮動小数点)。
+    ///
+    /// RFC 3550 §6.4.1 の "NTP timestamp ↔ RTP timestamp" 相関で、 wall clock
+    /// 経過を秒単位で取り出してサンプルクロック (Hz) に乗算するのに使う。
+    ///
+    /// NTP timestamp は (seconds: u32, fraction: u32) で 1900-01-01 起点
+    /// (RFC 5905 §6)。 fraction は 2^32 = 1 秒スケール。 ここでは秒は wrap-around
+    /// しない前提で素直に差し引き、 fraction は signed として扱う:
+    /// - `self >= earlier` のとき正の値を返す。
+    /// - `self < earlier` (時計が逆走) のとき負の値を返す (送信側で saturate
+    ///   する責任を呼出側に委譲)。
+    ///
+    /// 2^32 秒 ≒ 136 年なので、 sabiden の運用 (数時間 / 数日の通話) では
+    /// seconds の wrap-around は発生しない。
+    pub fn elapsed_from(&self, earlier: NtpTimestamp) -> f64 {
+        let self_secs = self.seconds as f64 + (self.fraction as f64) / (u32::MAX as f64 + 1.0);
+        let earlier_secs =
+            earlier.seconds as f64 + (earlier.fraction as f64) / (u32::MAX as f64 + 1.0);
+        self_secs - earlier_secs
+    }
 }
 
 /// 1 受信元あたりの Report Block (RFC 3550 §6.4.1)
@@ -257,6 +278,47 @@ mod tests {
         // 2020-01-01 in NTP seconds
         let cutoff = (1577836800u64 + NTP_UNIX_OFFSET) as u32;
         assert!(n.seconds > cutoff);
+    }
+
+    /// RFC 3550 §6.4.1 / Issue #182 (d): `elapsed_from` は 2 つの NTP timestamp
+    /// 間の経過秒数を浮動小数点で返す。 SR の RTP timestamp 線形計算で使う。
+    #[test]
+    fn rfc3550_6_4_1_elapsed_from_seconds_and_fraction() {
+        let earlier = NtpTimestamp {
+            seconds: 3_900_000_000,
+            fraction: 0,
+        };
+        // 5 秒後 + 0 fraction
+        let later_5s = NtpTimestamp {
+            seconds: earlier.seconds + 5,
+            fraction: 0,
+        };
+        let elapsed = later_5s.elapsed_from(earlier);
+        assert!(
+            (elapsed - 5.0).abs() < 1e-9,
+            "5 秒差は 5.0 (got {})",
+            elapsed
+        );
+
+        // 0.5 秒 (= fraction 半分)
+        let half = NtpTimestamp {
+            seconds: earlier.seconds,
+            fraction: (0.5_f64 * (u32::MAX as f64 + 1.0)) as u32,
+        };
+        let elapsed_half = half.elapsed_from(earlier);
+        assert!(
+            (elapsed_half - 0.5).abs() < 1e-6,
+            "fraction 半分は 0.5 秒 (got {})",
+            elapsed_half
+        );
+
+        // 逆走 (later → earlier) は負を返す (saturate は呼出側責任)
+        let elapsed_back = earlier.elapsed_from(later_5s);
+        assert!(
+            (elapsed_back + 5.0).abs() < 1e-9,
+            "逆向きは -5.0 (got {})",
+            elapsed_back
+        );
     }
 
     #[test]

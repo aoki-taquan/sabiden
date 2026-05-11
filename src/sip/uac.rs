@@ -1348,6 +1348,27 @@ mod tests {
         }
     }
 
+    /// RFC 3261 §9.1: 100 Trying (= Provisional) を受けた後の CANCEL は
+    /// MUST 送出され、 CANCEL の Via branch は元 INVITE と一致する
+    /// (§9.1 / §17.1.3)。
+    ///
+    /// ## Issue #238 同期方式
+    ///
+    /// 旧実装は `tokio::time::sleep(50ms)` で「たぶん 100 Trying が dispatch
+    /// されたろう」を期待していた。 CI 負荷で 50ms 内に 100 Trying の
+    /// transaction layer 反映が間に合わないと、 `cancel_pending` が
+    /// `InviteResponseProgress::Pending` を観測 → 1xx 待機経路に入り
+    /// テストシナリオと異なる挙動になる flake 余地があった。
+    ///
+    /// PR #236 (Closes #201) と同方式で 2 段階の deterministic 同期に置換:
+    ///
+    /// 1. `provisional_watch(&invite_id)` を `tokio::task::yield_now` ループで
+    ///    poll し registration 完了 (= `create_client` table 登録) を観測
+    /// 2. 得た `watch::Receiver` を `wait_for(Provisional)` で block し
+    ///    100 Trying が transaction layer に届いた瞬間まで待つ
+    ///
+    /// production API (`provisional_watch`) を同期点に流用するだけで、
+    /// test hook 追加なし (CLAUDE.md §6.3 production-side test hook 禁止)。
     #[tokio::test]
     async fn cancel_sends_cancel_with_invite_branch() {
         let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1395,34 +1416,47 @@ mod tests {
         uac_cfg.local_addr = client_local;
         let uac = Uac::new(uac_cfg, layer, server_addr);
         let plan = uac.build_invite("sip:remote@127.0.0.1:9999", None, None);
-        // INVITE は最終応答が来ないので別タスクで待つ
         let plan_for_cancel = plan.clone();
-        let invite_task = {
-            let plan_clone = plan.clone();
-            // Uac は Send なので tokio::spawn には移動できないため、
-            // ここでは plan_clone の自前送信で代用 (キャンセル後は不要)。
-            // INVITE は Trying 後 Timer B (32s) で Err を返す。
-            // テスト時間を抑えるためバックグラウンド送信は行わず、CANCEL 送信のみ確認する。
-            // (CANCEL のテスト目的に集中)
-            let _ = plan_clone;
-            tokio::spawn(async move {
-                // INVITE 単発送信のみ行い 100 Trying を受け取る (待機なし)
-            })
-        };
-        // INVITE 送信をフェイク的に行う: 直接 socket で送る代わりに、
-        // build_invite で生成した SipRequest を layer 経由で送る。
-        // ここでは UAC を再利用するため別タスク不要。
-        let plan_clone = plan_for_cancel.clone();
-        // INVITE の送信を別タスクで開始して、すぐに CANCEL する。
+
+        // INVITE の送信を別タスクで開始して、 100 Trying 観測後に CANCEL する。
+        // `send_request` は INVITE 最終応答まで返らないので fire-and-forget。
         let layer_for_invite = uac.layer.clone();
         let server_addr_invite = uac.server_addr;
+        let plan_clone = plan_for_cancel.clone();
         let invite_send_task = tokio::spawn(async move {
             let _ = layer_for_invite
                 .send_request(plan_clone.request, server_addr_invite)
                 .await;
         });
-        // 100 Trying が server に届いてから CANCEL を送る (短い遅延)
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // RFC 3261 §17.1.3 で identify される transaction id を先に算出し、
+        // `provisional_watch` が Some を返す = `create_client` が table に
+        // 登録完了、 を deterministic に観測する (registration は同一プロセス
+        // 内のロック取得 1 回で完了するので待ち時間は実質ゼロ)。
+        let invite_id =
+            crate::sip::transaction::TransactionId::from_request(&plan.request).unwrap();
+        let mut rx = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(rx) = uac.layer.provisional_watch(&invite_id).await {
+                    break rx;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("INVITE が transaction table に登録されない (test bug)");
+
+        // RFC 3261 §9.1: 100 Trying が transaction layer 内部状態を
+        // `InviteResponseProgress::Provisional` に遷移させるまで block。
+        // 旧実装は `sleep(50ms)` で「たぶん 100 Trying は届いてるだろう」と
+        // 同期していたが、 CI 負荷で flake する余地があった。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rx.wait_for(|v| matches!(v, InviteResponseProgress::Provisional)),
+        )
+        .await
+        .expect("100 Trying が transaction layer に届かない (test bug)")
+        .expect("provisional watch sender が drop された (test bug)");
 
         // RFC 3261 §9.1: 100 Trying (= Provisional) を受けた後の CANCEL は MUST 送出。
         let outcome = uac.cancel_pending(&plan_for_cancel).await.expect("cancel");
@@ -1434,7 +1468,6 @@ mod tests {
         };
         assert_eq!(cancel_resp.status_code, 200);
 
-        invite_task.abort();
         invite_send_task.abort();
         received.await.unwrap();
     }

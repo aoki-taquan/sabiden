@@ -90,6 +90,10 @@ pub struct RtpSession {
     /// 初回送信 (= `None`) もしくは [`TALKSPURT_GAP_THRESHOLD`] 以上空いたら
     /// 次パケットで M=1 を立てる (Issue #84)。
     last_send_time: Mutex<Option<Instant>>,
+    /// RFC 3550 §6.4.1 / §A.3 fraction_lost interval 計算用の per-SSRC 前回値。
+    /// `(last_reported_expected, last_reported_received)` を保持し、
+    /// `build_report_blocks` 出力後に最新累積値で更新する。
+    last_reported_per_ssrc: Mutex<HashMap<u32, (i64, u64)>>,
 }
 
 impl RtpSession {
@@ -118,6 +122,7 @@ impl RtpSession {
             depth,
             remote_last_sr_recv: Mutex::new(HashMap::new()),
             last_send_time: Mutex::new(None),
+            last_reported_per_ssrc: Mutex::new(HashMap::new()),
         })
     }
 
@@ -340,32 +345,56 @@ impl RtpSession {
         }
     }
 
+    /// RFC 3550 §6.4.1 / Appendix A.3 に従い RR / SR の各 SSRC 向け
+    /// report block を構築する。 `fraction_lost` は **直前の RR/SR 報告以降の
+    /// interval 内で観測したロス比** として算出する (§6.4.1 原文:
+    /// "expressed as a fixed point number with the binary point at the left
+    /// edge of the field … the fraction of RTP data packets from source SSRC_n
+    /// lost since the previous SR or RR packet was sent").
+    ///
+    /// 旧実装は累積 `cumulative_lost * 256 / expected` を返していたため、
+    /// 通話初期に発生したロスが永続的に fraction として残り続け、 受信側 NW
+    /// 品質の **直近** 状態を反映しなかった (Issue #199 / PR #196 follow-up)。
+    /// 本実装は各 SSRC について `(last_reported_expected, last_reported_received)`
+    /// を本セッションに保持し、 報告のたびに `JitterStats::fraction_lost` へ
+    /// 渡すことで差分ベースの計算を行う。 出力後に最新累積値で更新する。
+    ///
+    /// `cumulative_lost` は §A.3 のとおり累積値 (24-bit signed, under-flow は 0
+    /// にクランプ) を返す。 `extended_highest_seq` / `jitter` / `LSR` / `DLSR`
+    /// も §6.4.1 各フィールド定義に準拠。
     fn build_report_blocks(&self, now: Instant) -> Vec<ReportBlock> {
         let map = self.inbound.lock().expect("inbound mutex poisoned");
         let last_sr_recv = self
             .remote_last_sr_recv
             .lock()
             .expect("remote_last_sr_recv mutex poisoned");
+        let mut last_reported = self
+            .last_reported_per_ssrc
+            .lock()
+            .expect("last_reported_per_ssrc mutex poisoned");
         map.iter()
             .take(31)
             .map(|(ssrc, jb)| {
                 let s = jb.stats();
                 // RFC 3550 §6.4.1 / §A.3: cumulative_lost = expected - received
-                // (24-bit signed, clamp to 0 for under-flow).
-                // 旧実装は `s.lost` (バッファ overflow 検出ベースの近似値) を
-                // 使っていたため真のロス数を反映しなかった (Issue #93)。
+                // (24-bit signed, clamp to 0 for under-flow)。
                 let cum_signed = s.cumulative_lost();
                 let cum = cum_signed.max(0) as u32 & 0x00FF_FFFF;
-                let frac = if let Some(base) = s.base_seq_ext {
-                    let expected = (s.max_seq_ext - base + 1).max(0) as u64;
-                    let lost_total = cum_signed.max(0) as u64;
-                    (lost_total * 256)
-                        .checked_div(expected)
-                        .map(|v| v.min(255) as u8)
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
+
+                // RFC 3550 §6.4.1 fraction_lost: 直前 RR/SR 報告以降の
+                // interval (= 差分 expected / 差分 received) で算出。
+                // 前回値が無ければ (last_exp, last_recv) = (0, 0) で評価され、
+                // 累積全体を「最初の interval」として扱う初回 RR と整合する。
+                let (last_exp, last_recv) = last_reported.get(ssrc).copied().unwrap_or((0, 0));
+                let frac = s.fraction_lost(last_exp, last_recv);
+
+                // 出力後、 次回 interval の起点として現在の累積値を保存。
+                // expected = max_seq_ext - base_seq_ext + 1 (RFC §A.3)。
+                if let Some(base) = s.base_seq_ext {
+                    let expected_now = s.max_seq_ext - base + 1;
+                    last_reported.insert(*ssrc, (expected_now, s.received));
+                }
+
                 let (last_sr, dlsr) = last_sr_recv
                     .get(ssrc)
                     .map(|(mid, inst)| {
@@ -673,5 +702,151 @@ mod tests {
              (RFC 3550 §5.1 / §6.4.1 / Issue #96)",
             stats.recv_octets,
         );
+    }
+
+    /// 指定 SSRC / seq の PCMU 1 フレーム RTP パケットを `ingest_packet` 経由で
+    /// 注入するヘルパ。 fraction_lost 系テストで利用。
+    fn ingest_seq(s: &Arc<RtpSession>, ssrc: u32, seq: u16) {
+        s.ingest_packet(RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: false,
+            sequence: seq,
+            timestamp: (seq as u32) * SAMPLES_PER_FRAME as u32,
+            ssrc,
+            payload: vec![0; 160],
+        });
+    }
+
+    /// RFC 3550 §6.4.1 / Appendix A.3: 通常 loss が interval 内に分散している
+    /// ケース。 seq=1..=10 のうち seq=4 がロス、 1 回目の RR で
+    /// fraction_lost = 1 * 256 / 10 = 25 を観測する (初回 interval は累積全体)。
+    #[tokio::test]
+    async fn rfc3550_6_4_1_fraction_lost_normal_distribution() {
+        let s = make_session().await;
+        let ssrc = 0xCAFE_F00Du32;
+        // seq=1..=10 のうち 4 を欠落させる (9 packet 受信、 expected = 10)
+        for seq in [1u16, 2, 3, 5, 6, 7, 8, 9, 10] {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr = s.build_rr();
+        let rb = rr
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        // expected_interval = 10 (初回なので last_expected=0), received_interval = 9,
+        // lost_interval = 1, frac = 1 * 256 / 10 = 25
+        assert_eq!(
+            rb.fraction_lost, 25,
+            "初回 RR の fraction_lost = lost_interval * 256 / expected_interval"
+        );
+        // cumulative_lost (§A.3) = expected - received = 10 - 9 = 1
+        assert_eq!(rb.cumulative_lost, 1);
+    }
+
+    /// RFC 3550 §6.4.1: fraction_lost は **直前 RR 以降** のみを反映する。
+    /// 通話初期にロスが発生しても、 後続の RR では「その RR 以降の interval」
+    /// だけを見て計算するので、 過去ロスは fraction として残らない。
+    ///
+    /// 旧実装は累積 lost を expected で割っていたため初期ロスが永続化したが、
+    /// 本実装は interval 差分計算により 0 を返すべき (PR #196 follow-up)。
+    #[tokio::test]
+    async fn rfc3550_6_4_1_fraction_lost_only_reflects_since_last_rr() {
+        let s = make_session().await;
+        let ssrc = 0xBEEF_1234u32;
+        // Interval 1: seq=1..=5 のうち seq=3 がロス → 4 packet 受信、 expected = 5
+        for seq in [1u16, 2, 4, 5] {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr1 = s.build_rr();
+        let rb1 = rr1
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        // 初回 RR: expected_interval = 5, lost_interval = 1, frac = 1 * 256 / 5 = 51
+        assert_eq!(rb1.fraction_lost, 51, "初回 interval の loss が反映される");
+        assert_eq!(rb1.cumulative_lost, 1);
+
+        // Interval 2: seq=6..=10 全部受信 (ロスなし)
+        for seq in 6u16..=10u16 {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr2 = s.build_rr();
+        let rb2 = rr2
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        // 2 回目 RR: 直前 RR 以降の expected_interval = 5, received_interval = 5,
+        // lost_interval = 0 → fraction = 0。 累積 cumulative_lost = 1 は維持。
+        assert_eq!(
+            rb2.fraction_lost, 0,
+            "直前 RR 以降にロスが無ければ fraction_lost = 0 \
+             (RFC 3550 §6.4.1)"
+        );
+        assert_eq!(
+            rb2.cumulative_lost, 1,
+            "cumulative_lost は累積 (RFC 3550 §A.3) なので維持"
+        );
+    }
+
+    /// RFC 3550 §6.4.1: 初回 interval にロス無し → fraction_lost = 0。
+    /// 続く interval にロスが発生 → fraction_lost が直近 interval だけを反映する。
+    /// 本テストは「ロスなし interval は 0」「次 interval は分子差分」両方を確認。
+    #[tokio::test]
+    async fn rfc3550_6_4_1_fraction_lost_zero_then_nonzero() {
+        let s = make_session().await;
+        let ssrc = 0xDEAD_5678u32;
+        // Interval 1: seq=1..=4 全部受信
+        for seq in 1u16..=4u16 {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr1 = s.build_rr();
+        let rb1 = rr1
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        assert_eq!(
+            rb1.fraction_lost, 0,
+            "ロスなし interval の fraction_lost は 0"
+        );
+        assert_eq!(rb1.cumulative_lost, 0);
+
+        // Interval 2: seq=5..=8 のうち seq=6 がロス
+        for seq in [5u16, 7, 8] {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr2 = s.build_rr();
+        let rb2 = rr2
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        // expected_interval = (8 - 0 + 1) - (4 - 0 + 1) = 9 - 4 = 4,
+        // (注: base_seq_ext は base、 max_seq_ext は最新値)
+        // received_interval = 7 - 4 = 3, lost_interval = 1, frac = 1 * 256 / 4 = 64
+        assert_eq!(
+            rb2.fraction_lost, 64,
+            "interval 内 1 loss / 4 expected → 256/4 = 64"
+        );
+        assert_eq!(rb2.cumulative_lost, 1);
+
+        // Interval 3: seq=9..=12 全部受信 → 再度 fraction_lost = 0 に戻ること
+        for seq in 9u16..=12u16 {
+            ingest_seq(&s, ssrc, seq);
+        }
+        let rr3 = s.build_rr();
+        let rb3 = rr3
+            .reports
+            .iter()
+            .find(|rb| rb.ssrc == ssrc)
+            .expect("Report block 必要");
+        assert_eq!(
+            rb3.fraction_lost, 0,
+            "次の interval でロスが無くなれば fraction_lost は 0 に戻る"
+        );
+        assert_eq!(rb3.cumulative_lost, 1, "累積 loss は維持");
     }
 }

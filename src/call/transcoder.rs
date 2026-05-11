@@ -173,6 +173,49 @@ impl RtpEgressState {
         let (seq, ts, ssrc) = self.next(ts_increment);
         (seq, ts, ssrc, marker)
     }
+
+    /// RFC 3550 §8.2 (Collision Resolution and Loop Detection):
+    /// > If the SSRC identifier is found to collide with that of another
+    /// > participant, the participant MUST send an RTCP BYE packet for the
+    /// > old identifier and choose a new one.
+    ///
+    /// 本メソッドは ingress した RTP packet の SSRC が `self.ssrc` と
+    /// 一致する場合 (= sabiden が egress に使っている SSRC と入力 source の
+    /// SSRC が同値) を「衝突」とみなし、 `self.ssrc` を新規 random 値で再
+    /// 払い出して `true` を返す。 一致しなければ `false` を返す。
+    ///
+    /// RFC 3550 §8.2 は厳密には「異なる transport address から来た同 SSRC」
+    /// を collision、 「同 transport address から来た同 SSRC」 を loop と
+    /// 区別するが、 sabiden の transcoder 経路では:
+    /// - 入力 (NGN UDP socket / WebRTC RTP socket) と
+    /// - 出力 (反対側 socket) が常に別 transport
+    ///
+    /// のため、 ここでは単純化して「ingress SSRC == egress SSRC ⇒ collision
+    /// として egress を rotate」 として扱う (loop は発生しない設計)。
+    ///
+    /// RFC §8.2 が要求する「旧 SSRC からの RTCP BYE 送出」は transcoder 経路
+    /// では SR/RR/BYE を送出していない (Issue #182 (f) で別 PR) ため
+    /// 現状実装しない。 SSRC rotate だけは即時実施する。
+    ///
+    /// 新 SSRC は **必ず旧 SSRC と異なる値** にする (rand::random() で偶々
+    /// 同値が出る確率は 2^-32 だが、 防御的に loop で再抽選する)。
+    /// seq / timestamp は **rotate しない** (受信側からは新 source の同一
+    /// stream として連番継続される方が違和感が小さい。 厳密には新 SSRC では
+    /// seq/ts 初期値も random でよいが、 既存テスト・既存通話パス regression を
+    /// 避けるため最小変更とする)。
+    fn check_and_rotate_on_collision(&mut self, ingress_ssrc: u32) -> bool {
+        if ingress_ssrc != self.ssrc {
+            return false;
+        }
+        let old = self.ssrc;
+        let mut new_ssrc = rand::random::<u32>();
+        // 防御: 万一同値が連続払い出されたら別の値が出るまで再抽選。
+        while new_ssrc == old {
+            new_ssrc = rand::random::<u32>();
+        }
+        self.ssrc = new_ssrc;
+        true
+    }
 }
 
 /// 1 通話分のトランスコード ブリッジ。
@@ -461,6 +504,22 @@ async fn ngn_to_web_loop(
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                // RFC 3550 §8.2: ingress SSRC が egress SSRC と衝突したら
+                // egress SSRC を rotate する (Issue #182 (e))。
+                {
+                    let mut eg = state.ngn_to_web_egress.lock().await;
+                    if eg.check_and_rotate_on_collision(pkt.ssrc) {
+                        warn!(
+                            ssrc = format!("0x{:08x}", pkt.ssrc),
+                            new_ssrc = format!("0x{:08x}", eg.ssrc),
+                            "SSRC collision detected (ngn_to_web: ingress = egress), \
+                             rotating egress SSRC (RFC 3550 §8.2)"
+                        );
+                        if let Some(m) = metrics.as_ref() {
+                            m.add_ssrc_collision_detected(1);
+                        }
+                    }
+                }
                 jitter.push(pkt, Instant::now());
             }
             // 20ms tick → jitter buffer から pull → transcode → 送信
@@ -726,6 +785,22 @@ async fn web_to_ngn_loop(
                     );
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+                // RFC 3550 §8.2: ingress SSRC が egress SSRC と衝突したら
+                // egress SSRC を rotate する (Issue #182 (e))。
+                {
+                    let mut eg = state.web_to_ngn_egress.lock().await;
+                    if eg.check_and_rotate_on_collision(pkt.ssrc) {
+                        warn!(
+                            ssrc = format!("0x{:08x}", pkt.ssrc),
+                            new_ssrc = format!("0x{:08x}", eg.ssrc),
+                            "SSRC collision detected (web_to_ngn: ingress = egress), \
+                             rotating egress SSRC (RFC 3550 §8.2)"
+                        );
+                        if let Some(m) = metrics.as_ref() {
+                            m.add_ssrc_collision_detected(1);
+                        }
+                    }
                 }
                 jitter.push(pkt, Instant::now());
             }
@@ -1132,6 +1207,26 @@ async fn ngn_to_peer_loop(
             trace!(len = pkt.payload.len(), "NGN payload 長異常 → drop");
             state.transcode_errors.fetch_add(1, Ordering::Relaxed);
             continue;
+        }
+
+        // RFC 3550 §8.2: ingress SSRC が egress SSRC と衝突したら
+        // egress SSRC を rotate する (Issue #182 (e))。
+        // ngn_to_peer 方向は MediaFrame に SSRC が乗らない (str0m が割り当て)
+        // ため衝突自体が peer 側に伝わる経路は無いが、 egress state は他方向
+        // との対称性 / 観測性のため同様に rotate する。
+        {
+            let mut eg = state.ngn_to_web_egress.lock().await;
+            if eg.check_and_rotate_on_collision(pkt.ssrc) {
+                warn!(
+                    ssrc = format!("0x{:08x}", pkt.ssrc),
+                    new_ssrc = format!("0x{:08x}", eg.ssrc),
+                    "SSRC collision detected (ngn_to_peer: ingress = egress), \
+                     rotating egress SSRC (RFC 3550 §8.2)"
+                );
+                if let Some(m) = metrics.as_ref() {
+                    m.add_ssrc_collision_detected(1);
+                }
+            }
         }
 
         // payload を先に決めてから ts を払い出す (失敗時に ts を消費しないため)。
@@ -2745,6 +2840,95 @@ mod tests {
         let t2 = t1 + Duration::from_millis(30);
         let (_, _, _, m2) = eg.next_with_marker(160, t2);
         assert!(m2, "閾値以上 (30 ms >= 30 ms) は M=1");
+    }
+
+    /// RFC 3550 §8.2 (Collision Resolution) ユニットテスト (a): 通常パス。
+    /// ingress SSRC が egress SSRC と異なるとき、 `check_and_rotate_on_collision`
+    /// は `false` を返し、 egress SSRC は変化しない。
+    ///
+    /// production docstring (`check_and_rotate_on_collision`) と同一の RFC 3550
+    /// §8.2 normative wording (MUST) を以下に再掲する:
+    ///
+    /// > If a participant discovers at any time that two other participants
+    /// > [...] then the participant MUST send an RTCP BYE packet for the
+    /// > old identifier and choose a new one.
+    ///
+    /// 「同じ SSRC を使う participant を検出」=「ingress packet の SSRC が
+    /// 自 egress SSRC と一致」と読み替える (Issue #182 (e))。
+    #[test]
+    fn rfc3550_8_2_no_collision_keeps_egress_ssrc() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xAAAA_BBBB,
+            seq: 1,
+            timestamp: 100,
+            last_send_time: None,
+        };
+        // ingress SSRC ≠ egress SSRC → rotate 不要
+        let rotated = eg.check_and_rotate_on_collision(0xCCCC_DDDD);
+        assert!(!rotated, "衝突無しなら rotate しないはず");
+        assert_eq!(eg.ssrc, 0xAAAA_BBBB, "egress SSRC は変化しないはず");
+        // seq / timestamp も非変化
+        assert_eq!(eg.seq, 1);
+        assert_eq!(eg.timestamp, 100);
+    }
+
+    /// RFC 3550 §8.2 ユニットテスト (b): 衝突検出 + rotate。
+    /// ingress SSRC が egress SSRC と一致したら egress SSRC を新規値に rotate し、
+    /// 戻り値が `true`、 新 SSRC は **旧と異なる値**。 seq / timestamp は維持。
+    #[test]
+    fn rfc3550_8_2_collision_rotates_egress_ssrc() {
+        let old_ssrc: u32 = 0x1234_5678;
+        let mut eg = RtpEgressState {
+            ssrc: old_ssrc,
+            seq: 42,
+            timestamp: 8000,
+            last_send_time: None,
+        };
+        // ingress SSRC == egress SSRC → 衝突 → rotate
+        let rotated = eg.check_and_rotate_on_collision(old_ssrc);
+        assert!(rotated, "衝突を検出したら rotate するはず");
+        assert_ne!(
+            eg.ssrc, old_ssrc,
+            "rotate 後の SSRC は旧値と異なるはず (RFC 3550 §8.2: \"choose a new one\")"
+        );
+        // seq / timestamp は維持される (新 SSRC でも seq/ts continuity を保つ設計)
+        assert_eq!(eg.seq, 42, "seq は rotate で維持されるはず");
+        assert_eq!(eg.timestamp, 8000, "timestamp は rotate で維持されるはず");
+    }
+
+    /// RFC 3550 §8.2 ユニットテスト (c): rotate 後の旧 SSRC は別人。
+    /// 一度 rotate した後、 旧 SSRC と同値の ingress が再到来しても、 新 SSRC
+    /// (旧と異なる) との比較になるので 2 回目以降は rotate しない (=
+    /// rotate の連鎖が起きない)。
+    ///
+    /// この性質は、 mis-behaved な reflector / loop が「sabiden の旧 SSRC を
+    /// 持つ packet」を流し続けても、 sabiden 自身が new SSRC に切替済みなので
+    /// 無限 rotate ループにはならないことを保証する (RFC 3550 §8.2 のloop
+    /// 防止精神に整合)。
+    #[test]
+    fn rfc3550_8_2_rotated_egress_ignores_old_ssrc() {
+        let old_ssrc: u32 = 0xDEAD_BEEF;
+        let mut eg = RtpEgressState {
+            ssrc: old_ssrc,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+        };
+        // 1 回目: 衝突 → rotate
+        assert!(eg.check_and_rotate_on_collision(old_ssrc));
+        let new_ssrc = eg.ssrc;
+        assert_ne!(new_ssrc, old_ssrc);
+
+        // 2 回目: 旧 SSRC で再到来 → 既に new_ssrc に切替済みなので衝突しない
+        let rotated2 = eg.check_and_rotate_on_collision(old_ssrc);
+        assert!(
+            !rotated2,
+            "rotate 後の旧 SSRC ingress は衝突とみなさないはず (RFC 3550 §8.2 loop 防止)"
+        );
+        assert_eq!(
+            eg.ssrc, new_ssrc,
+            "2 回目の同 SSRC ingress では egress SSRC は変化しないはず"
+        );
     }
 
     /// Issue #135 🟡 3: `WebRtcAudioBridge::start` は infallible シグネチャ

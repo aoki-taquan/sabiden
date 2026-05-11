@@ -91,6 +91,11 @@ pub struct Metrics {
     /// `last_invite_at` から現在発信までの経過時間を `Allow` 時に記録する。
     pub invite_interval_total_ms: AtomicU64,
     pub invite_interval_samples: AtomicU64,
+    /// Issue #182 / RFC 3550 §8.2: transcoder egress で SSRC collision を
+    /// 検出し、 egress SSRC を rotate した累計数。 増加は flow 中の SSRC 衝突
+    /// (sabiden 側 egress と ingress が同値) を示し、 衝突自体は 2^-32 確率
+    /// 事象だが multi-call / 端末 implementation バグで連鎖し得る。
+    pub rtp_ssrc_collision_detected: AtomicU64,
 }
 
 impl Metrics {
@@ -188,6 +193,17 @@ impl Metrics {
         self.invite_interval_total_ms
             .fetch_add(interval_ms, Ordering::Relaxed);
         self.invite_interval_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #182 / RFC 3550 §8.2 (Collision Resolution): transcoder egress で
+    /// ingress SSRC が egress SSRC と一致する衝突を検出し、 egress SSRC を
+    /// 再払い出ししたときに +1 する。 RFC 3550 §8.2 は衝突検出後の resolution
+    /// 行動として「新規 SSRC への切替 + 旧 SSRC からの RTCP BYE 送出」を
+    /// 規定するが、 後者は sabiden が RTCP SR/RR を transcoder 経路で送って
+    /// いないため future work (Issue #182 (f))。
+    pub fn add_ssrc_collision_detected(&self, n: u64) {
+        self.rtp_ssrc_collision_detected
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format で全メトリクスを書き出す。
@@ -316,6 +332,17 @@ impl Metrics {
         out.push_str(&format!(
             "sabiden_sip_invite_interval_seconds_count {}\n",
             samples
+        ));
+
+        // Issue #182 / RFC 3550 §8.2: transcoder egress で衝突検出 + rotate した累計。
+        out.push_str(
+            "# HELP sabiden_rtp_ssrc_collision_detected_total \
+             RFC 3550 §8.2 SSRC 衝突検出で transcoder egress SSRC を rotate した累計\n",
+        );
+        out.push_str("# TYPE sabiden_rtp_ssrc_collision_detected_total counter\n");
+        out.push_str(&format!(
+            "sabiden_rtp_ssrc_collision_detected_total {}\n",
+            self.rtp_ssrc_collision_detected.load(Ordering::Relaxed)
         ));
 
         out

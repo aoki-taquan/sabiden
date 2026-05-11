@@ -1,9 +1,17 @@
-import { createSignal, Match, onMount, Switch, type Component } from "solid-js";
+import {
+  createSignal,
+  Match,
+  onCleanup,
+  onMount,
+  Switch,
+  type Component,
+} from "solid-js";
 import { Login, type LoginReason } from "./components/Login";
 import { Dialer } from "./components/Dialer";
 import { CallScreen } from "./components/CallScreen";
 import {
   parseExtIdFromToken,
+  parseRateLimitedRetryAfter,
   resolveSignalingUrl,
   SignalingClient,
   type ServerMessage,
@@ -43,6 +51,27 @@ export const App: Component = () => {
   const [extId, setExtId] = createSignal<string>("");
   const [status, setStatus] = createSignal("未接続");
   const [statusOk, setStatusOk] = createSignal(false);
+  /**
+   * Issue #194: backend rate limiter / NGN 503 Retry-After で発信抑制中の
+   * 解除予定時刻 (epoch ms)。 `null` なら抑制なし。 Date.now ベースなので
+   * WS が再接続しても期限が残っていれば適用継続する (Issue DoD)。
+   */
+  const [rateLimitedUntil, setRateLimitedUntil] = createSignal<number | null>(null);
+  /** 1 秒毎にカウントダウンを更新する派生値 (now() を 1Hz で進める)。 */
+  const [now, setNow] = createSignal<number>(Date.now());
+  /**
+   * UI に渡す「残り秒数」 (切り上げ)。 0 以下は `null` (= 抑制解除)。
+   * カウントダウンは Date.now() ベース。 `setInterval` がブラウザ throttle で
+   * 大幅遅延しても、 復帰時に Date.now で再計算するので「ボタンが N+α 秒残る」
+   * バグを防ぐ。
+   */
+  const rateLimitedSeconds = (): number | null => {
+    const until = rateLimitedUntil();
+    if (until === null) return null;
+    const remaining = Math.ceil((until - now()) / 1000);
+    return remaining > 0 ? remaining : null;
+  };
+  let countdownTimer: number | undefined;
 
   let signaling: SignalingClient | null = null;
   let call: WebRtcCall | null = null;
@@ -133,6 +162,20 @@ export const App: Component = () => {
         console.error("signaling error", msg);
         setStatus(`エラー: ${msg.code}`);
         setStatusOk(false);
+        // Issue #194 / PR #193: rate_limited / outbound_failed (NGN 503 +
+        // Retry-After) を検出して発信ボタンを抑制する。 retry_after は backend
+        // が `ServerMessage::error.message` 本文に埋めてくる (RFC 3261 §20.33,
+        // TTC JJ-90.24v2 §5.7.1 / §5.7.3)。
+        if (msg.code === "rate_limited" || msg.code === "outbound_failed") {
+          const secs = parseRateLimitedRetryAfter(msg.message);
+          if (secs !== null && secs > 0) {
+            // 既存の解除予定時刻より遠い方を採用する (重複 error 受信で短縮
+            // しないため: 一度長期抑制を受けたら短い後続値で上書きしない)。
+            const candidate = Date.now() + secs * 1000;
+            setRateLimitedUntil((prev) => (prev === null ? candidate : Math.max(prev, candidate)));
+            setNow(Date.now()); // 即座に UI を更新
+          }
+        }
         break;
       case "bye":
         setView((v) => (v.kind === "call" ? { ...v, state: "ended", stream: null } : v));
@@ -257,10 +300,35 @@ export const App: Component = () => {
   };
 
   onMount(async () => {
+    // Issue #194: rate-limited 残秒数を 1Hz で再計算する。 Date.now ベースで
+    // 計算しているので throttle 等で interval が遅延しても誤差を蓄積しない
+    // (interval は単に「再描画契機」 を作るだけ)。 setInterval の callback は
+    // SolidJS reactive tracking scope ではない (= createEffect 等ではない) ため
+    // `solid/reactivity` lint warning が出るが、 ここではむしろ tracking させたく
+    // ない (1Hz 固定で読み出すだけ、 シグナル変化で再走させない) ので意図的に抑制。
+    // eslint-disable-next-line solid/reactivity
+    countdownTimer = window.setInterval(() => {
+      const until = rateLimitedUntil();
+      if (until === null) return;
+      const t = Date.now();
+      setNow(t);
+      if (t >= until) {
+        // 期限切れ: 抑制解除 (interval は走らせ続ける = 次の rate_limited を即反映)。
+        setRateLimitedUntil(null);
+      }
+    }, 1000);
+
     // 1) URL ハッシュ #token=... を最優先で取り込み
     const hashTok = consumeTokenFromHash();
     const stored = hashTok ?? loadToken();
     if (stored) await connect(stored);
+  });
+
+  onCleanup(() => {
+    if (countdownTimer !== undefined) {
+      window.clearInterval(countdownTimer);
+      countdownTimer = undefined;
+    }
   });
 
   const handleLogin = async (tok: string) => {
@@ -294,6 +362,16 @@ export const App: Component = () => {
 
   const placeCall = async (number: string) => {
     if (!signaling) return;
+    // Issue #194: rate-limited 中は WS にも投げず、 ローカルで弾く。
+    // backend (`src/call/orchestrator.rs::handle_pwa_outbound_offer`) は
+    // どのみち再度 `rate_limited` を返すだけなので無駄パケットになる。
+    // NGN cooldown は backend rate limiter で完結しているため、 PWA から
+    // 再投しなくても NGN 連鎖は起きないが、 UI 連発抑止 / WS 帯域節約のために
+    // 早期弾きする (DoD「NGN cooldown を加速させない」 を満たす)。
+    if ((rateLimitedSeconds() ?? 0) > 0) {
+      console.warn("placeCall: 抑制中 (rate-limited) のためローカルで拒否");
+      return;
+    }
     setView({
       kind: "call",
       peerLabel: number,
@@ -402,6 +480,7 @@ export const App: Component = () => {
           onLogout={handleLogout}
           status={status()}
           statusOk={statusOk()}
+          rateLimitedSeconds={rateLimitedSeconds()}
         />
       </Match>
       <Match when={view().kind === "call"}>

@@ -371,6 +371,27 @@ PWA 経路の rate limiter 詳細は「発信 (スマホ → NGN)」セクショ
 PWA 経路では bucket key として ngn_uac の REGISTER AOR を使うため、 複数 PWA
 WS セッションが同時に連投しても同じ bucket で集約され、 NGN cooldown 連鎖を防ぐ。
 
+**PWA UI 側 retry_after 反映 (Issue #194)**:
+
+backend が `ServerMessage::error` で抑制秒数を返すのに合わせて、 PWA フロント
+エンドは発信ボタンを N 秒 disable + 残秒数カウントダウン表示する。 wire
+format は既存の `error.message` 本文に文字列埋込のまま (Issue #194 で
+「protocol を触らない」 制約)、 PWA 側 parser (`frontend/src/lib/signaling.ts::parseRateLimitedRetryAfter`)
+で抽出する。
+
+| `error.code` | message 本文 (backend 固定文言) | PWA 側挙動 |
+|---|---|---|
+| `rate_limited` | `outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after <N> sec` | 発信ボタン N 秒 disable、 カウントダウン表示、 解除まで `placeCall` をローカルで弾く |
+| `outbound_failed` | `NGN INVITE 失敗: <code> <reason> (retry_after=<N>s)` (Retry-After 受信時のみ) | 同上 |
+| `outbound_failed` (Retry-After なし) | `NGN INVITE 失敗: 486 Busy Here` 等 | 通常エラー表示のみ (発信ボタンは disable しない) |
+
+カウントダウンは `Date.now()` ベースで保持 (`rateLimitedUntil: epoch_ms`)。 WS
+が transient close (1006 等) で再接続しても期限が残っていれば適用継続する。
+複数 error が重なった場合は max(既存期限, 新候補) を採用し、 短い後続値で
+解除予定を縮めない (= NGN 抑制を緩めない方向に倒す)。 WAI-ARIA 1.2 §6 Live
+Region (`role="status" aria-live="polite" aria-atomic="true"`) で screen
+reader にも残秒数を割り込みなしで読み上げる。
+
 **双方向 BYE 連動 (Issue #147)**:
 
 PWA は SIP dialog を持たないため、 既存の `OutboundCallRegistry`

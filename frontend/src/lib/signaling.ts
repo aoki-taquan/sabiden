@@ -561,6 +561,48 @@ export function parseServerMessage(raw: string): ServerMessage | null {
 }
 
 /**
+ * `ServerMessage::error` の `message` 本文から retry_after 秒数を抽出する
+ * (Issue #194, PR #193 連動)。
+ *
+ * sabiden backend (`src/call/orchestrator.rs`) は PWA が SIP dialog を持たない
+ * ため、 NGN P-CSCF / 自前 rate limiter からの抑制秒数を **WS の
+ * `ServerMessage::error.message` 本文に文字列埋込** で渡す (構造化フィールドは
+ * wire format 互換性のため追加していない、 Issue #194 「touch しない」 領域)。
+ * RFC 3261 §20.33 Retry-After / TTC JJ-90.24v2 §5.7.1 (連続抑制) /
+ * §5.7.3 (5xx 自動 retry 禁止) を PWA UI 側で観測できる経路はこの埋込のみ。
+ *
+ * backend 既知の 2 系統 (orchestrator.rs ソース由来):
+ *
+ *   1. `rate_limited`:
+ *      `"outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after <N> sec"`
+ *      → `retry after <N> sec` を拾う。
+ *   2. `outbound_failed` (NGN 503 + Retry-After):
+ *      `"NGN INVITE 失敗: 503 Service Unavailable (retry_after=<N>s)"`
+ *      → `retry_after=<N>s` を拾う。
+ *
+ * どちらの形式でも非負整数の秒数のみ受け付ける。 該当パターンが無い (例:
+ * `outbound_failed` で NGN が Retry-After を返さなかったケース) や、 0 以下 /
+ * NaN の場合は `null` (= UI ロックを開始しない)。
+ *
+ * 純関数 (副作用なし)。 vitest からそのまま呼べる。
+ */
+export function parseRateLimitedRetryAfter(message: string): number | null {
+  // 1) `rate_limited` 形式: `retry after <N> sec` (英大小は backend で固定だが念のため大小無視)。
+  const m1 = /retry\s+after\s+(\d+)\s*sec/i.exec(message);
+  if (m1) {
+    const n = Number(m1[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // 2) `outbound_failed` 形式: `retry_after=<N>s` (orchestrator.rs PR #193 review #2 🟡#1)。
+  const m2 = /retry_after\s*=\s*(\d+)\s*s/i.exec(message);
+  if (m2) {
+    const n = Number(m2[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
  * トークン形式 `<ext_id>.<expiry>.<sig>` から ext_id だけ取り出す。
  * 署名検証はサーバ側で行う (クライアントは秘密鍵を持たない)。
  */

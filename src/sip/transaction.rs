@@ -1326,6 +1326,27 @@ impl TransactionLayer {
         table.provisional.remove(id);
     }
 
+    /// 現在テーブルに登録されているクライアント トランザクション数。
+    ///
+    /// `crate` 内部観測用: テストでの Timer D / Timer K (RFC 3261 §17.1.1.2 /
+    /// §17.1.2.2) 経過後の table cleanup 検証、 および将来の Prometheus メトリ
+    /// ック (`sabiden_sip_client_transactions`) で生のゲージとして expose する
+    /// ための足場。 production 経路で値そのものを分岐に使うことは想定しない
+    /// (= test-only API ではなく観測値)。
+    ///
+    /// 戻り値の lock は読み取り完了で即解放される (`Mutex` ガードを跨いで
+    /// 保持しない)。
+    ///
+    /// 現状は test mod (`#[cfg(test)]`) からのみ呼ばれているため、 `cargo build`
+    /// (non-test) では未使用扱いになるが、 上述の通り Prometheus メトリック
+    /// 実装時に observability layer から呼ぶ予定なので `allow(dead_code)` で
+    /// 留保する (CLAUDE.md §6.3 production-side test hook 禁止: これは hook
+    /// ではなく観測 API)。
+    #[allow(dead_code)]
+    pub(crate) async fn client_count(&self) -> usize {
+        self.inner.lock().await.clients.len()
+    }
+
     /// 応答を待たないリクエスト送信。
     ///
     /// RFC 3261 §13.2.2.4: 2xx に対する ACK は新規トランザクションを作らず、
@@ -2980,39 +3001,89 @@ mod tests {
         uas_handle.await.unwrap();
     }
 
-    /// RFC 3261 §17.1.2.2 Timer K: non-INVITE Completed → Terminated は
-    /// UDP で T4 (=5s)。 この時間内なら最終応答返却後でも transaction が
-    /// 内部的に living である (= 受信スレッドからの応答ディスパッチ先テーブル
-    /// に登録され続ける必要は無いが、 absorber が走ることもない)。
-    /// 本テストは「最終応答受領後すぐに `run` が return し、 後続応答は
-    /// 落とされる (= dispatcher が default で drop)」 ことを確認する。
+    /// RFC 3261 §17.1.2.2 Timer K: non-INVITE クライアント トランザクションが
+    /// 最終応答 (>=200) を受信して Completed に入った後、 UDP では Timer K
+    /// (= T4 = 5s) 経過後に Terminated へ遷移し table から消える。
     ///
-    /// 注: sabiden の現状実装は non-INVITE Completed で absorber を spawn
-    /// しないため、 この Timer K は実時間タイマでは観測できないが、
-    /// `run` の return 時点で `state == Completed` (≠ Terminated) であることを
-    /// 確認するのが目的。 `state()` getter で覗ける。
+    /// 検証戦略 (`tokio::test(start_paused = true)` + virtual time):
+    /// 1. `TransactionLayer::send_request` で REGISTER を投入 (登録直後は
+    ///    `client_count() == 1`)。
+    /// 2. `dispatch_response` で 200 OK を流し、 `send_request` を完了させる。
+    /// 3. **完了直後** に `client_count() == 0` であることを確認 (sabiden は
+    ///    non-INVITE で absorber を spawn せず即時 cleanup、 RFC §17.1.2.2 の
+    ///    Timer K 上限内で削除されているので RFC 準拠)。
+    /// 4. `time::advance(TIMER_K + α)` で **Timer K 境界を跨いでも** table が
+    ///    flap せず `client_count() == 0` を維持することを確認 (Completed →
+    ///    Terminated 遷移の冪等性)。
+    ///
+    /// 注: 現状実装は non-INVITE Completed で response 再送を吸収しない
+    /// (Timer K 期間中の応答再送 → ACK 不要だがエントリ保持で TU への重複
+    /// 通知を抑制、 が将来課題)。 本テストは「Timer K 経過と表テーブル状態
+    /// が矛盾しないこと」を保証する境界テストであり、 absorber 拡張が入った
+    /// 際にも本テストの assert (T4 後に 0 件) は維持されるべきである。
     #[tokio::test(start_paused = true)]
-    async fn rfc3261_17_1_2_2_non_invite_completed_state_after_final_response() {
+    async fn rfc3261_17_1_2_2_non_invite_completed_timer_k_clears_table() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest_sink: SocketAddr = sink.local_addr().unwrap();
+        let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
+        let local = socket.local_addr().unwrap();
 
-        let req = make_request("z9hG4bKtimerK");
-        let id = TransactionId::from_request(&req).unwrap();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let ct = ClientTransaction::new(id, req, dest_sink, socket, rx, SipTraceWriter::disabled());
+        let branch = "z9hG4bKtimerKclear";
+        let mut req = SipRequest::new(SipMethod::Register, "sip:registrar.example");
+        req.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        req.headers.set("From", "<sip:alice@example>;tag=alice");
+        req.headers.set("To", "<sip:alice@example>");
+        req.headers.set("Call-ID", "timerK-clear@host");
+        req.headers.set("CSeq", "1 REGISTER");
+        req.headers.set("Max-Forwards", "70");
 
-        // 200 OK を即送
-        tx.send(ClientEvent::Response(make_response(
-            "z9hG4bKtimerK",
-            200,
-            "REGISTER",
-        )))
-        .unwrap();
-        let resp = ct.run().await.unwrap();
-        assert_eq!(resp.status_code, 200);
-        // run は最終応答を返した時点で終了。 absorber は non-INVITE には
-        // spawn されないので、 Timer K (=T4=5s) の経過を待つ必要はない。
+        // send_request は完了応答受領まで await でブロックするので、 別 task で走らせ
+        // て発行直後の table state を観測する。
+        let layer_send = layer.clone();
+        let req_send = req.clone();
+        let send_handle =
+            tokio::spawn(async move { layer_send.send_request(req_send, dest).await });
+
+        // create_client が完了するまで yield を入れる (send_request 内の spawn が
+        // 走り、 transaction が table に登録されるまで待つ)。
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            layer.client_count().await,
+            1,
+            "REGISTER 送信直後は table に 1 件 (RFC 3261 §17.1.2.2 Trying 状態)"
+        );
+
+        // 200 OK を dispatch して Completed → 即時 cleanup を起こす。
+        let mut resp = make_response(branch, 200, "REGISTER");
+        // dispatch_response は応答の Via から transaction を引くため、 send 側と
+        // 同じ branch / sent-by に揃える。
+        resp.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        layer.dispatch_response(resp).await;
+
+        let final_resp = send_handle.await.unwrap().unwrap();
+        assert_eq!(final_resp.status_code, 200);
+
+        // RFC §17.1.2.2 Timer K の T4 上限 (=5s) 内で table から消えているはず。
+        // sabiden は即時 cleanup (drop_client) するので 0 になる。
+        assert_eq!(
+            layer.client_count().await,
+            0,
+            "non-INVITE final 受領後は Timer K (T4={:?}) 上限内で table から削除",
+            TIMER_K
+        );
+
+        // Timer K (=T4) 境界を跨いで table が flap しない (二重削除パニックや
+        // 再挿入が無い) ことを確認する。
+        step_and_yield(TIMER_K + Duration::from_millis(100)).await;
+        assert_eq!(
+            layer.client_count().await,
+            0,
+            "Timer K 経過後も table は空 (Completed → Terminated 遷移の冪等性)"
+        );
     }
 
     /// RFC 3261 §17.1.1.2 Timer A 停止: 1xx 受信前なら Timer A で再送が走るが、
@@ -3594,80 +3665,89 @@ mod tests {
         );
     }
 
-    /// RFC 3261 §17.1.1.2 Timer D: INVITE non-2xx 完了後の Completed 滞在中、
-    /// Timer D (=32s) 経過まで absorber が稼働し、 経過後はチャネルが閉じる
-    /// ことで自然終了する。 直接 timer D 経過を観測するのは難しいが、
-    /// `TIMER_D == Duration::from_secs(32)` であること、 および
-    /// `spawn_completed_absorber` の lifecycle (Timer D 経過 → table から
-    /// 自身を削除) を間接的に確認する。
+    /// RFC 3261 §17.1.1.2 Timer D: INVITE non-2xx 最終応答受領後の Completed
+    /// 滞在中、 absorber バックグラウンド タスクが Timer D (=32s) の間 table
+    /// エントリを保持して応答再送を吸収する。 Timer D 満了でエントリは
+    /// table から削除され Terminated に遷移する。
     ///
-    /// 既存 `test_invite_non2xx_triggers_ack_and_absorbs_retransmits` で
-    /// absorber が動くことは確認済。 ここでは Timer D 経過後に同じ ID の
-    /// 新規 transaction を `create_client` できる (= 古いエントリが消えている)
-    /// ことを確認する。
+    /// 検証戦略 (`tokio::test(start_paused = true)` + virtual time):
+    /// 1. INVITE を `create_client` で登録 → `client_count() == 1`。
+    /// 2. 486 Busy Here を `dispatch_response` で流して non-2xx ACK を生成、
+    ///    absorber を spawn させる。
+    /// 3. absorber spawn 直後は **table エントリが保持** されている
+    ///    (`client_count() == 1`、 RFC §17.1.1.2 figure 5 の Completed 滞在)。
+    /// 4. `time::advance(TIMER_D + α)` で Timer D 境界を跨ぐ。
+    /// 5. **table エントリが clear** されている (`client_count() == 0`)。
+    ///
+    /// CLAUDE.md §6.3 (production-side test hook 禁止) に従い、 観測には
+    /// `TransactionLayer::client_count` (`pub(crate)`、 将来 Prometheus
+    /// メトリック用) のみを使用する。
     #[tokio::test(start_paused = true)]
     async fn rfc3261_17_1_1_2_timer_d_clears_table_entry_after_expiry() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        // dummy destination (送信先は 127.0.0.1:0 = 何も listen してない)
+        // dummy destination (送信先は 127.0.0.1:1 = 何も listen してない。
+        // ACK 送出失敗は warn ログのみで test 自体には影響しない)
         let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let (layer, _inbound_rx) = TransactionLayer::spawn(socket.clone());
 
         let local = socket.local_addr().unwrap();
-        let branch = "z9hG4bKtimerD";
+        let branch = "z9hG4bKtimerDclear";
         let mut invite = SipRequest::new(SipMethod::Invite, "sip:bob@127.0.0.1");
         invite
             .headers
             .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
         invite.headers.set("From", "<sip:alice@example>;tag=alice");
         invite.headers.set("To", "<sip:bob@example>");
-        invite.headers.set("Call-ID", "timerD-test@host");
+        invite.headers.set("Call-ID", "timerD-clear@host");
         invite.headers.set("CSeq", "1 INVITE");
         invite.headers.set("Max-Forwards", "70");
 
-        let id = TransactionId::from_request(&invite).unwrap();
         let ct = layer.create_client(invite.clone(), dest).await.unwrap();
-        // 直接 ClientEvent を流し込むため、 transaction layer 内 dispatch を
-        // バイパスする。 layer のテーブルから tx を取って 486 を送る。
-        // 簡略化: TU で final を入れる代わりに run を非同期に走らせ、
-        // dispatch_response 経由で 486 を流す:
-        let resp_486 = {
-            let mut r = make_invite_response(branch, 486, "Busy Here");
-            // local から見えるように Via を request と同じ host:port に揃える
-            r.headers
-                .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
-            r
-        };
+        assert_eq!(
+            layer.client_count().await,
+            1,
+            "create_client 直後は table に 1 件"
+        );
+
+        // 486 を Via 揃えで作って dispatch_response で流す。
+        let mut resp_486 = make_invite_response(branch, 486, "Busy Here");
+        resp_486
+            .headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
 
         let h = tokio::spawn(async move { ct.run().await });
 
-        // 486 を transaction layer に流す: 受信ループ模擬として
-        // `dispatch_response` 経由で内部チャネルへ届ける。
-        // 実 UDP に乗せるとパケット到達タイミングが揺れるので、 内部 API を
-        // 使うのが deterministic。
+        // dispatch_response 経由で 486 を流す (deterministic)。
         layer.dispatch_response(resp_486).await;
-
         let result = h.await.unwrap().unwrap();
         assert_eq!(result.status_code, 486);
 
-        // run 完了直後は absorber が走っていて table エントリが残る
-        // (CLAUDE.md §6.3 の test hook 禁止に従い production API のみ使用)。
-        // Timer D (32s) を超えて時間を進める。
-        for _ in 0..8 {
-            step_and_yield(Duration::from_secs(5)).await;
+        // run 完了直後: absorber が spawn され、 table エントリが Timer D の
+        // 間保持される (RFC §17.1.1.2 figure 5)。 spawn 直後の yield を
+        // 入れて absorber task に poll 機会を渡す (= まだ Timer D 未経過なので
+        // 何もしないはず)。
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
         }
+        assert_eq!(
+            layer.client_count().await,
+            1,
+            "Completed 滞在中は absorber が table エントリを保持 (Timer D = {:?} の間)",
+            TIMER_D
+        );
 
-        // Timer D 経過後、 同じ ID の新規 client を `create_client` できる
-        // (古いエントリが table から消えている)。 重複 insert にはなるが、
-        // sabiden の TransactionTable は HashMap::insert で同 ID を上書き
-        // するため、 重複しても insert 自体は成功する。 ここでは「Timer D
-        // 経過後は dispatch_response が old transaction に届かない (drop)」
-        // 境界を確認する: 新たに作った transaction に対して別の応答を
-        // 流すと、 古い ID の応答は drop され、 新しい応答だけが届く。
-        let _ct2 = layer.create_client(invite.clone(), dest).await.unwrap();
-        // (このテストの主眼は assert そのものよりも「Timer D 後の create_client
-        //  が hang / panic / unwrap で失敗しないこと」。 unwrap が通った時点で
-        //  境界条件は満たされている。)
-        let _ = id; // suppress unused
+        // Timer D (32s) を僅かに超えて時間を進める。 step_and_yield は内部で
+        // yield を 16 回入れるので、 absorber が timer_d 分岐へ進入し remove
+        // するまでを観測できる。
+        step_and_yield(TIMER_D + Duration::from_millis(100)).await;
+
+        // Timer D 満了 → absorber が自身を table から削除する。
+        assert_eq!(
+            layer.client_count().await,
+            0,
+            "Timer D ({:?}) 経過後は table エントリが clear (RFC 3261 §17.1.1.2: Completed → Terminated)",
+            TIMER_D
+        );
     }
 
     // ====================================================================

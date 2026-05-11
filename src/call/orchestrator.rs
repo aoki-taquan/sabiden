@@ -98,17 +98,16 @@ const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
 /// - `OPTIONS`: keep-alive / capabilities probe (RFC 3261 §11)
 /// - `UPDATE`: Re-INVITE 代替の SDP / Session-Timer 更新 (RFC 3311)
 /// - `INFO`: DTMF (RFC 4733 / RFC 6086、 sabiden 実装済)
+/// - `PRACK` (RFC 3262 §4): 100rel reliable 18x への ACK 受信 (Issue #251 Phase B)
 ///
 /// **意図的除外**:
-/// - `PRACK` (RFC 3262): sabiden は現在 100rel 未実装 (audit Phase B、 Issue #251)、
-///   Allow に載せると capabilities 偽広告になる。
 /// - `NOTIFY` / `SUBSCRIBE` / `MESSAGE` / `REFER` / `PUBLISH`: 限定的処理のみ
 ///   (NOTIFY/SUBSCRIBE は 481、 MESSAGE は受け流し)。 carrier IMS が
 ///   「これらを使える」と誤認しないよう除外。
-const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, INFO";
+const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, INFO, PRACK";
 
-/// RFC 4028 §7 / RFC 3891 §3 (Issue #251 Phase A): NGN inbound INVITE 経路の
-/// 18x / 2xx 応答に常時付与する `Supported` ヘッダ値。 §20.37 によれば
+/// RFC 4028 §7 / RFC 3891 §3 / RFC 3262 §3 (Issue #251 Phase B): NGN inbound INVITE
+/// 経路の 18x / 2xx 応答に常時付与する `Supported` ヘッダ値。 §20.37 によれば
 /// `Supported` 不在は peer に「何の extension がサポートされているか不明」と
 /// 解釈され、 carrier IMS の機能 negotiate ロジックを混乱させる。
 ///
@@ -117,12 +116,10 @@ const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, 
 ///   経路があり、 `Require` を出すなら `Supported` にも明示するのが §7.4 整合。
 /// - `replaces` (RFC 3891): Call-Replace。 sabiden は将来の transfer 経路で
 ///   利用するため capability として常時広告 (受信処理は将来 Phase で実装)。
-///
-/// **意図的除外**:
-/// - `100rel` (RFC 3262): PRACK 経路未実装 (audit Phase B、 Issue #251)。
-///   `Supported: 100rel` を出すと carrier UAC が `Require: 100rel` で PRACK を
-///   期待し、 sabiden は対応できず即 BYE。 capabilities 偽広告防止。
-const UAS_INBOUND_2XX_SUPPORTED: &str = "timer, replaces";
+/// - `100rel` (RFC 3262 §3): Reliability of Provisional Responses。 NGN INVITE
+///   が `Supported: 100rel` を提示してきた場合、 sabiden は reliable 180 Ringing
+///   (Require: 100rel + RSeq) を送出し PRACK を待ち合わせる (Phase B)。
+const UAS_INBOUND_2XX_SUPPORTED: &str = "timer, replaces, 100rel";
 
 /// RFC 3261 §20.41 (Issue #251 Phase A): UAS 応答に載せる `Server` ヘッダ値。
 /// Asterisk 実機 (`docs/asterisk-real-invite.md` §3.1) は `Server: Asterisk PBX
@@ -231,11 +228,10 @@ fn resolve_response_refresher(request_refresher: Option<&str>) -> &'static str {
 ///   (現状は dialog 確立後に replaces を活用する dialog replacement は未実装、
 ///   ただし carrier が `Require: replaces` を送るケースは実機未確認)。
 ///
-/// **意図的非ホワイトリスト**:
-/// - `100rel` (RFC 3262): PRACK 未実装。 carrier が `Require: 100rel` を出して
-///   くる経路に対しては 420 で正直に拒否すべき (capability negotiate 失敗を
-///   carrier に伝えて UAC 側 fallback を促す、 §8.2.2.3 が想定する正規動作)。
-const KNOWN_OPTION_TAGS: &[&str] = &["timer", "replaces"];
+/// - `100rel` (RFC 3262 §3、 Issue #251 Phase B): PRACK 経路を実装したため
+///   `Require: 100rel` も受け入れる。 受け入れ後の挙動は orchestrator
+///   `handle_invite` 内で reliable 180 Ringing + RSeq 送出 + PRACK 待ちに分岐。
+const KNOWN_OPTION_TAGS: &[&str] = &["timer", "replaces", "100rel"];
 
 /// `Require` ヘッダ値 (例 `"timer, 100rel"`) をパースし、 `KNOWN_OPTION_TAGS` に
 /// 含まれない option-tag 一覧を返す (大文字小文字無視、 RFC 3261 §7.3.1)。
@@ -269,6 +265,171 @@ fn apply_uas_inbound_2xx_headers(resp: &mut SipResponse) {
     resp.headers.set("Supported", UAS_INBOUND_2XX_SUPPORTED);
     resp.headers.set("Date", http_date_now());
     resp.headers.set("Server", sabiden_server_header());
+}
+
+/// RFC 3262 §3 (Issue #251 Phase B): 100rel 用 option-tag の文字列。
+/// Supported / Require 両方で大文字小文字無視・comma 区切りで現れる。
+const OPTION_TAG_100REL: &str = "100rel";
+
+/// RFC 3262 §3 / §7.1 ABNF: `RSeq = "RSeq" HCOLON response-num`
+///   ここで `response-num = 1*DIGIT` (= 1..=2^32-1)。 32-bit 範囲で wrap せず
+///   monotonically increasing する必要があり、 連続する reliable provisional
+///   間で +1 で進める (§3 "increase by one for each provisional response sent
+///   reliably in this transaction")。
+///
+/// `RAck = "RAck" HCOLON response-num LWS CSeq-num LWS Method` (§7.2)。
+///
+/// 初期 RSeq は §3 で `between 1 and 2^31 - 1` の範囲のランダム値が SHOULD。
+/// sabiden は単純化のため `rand::thread_rng()` で uniform 抽出。
+fn random_initial_rseq() -> u32 {
+    // RFC 3262 §3: "It is RECOMMENDED that the initial value of RSeq be
+    // chosen so as to be unpredictable within the range of 1 to 2**31 - 1."
+    // OS-RNG を使い、 0 は除外する (§7.1 ABNF が 1 始まり)。
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    // 1..=2^31-1 (i32 max) の範囲。
+    rng.gen_range(1u32..=0x7FFF_FFFF)
+}
+
+/// RFC 3262 §7.2 ABNF: `RAck-value = response-num LWS CSeq-num LWS Method`。
+///
+/// 受信した PRACK の `RAck` ヘッダから (RSeq, CSeq-num, Method) を取り出す。
+/// パース失敗 (フィールド数 < 3 / 数値不正) は `None`。
+///
+/// 例: `"123 5 INVITE"` → `Some((123, 5, "INVITE"))`
+fn parse_rack_header(rack: &str) -> Option<(u32, u32, String)> {
+    let mut parts = rack.split_ascii_whitespace();
+    let rseq: u32 = parts.next()?.parse().ok()?;
+    let cseq: u32 = parts.next()?.parse().ok()?;
+    let method = parts.next()?.to_string();
+    if parts.next().is_some() {
+        // §7.2 ABNF は 3 トークン固定。 余剰トークンは保守的に reject (誤認 RAck 防止)。
+        return None;
+    }
+    Some((rseq, cseq, method))
+}
+
+/// `Supported` / `Require` の comma 区切り option-tag リストに指定 tag が
+/// 含まれるか (大文字小文字無視、 RFC 3261 §7.3.1)。 `header_value` が `None`
+/// なら `false`。
+fn header_has_option_tag(header_value: Option<&str>, tag: &str) -> bool {
+    let Some(value) = header_value else {
+        return false;
+    };
+    value.split(',').any(|t| t.trim().eq_ignore_ascii_case(tag))
+}
+
+/// RFC 3262 §3 (Issue #251 Phase B): `handle_invite` が PRACK 受信を待ち合わせる
+/// ときの結果。 `wait_for_prack` 経由で per-Call-ID Notify を `notified()` 待ち
+/// する。
+#[derive(Debug, PartialEq, Eq)]
+enum PrackOutcome {
+    /// PRACK が `KNOWN_OPTION_TAGS` 整合の RAck と共に到着し、 `handle_prack`
+    /// が state を消費した。
+    Received,
+    /// 32 秒 (RFC 3262 §3 / RFC 3261 §17.1.1.2 Timer F = 64*T1) 待っても
+    /// PRACK が来なかった。 呼出側は 408 で INVITE トランザクションを終結。
+    Timeout,
+    /// reliable 18x を出していない、 または既に他経路で消費済。 PRACK 待ちは
+    /// no-op で進行可能。
+    NoState,
+}
+
+/// RFC 3262 §3: 100rel 経路の状態。 NGN→sabiden 着信 INVITE 1 件につき
+/// 最大 1 つ生存し、 reliable provisional 送出 → PRACK 受信 / timeout で
+/// 消える。 `handle_invite` が「PRACK 待ちで 200 OK を保留」 するために
+/// `prack_received` Notify を await する。
+///
+/// **同時生存条件**: §3 "The UAS MUST NOT send a second reliable provisional
+/// response until the first is acknowledged." sabiden は **18x を 1 回しか
+/// 出さない** (180 Ringing のみ) ため、 in-flight reliable response は
+/// 高々 1 つ。 これにより RSeq の単一管理で十分。
+struct Rc100relState {
+    /// 待機中の `RSeq` 値 (= 直近送出した reliable 18x のもの)。
+    rseq: u32,
+    /// `RAck` 突合用 INVITE の CSeq 番号 (= reliable 18x が応答する CSeq)。
+    invite_cseq: u32,
+    /// retransmit task 停止通知用の Notify。 `Notify::notified()` を
+    /// retransmit task が select! で listen し、 PRACK 受信時に `notify_one`
+    /// で停止する (§3 自発再送停止)。
+    prack_received: Arc<tokio::sync::Notify>,
+    /// `handle_invite::wait_for_prack` 側を確実に wake させる oneshot。
+    /// Notify の `notified()` future 単体では、 「PRACK が wait_for_prack の
+    /// select! 入りより先に handle_prack で発火」 した場合に permit/waker の
+    /// 取り逃しが起きるレースを観測したため (Issue #251 Phase B 開発時)、
+    /// **冗長経路** として oneshot::channel を併用する。 `Option<Sender>`
+    /// で 1 回送信後は `take()` で剥がす (= idempotent)。
+    prack_oneshot_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// `wait_for_prack` 側に渡す Receiver。 INVITE 開始時の自身しか取れない
+    /// (`take()` で 1 度きり)。
+    prack_oneshot_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// reliable 18x 再送タスク (RFC 3262 §3 / §6: T1 起点で指数バックオフ、
+    /// PRACK 受信 / Timer 満了で停止)。 `Drop` で abort される。
+    retransmit_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rc100relState {
+    fn drop(&mut self) {
+        if let Some(h) = self.retransmit_task.take() {
+            h.abort();
+        }
+    }
+}
+
+/// RFC 3262 §3 / §6: reliable provisional response を T1 起点に指数バックオフ
+/// で再送するタイマタスクを spawn する。 `notify` が `notify_one` されると即終了。
+///
+/// §3 引用:
+/// > If a reliable provisional response is retransmitted, it MUST be sent
+/// > with the same RSeq.
+///
+/// §6 (RFC 3261 §17.2.1 互換): 初期 T1 = 500ms、 2*T1, 4*T1, ... と倍々で
+/// 増加し、 T2 (4s) で頭打ち、 合計時間 64*T1 (= 32 秒) で諦める。
+///
+/// 諦めた場合は §3 後段により「UAS は 5xx で INVITE トランザクションを終結」
+/// するが、 本タスク自体はその判定をせず単に終了する。 INVITE 側の
+/// `wait_for_prack` が timeout 検出して 5xx 応答経路に入る。
+fn spawn_reliable_provisional_retransmit(
+    socket: Arc<UdpSocket>,
+    dest: SocketAddr,
+    bytes: Vec<u8>,
+    notify: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    // RFC 3261 §17.1.1.2: T1 = 500ms (RTT 推定の出発点)、 T2 = 4s (上限)。
+    const T1: Duration = Duration::from_millis(500);
+    const T2: Duration = Duration::from_secs(4);
+    // 64 * T1 = 32 秒。 §3 で reliable 18x の PRACK 待ち上限と等価。
+    const TIMER_LIMIT: Duration = Duration::from_secs(32);
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let mut interval = T1;
+        loop {
+            // PRACK 受信通知 or タイマ到達のどちらかで分岐。
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = notify.notified() => {
+                    debug!("RFC 3262 §3: PRACK 受信通知 → reliable 18x 再送停止");
+                    return;
+                }
+                _ = &mut sleep => {
+                    if started.elapsed() >= TIMER_LIMIT {
+                        warn!(
+                            "RFC 3262 §3: reliable 18x PRACK 不到来で 32 秒経過 → 再送停止"
+                        );
+                        return;
+                    }
+                    if let Err(e) = socket.send_to(&bytes, dest).await {
+                        warn!(error=%e, "reliable 18x 再送失敗");
+                        return;
+                    }
+                    debug!(?interval, "RFC 3262 §3: reliable 18x 自発再送");
+                    // T1 → 2T1 → 4T1 → ... → T2 で頭打ち。
+                    interval = std::cmp::min(interval.saturating_mul(2), T2);
+                }
+            }
+        }
+    })
 }
 
 /// `webrtc_active` leak sweeper の最小 / フォールバック周期 (Issue #218)。
@@ -504,6 +665,15 @@ pub struct NgnInboundHandler {
     /// (RFC 3261 §9.1: NGN が CANCEL を出した時点で sabiden は内線フォークを
     /// 中止し、INVITE には 487 Request Terminated を返す)。
     in_flight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// RFC 3262 §3 / §4 (Issue #251 Phase B): 100rel reliable provisional
+    /// 経路の per-Call-ID 状態。 INVITE 受信時に `Supported: 100rel` があれば
+    /// reliable 180 Ringing を出して entry を作成し、 PRACK 受信時に entry
+    /// から `prack_received` を `notify_one` して INVITE 側の wait を解除する。
+    ///
+    /// entry の生存範囲: reliable 18x 送出時 → PRACK 受信 / 32 秒タイムアウト /
+    /// CANCEL / 200 OK 送出後の cleanup。 これにより `handle_inbound` の
+    /// PRACK 分岐から O(1) で対応 INVITE を引ける。
+    rc100rel: Arc<Mutex<HashMap<String, Arc<Mutex<Rc100relState>>>>>,
     /// RTP ブリッジを管理する Call Manager。`None` なら SDP 透過モードで動く
     /// (Issue #15 互換)。
     call_manager: Option<Arc<CallManager>>,
@@ -543,6 +713,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: None,
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -586,6 +757,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -614,6 +786,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -828,22 +1001,13 @@ impl NgnInboundHandler {
                 tx.respond(resp).await?;
                 Ok(())
             }
-            // RFC 3262 §4: PRACK は UAS が `Require: 100rel` 付きの 1xx を
-            // 出した場合のみ正規に届く。 sabiden は 100rel を発行しないので、
-            // PRACK 受信は対応する PRACK-able 状態が無い = 481 で返す
-            // (RFC 3262 §4 / §7.1: 該当 transaction なし扱い)。
-            SipMethod::Prack => {
-                warn!(
-                    call_id = ?request.headers.get("call-id"),
-                    "NGN 側 PRACK: 100rel 未送信 → 481 (RFC 3262 §4)"
-                );
-                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
-                let mut resp =
-                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
-                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
-                tx.respond(resp).await?;
-                Ok(())
-            }
+            // RFC 3262 §4 (Issue #251 Phase B): PRACK は UAS が
+            // `Require: 100rel` 付きの 1xx を出した直後に届く ACK 相当。
+            // `handle_prack` で per-Call-ID `Rc100relState` を引き、
+            //   - RAck が直近 reliable 18x の (RSeq, INVITE CSeq) と一致 →
+            //     200 OK PRACK + retransmit task を停止 + INVITE 側の wait を解除。
+            //   - state 無し / RAck 不一致 → 481 (RFC 3262 §4 / §7.1)。
+            SipMethod::Prack => self.handle_prack(request, remote).await,
             // RFC 3903 §6: PUBLISH も event package ベース。 sabiden は
             // event state 受信機能を持たないので 489 (Bad Event) で返す。
             SipMethod::Publish => {
@@ -1128,6 +1292,24 @@ impl NgnInboundHandler {
             // `build_response_skeleton` が non-100 応答に sabiden 生成 tag を
             // 自動付与するため、 180 の To-tag を取り出して後続 200 OK で
             // 再利用する (= `dialog_to_tag` で持ち回り)。
+            // RFC 3262 §3 (Issue #251 Phase B): INVITE に `Supported: 100rel`
+            // (または `Require: 100rel`) があれば reliable 18x 経路に分岐し、
+            // 180 Ringing に `Require: 100rel` + `RSeq: <random>` を載せて
+            // 送出する。 PRACK 受信まで fork (= 内線レッグ呼び出し) を
+            // 待ち合わせる必要は無い (§3 はそのような順序を要求しない)。 ここでは
+            // 「reliable 18x が確実に届いたことを PRACK で確認する」 経路と
+            // 「内線フォークを並行で開始する」 経路を **並走** させ、 PRACK 不到来
+            // でも 200 OK 直前まで状態を維持する。
+            let invite_wants_100rel =
+                header_has_option_tag(request.headers.get("supported"), OPTION_TAG_100REL)
+                    || header_has_option_tag(request.headers.get("require"), OPTION_TAG_100REL);
+            let invite_cseq_num = request
+                .headers
+                .get("cseq")
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+
             let dialog_to_tag: Option<String> = {
                 let mut tx = stx.lock().await;
                 let mut ringing = build_response_skeleton(tx.request(), 180, "Ringing");
@@ -1152,11 +1334,63 @@ impl NgnInboundHandler {
                 // ensure_to_tag は has_to_tag を見て既存があれば二重付与しない。
                 // build_response_skeleton が自動付与した tag をそのまま使う。
                 ensure_to_tag(&mut ringing);
+
+                // RFC 3262 §3 (Issue #251 Phase B): reliable provisional 経路は
+                // **同一 INVITE transaction に対して in-flight 1 件まで** の制約が
+                // あるため (§3 "MUST NOT send a second reliable provisional response
+                // until the first is acknowledged")、 sabiden では 180 Ringing のみを
+                // reliable にする。 100 Trying は reliable にしない (§3 "100 Trying
+                // ... is never sent reliably")。 200 OK は別 transaction の終結。
+                if invite_wants_100rel {
+                    let rseq = random_initial_rseq();
+                    ringing.headers.set("Require", OPTION_TAG_100REL);
+                    ringing.headers.set("RSeq", rseq.to_string());
+
+                    // ServerTransaction が 18x 送信時に Via を `response_via` で
+                    // 上書きするため、 retransmit task に渡す bytes も同じ Via で
+                    // 組み立てる。 これで 1 回目送信 (tx.respond) と再送 (spawn task)
+                    // が完全に同一 octet stream となる (RFC 3262 §3 "MUST be sent
+                    // with the same RSeq" の趣旨を bytes レベルで遵守)。
+                    let resp_via = tx.response_via().to_string();
+                    let response_dest = tx.response_dest();
+                    ringing.headers.set("Via", resp_via);
+                    let retransmit_bytes = ringing.to_bytes();
+
+                    let prack_received = Arc::new(tokio::sync::Notify::new());
+                    let retransmit_task = spawn_reliable_provisional_retransmit(
+                        self.socket.clone(),
+                        response_dest,
+                        retransmit_bytes,
+                        prack_received.clone(),
+                    );
+                    let (prack_tx, prack_rx) = tokio::sync::oneshot::channel::<()>();
+                    let state = Rc100relState {
+                        rseq,
+                        invite_cseq: invite_cseq_num,
+                        prack_received,
+                        prack_oneshot_tx: Some(prack_tx),
+                        prack_oneshot_rx: Some(prack_rx),
+                        retransmit_task: Some(retransmit_task),
+                    };
+                    self.rc100rel
+                        .lock()
+                        .await
+                        .insert(call_id.clone(), Arc::new(Mutex::new(state)));
+                    debug!(
+                        rseq,
+                        invite_cseq = invite_cseq_num,
+                        %call_id,
+                        "RFC 3262 §3: reliable 180 Ringing + Require: 100rel + RSeq 送出"
+                    );
+                }
                 let tag = ringing.headers.get("to").and_then(extract_to_tag);
                 tx.respond(ringing).await?;
                 tag
             };
-            debug!(?dialog_to_tag, "180 Ringing 送出 (RFC 3261 §13.3.1.4)");
+            debug!(
+                ?dialog_to_tag,
+                invite_wants_100rel, "180 Ringing 送出 (RFC 3261 §13.3.1.4)"
+            );
 
             // フォーク (内線レッグ): SIP / WebRTC を transport で分岐して並列に呼び出す。
             // NGN から CANCEL が来たら fork を打ち切るため Notify を仕込んで
@@ -1180,7 +1414,11 @@ impl NgnInboundHandler {
                 biased;
                 _ = cancel_notify.notified() => {
                     // NGN が CANCEL を出した。INVITE 側は 487 で打ち切る。
+                    // RFC 3262 §3 (Issue #251 Phase B): reliable 18x 状態が
+                    // あれば retransmit task を abort してから 487 を送出する
+                    // (cleanup を欠くと 32s 間ゾンビ task が残る)。
                     info!("NGN CANCEL を受信 → 487 Request Terminated で打ち切り");
+                    self.cleanup_rc100rel(&call_id).await;
                     self.respond(&stx, 487, "Request Terminated").await?;
                     self.pending.lock().await.remove(&call_id);
                     self.in_flight.lock().await.remove(&call_id);
@@ -1193,6 +1431,40 @@ impl NgnInboundHandler {
 
             // fork が完了したので in_flight からは外す (CANCEL の競合は無視する)。
             self.in_flight.lock().await.remove(&call_id);
+
+            // RFC 3262 §3 (Issue #251 Phase B): reliable 18x を出した経路では、
+            // **PRACK を受信するまで final response を送ってはならない**
+            // (§3 "The UAS MUST NOT send a 2xx response until the corresponding
+            // PRACK arrives ..."). PRACK が来ないまま 32 秒 (= Timer 64*T1)
+            // 経過したら諦め、 INVITE トランザクションを 408 で終結させる
+            // (RFC 3262 §3 後段: "The UAS treats the failure to receive the
+            // PRACK ... as if there were no response at all to the request"、
+            // sabiden では Timer F 相当の Timeout として 408 にマップ)。
+            if invite_wants_100rel {
+                let prack_outcome = self.wait_for_prack(&call_id).await;
+                match prack_outcome {
+                    PrackOutcome::Received => {
+                        debug!(%call_id, "RFC 3262 §3: PRACK 受信 → final response 送出可能");
+                    }
+                    PrackOutcome::Timeout => {
+                        warn!(
+                            %call_id,
+                            "RFC 3262 §3: PRACK 32 秒不到来 → 408 で INVITE 終結"
+                        );
+                        self.cleanup_rc100rel(&call_id).await;
+                        self.respond(&stx, 408, "Request Timeout").await?;
+                        self.pending.lock().await.remove(&call_id);
+                        self.metrics.record_invite_extension(InviteResult::Timeout);
+                        self.metrics.record_invite_ngn(InviteResult::Timeout);
+                        return Ok(());
+                    }
+                    PrackOutcome::NoState => {
+                        // 既に他経路 (cancel / fork 失敗 早期 return) で cleanup
+                        // 済み。 final response はこの match 経路で送る。
+                        debug!(%call_id, "RFC 3262 §3: rc100rel state 既消費");
+                    }
+                }
+            }
 
             match result {
                 ForkResult::Answered {
@@ -1251,6 +1523,7 @@ impl NgnInboundHandler {
                                     call_id: call_id.clone(),
                                 });
                             }
+                            self.cleanup_rc100rel(&call_id).await;
                             self.respond(&stx, 502, "Bad Gateway").await?;
                             self.pending.lock().await.remove(&call_id);
                             self.metrics.record_invite_extension(InviteResult::Error);
@@ -1410,10 +1683,173 @@ impl NgnInboundHandler {
                     self.metrics.record_invite_ngn(InviteResult::Timeout);
                 }
             }
+            // RFC 3262 §3 (Issue #251 Phase B): 全 match arm 共通の cleanup。
+            // 成功経路 (200 OK) では PRACK 受信時に cleanup 済 / 失敗経路
+            // (Rejected / Timeout) では state を消す。 idempotent。
+            self.cleanup_rc100rel(&call_id).await;
             Ok(())
         }
         .instrument(span)
         .await
+    }
+
+    /// RFC 3262 §4 (Issue #251 Phase B): PRACK を per-Call-ID `Rc100relState` と
+    /// 突合して 200 OK / 481 を返す。
+    ///
+    /// 受信 PRACK の挙動:
+    ///
+    /// 1. `Call-ID` で `rc100rel` を引く。 entry 無し → 481 (RFC 3262 §4 / §7.1
+    ///    "PRACK ... matches a transaction ... no matching transaction → 481")。
+    /// 2. entry あり: `RAck` を §7.2 ABNF (`response-num CSeq-num Method`) で
+    ///    パースし、 (RSeq, INVITE CSeq, "INVITE") と一致するか確認。
+    ///    不一致 → 481 (state は残置、 次の正しい PRACK を待つ)。
+    /// 3. 一致 → 200 OK PRACK を返し、 `prack_received.notify_one()` で
+    ///    `handle_invite` 側の `wait_for_prack` を解除、 entry は state.consume()
+    ///    パターンで `cleanup_rc100rel` に委譲する (retransmit task abort 含む)。
+    async fn handle_prack(&self, request: SipRequest, remote: SocketAddr) -> Result<()> {
+        let call_id = match request.headers.get("call-id") {
+            Some(v) => v.to_string(),
+            None => {
+                warn!("PRACK に Call-ID なし → 481");
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                return Ok(());
+            }
+        };
+
+        // RFC 3262 §7.2: RAck は必須。 不在は 400 でも 481 でも reject 可能だが、
+        // §4 が「該当 transaction 不在 = 481」 を明示するため 481 で統一。
+        let rack_header = match request.headers.get("rack") {
+            Some(v) => v.to_string(),
+            None => {
+                warn!(%call_id, "PRACK に RAck ヘッダ無し → 481 (RFC 3262 §7.2)");
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                return Ok(());
+            }
+        };
+
+        let state_arc = self.rc100rel.lock().await.get(&call_id).cloned();
+        let state_arc = match state_arc {
+            Some(s) => s,
+            None => {
+                warn!(%call_id, "PRACK 該当 reliable 18x 状態無し → 481 (RFC 3262 §4)");
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                return Ok(());
+            }
+        };
+
+        // RFC 3262 §7.2 ABNF パース。
+        let parsed = parse_rack_header(&rack_header);
+        let (rseq, cseq_num, method) = match parsed {
+            Some(v) => v,
+            None => {
+                warn!(%call_id, rack = %rack_header, "PRACK RAck パース失敗 → 481");
+                let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+                let mut resp =
+                    build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+                resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+                tx.respond(resp).await?;
+                return Ok(());
+            }
+        };
+
+        // RFC 3262 §4: RAck (RSeq, CSeq-num, Method) が直近 reliable 18x と
+        // 一致するか確認。 一致しなければ 481 (誤対応 PRACK は無視扱い)。
+        let matched = {
+            let state = state_arc.lock().await;
+            rseq == state.rseq
+                && cseq_num == state.invite_cseq
+                && method.eq_ignore_ascii_case("INVITE")
+        };
+        if !matched {
+            warn!(
+                %call_id,
+                rack = %rack_header,
+                "PRACK RAck 不一致 (期待値と異なる) → 481 (RFC 3262 §4)"
+            );
+            let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+            let mut resp =
+                build_response_skeleton(tx.request(), 481, "Call/Transaction Does Not Exist");
+            resp.headers.set("Allow", SUPPORTED_METHODS_ALLOW);
+            tx.respond(resp).await?;
+            return Ok(());
+        }
+
+        // 一致 → 200 OK を返し、 `handle_invite` 側を起こす。 state の
+        // retransmit task は cleanup_rc100rel で abort する。
+        let (prack_notify, prack_oneshot_tx) = {
+            let mut state = state_arc.lock().await;
+            (state.prack_received.clone(), state.prack_oneshot_tx.take())
+        };
+        let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
+        let resp = build_response_skeleton(tx.request(), 200, "OK");
+        tx.respond(resp).await?;
+        // retransmit task 用 (§3 自発再送停止) は Notify。
+        prack_notify.notify_one();
+        // `wait_for_prack` 解除は oneshot で確実化 (= waker 取り逃し無し)。
+        if let Some(tx) = prack_oneshot_tx {
+            let _ = tx.send(());
+        }
+        self.cleanup_rc100rel(&call_id).await;
+        debug!(%call_id, "RFC 3262 §4: PRACK 受理 → 200 OK + INVITE wait 解除");
+        Ok(())
+    }
+
+    /// RFC 3262 §3 (Issue #251 Phase B): `handle_invite` から呼ばれ、
+    /// per-Call-ID の `prack_received` Notify を 64*T1 (= 32 秒) まで
+    /// 待ち合わせる。
+    ///
+    /// - state 不在 → `NoState` (= reliable 18x 未送出 / 既消費)。
+    /// - PRACK 受信 → `Received`。
+    /// - timeout → `Timeout`。
+    async fn wait_for_prack(&self, call_id: &str) -> PrackOutcome {
+        // RFC 3262 §3 (Issue #251 Phase B): PRACK 受信を `oneshot::channel` で
+        // 待ち合わせる。 旧実装は `tokio::sync::Notify` 経由だったが、
+        // `handle_prack` が `notify_one` を呼んでも `wait_for_prack` 側の
+        // waker が 32 秒間 wake しないレースを観測したため、 oneshot で確実化。
+        let rx_opt = {
+            let map_guard = self.rc100rel.lock().await;
+            match map_guard.get(call_id) {
+                Some(state_arc) => state_arc.lock().await.prack_oneshot_rx.take(),
+                None => None,
+            }
+        };
+        let mut rx = match rx_opt {
+            Some(rx) => rx,
+            None => return PrackOutcome::NoState,
+        };
+        // RFC 3261 §17.1.1.2 / RFC 3262 §3: Timer F = 64*T1 = 32 秒。
+        const PRACK_TIMER: Duration = Duration::from_secs(32);
+        tokio::select! {
+            biased;
+            res = &mut rx => match res {
+                Ok(()) => PrackOutcome::Received,
+                // Sender drop = state 消滅 (cancel 等) → NoState 等価。 final
+                // response は呼出側 (match result) で処理。
+                Err(_) => PrackOutcome::NoState,
+            },
+            _ = tokio::time::sleep(PRACK_TIMER) => PrackOutcome::Timeout,
+        }
+    }
+
+    /// `rc100rel` から entry を削除し、 retransmit task を `Drop` 経由で abort
+    /// する。 idempotent: 既消費でも no-op。
+    async fn cleanup_rc100rel(&self, call_id: &str) {
+        let removed = self.rc100rel.lock().await.remove(call_id);
+        if removed.is_some() {
+            debug!(%call_id, "RFC 3262 §3: rc100rel state cleanup (retransmit task abort)");
+        }
     }
 
     /// NGN 側から到着した BYE を処理する (RFC 3261 §15.1.2 / RFC 5853 §3.2.2)。
@@ -13128,20 +13564,24 @@ mod tests {
     }
 
     /// RFC 3261 §8.2.2.3: `Require` に未対応 option-tag があれば 420 を返す。
-    /// sabiden 既知 (`KNOWN_OPTION_TAGS`) = timer / replaces。
+    /// sabiden 既知 (`KNOWN_OPTION_TAGS`) = timer / replaces / 100rel
+    /// (Issue #251 Phase B で 100rel 追加)。
     #[test]
     fn rfc3261_8_2_2_3_unsupported_option_tags_detects_unknown() {
         // 全て既知 → 空
         assert!(unsupported_option_tags("timer").is_empty());
         assert!(unsupported_option_tags("timer, replaces").is_empty());
+        // 100rel も既知 (RFC 3262 §3、 Issue #251 Phase B)
+        assert!(unsupported_option_tags("100rel").is_empty());
+        assert!(unsupported_option_tags("timer, 100rel").is_empty());
         // case-insensitive (RFC 3261 §7.3.1)
-        assert!(unsupported_option_tags("TIMER, Replaces").is_empty());
+        assert!(unsupported_option_tags("TIMER, Replaces, 100REL").is_empty());
         // 未知混入 → 未知 tag のみ列挙
-        let u = unsupported_option_tags("timer, 100rel");
-        assert_eq!(u, vec!["100rel".to_string()]);
+        let u = unsupported_option_tags("timer, precondition");
+        assert_eq!(u, vec!["precondition".to_string()]);
         // 全て未知
-        let u = unsupported_option_tags("100rel, precondition");
-        assert_eq!(u, vec!["100rel".to_string(), "precondition".to_string()]);
+        let u = unsupported_option_tags("foo, precondition");
+        assert_eq!(u, vec!["foo".to_string(), "precondition".to_string()]);
         // 空ヘッダ → 空 (= 通常処理を継続)
         assert!(unsupported_option_tags("").is_empty());
     }
@@ -13166,10 +13606,10 @@ mod tests {
         assert_eq!(resolve_response_refresher(Some("")), "uas");
     }
 
-    /// RFC 3261 §20.5 / §20.17 / §20.41 / RFC 4028 §7 (Issue #251 Phase A):
-    /// `apply_uas_inbound_2xx_headers` が Allow / Supported / Date / Server を
-    /// 必ず付与する。 値は Asterisk 実機 §3.1 と同等 (PRACK は除外、
-    /// `Supported: 100rel` は出さない = capability 偽広告防止)。
+    /// RFC 3261 §20.5 / §20.17 / §20.41 / RFC 4028 §7 / RFC 3262 §3
+    /// (Issue #251 Phase A + B): `apply_uas_inbound_2xx_headers` が
+    /// Allow / Supported / Date / Server を必ず付与し、 PRACK / 100rel
+    /// 経路を含むこと。
     #[test]
     fn rfc3261_20_5_apply_uas_inbound_2xx_headers_sets_allow_supported_date_server() {
         let mut resp = SipResponse {
@@ -13181,27 +13621,23 @@ mod tests {
         apply_uas_inbound_2xx_headers(&mut resp);
 
         let allow = resp.headers.get("allow").expect("Allow 必須");
-        // INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE/INFO は含む
+        // INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE/INFO/PRACK は含む
+        // (PRACK は Phase B で追加、 RFC 3262 §4)
         for m in [
-            "INVITE", "ACK", "BYE", "CANCEL", "OPTIONS", "UPDATE", "INFO",
+            "INVITE", "ACK", "BYE", "CANCEL", "OPTIONS", "UPDATE", "INFO", "PRACK",
         ] {
             assert!(allow.contains(m), "Allow に {m} を含むべき: {allow}");
         }
-        // PRACK は除外 (sabiden が 100rel 未実装、 capability 偽広告防止)
-        assert!(
-            !allow.to_ascii_uppercase().contains("PRACK"),
-            "Allow に PRACK を含めるべきではない (未実装): {allow}"
-        );
 
         let supported = resp.headers.get("supported").expect("Supported 必須");
         assert!(
             supported.to_ascii_lowercase().contains("timer"),
             "Supported に timer を含むべき: {supported}"
         );
-        // 100rel は出さない (PRACK 未実装)
+        // 100rel は出す (Phase B で追加、 RFC 3262 §3)
         assert!(
-            !supported.to_ascii_lowercase().contains("100rel"),
-            "Supported に 100rel を含めるべきではない: {supported}"
+            supported.to_ascii_lowercase().contains("100rel"),
+            "Supported に 100rel を含むべき (Phase B): {supported}"
         );
 
         let date = resp.headers.get("date").expect("Date 必須");
@@ -13621,13 +14057,14 @@ mod tests {
             &ngn_sock.local_addr().unwrap(),
             "sip:0191349809@sabiden",
             "rfc3261-8-2-2-3-cid",
-            "z9hG4bK-require-100rel",
+            "z9hG4bK-require-precondition",
             b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
               m=audio 20206 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
                 .to_vec(),
         );
-        // sabiden 未実装 (Phase B): 100rel
-        invite.headers.set("Require", "100rel");
+        // sabiden 未実装: precondition (RFC 3312)。 100rel は Phase B で実装済の
+        // ため、 既知 tag に移動した。 unknown tag を別途用意する必要がある。
+        invite.headers.set("Require", "precondition");
 
         ngn_sock
             .send_to(&invite.to_bytes(), sabiden_addr)
@@ -13644,8 +14081,8 @@ mod tests {
             .get("unsupported")
             .expect("Unsupported ヘッダ MUST (§8.2.2.3)");
         assert!(
-            unsupported.contains("100rel"),
-            "Unsupported に 100rel を含むべき: {unsupported}"
+            unsupported.contains("precondition"),
+            "Unsupported に precondition を含むべき: {unsupported}"
         );
         // 200 OK が来てはいけない (= 通常処理を継続してはいけない)
         assert!(
@@ -13746,5 +14183,625 @@ mod tests {
         assert_eq!(extract_to_tag("<sip:dest@sabiden>"), None);
         // 山括弧内の tag= は無視 (URI userinfo の tag は header param ではない)
         assert_eq!(extract_to_tag("<sip:dest;tag=fake@sabiden>"), None);
+    }
+
+    // ====================================================================
+    // RFC 3262 (Issue #251 Phase B) 100rel / PRACK reliable provisional
+    // response テスト。 純粋関数 + 結合テストの両方を含む。
+    // ====================================================================
+
+    /// RFC 3262 §7.2 ABNF: `RAck = "RAck" HCOLON response-num LWS CSeq-num LWS Method`。
+    /// `parse_rack_header` が正常系 / 異常系を区別する。
+    #[test]
+    fn rfc3262_7_2_parse_rack_header_well_formed_and_malformed() {
+        // 正常系
+        assert_eq!(
+            parse_rack_header("123 5 INVITE"),
+            Some((123, 5, "INVITE".to_string()))
+        );
+        // case-insensitive method (ABNF 上 method は大文字推奨だが解析は寛容に)
+        assert_eq!(
+            parse_rack_header("1 1 invite"),
+            Some((1, 1, "invite".to_string()))
+        );
+        // 余計な空白は許容 (LWS は複数 SP / HTAB)
+        assert_eq!(
+            parse_rack_header("  123   5   INVITE  "),
+            Some((123, 5, "INVITE".to_string()))
+        );
+        // フィールド不足 → None
+        assert_eq!(parse_rack_header("123"), None);
+        assert_eq!(parse_rack_header("123 5"), None);
+        // 余剰トークン → None (ABNF 厳格)
+        assert_eq!(parse_rack_header("123 5 INVITE extra"), None);
+        // 数値外 → None
+        assert_eq!(parse_rack_header("abc 5 INVITE"), None);
+        assert_eq!(parse_rack_header("123 abc INVITE"), None);
+        // 0 / overflow は数値として通る (RSeq 0 は ABNF 違反だが parser 層で拒否しない)
+        assert_eq!(
+            parse_rack_header("0 0 INVITE"),
+            Some((0, 0, "INVITE".to_string()))
+        );
+    }
+
+    /// RFC 3262 §3 / §7.1: `RSeq` の初期値は 1..=2^31-1。 `random_initial_rseq`
+    /// が ABNF / SHOULD を遵守する。
+    #[test]
+    fn rfc3262_3_random_initial_rseq_within_valid_range() {
+        for _ in 0..100 {
+            let r = random_initial_rseq();
+            assert!(r >= 1, "RSeq は 1 以上 (RFC 3262 §7.1 ABNF)");
+            assert!(r <= 0x7FFF_FFFF, "RSeq SHOULD は 2^31-1 以下 (RFC 3262 §3)");
+        }
+    }
+
+    /// RFC 3261 §7.3.1 / RFC 3262 §3: `Supported` / `Require` の comma 区切り
+    /// option-tag リストで 100rel を case-insensitive に検出する。
+    #[test]
+    fn rfc3262_3_header_has_option_tag_case_insensitive_comma_list() {
+        assert!(header_has_option_tag(Some("100rel"), OPTION_TAG_100REL));
+        assert!(header_has_option_tag(Some("100REL"), OPTION_TAG_100REL));
+        assert!(header_has_option_tag(
+            Some("timer, 100rel"),
+            OPTION_TAG_100REL
+        ));
+        assert!(header_has_option_tag(
+            Some("timer,100rel,replaces"),
+            OPTION_TAG_100REL
+        ));
+        assert!(header_has_option_tag(Some("  100rel  "), OPTION_TAG_100REL));
+        // 不在 / None / 別 tag のみ
+        assert!(!header_has_option_tag(Some("timer"), OPTION_TAG_100REL));
+        assert!(!header_has_option_tag(Some(""), OPTION_TAG_100REL));
+        assert!(!header_has_option_tag(None, OPTION_TAG_100REL));
+        // 部分一致は false (`1100rel` は別 tag 扱い、 RFC 3261 §7.3.1 で
+        // option-tag は token なので部分一致は誤検知)
+        assert!(!header_has_option_tag(Some("1100rel"), OPTION_TAG_100REL));
+    }
+
+    /// RFC 3262 §3: NGN INVITE が `Supported: 100rel` を提示したら、 sabiden の
+    /// 180 Ringing に `Require: 100rel` + `RSeq: <u32>` が乗ること。 既存の
+    /// non-reliable 180 (capability 不在の旧経路) と区別される。
+    #[tokio::test]
+    async fn rfc3262_3_inbound_invite_with_supported_100rel_triggers_reliable_180() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6301".to_string(),
+                "127.0.0.1:6301".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 内線レッグは無応答 (fork timeout 経路) で良い。 ここでは reliable 180
+        // が出ているか **だけ** 観測する。 ScriptedAction::ok() は即 200 を
+        // 返してしまうので、 reliable 180 と 200 OK を切り離すため `ringing` で
+        // 内線を 180 状態に留める。 ただし sabiden の fork は内線 200 OK で
+        // 確定するため、 ここでは inviter から ok() を返すが drain_responses は
+        // 180 / 200 を順に拾うので、 180 に Require / RSeq が乗っていることが
+        // 検証できれば十分。
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30301 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3262-3-supported-100rel-cid",
+            "z9hG4bK-100rel-supp",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20301 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Supported", "100rel");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // 100 Trying / 180 Ringing を拾う。 200 OK は PRACK 待ちで永遠に来ない
+        // (= PRACK 32 秒 timeout 経路) ため、 ここでは短いタイムアウトで止める。
+        let mut buf = vec![0u8; 8192];
+        let mut got_180: Option<SipResponse> = None;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_millis(500), ngn_sock.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok((n, _))) => {
+                    if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                        if r.status_code == 180 {
+                            got_180 = Some(r);
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let r180 = got_180.expect("180 Ringing が来るべき (RFC 3261 §13.3.1.4)");
+        let require = r180.headers.get("require").expect(
+            "RFC 3262 §3: Supported: 100rel offer に対し reliable 180 は Require: 100rel を載せる",
+        );
+        assert!(
+            require.to_ascii_lowercase().contains("100rel"),
+            "Require に 100rel を含むべき: {require}"
+        );
+        let rseq = r180
+            .headers
+            .get("rseq")
+            .expect("RFC 3262 §3 / §7.1: reliable 18x は RSeq ヘッダ MUST");
+        let rseq_num: u32 = rseq.parse().expect("RSeq は u32 数値");
+        assert!(
+            (1..=0x7FFF_FFFF).contains(&rseq_num),
+            "RSeq は 1..=2^31-1 (RFC 3262 §3 / §7.1): {rseq_num}"
+        );
+    }
+
+    /// RFC 3262 §3 regression: `Supported: 100rel` が無ければ既存の non-reliable
+    /// 180 Ringing (Require / RSeq 不在) のまま、 既存通話パスは不変。
+    #[tokio::test]
+    async fn rfc3262_3_inbound_invite_without_100rel_keeps_non_reliable_180() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6302".to_string(),
+                "127.0.0.1:6302".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30302 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        // `Supported` には timer のみ。 100rel は **不在**。
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3262-3-no100rel-cid",
+            "z9hG4bK-no100rel",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20302 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Supported", "timer");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r180 = responses
+            .iter()
+            .find(|r| r.status_code == 180)
+            .expect("180 Ringing が来るべき (RFC 3261 §13.3.1.4 regression)");
+        // Require: 100rel は **載せない** (carrier が 100rel を要求していないため)
+        let require = r180.headers.get("require").unwrap_or("");
+        assert!(
+            !require.to_ascii_lowercase().contains("100rel"),
+            "100rel 非要求時は Require: 100rel を載せない: {require}"
+        );
+        assert!(
+            r180.headers.get("rseq").is_none(),
+            "100rel 非要求時は RSeq を載せない (RFC 3262 §3): {:?}",
+            r180.headers.get("rseq")
+        );
+        // 既存通話パス: 200 OK が来る (= fork 成功で確定するシーケンスに到達)
+        assert!(
+            responses.iter().any(|r| r.status_code == 200),
+            "100rel 不在経路は既存通り 200 OK で確定: codes={:?}",
+            responses.iter().map(|r| r.status_code).collect::<Vec<_>>()
+        );
+    }
+
+    /// RFC 3262 §4: 受信 PRACK の RAck が直近 reliable 18x の (RSeq, INVITE
+    /// CSeq, "INVITE") と一致しなければ 481 を返す。 `handle_inbound` の
+    /// PRACK 分岐で `rc100rel` に entry 無し (= reliable 18x 未送出) の経路。
+    #[tokio::test]
+    async fn rfc3262_4_prack_unrecognized_rack_returns_481() {
+        // この経路は reliable 18x を出していない (= rc100rel entry 無し) ため、
+        // 任意の RAck で 481。 既存 PRACK→481 テスト
+        // `rfc3262_4_ngn_prack_returns_481_with_allow_header` (Phase A) を
+        // 補強する: 明示的に `RAck` ヘッダを付けても結果は同じ (§4)。
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut prack = builders::request_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            SipMethod::Prack,
+            "sip:sabiden@127.0.0.1",
+            "rfc3262-4-prack-unknown-cid",
+            "z9hG4bK-prack-unknown",
+        );
+        // RAck を付ける (= 「PRACK は届いたが該当 state 無し」 経路の検証)。
+        prack.headers.set("RAck", "999999 1 INVITE");
+        ngn_sock
+            .send_to(&prack.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let mut got: Option<SipResponse> = None;
+        for _ in 0..3 {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_secs(2), ngn_sock.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    got = Some(r);
+                    break;
+                }
+            }
+        }
+        let r = got.expect("PRACK 応答が来るべき");
+        assert_eq!(
+            r.status_code, 481,
+            "RFC 3262 §4: rc100rel state 無し PRACK は 481"
+        );
+    }
+
+    /// RFC 3262 §3: reliable 180 を出したまま PRACK が来ない経路で、
+    /// 32 秒 (= 64*T1) timeout 後に 408 で INVITE を終結させる。
+    /// `tokio::time::pause` で仮想時間を進めて高速検証。
+    #[tokio::test(start_paused = true)]
+    async fn rfc3262_3_prack_timeout_terminates_invite_with_408() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6303".to_string(),
+                "127.0.0.1:6303".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 内線 OK 応答 (= fork 即成功) にして、 200 OK 直前の PRACK 待ちのみが
+        // タイムアウト経路に乗ることを保証する。
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30303 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3262-3-prack-timeout-cid",
+            "z9hG4bK-prack-timeout",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20303 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Supported", "100rel");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // 32 秒進める前に 100 / 180 / retransmits を捌くため数 ms 進行。
+        // start_paused=true なので manual advance が必要。 仮想時間で
+        // 32 秒 + α 進めれば PRACK 待ち timeout 経路 (408) に到達。
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        // PRACK timeout (32 秒) を超える分だけ進める。
+        tokio::time::advance(Duration::from_secs(35)).await;
+        tokio::task::yield_now().await;
+
+        // 仮想時間進行中も UDP recv はリアルタイムなので、 タイムアウト短めで
+        // 既送出メッセージを拾う。
+        let mut buf = vec![0u8; 8192];
+        let mut codes: Vec<u16> = Vec::new();
+        for _ in 0..16 {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(100), ngn_sock.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    codes.push(r.status_code);
+                }
+            } else {
+                // 仮想時間を更に進めて poll 機会を増やす。
+                tokio::time::advance(Duration::from_millis(50)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            codes.contains(&408),
+            "RFC 3262 §3: PRACK 不到来 32 秒で 408 Request Timeout で終結。 codes={codes:?}"
+        );
+    }
+
+    /// RFC 3262 §3 / RFC 3261 §17.1.1.2: reliable 18x は T1 (= 500ms) 起点に
+    /// T2 (= 4s) 頭打ちの指数バックオフで再送される。 仮想時間で T1, 2T1, 4T1
+    /// の境界を確認する。 同一 RSeq で送られ続けることが §3 の MUST。
+    #[tokio::test(start_paused = true)]
+    async fn rfc3262_3_reliable_180_retransmits_on_t1_backoff() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6304".to_string(),
+                "127.0.0.1:6304".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30304 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3262-3-retransmit-cid",
+            "z9hG4bK-retx",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20304 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Supported", "100rel");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // T1 (500ms) + 2T1 (1s) + 4T1 (2s) = 3.5s を経過すれば 4 回目の境界。
+        // 100 Trying と 180 Ringing 初回 + 3 回の再送 ≒ 計 5 個の応答が見える。
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let mut buf = vec![0u8; 8192];
+        let mut rseq_values: Vec<u32> = Vec::new();
+        let mut count_180 = 0usize;
+        for _ in 0..20 {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(100), ngn_sock.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    if r.status_code == 180 {
+                        count_180 += 1;
+                        if let Some(v) = r.headers.get("rseq").and_then(|s| s.parse::<u32>().ok()) {
+                            rseq_values.push(v);
+                        }
+                    }
+                }
+            } else {
+                tokio::time::advance(Duration::from_millis(100)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            count_180 >= 2,
+            "RFC 3262 §3: reliable 180 は T1 起点で自発再送される (PRACK 未到来時)。 count_180={count_180}"
+        );
+        // RFC 3262 §3: "MUST be sent with the same RSeq" 全再送で同一 RSeq。
+        if rseq_values.len() >= 2 {
+            let first = rseq_values[0];
+            assert!(
+                rseq_values.iter().all(|v| *v == first),
+                "RFC 3262 §3: reliable 18x 再送は同一 RSeq MUST: {rseq_values:?}"
+            );
+        }
+    }
+
+    /// RFC 3262 §4: 受信 PRACK の RAck が直近 reliable 18x の (RSeq, CSeq, "INVITE")
+    /// と一致したら 200 OK PRACK を返し、 INVITE 側の wait を解除する。
+    /// reliable 180 取得 → PRACK 送出 → 200 OK PRACK + 200 OK INVITE が
+    /// 順に届く end-to-end フロー。
+    #[tokio::test]
+    async fn rfc3262_4_prack_with_matching_rack_returns_200_ok() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6305".to_string(),
+                "127.0.0.1:6305".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30305 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let call_id = "rfc3262-4-prack-ok-cid";
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            call_id,
+            "z9hG4bK-prack-ok",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20305 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Supported", "100rel");
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // reliable 180 を待つ。
+        let mut buf = vec![0u8; 8192];
+        let mut r180: Option<SipResponse> = None;
+        for _ in 0..6 {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_secs(2), ngn_sock.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    if r.status_code == 180 {
+                        r180 = Some(r);
+                        break;
+                    }
+                }
+            }
+        }
+        let r180 = r180.expect("reliable 180 が来るべき");
+        let rseq: u32 = r180
+            .headers
+            .get("rseq")
+            .expect("RSeq")
+            .parse()
+            .expect("RSeq u32");
+
+        // RFC 3262 §7.2: PRACK の RAck = "<RSeq> <CSeq> INVITE"
+        let mut prack = builders::request_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            SipMethod::Prack,
+            "sip:sabiden@127.0.0.1",
+            call_id,
+            "z9hG4bK-prack-match",
+        );
+        prack.headers.set("RAck", format!("{} 1 INVITE", rseq));
+        ngn_sock
+            .send_to(&prack.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        // 200 PRACK と 200 INVITE が順次届くことを確認 (順序は環境依存だが
+        // 両方とも届く)。
+        let mut got_200_prack = false;
+        let mut got_200_invite = false;
+        let mut observed: Vec<(u16, String)> = Vec::new();
+        for _ in 0..20 {
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_secs(2), ngn_sock.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    let cseq = r.headers.get("cseq").unwrap_or("").to_string();
+                    observed.push((r.status_code, cseq.clone()));
+                    if r.status_code == 200 {
+                        if cseq.to_ascii_uppercase().contains("PRACK") {
+                            got_200_prack = true;
+                        } else if cseq.to_ascii_uppercase().contains("INVITE") {
+                            got_200_invite = true;
+                        }
+                    }
+                }
+            }
+            if got_200_prack && got_200_invite {
+                break;
+            }
+        }
+        assert!(
+            got_200_prack,
+            "RFC 3262 §4: matching RAck PRACK は 200 OK が返る。 observed={observed:?}"
+        );
+        assert!(
+            got_200_invite,
+            "RFC 3262 §3: PRACK 受信後に INVITE 側 200 OK が出る。 observed={observed:?}"
+        );
     }
 }

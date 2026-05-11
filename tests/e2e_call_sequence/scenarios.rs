@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use sabiden::sip::message::SipMessage;
+use sabiden::sip::message::{SipMessage, SipResponse};
 
 use crate::mock_extension_ua::MockExtensionUa;
 use crate::mock_ngn_carrier::{
@@ -447,4 +447,85 @@ async fn harness_starts_without_panic() {
             }
         }
     }
+}
+
+// =============================================================================
+// (e) RFC 3262 100rel / PRACK reliable provisional (Issue #251 Phase B)
+// =============================================================================
+
+/// `mock_carrier --INVITE (Supported: 100rel)--> sabiden --INVITE--> mock_ext_ua
+/// --200 OK--> sabiden --180 Ringing (Require: 100rel + RSeq)--> mock_carrier
+/// --PRACK (RAck: <rseq>)--> sabiden --200 OK PRACK--> sabiden --200 OK INVITE
+/// --> mock_carrier --ACK--> sabiden --BYE--> 200 OK`
+///
+/// RFC 3262 §3 (reliable 18x) / §4 (PRACK) のフル dialog 確立。 sabiden が
+/// `Supported: 100rel` を見て reliable 180 を選択 → PRACK 受信で 200 OK INVITE
+/// が送出可能になる、 という Phase B のメインシーケンスを 1 test で精査。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3262_3_inbound_invite_with_100rel_full_dialog_succeeds() {
+    let ext_ua = MockExtensionUa::start("iphone").await;
+    let harness = SabidenHarness::start_with_mock_extensions(&[&ext_ua]).await;
+    let carrier = MockNgnCarrier::start().await;
+
+    // (1) carrier 側から `Supported: 100rel` 付き INVITE 注入。
+    let injected = carrier
+        .inject_inbound_invite(
+            harness.ngn_addr,
+            InviteOpts {
+                sdp_offer: sdp_offer_pcmu("127.0.0.1", 20100),
+                advertise_100rel: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // (2) 内線 UA に INVITE が forward される。
+    let inbound = ext_ua.expect_inbound_invite(Duration::from_secs(5)).await;
+    let _ext_tag = ext_ua
+        .answer_with(&inbound, sdp_answer_pcmu("127.0.0.1", 30100))
+        .await;
+
+    // (3) sabiden → carrier: reliable 180 Ringing (Require: 100rel + RSeq)。
+    let (rseq, _r180) = carrier.expect_reliable_180_with_rseq().await;
+
+    // (4) carrier → sabiden: PRACK with RAck: <rseq> 1 INVITE。
+    //     ここで wait_for_prack が解除され 200 OK INVITE 送出に進む。
+    carrier
+        .send_prack(harness.ngn_addr, &injected, rseq, 1)
+        .await;
+
+    // (5) sabiden → carrier: 200 OK PRACK と 200 OK INVITE が順に来る。
+    //     先着順序は実装依存だが、 両方届くのが MUST (§4)。
+    let mut got_200_prack = false;
+    let mut r200_invite: Option<SipResponse> = None;
+    for _ in 0..8 {
+        if let Some((resp, _)) = carrier.recv_response(Duration::from_secs(3)).await {
+            if resp.status_code == 200 {
+                let cseq = resp.headers.get("cseq").unwrap_or("").to_string();
+                if cseq.to_ascii_uppercase().contains("PRACK") {
+                    got_200_prack = true;
+                } else if cseq.to_ascii_uppercase().contains("INVITE") {
+                    r200_invite = Some(resp);
+                }
+            }
+            if got_200_prack && r200_invite.is_some() {
+                break;
+            }
+        }
+    }
+    assert!(
+        got_200_prack,
+        "RFC 3262 §4: PRACK 受理時は 200 OK PRACK を返す"
+    );
+    let r200_invite = r200_invite.expect("RFC 3262 §3: PRACK 後の 200 OK INVITE");
+
+    // (6) ACK + BYE で dialog 確立を確認。
+    let to_tag = extract_to_tag(&r200_invite).expect("To-tag MUST");
+    carrier.send_ack(harness.ngn_addr, &injected, &to_tag).await;
+    carrier.send_bye(harness.ngn_addr, &injected, &to_tag).await;
+    let (bye_200, _) = carrier.await_status(200, 6).await;
+    assert_eq!(
+        bye_200.status_code, 200,
+        "RFC 3261 §15.1.2: BYE には 200 OK 必須"
+    );
 }

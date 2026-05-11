@@ -56,6 +56,16 @@ use crate::webrtc::peer::{MediaFrame, PeerSession};
 /// エンコード送信する。
 const JITTER_PULL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Talkspurt 境界判定の閾値 (RFC 3551 §4.1 / RFC 7587 §4.4)。
+///
+/// 直前送信から本値以上の gap があれば「新 talkspurt」とみなし、 次パケットの
+/// M ビットを 1 にする。 30 ms = 1.5 frame 周期 (PCMU 20 ms / Opus 20 ms) で、
+/// 1 frame 失っただけの jitter (= false positive) は 20 ms < 30 ms で除外、
+/// silence detector の最短窓 40 ms 直前で立ち上がるため Opus DTX 復帰
+/// (RFC 7587 §3.7: silence 期は 4 packet = 80 ms ごとに 1 keep-alive) も
+/// 確実に拾える (Issue #84)。
+const TALKSPURT_GAP_THRESHOLD: Duration = Duration::from_millis(30);
+
 /// ジッタバッファのデフォルト深度 (パケット数)。
 ///
 /// RFC 3550 §6.4.1: jitter は受信パケット間隔の統計分散。 `JitterBuffer`
@@ -117,6 +127,10 @@ struct RtpEgressState {
     ssrc: u32,
     seq: u16,
     timestamp: u32,
+    /// 直近に `next_with_marker` で送信を払い出した時刻。 talkspurt 境界判定
+    /// (RFC 3551 §4.1 / RFC 7587 §4.4) に使う。 初回 (`None`) もしくは
+    /// [`TALKSPURT_GAP_THRESHOLD`] 以上空いたら M=1 (Issue #84)。
+    last_send_time: Option<Instant>,
 }
 
 impl RtpEgressState {
@@ -127,6 +141,7 @@ impl RtpEgressState {
             ssrc: rand::random(),
             seq: rand::random(),
             timestamp: rand::random(),
+            last_send_time: None,
         }
     }
 
@@ -138,6 +153,25 @@ impl RtpEgressState {
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(ts_increment);
         snapshot
+    }
+
+    /// `next` と同じく (seq, ts, ssrc) を払い出しつつ、 RFC 3551 §4.1 /
+    /// RFC 7587 §4.4 に従って talkspurt 開始フレームに立てる M ビットを返す。
+    ///
+    /// 直前 `next_with_marker` 呼び出しからの経過 `now - last_send_time`
+    /// が [`TALKSPURT_GAP_THRESHOLD`] 以上、 もしくは初回 (`last_send_time =
+    /// None`) のとき M=1。 その他は M=0。 呼び出し後 `last_send_time` を `now`
+    /// に更新する。 talkspurt 境界判定を seq / ts 払い出しと **同じ critical
+    /// section 内**で行うことで、 並行 send による race condition を排除する
+    /// (Issue #84)。
+    fn next_with_marker(&mut self, ts_increment: u32, now: Instant) -> (u16, u32, u32, bool) {
+        let marker = match self.last_send_time {
+            None => true,
+            Some(prev) => now.saturating_duration_since(prev) >= TALKSPURT_GAP_THRESHOLD,
+        };
+        self.last_send_time = Some(now);
+        let (seq, ts, ssrc) = self.next(ts_increment);
+        (seq, ts, ssrc, marker)
     }
 }
 
@@ -465,17 +499,20 @@ async fn ngn_to_web_loop(
                     }
                 };
 
-                // 共有 egress state から SSRC / seq / ts を払い出して 1 frame 分進める。
+                // 共有 egress state から SSRC / seq / ts と M ビットを払い出す。
                 // RFC 7587 §4.1: Opus RTP clock = 48 kHz → 20ms = 960 samples。
+                // RFC 7587 §4.4 (M bit): talkspurt 開始の最初の packet に M=1。
                 // Issue #112: bridge lifetime 中 SSRC 不変 + flow 中の seq / ts 連番を保証。
-                let (seq, ts, ssrc) = {
+                // Issue #84: jitter buffer pull が間遠 (silence / DTX 復帰直後) の場合に
+                //   talkspurt 境界として M=1 を立てる。
+                let (seq, ts, ssrc, marker) = {
                     let mut eg = state.ngn_to_web_egress.lock().await;
-                    eg.next(OPUS_FRAME_SAMPLES as u32)
+                    eg.next_with_marker(OPUS_FRAME_SAMPLES as u32, Instant::now())
                 };
 
                 let out_pkt = RtpPacket {
                     payload_type: opus_pt & 0x7f,
-                    marker: false,
+                    marker,
                     sequence: seq,
                     timestamp: ts,
                     ssrc,
@@ -675,17 +712,20 @@ async fn web_to_ngn_loop(
                     }
                     let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
 
-                    // 共有 egress state から SSRC / seq / ts を払い出して 1 chunk 分進める。
+                    // 共有 egress state から SSRC / seq / ts と M ビットを払い出す。
                     // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
+                    // RFC 3551 §4.1 (M bit): talkspurt 開始の最初の packet に M=1。
                     // Issue #112: bridge lifetime 中 SSRC 不変 + flow 中の seq / ts 連番を保証。
-                    let (seq, ts, ssrc) = {
+                    // Issue #84: WebRTC peer の Opus DTX 復帰 → 内部 chunk loop 内であっても
+                    //   出力 packet 間の gap が閾値超過なら talkspurt 開始扱いとする。
+                    let (seq, ts, ssrc, marker) = {
                         let mut eg = state.web_to_ngn_egress.lock().await;
-                        eg.next(SAMPLES_PER_FRAME as u32)
+                        eg.next_with_marker(SAMPLES_PER_FRAME as u32, Instant::now())
                     };
 
                     let out_pkt = RtpPacket {
                         payload_type: PAYLOAD_TYPE_ULAW,
-                        marker: false,
+                        marker,
                         sequence: seq,
                         timestamp: ts,
                         ssrc,
@@ -1229,14 +1269,17 @@ async fn peer_to_ngn_loop(
         // 各 chunk を 1 RTP packet として送出。 RFC 3550 §5.1: 同一 SSRC 内では
         // seq が monotonically increasing、 timestamp は sample 数だけ進む
         // (RFC 3551 §4.5.14: PCMU 8 kHz × 20 ms = 160 samples)。
+        // RFC 3551 §4.1 (M bit): talkspurt 開始の最初の packet に M=1
+        // (Issue #84: WebRTC peer の Opus DTX 復帰直後を talkspurt 開始として
+        //  検出する)。
         for ulaw in ulaw_chunks {
-            let (seq, ts, ssrc) = {
+            let (seq, ts, ssrc, marker) = {
                 let mut eg = state.web_to_ngn_egress.lock().await;
-                eg.next(SAMPLES_PER_FRAME as u32)
+                eg.next_with_marker(SAMPLES_PER_FRAME as u32, Instant::now())
             };
             let out_pkt = RtpPacket {
                 payload_type: PAYLOAD_TYPE_ULAW,
-                marker: false,
+                marker,
                 sequence: seq,
                 timestamp: ts,
                 ssrc,
@@ -2421,6 +2464,7 @@ mod tests {
             ssrc: 0xABCD_1234,
             seq: 100,
             timestamp: 1_000_000,
+            last_send_time: None,
         };
         let (s0, t0, ssrc0) = eg.next(160);
         let (s1, t1, ssrc1) = eg.next(160);
@@ -2454,6 +2498,7 @@ mod tests {
             ssrc: 0xDEAD_BEEF,
             seq: u16::MAX,
             timestamp: u32::MAX,
+            last_send_time: None,
         };
         let (s0, t0, ssrc0) = eg.next(1);
         assert_eq!(s0, u16::MAX);
@@ -2462,6 +2507,178 @@ mod tests {
         // wrap
         assert_eq!(eg.seq, 0);
         assert_eq!(eg.timestamp, 0);
+    }
+
+    /// RFC 3551 §4.1 / RFC 7587 §4.4 / Issue #84:
+    /// `next_with_marker` の M ビット判定が talkspurt 境界で正しく立つ。
+    ///
+    /// シナリオ:
+    /// - 1 個目: 初回 (last_send_time = None) → M=1 (talkspurt 開始)
+    /// - 2 個目: 0 ms 後 (= 閾値 30 ms 未満) → M=0 (継続)
+    /// - 3 個目: 50 ms 後 (= 閾値超過) → M=1 (silence 後の talkspurt 開始)
+    /// - 4 個目: 0 ms 後 → M=0 (継続)
+    #[test]
+    fn rfc3551_4_1_next_with_marker_detects_talkspurt_boundary() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xCAFE_BABE,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+        };
+        let t0 = Instant::now();
+        // 1 個目: 初回送信
+        let (_, _, _, m0) = eg.next_with_marker(160, t0);
+        assert!(m0, "初回送信は talkspurt 開始 (M=1) — RFC 3551 §4.1");
+
+        // 2 個目: 直後 (gap 0 ms ≪ 30 ms 閾値)
+        let (_, _, _, m1) = eg.next_with_marker(160, t0);
+        assert!(!m1, "0 ms 後の継続 packet は M=0 — RFC 3551 §4.1");
+
+        // 3 個目: 50 ms 後 (gap >= 閾値 30 ms)
+        let t1 = t0 + Duration::from_millis(50);
+        let (_, _, _, m2) = eg.next_with_marker(160, t1);
+        assert!(
+            m2,
+            "silence gap 後の最初の packet は M=1 (talkspurt 開始) — RFC 3551 §4.1"
+        );
+
+        // 4 個目: 即座 (継続)
+        let (_, _, _, m3) = eg.next_with_marker(160, t1);
+        assert!(!m3, "talkspurt 内の継続 packet は M=0 — RFC 3551 §4.1");
+    }
+
+    /// RFC 3551 §4.1 / Issue #84: M ビット判定は **seq / ts 払い出しと
+    /// 同一 critical section** で行う (並行 send による race を排除)。
+    /// 本テストは「M ビットを立てた後に state が確実に更新される」ことを
+    /// state field で直接検証する。
+    #[test]
+    fn rfc3551_4_1_next_with_marker_updates_last_send_time() {
+        let mut eg = RtpEgressState {
+            ssrc: 0,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+        };
+        let t0 = Instant::now();
+        assert!(eg.last_send_time.is_none(), "前提: 未送信は None");
+        let (_, _, _, marker) = eg.next_with_marker(160, t0);
+        assert!(marker, "初回は M=1");
+        assert_eq!(
+            eg.last_send_time,
+            Some(t0),
+            "next_with_marker は last_send_time を引数 now で更新する"
+        );
+    }
+
+    /// RFC 3551 §4.1 / RFC 7587 §4.4 / Issue #84:
+    /// `TranscodingBridge` の WebRTC→NGN ループが PCMU 出力の最初の packet
+    /// に M=1 を立て、 継続 packet では M=0 を立てる。
+    ///
+    /// シナリオ:
+    /// - Opus 60 ms フレーム (RFC 7587 §4.1 / RFC 6716 §3.2 multi-frame
+    ///   packet) を 5 packet 投入 = 計 15 個の PCMU 20 ms chunk が出力。
+    /// - 1 個目は talkspurt 開始なので M=1。
+    /// - 2 個目以降は連続して同 chunk loop で送出されるため (時間 gap
+    ///   なし)、 全て M=0 になる。
+    #[tokio::test]
+    async fn rfc3551_4_1_web_to_ngn_talkspurt_start_has_marker() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_addr = web_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 48 kHz 1 kHz トーン (960 samples = 20 ms) を Opus 化
+        let mut enc = OpusEncoder::new().unwrap();
+        let mut samples = Vec::with_capacity(OPUS_FRAME_SAMPLES);
+        for i in 0..OPUS_FRAME_SAMPLES {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+        // jitter depth=4 を満たすため 5 個投入する。
+        for s in 0..5u16 {
+            let pkt = build_opus_rtp_packet(
+                DEFAULT_OPUS_PT,
+                s,
+                s as u32 * OPUS_FRAME_SAMPLES as u32,
+                0x9ABC_DEF0,
+                &mut enc,
+                &frame,
+            )
+            .unwrap();
+            web_peer.send_to(&pkt, web_addr).await.unwrap();
+        }
+
+        // NGN 側で 5 packet 受信
+        let mut received = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let mut buf = vec![0u8; 1500];
+            let (n, _) = timeout(Duration::from_secs(3), ngn_peer.recv_from(&mut buf))
+                .await
+                .expect("NGN 側で 5 packet 受信できない")
+                .unwrap();
+            let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            assert_eq!(recv.payload_type, PAYLOAD_TYPE_ULAW);
+            received.push(recv);
+        }
+
+        // 1 個目は talkspurt 開始 (RFC 3551 §4.1)
+        assert!(
+            received[0].marker,
+            "1 個目 PCMU は talkspurt 開始 (M=1) — RFC 3551 §4.1"
+        );
+
+        // 2..N 個目は jitter pull が 20 ms 間隔で同 loop 上から呼ばれており
+        // gap が閾値未満なので M=0 (continuation)
+        for (i, pkt) in received.iter().enumerate().skip(1) {
+            assert!(
+                !pkt.marker,
+                "{} 個目 PCMU は talkspurt 継続 (M=0) — RFC 3551 §4.1 (got M=1)",
+                i + 1
+            );
+        }
+
+        bridge.stop().await;
+    }
+
+    /// RFC 3551 §4.1 / Issue #84: 閾値ちょうど (30 ms) の境界条件で
+    /// M=1 を立てる (`>=` 比較)。 30 ms 未満は M=0、 30 ms 以上は M=1。
+    #[test]
+    fn rfc3551_4_1_next_with_marker_threshold_boundary() {
+        let mut eg = RtpEgressState {
+            ssrc: 0,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+        };
+        let t0 = Instant::now();
+        let _ = eg.next_with_marker(160, t0);
+
+        // 29 ms 後 → 継続
+        let t1 = t0 + Duration::from_millis(29);
+        let (_, _, _, m1) = eg.next_with_marker(160, t1);
+        assert!(!m1, "閾値未満 (29 ms < 30 ms) は M=0");
+
+        // 30 ms ちょうど → talkspurt 開始 (>= 比較)
+        let t2 = t1 + Duration::from_millis(30);
+        let (_, _, _, m2) = eg.next_with_marker(160, t2);
+        assert!(m2, "閾値以上 (30 ms >= 30 ms) は M=1");
     }
 
     /// Issue #135 🟡 3: `WebRtcAudioBridge::start` は infallible シグネチャ

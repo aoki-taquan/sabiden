@@ -269,9 +269,12 @@ step 5/6 に準拠させた。
   `close_and_drain_webrtc_legs` で `ServerMessage::Cancel` が流れる。 SIP 残レッグ
   は spawn 済 future が継続するが結果は drop される (= 緩 cancel)。
 - **step 6 (best response priority)**: `should_replace_status` で
-  「6xx > 5xx > 4xx > 3xx、 同クラスは first-wins」 を実装。 これにより 603 先着
+  「6xx > 4xx > 5xx > 3xx、 同クラスは first-wins」 を実装。 これにより 603 先着
   → 486 後着 race でも `last_status = Some(603)` が維持され、 NGN へ 603 Decline
-  が正しく返る。
+  が正しく返る。 RFC 3261 §16.7 step 6 は「4xx と 5xx 間の厳密な順序」 を明示し
+  ていないが (`MUST` 列挙は 6xx 最優先のみ)、 sabiden は内線 fork の代表的失敗
+  (= 4xx Busy 系) を 5xx (= server-side 障害) より優先採用する簡略化を選択。
+  厳密化は将来 issue で扱う。
 - **603 reason phrase**: PR #210 では誤って "Declined" (過去分詞) を返していたが、
   RFC 3261 §21.6.2 の正規表記は **単数** "Decline"。 `reason_phrase_for_status`
   で 486/487/603 + 既定の reason phrase を集中管理する。

@@ -3582,6 +3582,19 @@ fn should_replace_status(current: Option<u16>, new: u16) -> bool {
 
 /// RFC 3261 §16.7 step 6 best response の優先度を返す。 値が大きいほど優先。
 ///
+/// **順序**: `6xx > 4xx > 5xx > 3xx`。
+///
+/// RFC 3261 §16.7 step 6 (proxy stateful forking) は「6xx を受け取ったらそれを
+/// best response として採用 (MUST)」 とだけ強く規定し、 3xx/4xx/5xx 間の厳密な
+/// 比較順序は実装定義 (`SHOULD aggregate` 程度の緩い指針)。 sabiden は B2BUA
+/// 内線 fork の特性 (= 内線端末の代表的失敗は 486 Busy / 404 Not Found 等の 4xx)
+/// に合わせ、 4xx を 5xx (server 障害系) より優先採用する簡略化を選択。
+///
+/// この簡略化は RFC 違反ではないが、 厳密 RFC 3261 §16.7 step 6 解釈 (例: 5xx
+/// を `proxy retry` 対象として 4xx より「より致命的」 と見なす派閥) とは差分が
+/// ある。 厳密化は別 issue で扱う想定。
+/// TODO(本流対応): RFC 3261 §16.7 step 6 4xx/5xx 厳密順序を別 issue で詰める。
+///
 /// 1xx / 2xx は本関数の対象外 (呼出側で除外済) で、 もし渡されれば最下位 (0)
 /// として扱う (= 既存の 3xx/4xx/5xx/6xx を上書きしない)。
 fn final_response_class_rank(code: u16) -> u8 {

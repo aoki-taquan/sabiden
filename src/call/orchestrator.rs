@@ -3752,7 +3752,7 @@ pub async fn fork_to_bindings(
                 // Issue #211 / RFC 3261 §16.7 step 6 best response selection:
                 // 並走中の SIP 内線 486 が後着すると `last_status` を 486 で
                 // 上書きし、 先着の PWA 603 Decline を埋没させていた。
-                // `should_replace_status` で 6xx > 5xx > 4xx > 3xx の優先度
+                // `should_replace_status` で 6xx > 4xx > 5xx > 3xx の優先度
                 // (同クラスは first-wins) を実装し、 「先着優位 + クラス優位」
                 // で集約する。
                 if should_replace_status(last_status, status) {

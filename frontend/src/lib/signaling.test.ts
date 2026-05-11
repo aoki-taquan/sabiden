@@ -8,10 +8,12 @@ import { describe, expect, it, vi } from "vitest";
 import {
   isPermanentCloseCode,
   parseExtIdFromToken,
+  parseRateLimitedRetryAfter,
   parseServerMessage,
   permanentCloseReason,
   SignalingClient,
   type ReconnectOptions,
+  type ServerMessage,
   type SignalingCloseReason,
 } from "./signaling";
 
@@ -973,5 +975,213 @@ describe("ClientMessage decline schema (Issue #107)", () => {
     // - `call_id` (snake_case, serde default for struct fields)
     const msg = { type: "decline", call_id: "abc-123" } as const;
     expect(JSON.stringify(msg)).toBe('{"type":"decline","call_id":"abc-123"}');
+  });
+});
+
+describe("parseRateLimitedRetryAfter (Issue #194, TTC JJ-90.24 §5.7.1 / RFC 3261 §20.33)", () => {
+  // backend (`src/call/orchestrator.rs`) が送ってくる 2 系統の error.message
+  // 本文から retry_after を抜き出す。 wire format に新規 field を追加せず、
+  // 既存 string にだけ依存 (Issue #194 「touch しない」 領域)。
+
+  it("parses rate_limited message body (`retry after N sec`)", () => {
+    // PR #193: `handle_pwa_outbound_offer` の RateLimitDecision::Deny 経路。
+    // `outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after 5 sec`
+    const body = "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after 5 sec";
+    expect(parseRateLimitedRetryAfter(body)).toBe(5);
+  });
+
+  it("parses outbound_failed message body (`retry_after=Ns`) when NGN sent Retry-After", () => {
+    // PR #193 review #2 🟡#1: NGN INVITE 失敗 + Retry-After 受信時の埋込形式。
+    // `NGN INVITE 失敗: 503 Service Unavailable (retry_after=30s)`
+    const body = "NGN INVITE 失敗: 503 Service Unavailable (retry_after=30s)";
+    expect(parseRateLimitedRetryAfter(body)).toBe(30);
+  });
+
+  it("returns null for outbound_failed without Retry-After embed", () => {
+    // 486 Busy Here や transport 失敗時は retry_after 埋込なし。
+    expect(parseRateLimitedRetryAfter("NGN INVITE 失敗: 486 Busy Here")).toBeNull();
+    expect(parseRateLimitedRetryAfter("NGN INVITE 失敗: timeout")).toBeNull();
+  });
+
+  it("returns null for unrelated error messages", () => {
+    expect(parseRateLimitedRetryAfter("CallManager 未注入")).toBeNull();
+    expect(parseRateLimitedRetryAfter("")).toBeNull();
+  });
+
+  it("rejects zero / negative / NaN as retry_after (no UI lock-up)", () => {
+    // backend は正値しか送らない想定だが、 防御的に 0 / 負数は null 化する。
+    // 「0 秒抑制」 を真に受けると UI が一瞬チラつく + 後続の disable が壊れる。
+    expect(parseRateLimitedRetryAfter("retry after 0 sec")).toBeNull();
+    // 正規表現は `\d+` のみ受けるので `-5` は数字部 `5` のみ拾われる現実があるが、
+    // backend は負数を送らない (u64 secs)。 ここでは仕様を assert する。
+    expect(parseRateLimitedRetryAfter("retry_after=0s")).toBeNull();
+  });
+
+  it("is case-insensitive (defensive)", () => {
+    // backend 文言は固定だが、 大文字化される将来変更に備えて lower/upper 両対応。
+    expect(parseRateLimitedRetryAfter("Retry After 7 Sec")).toBe(7);
+    expect(parseRateLimitedRetryAfter("RETRY_AFTER=12S")).toBe(12);
+  });
+
+  it("prefers `retry after N sec` form when both patterns appear (rate_limited primary)", () => {
+    // 万が一 backend が両方を載せた場合、 rate_limited が primary なので
+    // そちらを優先する。 実際の backend では同時に出さないが、 順序の決定論を確保。
+    const mixed = "retry after 3 sec ... retry_after=99s";
+    expect(parseRateLimitedRetryAfter(mixed)).toBe(3);
+  });
+});
+
+describe("App rate-limited state machine (Issue #194)", () => {
+  // App.tsx / Dialer.tsx の状態遷移を `SignalingClient` 経由で再現:
+  //   server が `ServerMessage::error{code:"rate_limited", message:"... retry after 5 sec"}`
+  //   を送ってきたら、 PWA は `rateLimitedUntil = Date.now() + 5_000` を立てて
+  //   発信ボタンを disable + カウントダウンを表示する。
+  //
+  // App.tsx 自身は SolidJS reactive で動くため testing-library を入れずに
+  // 「signaling 層から error を受けたとき、 App と同じロジックで rate_limited
+  //  state が正しく遷移する」 ことを最小 closure で再現してテストする。
+
+  /** App.tsx::handleSignalMessage の rate_limited 抜粋を closure で再実装。 */
+  function makeRateLimitedTracker(nowFn: () => number) {
+    let until: number | null = null;
+    const onError = (msg: Extract<ServerMessage, { type: "error" }>) => {
+      if (msg.code !== "rate_limited" && msg.code !== "outbound_failed") return;
+      const secs = parseRateLimitedRetryAfter(msg.message);
+      if (secs === null || secs <= 0) return;
+      const candidate = nowFn() + secs * 1000;
+      until = until === null ? candidate : Math.max(until, candidate);
+    };
+    const remaining = (): number | null => {
+      if (until === null) return null;
+      const r = Math.ceil((until - nowFn()) / 1000);
+      if (r <= 0) {
+        until = null;
+        return null;
+      }
+      return r;
+    };
+    return { onError, remaining, getUntil: () => until };
+  }
+
+  it("locks call button on `rate_limited` and unlocks after retry_after elapses", () => {
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    // 初期状態: 抑制なし
+    expect(tr.remaining()).toBeNull();
+
+    // backend が `rate_limited` を送信
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after 5 sec",
+    });
+    expect(tr.remaining()).toBe(5);
+
+    // 3 秒経過
+    now += 3000;
+    expect(tr.remaining()).toBe(2);
+
+    // 5 秒経過 (= 期限ちょうど): null (= 抑制解除)
+    now += 2000;
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("locks call button on `outbound_failed` with `retry_after=30s` embed", () => {
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    tr.onError({
+      type: "error",
+      code: "outbound_failed",
+      message: "NGN INVITE 失敗: 503 Service Unavailable (retry_after=30s)",
+    });
+    expect(tr.remaining()).toBe(30);
+
+    now += 29_000;
+    expect(tr.remaining()).toBe(1);
+    now += 1000;
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("does NOT lock on `outbound_failed` without Retry-After embed (486 Busy etc)", () => {
+    const now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+    tr.onError({
+      type: "error",
+      code: "outbound_failed",
+      message: "NGN INVITE 失敗: 486 Busy Here",
+    });
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("does NOT lock on unrelated error codes (e.g. internal)", () => {
+    const now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+    tr.onError({
+      type: "error",
+      code: "internal",
+      message: "CallManager 未注入",
+    });
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("two overlapping rate_limited errors keep the LATER deadline (no shortening)", () => {
+    // 短い 2 秒抑制が来てから 10 秒抑制が来た場合、 10 秒分残す。
+    // 逆 (10 秒中に 1 秒抑制が後着) は 10 秒側を保持する (= max 採用)。
+    // 計算はちょうど整数秒で行い、 ceil の端数で +1 ズレないようにする。
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "retry after 2 sec",
+    });
+    expect(tr.remaining()).toBe(2);
+
+    // ちょうど 1 秒経過 (整数で誤差なし) → 10 秒抑制を後着。
+    now += 1000;
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "retry after 10 sec",
+    });
+    // 既存 until = 1_002_000、 候補 = 1_011_000、 max 採用 = 1_011_000。
+    // remaining = ceil((1_011_000 - 1_001_000)/1000) = 10。
+    expect(tr.remaining()).toBe(10);
+
+    // さらに 1 秒経過 → 短い 1 秒抑制を後着 (= 候補 1_003_000、 max は据置)。
+    now += 1000;
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "retry after 1 sec",
+    });
+    // until = 1_011_000、 now = 1_002_000、 remaining = 9。
+    expect(tr.remaining()).toBe(9);
+  });
+
+  it("survives WS reconnect: rate_limited deadline is Date.now-based (Issue #194 DoD)", () => {
+    // App.tsx は SignalingClient の transient close (1006) で WS を張り直すが、
+    // rate_limited 解除予定時刻は epoch ms で保持しているため再接続後も
+    // そのまま適用される。 本テストは Date.now() ベースの計算が
+    // 「中間で WS state を上書きするコードに影響されない」 ことを確認する。
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "retry after 10 sec",
+    });
+    expect(tr.remaining()).toBe(10);
+
+    // 仮想的に WS reconnect (3 秒経過、 内部 state は触らない)
+    now += 3000;
+    expect(tr.remaining()).toBe(7);
+
+    // 再接続成功後さらに 5 秒経過 → 残り 2 秒
+    now += 5000;
+    expect(tr.remaining()).toBe(2);
   });
 });

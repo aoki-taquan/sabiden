@@ -44,3 +44,9 @@ str0m = { version = "0.19", default-features = false, features = ["openssl"] }
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.21"
+
+# E2E SIP testbed: NGN P-CSCF + 内線 UA mock を tokio 内で立ち上げ、
+# sabiden の通話シーケンス全体を 1 test で検証する (CLAUDE.md §7 / docs/test-strategy.md §3)。
+[[test]]
+name = "e2e_call_sequence"
+path = "tests/e2e_call_sequence/mod.rs"

@@ -1352,6 +1352,64 @@ NGN へ伝搬する (Issue #207):
   を内線へ中継する (491 Request Pending を含む RFC 3261 §14.2 glare 解消は
   内線 UA の責務)。
 
+## テスト基盤
+
+### E2E SIP testbed (`tests/e2e_call_sequence/`)
+
+`docs/test-strategy.md` §3 「E2E (orchestrator 全部繋ぐ)」の最上層として、
+NGN P-CSCF と内線 UA を **両側 UDP socket** で立ち上げ、 sabiden の
+**通話シーケンス全体** (INVITE → 100 → 180 → 200 → ACK → BYE → 200) を 1 test
+で検証する。 既存 `src/call/inbound_e2e_tests.rs` は `LegInviter` の `ScriptedInviter`
+ハーネスで内線レッグを「合成レスポンス返却」 で簡略化していたが、 本 testbed は
+両側を生 UDP で駆動するため、 INVITE 経路上の Via / branch / To-tag / 順序保証
+の取り違えが pcap でなくとも検出できる。
+
+#### 構成 (Cargo `[[test]]` で `e2e_call_sequence` 名で登録):
+
+| ファイル | 責務 |
+|---|---|
+| `tests/e2e_call_sequence/mod.rs` | エントリ。 サブモジュール宣言のみ。 |
+| `tests/e2e_call_sequence/mock_ngn_carrier.rs` | NTT NGN P-CSCF 模擬。 080 着信風 INVITE 注入 (`Session-Expires` / `Min-SE` / `Supported: timer,100rel` / `Record-Route` / `P-Called-Party-ID` / anonymous From)、 100/180/200 受領、 ACK/BYE 送出。 2xx MUST/SHOULD 一括 assert DSL `expect_invite_2xx_with` (Allow / Date / Session-Expires / Require: timer / Contact / Content-Type / ptime)。 |
+| `tests/e2e_call_sequence/mock_extension_ua.rs` | 内線 UA 模擬 (UDP)。 INVITE 受信 → 200 OK + SDP answer / 拒否 (busy / decline) / 内線側 BYE 等。 |
+| `tests/e2e_call_sequence/leg_inviter.rs` | `sabiden::call::manager::LegInviter` の **テスト実装**。 sabiden の fork が呼ぶ `invite(target_uri, sdp_offer)` を、 mock UA の UDP addr に **生 SIP INVITE を送信して 200 を待つ** 経路で駆動する。 production 型 (`UacForker` / `Uac`) は mock しない (CLAUDE.md §6.3)。 |
+| `tests/e2e_call_sequence/sabiden_harness.rs` | sabiden を in-process に組み立てるエントリ。 `wire_ngn_inbound` で `NgnInboundHandler` を spawn し、 NGN 側 UDP socket addr を返す。 WebRTC / 内線 UAS / RTP ブリッジ実体は持たない (SIP のみ精査)。 |
+| `tests/e2e_call_sequence/scenarios.rs` | 初期 4 件のシナリオ + smoke test。 |
+
+#### 初期シナリオ (RFC 引用付き):
+
+| test 名 | 検証対象 RFC |
+|---|---|
+| `rfc3261_inbound_invite_full_sequence_succeeds` | RFC 3261 §13.2.2.4 / §17.2.1 / §13.3.1.4 / §15.1.1: 100 → 180 → 200 → ACK → BYE → 200 のフル経路。 |
+| `rfc4028_inbound_invite_negotiates_session_timer` | RFC 4028 §7.1: 2xx で Session-Expires echo + Require: timer。 |
+| `rfc4028_inbound_invite_below_min_se_returns_422` | RFC 4028 §10: SE < Min-SE は 422 + Min-SE で reject。 |
+| `rfc3261_inbound_invite_sends_180_ringing_before_200` | RFC 3261 §13.3.1.4 + §12.1.1: 180 が 200 OK より前、 To-tag が同値 (early == confirmed dialog)。 |
+| `rfc3264_inbound_invite_sdp_answer_subsets_offer` | RFC 3264 §6.1: PCMU+PCMA offer に対し PCMU のみ answer (intersection / subset)、 ptime echo。 |
+
+#### `expect_invite_2xx_with` の検査範囲 (DSL):
+
+- `Contact` (RFC 3261 §13.3.1.4): UAS が dialog target を確定するため MUST。
+- `To` に tag (RFC 3261 §8.2.6.2 / §12.1.1): 2xx で MUST。
+- `Allow` (RFC 3261 §20.5): SHOULD on 2xx。
+- `Date` (RFC 3261 §20.17): SHOULD on responses。
+- `Session-Expires` + `Require: timer` (RFC 4028 §7.1): INVITE に Session-Expires が
+  乗っていれば echo MUST。
+- `Content-Type: application/sdp` (RFC 3261 §20.15): SDP body 付き応答に MUST。
+- `a=ptime:N` (RFC 4566 §6.10): offer 由来 ptime の echo。
+
+`Expect2xx` フラグで個別 SHOULD は opt-out 可能。 sabiden の既存実装が満たして
+いない SHOULD (例: `Date` / `Allow`) は audit fix 完了まで opt-out しておき、
+fix が入ったら ON に戻して regression を縛る (= 「audit gap の regression
+test 雛形」 として機能する)。
+
+#### 設計原則:
+
+- production 型 (`ServerTransaction` / `UAS` / `Uac`) を mock しない (CLAUDE.md §6.3)。
+- mock は `tokio::net::UdpSocket` で生 SIP を読み書きする最小実装。
+- timeout は `tokio::time` で deterministic に。 RNG (Call-ID / branch / tag) は
+  `rand::thread_rng()` で発行するが各 test は独立 socket で独立動作するため
+  flakiness は無い。
+- WebRTC / 内線 UAS は本 testbed の scope 外。 PWA / RTP ブリッジは別 E2E が担当。
+
 ## Phase 計画
 
 ### Phase 1: 基本機能（現在）

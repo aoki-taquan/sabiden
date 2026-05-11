@@ -82,22 +82,65 @@ export const App: Component = () => {
   // バッファに溜め、 acceptIncomingOffer / placeCall で call を生成した
   // 直後に flush する (W3C WebRTC §4.4.6: setRemoteDescription 前の
   // candidate は buffer 推奨)。
-  let pendingIceCandidates: string[] = [];
+  //
+  // Issue #173 (race fix): 旧実装は `pendingIceCandidates: string[]` + `teardownCall`
+  // で配列を空に再代入していたため、 以下 2 race を踏んでいた:
+  //   (R1) WS が "offer" の前に新着信の "ice" を先送りしてくる順序差 (RFC 8839
+  //        §4.2 trickle ICE は任意順序を許す) で、 buffer に積んだ ICE を
+  //        後続 offer ハンドラ内 `teardownCall()` が wipe する → 新着信の ICE
+  //        が消える。
+  //   (R2) `flushPendingIce` ループの `await call.addIce(cand)` の合間に
+  //        "bye"/"cancel" 受信 → `teardownCall()` で `call=null` + buffer 空、
+  //        ループは古い `buffered` 参照で続行し、 hangup 済 PC への addIce で
+  //        warn が出る (実害は無いが診断ノイズ)。
+  //
+  // 修正: ICE candidate を **dialog epoch (call 世代カウンタ)** でタグ付けする。
+  //   - `teardownCall()` は epoch++ するだけ (buffer 配列再代入は不要)
+  //   - "ice" 受信時は **その時点の epoch を snapshot** して push
+  //   - `flushPendingIce()` は **現 epoch と一致するエントリだけ** addIce する
+  //
+  // これにより:
+  //   - R1 解消: offer → teardownCall (epoch=N→N+1) → 以後の ICE は epoch=N+1 で
+  //     buffer。 ringing 中に到達した ICE は新 epoch なので Accept 時 flush で
+  //     正しく適用される。
+  //   - R2 解消: bye 受信 → teardownCall (epoch++) → 進行中の flushPendingIce
+  //     ループは次イテレーションで epoch 不一致になり addIce を skip する。
+  //
+  // 単一スレッド JS なので epoch の読み書きは torn read 不可能 (W3C HTML Living
+  // Standard §8.1.4: 各タスク / microtask は他タスクと並行実行されない)。
+  // Mutex / Promise.race 風の lock は不要。
+  type PendingIce = { epoch: number; candidate: string };
+  let pendingIceCandidates: PendingIce[] = [];
+  let dialogEpoch = 0;
 
   const teardownCall = () => {
     call?.hangup();
     call = null;
-    pendingIceCandidates = [];
+    // epoch++ で在庫 ICE を「現役外」 にする。 配列は次回 flush または次回
+    // teardown 時に世代不一致エントリを一括破棄するので、 ここでは触らない
+    // (Issue #173 の race avoidance、 上記コメント R1 参照)。
+    dialogEpoch += 1;
   };
 
-  /** バッファ済 ICE candidate を call に流し込む (失敗は warn のみ). */
+  /** バッファ済 ICE candidate のうち **現 epoch と一致するもの** だけを
+   * call に流し込む (失敗は warn のみ)。 不一致エントリ (= 過去 dialog 由来) は
+   * 破棄する (Issue #173)。 */
   const flushPendingIce = async () => {
-    if (!call || pendingIceCandidates.length === 0) return;
-    const buffered = pendingIceCandidates;
+    if (!call) return;
+    const currentEpoch = dialogEpoch;
+    // 現 epoch 一致分を取り出す。 不一致 (= 古い) は drop。
+    // 取り出した時点で buffer を空にして、 await 中に届く新着 ICE は
+    // 新規エントリとして残る (= flush 後の取りこぼし無し: call は既に
+    // 立ち上がっているので、 "ice" ハンドラの `if (call)` 分岐で直接
+    // addIce される)。
+    const buffered = pendingIceCandidates.filter((p) => p.epoch === currentEpoch);
     pendingIceCandidates = [];
-    for (const cand of buffered) {
+    for (const { candidate } of buffered) {
+      // ループ中に teardownCall が走った場合は epoch が進んで `call` も null。
+      // 次イテレーションで両方を確認して即抜ける。
+      if (!call || dialogEpoch !== currentEpoch) return;
       try {
-        await call.addIce(cand);
+        await call.addIce(candidate);
       } catch (e) {
         console.warn("flushPendingIce: addIce failed", e);
       }
@@ -122,9 +165,10 @@ export const App: Component = () => {
         // NGN 着信: sabiden が生成した offer をブラウザに push してきた。
         // ringing UI を出して、ユーザの応答ボタン待ち。
         // 多重着信は後勝ち (現行の View が単一通話前提なので).
-        // Issue #91: 新着信受信時に古い ICE buffer は捨てる (teardownCall が
-        // pendingIceCandidates をクリアする)。 ただし新着信に紐づく ICE は
-        // この行以降に到達するので、 teardownCall は offer 受信時 1 回だけ。
+        // Issue #91/#173: 旧 dialog をクリーンアップする (teardownCall が
+        // dialogEpoch++ で旧 dialog の在庫 ICE を「現役外」 にする)。 新 dialog
+        // の ICE は この行以降に到達するため新 epoch でタグ付けされる
+        // (= teardownCall に wipe されない、 race 修正の本丸)。
         if (!signaling) break;
         teardownCall();
         // caller display name は Issue #41 のスコープ外: TODO で call_id を表示。
@@ -152,10 +196,17 @@ export const App: Component = () => {
         // Issue #91: call が無ければ buffer に積む (RFC 8839 §4 trickle ICE
         // のうち remote description / PeerConnection 未確立期間の candidate は
         // 受信側で buffer すべき)。 acceptIncomingOffer / placeCall 後に flush。
+        //
+        // Issue #173: buffer 時に **現 dialog epoch を snapshot** する。
+        // 後続 teardownCall で epoch が進んでも、 epoch 一致しないので flush で
+        // 適用されない (= 「次の dialog の ICE と勘違いされない」 保証)。
+        //
+        // 単一スレッド JS なので await 直前/直後で他 task が割り込んで epoch を
+        // 変えても、 push 自体は同一 microtask 内で完結する。
         if (call) {
           await call.addIce(msg.candidate);
         } else {
-          pendingIceCandidates.push(msg.candidate);
+          pendingIceCandidates.push({ epoch: dialogEpoch, candidate: msg.candidate });
         }
         break;
       case "error":

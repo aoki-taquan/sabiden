@@ -637,6 +637,30 @@ end trickle ice")。 そのため本 marker は観測ログのみに使われ、
 判定は str0m 内部 timer に委ねる (sabiden は ICE-Lite controlled なので、
 ブラウザ側の候補列挙完了を待つ必要はない)。
 
+### PWA 側 ICE buffer (dialog epoch、 Issue #91 / #173)
+
+NGN→PWA 着信フローで sabiden は ringing 段階 (browser が応答ボタンを押す
+前) で `ServerMessage::Ice` を push し始める (trickle ICE、 RFC 8839 §4.2)。
+browser 側 `RTCPeerConnection` は応答ボタン押下時に初めて生成されるため、
+**応答前の ICE candidate は `App.tsx::pendingIceCandidates` で buffer** し、
+`acceptIncomingOffer` / `placeCall` で call を生成した直後に `flushPendingIce`
+で適用する (W3C WebRTC §4.4.6: `setRemoteDescription` 前の candidate は
+buffer 推奨)。
+
+buffer エントリは **dialog epoch (call 世代カウンタ)** でタグ付けする
+(Issue #173)。 `teardownCall()` は `dialogEpoch += 1` するだけで配列は
+触らず、 `flushPendingIce()` は **現 epoch と一致するエントリだけ** addIce
+する。 これにより以下 2 race を解消する:
+
+| Race | 旧実装 | 新実装 (dialog epoch) |
+|---|---|---|
+| R1: "ice" → "offer" 順 (= RFC 8839 §4.2 任意順序、 NGN 着信開始時) | offer ハンドラ内 `teardownCall` が `pendingIceCandidates = []` で wipe → 先着 ICE 喪失 | epoch++ のみ。 旧 epoch (= 旧 dialog 由来) は flush で drop、 新 dialog の ICE は新 epoch で残る |
+| R2: `flushPendingIce` await 合間に "bye"/"cancel" → `teardownCall` 割り込み | 旧 `buffered` 参照で続行 → hung-up PC に addIce で warn ノイズ | ループ先頭で `dialogEpoch !== currentEpoch` を見て即 return |
+
+単一スレッド JS なので epoch の読み書きは torn read 不可能 (W3C HTML Living
+Standard §8.1.4: 各 task / microtask は他 task と並行実行されない)。 Mutex
+や Promise.race 風 lock は不要 — epoch snapshot で順序問題を完全に解決する。
+
 ### SDP 変換ヘルパ `convert_avp_to_savpf` / `convert_savpf_to_avp` (Issue #99)
 
 `src/sdp/builder.rs` の 2 関数は B2BUA SDP anchoring (RFC 5853 §3.2) のうち

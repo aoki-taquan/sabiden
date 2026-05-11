@@ -876,16 +876,18 @@ NGN 側は PCMU 20 ms 固定 (RFC 3551 §4.5.14) なので、 transcoder は
 受信した N×20 ms Opus packet を 20 ms chunk に分割し、 N 個の PCMU RTP
 packet として NGN へ送出する。
 
-| ソース | 修正前の挙動 | 修正後 (Issue #89) |
+| ソース | 修正前の挙動 | 修正後 (Issue #89 / #200) |
 |---|---|---|
 | `OpusDecoder::decode` | 出力バッファ 960 固定、 40/60 ms は libopus エラー or truncate | `get_nb_samples` で必要量を取り、 5760 まで対応 |
-| `TranscodingBridge::web_to_ngn_loop` | `len != 960` で silently drop | `chunks(960)` で N packet 送出 |
+| `TranscodingBridge::web_to_ngn_loop` | `len != 960` で silently drop | `OpusToPcmuAccum::push` で 20 ms 境界に累積後 N packet 送出 |
 | `WebRtcAudioBridge::peer_to_ngn_loop` (non-passthrough) | 同上 | 同上 |
+| 2.5 / 5 / 10 ms (短フレーム / RFC 7587 §4.2) | silently drop | `OpusToPcmuAccum` が 8/4/2 frame 単位に累積、 20 ms 揃いで PCMU 1 packet emit |
 | PLC (packet.is_empty()) | 不変 | 不変 (RFC 7587 §6.2、 20 ms 固定で `OPUS_GET_LAST_PACKET_DURATION` 連動は将来) |
 
-2.5 / 5 / 10 ms (= 20 ms の倍数でない非標準フレーム長) は現時点で未サポート
-(transcoder で drop)。 これらは VoIP では稀で WebRTC ブラウザも生成しないため、
-内部累積バッファでの 20 ms 揃え直しは将来 Issue で扱う。
+RFC 7587 §4.2 / RFC 6716 §3.2 が許す **全フレーム長 (2.5/5/10/20/40/60 ms)** を
+`OpusToPcmuAccum` で一般化して処理する (Issue #200)。 20 ms 未満のフレームは
+内部 buffer に蓄積し 20 ms 揃ったタイミングで PCMU を emit する。 buffer は
+PCMU passthrough mode (`direct_pcmu_passthrough = true`) では一切経由しない (PR #149 透過パス無破壊)。
 
 #### Talkspurt 境界の M ビット (Issue #84)
 

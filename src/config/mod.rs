@@ -145,7 +145,7 @@ impl Default for UasConfig {
 /// Issue #28 で実 ICE/DTLS-SRTP (str0m) を有効化する場合は `public_ip` を
 /// 設定し、UDP ポート範囲を `udp_port_range` で固定する (Cloudflare Tunnel /
 /// 静的ファイアウォール構成での予測可能性のため)。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebRtcConfig {
     /// HMAC-SHA256 トークン検証用の共有秘密 (16 進文字列)。
     /// 未設定の場合 WebRTC ゲートウェイは無効。
@@ -202,6 +202,32 @@ pub struct WebRtcConfig {
     /// Cloudflare の 100 秒 timeout より十分小さい (Issue #98 / #131)。
     #[serde(default = "default_webrtc_idle_timeout")]
     pub idle_timeout_secs: u64,
+}
+
+/// `#[derive(Default)]` だと `u64` の既定値が 0 になり、
+/// `WebRtcConfig::default()` 経由で構築したシグナリングが
+/// `tokio::time::interval(Duration::from_secs(0))` で panic する
+/// (`Duration::ZERO` は `interval` の事前条件違反)。
+/// また `idle_timeout_secs = 0` は受信フレーム不在で即座に WS 切断と
+/// 解釈されてしまうため、 keepalive 機構自体が成立しなくなる。
+///
+/// Issue #166 (PR #165 review follow-up) / CLAUDE.md §6.5 panic 禁止。
+/// 既定値は `default_webrtc_*` ヘルパと同一: keepalive 30s / idle 60s
+/// (Issue #98 / #131、 Cloudflare Tunnel 100 秒 idle 切断対策、
+/// RFC 6455 §5.5.2 Ping)。
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            secret_hex: None,
+            register_ttl_secs: default_webrtc_register_ttl(),
+            backend: default_webrtc_backend(),
+            public_ip: None,
+            udp_port_range: None,
+            ice_servers: Vec::new(),
+            keepalive_interval_secs: default_webrtc_keepalive_interval(),
+            idle_timeout_secs: default_webrtc_idle_timeout(),
+        }
+    }
 }
 
 /// NGN 直収モード関連の設定 (Issue #37)。
@@ -392,14 +418,10 @@ impl Config {
             uas: None,
             extensions: Vec::new(),
             trace: TraceConfig::default(),
-            webrtc: WebRtcConfig {
-                backend: default_webrtc_backend(),
-                // Issue #131: env-only 起動でも keepalive 既定が反映される
-                // よう明示する (Default::default() は 0 を返すため)。
-                keepalive_interval_secs: default_webrtc_keepalive_interval(),
-                idle_timeout_secs: default_webrtc_idle_timeout(),
-                ..WebRtcConfig::default()
-            },
+            // Issue #166: `WebRtcConfig::default()` が手書き Default で
+            // keepalive 30s / idle 60s を初期化するため、 env-only 起動
+            // (TOML 不在) でも既定値が確実に反映される。
+            webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
         })
@@ -813,6 +835,46 @@ secret_hex = "00"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.webrtc.keepalive_interval_secs, 30);
         assert_eq!(cfg.webrtc.idle_timeout_secs, 60);
+    }
+
+    /// Issue #166 (PR #165 follow-up): `WebRtcConfig::default()` を直接呼んだ
+    /// 場合に keepalive_interval / idle_timeout が 0 ではなく既定値で初期化
+    /// されること。`#[derive(Default)]` のままだと `u64` が 0 になり、
+    /// `tokio::time::interval(Duration::ZERO)` で panic / idle 即切断に
+    /// なるため、 手書き `Default` で 30s / 60s を保証する。
+    /// CLAUDE.md §6.5 (production code で panic 禁止) / RFC 6455 §5.5.2 Ping。
+    #[test]
+    fn webrtc_config_default_initializes_keepalive_non_zero() {
+        let webrtc = WebRtcConfig::default();
+        assert_ne!(
+            webrtc.keepalive_interval_secs, 0,
+            "keepalive_interval_secs must be non-zero to avoid \
+             tokio::time::interval(Duration::ZERO) panic"
+        );
+        assert_ne!(
+            webrtc.idle_timeout_secs, 0,
+            "idle_timeout_secs must be non-zero to avoid \
+             immediate WS disconnect on absence of inbound frames"
+        );
+        assert_eq!(webrtc.keepalive_interval_secs, 30);
+        assert_eq!(webrtc.idle_timeout_secs, 60);
+        // 連動する他の既定値も併せて確認 (`backend`/`register_ttl_secs`
+        // が手書き Default で抜けないこと回帰防止)。
+        assert_eq!(webrtc.backend, "stub");
+        assert_eq!(webrtc.register_ttl_secs, 300);
+        assert!(webrtc.secret_hex.is_none());
+        assert!(webrtc.public_ip.is_none());
+        assert!(webrtc.udp_port_range.is_none());
+        assert!(webrtc.ice_servers.is_empty());
+    }
+
+    /// Issue #166: `Duration::from_secs(0)` を `tokio::time::interval` に渡すと
+    /// panic することの再現テスト (semantics 文書化)。 本 PR の Default
+    /// 修正が無いと WebRtcConfig::default() からこの panic 経路に入る。
+    #[tokio::test]
+    #[should_panic]
+    async fn tokio_interval_panics_on_zero_duration() {
+        let _ = tokio::time::interval(std::time::Duration::from_secs(0));
     }
 
     /// Issue #131: TOML で keepalive を上書きできる (経路追加 idle timer 対策)。

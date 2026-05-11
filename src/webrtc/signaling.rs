@@ -293,6 +293,37 @@ pub trait PwaOutboundCloser: Send + Sync {
     async fn close_pwa_outbound_for_ws(&self, ws: &WsSink) -> usize;
 }
 
+/// NGN→PWA **着信** 通話の cleanup ハンドラ (Bug B / Issue #268)。
+///
+/// 役割: 旧実装は WS close 時に inbound 通話 entry を放置していたため、 PWA
+/// がタブ閉じ / ネットワーク断したとき、 NGN 側 dialog が 5-10 秒タイムアウト
+/// するまで sabiden は何も通知せず、 NGN→sabiden の RTP もブリッジが生きた
+/// まま流れ続けていた (実機 v7 で 6 秒の `recv BYE` 待ちを観測)。
+///
+/// 本 trait は WS セッション終了側から呼ばれる ([`PwaOutboundCloser`] と同じ
+/// 経路 / 同じ順序)。 実装 ([`crate::call::orchestrator::NgnInboundHandler`]) は:
+///
+/// 1. `webrtc_active` テーブルから WS 一致 entry を `extract_if` で抽出する。
+/// 2. 各 entry の `send_bye` で NGN へ BYE を撃つ (UAS dialog 由来、
+///    RFC 3261 §15.1.1)。
+/// 3. RTP ブリッジ (`self.active` 経由) を `terminate` する。
+/// 4. `metrics.dec_call_active` を呼ぶ。
+///
+/// RFC 3261 §15.1.2 / RFC 5853 §3.2.2 (SBC framework): B2BUA は片側 dialog
+/// 終了をもう片側へ伝搬する責務を負う。 outbound (Issue #147 で実装済) と
+/// inbound (本 trait) を両方持って初めて、 PWA 切断 → NGN 即時 BYE という
+/// 対称な hangup シーケンスが成立する。
+///
+/// `WebRtcInboundActive` テーブル本体は orchestrator 内部に閉じ、 シグナ
+/// リング層からは本 trait 経由でしか触らない (依存方向: signaling → orchestrator)。
+#[async_trait::async_trait]
+pub trait PwaInboundCloser: Send + Sync {
+    /// 指定 WS と紐づく NGN→PWA inbound 通話を全て NGN BYE で閉じる。
+    /// 戻り値は閉じたエントリ数 (テスト / 観測用、 production code は
+    /// 戻り値を読まなくて良い)。 該当無し = 0 (idempotent: 二重 close 安全)。
+    async fn close_pwa_inbound_for_ws(&self, ws: &WsSink) -> usize;
+}
+
 /// PWA→NGN 発信ハンドラ (Issue #145)。
 ///
 /// `ClientMessage::Offer { target, sdp }` を受けたとき、 sabiden が
@@ -400,6 +431,11 @@ pub struct SignalingState {
     /// 同義。 通常 `pwa_outbound` と同じ `UasEventHandler` を `Arc::clone`
     /// で渡す (`PwaOutboundHandler` と `PwaOutboundCloser` の両方を実装)。
     pub pwa_outbound_closer: Option<Arc<dyn PwaOutboundCloser>>,
+    /// NGN→PWA 着信通話の cleanup ハンドラ (Bug B / Issue #268)。 WS close 時に
+    /// 該当 WS の inbound 通話を NGN へ BYE で伝搬する。 `None` のときは旧挙動
+    /// 互換 (= NGN タイムアウト BYE 待ち、 5-10 秒)。 通常 `NgnInboundHandler`
+    /// を `Arc::clone` で渡す。
+    pub pwa_inbound_closer: Option<Arc<dyn PwaInboundCloser>>,
 }
 
 impl SignalingState {
@@ -418,6 +454,7 @@ impl SignalingState {
             idle_timeout: Duration::from_secs(60),
             pwa_outbound: None,
             pwa_outbound_closer: None,
+            pwa_inbound_closer: None,
         }
     }
 
@@ -444,6 +481,13 @@ impl SignalingState {
     /// 通常 `with_pwa_outbound` と同じ `UasEventHandler` を渡す。
     pub fn with_pwa_outbound_closer(mut self, h: Arc<dyn PwaOutboundCloser>) -> Self {
         self.pwa_outbound_closer = Some(h);
+        self
+    }
+
+    /// NGN→PWA 着信通話の cleanup ハンドラを差し込む (Bug B / Issue #268)。
+    /// 通常 `NgnInboundHandler` を `Arc::clone` で渡す。
+    pub fn with_pwa_inbound_closer(mut self, h: Arc<dyn PwaInboundCloser>) -> Self {
+        self.pwa_inbound_closer = Some(h);
         self
     }
 }
@@ -870,6 +914,29 @@ pub async fn run_session(
             info!(
                 closed = n,
                 "PWA→NGN BYE: WS close 経路で cleanup (Issue #147)"
+            );
+        }
+    }
+
+    // Bug B / Issue #268: NGN→PWA 着信通話の cleanup も同じ経路で実施する。
+    // PWA がタブ閉じ / ネットワーク断 / Cloudflare Tunnel idle 切断したとき、
+    // sabiden は 旧実装 (Issue #81) では「NGN BYE を待つ」 だけで NGN に何も
+    // 通知しなかったため、 NGN は dialog confirmed のまま 5-10 秒タイムアウト
+    // するまで RTP を流し続けていた (実機 v7 で 6 秒 `recv BYE` 待ちを観測)。
+    //
+    // 本呼出で sabiden が NGN へ即座に BYE を撃ち、 RTP ブリッジ / metrics
+    // を cleanup する (RFC 3261 §15.1.1 / RFC 5853 §3.2.2 SBC framework:
+    // B2BUA は片側 dialog 終了をもう片側へ伝搬する責務を負う)。
+    //
+    // 順序: outbound closer の後 / `pending_answers.cancel_all()` の前。
+    // outbound (発信中) と inbound (着信中) が同じ WS に同居することは
+    // 通常ない (UI は同時 1 通話) が、 idempotent なので順序入替も無害。
+    if let Some(closer) = state.pwa_inbound_closer.as_ref() {
+        let n = closer.close_pwa_inbound_for_ws(&ws_sink).await;
+        if n > 0 {
+            info!(
+                closed = n,
+                "NGN→PWA BYE: WS close 経路で cleanup (Bug B / Issue #268)"
             );
         }
     }

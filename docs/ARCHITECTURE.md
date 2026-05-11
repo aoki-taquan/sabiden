@@ -442,6 +442,19 @@ format は既存の `error.message` 本文に文字列埋込のまま (Issue #19
 Region (`role="status" aria-live="polite" aria-atomic="true"`) で screen
 reader にも残秒数を割り込みなしで読み上げる。
 
+**session 境界でのリセット (Issue #219)**: WS reconnect (transient) は deadline
+を温存するが、 session 自体が終了する以下の経路では PWA 側で `rateLimitedUntil`
+を `null` に戻す:
+
+- 明示 logout (`App.tsx::handleLogout`)
+- auth 失敗 close (`onClosedReason: "auth"`、 token 失効で `clearToken` 後)
+- exhausted close (`onClosedReason: "exhausted"`、 再接続上限到達後)
+
+これは「別ユーザが同 PWA で続けて login するシナリオで前 session の deadline が
+残り、 ユーザが context 不明な待機中 UI を見るバグ」 を防ぐ。 backend bucket は
+AOR 共有なので技術的には継続中だが、 PWA 側は新 session 開始時点で UI ロックを
+一旦クリアし、 次の `rate_limited` error 受信で正しく再構成する。
+
 **双方向 BYE 連動 (Issue #147)**:
 
 PWA は SIP dialog を持たないため、 既存の `OutboundCallRegistry`

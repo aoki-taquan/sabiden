@@ -1063,7 +1063,13 @@ describe("App rate-limited state machine (Issue #194)", () => {
       }
       return r;
     };
-    return { onError, remaining, getUntil: () => until };
+    // Issue #219: session 境界 (logout / auth / exhausted) で deadline を
+    // 強制リセットする経路。 App.tsx::handleLogout と
+    // App.tsx::onClosedReason{auth,exhausted} に対応する。
+    const reset = () => {
+      until = null;
+    };
+    return { onError, remaining, reset, getUntil: () => until };
   }
 
   it("locks call button on `rate_limited` and unlocks after retry_after elapses", () => {
@@ -1186,5 +1192,86 @@ describe("App rate-limited state machine (Issue #194)", () => {
     // 再接続成功後さらに 5 秒経過 → 残り 2 秒
     now += 5000;
     expect(tr.remaining()).toBe(2);
+  });
+
+  // Issue #219: session 境界での deadline リセット。
+  //
+  // PR #215 で導入された `rateLimitedUntil` は WS reconnect (transient close)
+  // を跨いで生存させるのが正しい (Issue #194 DoD)。 ただし以下の **session 終了**
+  // パスでは別 session の context が引き継がれて UI が「context 不明な待機中」
+  // を出してしまう (Issue #219):
+  //   - 明示 logout: ユーザが別 ext_id で login し直す可能性
+  //   - auth エラー: token 失効後の別ユーザ login (背景 NGN bucket は AOR 共有
+  //     だが UX 上 context 不明)
+  //   - exhausted: reconnect 上限到達で session 終了
+  //
+  // これらの 3 経路で `rateLimitedUntil` を `null` に戻すロジックを App.tsx に
+  // 追加した (`handleLogout` と `onClosedReason: "auth"/"exhausted"`)。
+  // tracker.reset() がそれと同じ closure 動作をする。
+  it("resets rateLimitedUntil on explicit logout (Issue #219)", () => {
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    // session A: rate_limited を受けて UI ロック中
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "outbound INVITE rate-limited (TTC JJ-90.24 §5.7.1): retry after 30 sec",
+    });
+    expect(tr.remaining()).toBe(30);
+    expect(tr.getUntil()).not.toBeNull();
+
+    // ユーザが明示 logout → handleLogout が deadline を null にリセット
+    tr.reset();
+    expect(tr.getUntil()).toBeNull();
+    expect(tr.remaining()).toBeNull();
+
+    // session B (= 別ユーザ login 後) でも deadline は残らない (carryover なし)
+    now += 1000;
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("resets rateLimitedUntil on auth-failure close (Issue #219)", () => {
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    // backend が `outbound_failed` (NGN 503 + Retry-After) を返して UI ロック
+    tr.onError({
+      type: "error",
+      code: "outbound_failed",
+      message: "NGN INVITE 失敗: 503 Service Unavailable (retry_after=60s)",
+    });
+    expect(tr.remaining()).toBe(60);
+
+    // token 失効 → SignalingClient が close code を auth に分類して onClosedReason
+    // を発火 → App.tsx は clearToken + setRateLimitedUntil(null) + 再ログイン画面
+    tr.reset();
+    expect(tr.getUntil()).toBeNull();
+    expect(tr.remaining()).toBeNull();
+
+    // 再ログイン後に時刻が進んでも、 残骸が UI に出てこない
+    now += 30_000;
+    expect(tr.remaining()).toBeNull();
+  });
+
+  it("resets rateLimitedUntil on exhausted close (reconnect attempts cap) (Issue #219)", () => {
+    let now = 1_000_000;
+    const tr = makeRateLimitedTracker(() => now);
+
+    // 抑制中に長時間ネットワーク不安定 → 再接続上限到達で exhausted close。
+    tr.onError({
+      type: "error",
+      code: "rate_limited",
+      message: "retry after 120 sec",
+    });
+    expect(tr.remaining()).toBe(120);
+
+    // exhausted close → onClosedReason("exhausted") で deadline をリセット。
+    tr.reset();
+    expect(tr.getUntil()).toBeNull();
+
+    // ネットワーク復帰後にユーザが再ログイン: 古い deadline が再構築されない
+    now += 60_000; // 元 deadline までまだ余裕がある時刻でも null のまま
+    expect(tr.remaining()).toBeNull();
   });
 });

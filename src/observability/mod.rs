@@ -96,6 +96,11 @@ pub struct Metrics {
     /// (sabiden 側 egress と ingress が同値) を示し、 衝突自体は 2^-32 確率
     /// 事象だが multi-call / 端末 implementation バグで連鎖し得る。
     pub rtp_ssrc_collision_detected: AtomicU64,
+    /// Issue #182 (f) / RFC 3550 §6.4.1 / RFC 5761 §3.3: transcoder egress の
+    /// 各方向 (`ngn_to_web` / `web_to_ngn` / `peer_to_ngn`) から送出した
+    /// RTCP Sender Report 累計。 1 通話 5 秒間隔で送出するので、 60 秒通話で
+    /// 各方向 12 件、 60 分通話で 720 件のオーダ。
+    pub rtcp_sr_sent: AtomicU64,
 }
 
 impl Metrics {
@@ -204,6 +209,14 @@ impl Metrics {
     pub fn add_ssrc_collision_detected(&self, n: u64) {
         self.rtp_ssrc_collision_detected
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Issue #182 (f) / RFC 3550 §6.4.1 / RFC 5761 §3.3: transcoder egress から
+    /// RTCP Sender Report を 1 件送出した時に呼ぶ。 全方向 (ngn_to_web /
+    /// web_to_ngn / peer_to_ngn) で同一 counter を共有する (= 通話単位の総 SR 数
+    /// として観測する。 方向別に分解したくなった場合は将来 label 化を検討)。
+    pub fn add_rtcp_sr_sent(&self, n: u64) {
+        self.rtcp_sr_sent.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format で全メトリクスを書き出す。
@@ -343,6 +356,18 @@ impl Metrics {
         out.push_str(&format!(
             "sabiden_rtp_ssrc_collision_detected_total {}\n",
             self.rtp_ssrc_collision_detected.load(Ordering::Relaxed)
+        ));
+
+        // Issue #182 (f) / RFC 3550 §6.4.1 / RFC 5761 §3.3: transcoder egress
+        // 経路で送出した RTCP Sender Report 累計。 通話品質モニタリング (RTT /
+        // 受信側 jitter buffer 適応) の入力源となる。
+        out.push_str(
+            "# HELP sabiden_rtcp_sr_sent_total transcoder egress から送出した RTCP SR (RFC 3550 §6.4.1) 累計\n",
+        );
+        out.push_str("# TYPE sabiden_rtcp_sr_sent_total counter\n");
+        out.push_str(&format!(
+            "sabiden_rtcp_sr_sent_total {}\n",
+            self.rtcp_sr_sent.load(Ordering::Relaxed)
         ));
 
         out

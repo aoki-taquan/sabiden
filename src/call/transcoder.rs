@@ -45,6 +45,7 @@ use crate::rtp::codec::resample::{
 use crate::rtp::codec::AudioFrame;
 use crate::rtp::jitter::{JitterBuffer, DEFAULT_DEPTH};
 use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME};
+use crate::rtp::rtcp::{NtpTimestamp, SenderReport};
 use crate::rtp::{decode_ulaw, encode_ulaw, set_rtp_dscp, RECV_BUF_SIZE};
 use crate::webrtc::peer::{MediaFrame, PeerSession};
 
@@ -74,6 +75,23 @@ const TALKSPURT_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 /// 超えたら強制 pull (= overflow ロス) する。 デフォルト 4 packet ≒ 80 ms は
 /// `src/rtp/jitter.rs::DEFAULT_DEPTH` と整合。
 const JITTER_DEPTH: usize = DEFAULT_DEPTH;
+
+/// RTCP Sender Report (SR) を送出する周期 (Issue #182 (f) / #112)。
+///
+/// RFC 3550 §6.2 (Transmission Interval) は RTCP 帯域を RTP セッション総帯域の
+/// 5% に抑える adaptive interval (`T = avg_rtcp_size / rtcp_bw * n_members`) を
+/// 規定する。 また §6.2 は **minimum interval = 5 秒** を mandate しており、
+/// 計算結果がそれを下回ってはならない。
+///
+/// 本実装は単純化のため固定 5 秒 (RFC 3550 §6.2 minimum) を採用する。 transcoder
+/// 経路は 2-party (sabiden ⇔ NGN/PWA peer) なので n_members = 2、 1 通話あたりの
+/// RTP avg_rate ≒ 64 kbit/s (PCMU) ~ 70 kbit/s (Opus 64 kbps + RTP header) で
+/// 5% = 3.2 kbit/s。 SR 28 byte (RC=0) ≒ 224 bit を 5 秒に 1 回送ると約 45 bit/s で
+/// 5% bandwidth の制限を十分下回る。
+///
+/// Phase R5/R6 (`docs/refactor-plan.md`) で adaptive interval (RFC 3550 §6.3
+/// の `T_rr_interval` 計算) と randomization (0.5x〜1.5x) への移行を検討する。
+const RTCP_SR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Opus ペイロード PT。WebRTC SDP では動的 PT (96-127) を使うのが一般的。
 /// SDP で受け取った値を渡せるようにし、デフォルトは 111 (Chromium 互換)。
@@ -131,6 +149,14 @@ struct RtpEgressState {
     /// (RFC 3551 §4.1 / RFC 7587 §4.4) に使う。 初回 (`None`) もしくは
     /// [`TALKSPURT_GAP_THRESHOLD`] 以上空いたら M=1 (Issue #84)。
     last_send_time: Option<Instant>,
+    /// 累積送信 RTP packet 数。 RFC 3550 §6.4.1 SR の `sender's packet count`。
+    /// `record_sent` で +1 する (= `next` / `next_with_marker` で payload を
+    /// 払い出した後、 上位 loop が `to_socket.send_to` 成功時に呼ぶ)。
+    /// Issue #182 (f) / #112 で SR 送出のために導入。
+    sent_packets: u64,
+    /// 累積送信 payload octet 数 (RTP header 含まず)。 RFC 3550 §6.4.1 SR の
+    /// `sender's octet count`。 `record_sent(payload_len)` で加算する。
+    sent_octets: u64,
 }
 
 impl RtpEgressState {
@@ -142,6 +168,8 @@ impl RtpEgressState {
             seq: rand::random(),
             timestamp: rand::random(),
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         }
     }
 
@@ -216,12 +244,64 @@ impl RtpEgressState {
         self.ssrc = new_ssrc;
         true
     }
+
+    /// RFC 3550 §6.4.1 SR 用に「送信した 1 packet + payload octet」を記録する。
+    /// 上位 loop が `to_socket.send_to(...).await` 成功直後に呼ぶ。 send 失敗時は
+    /// **呼ばない** (= 実 wire に出ていない packet を SR にカウントしないため)。
+    fn record_sent(&mut self, payload_len: usize) {
+        self.sent_packets = self.sent_packets.saturating_add(1);
+        self.sent_octets = self.sent_octets.saturating_add(payload_len as u64);
+    }
+
+    /// RFC 3550 §6.4.1 (Sender Report) を本 egress 状態のスナップショットから組む。
+    ///
+    /// SR は「自 SSRC が送信した RTP の累積統計 + 現在の NTP/RTP timestamp」を
+    /// 受信側に伝え、 受信側が `lip-sync` (= NTP↔RTP の relationship) と平均
+    /// 送信レートを計算するための情報源 (§6.4.1 NTP timestamp / RTP timestamp の
+    /// 相関の定義)。
+    ///
+    /// - `ssrc`: 自送信 SSRC (rotate (Issue #182 (e) / PR #239) が入っているので、
+    ///   本関数は **現在の `self.ssrc`** を読み新 SSRC で SR が出る。
+    /// - `ntp`: 現在の wall clock を NTP 形式で取る。 [`NtpTimestamp::now`]
+    ///   (`src/rtp/rtcp.rs`) は `SystemTime::now()` + 1900 epoch 補正。 RFC 3550
+    ///   §6.4.1 の "NTP timestamp" フィールド (64-bit) に書く。
+    /// - `rtp_timestamp`: 現在の `self.timestamp` (= 次回送信予定の値)。 厳密には
+    ///   RFC 3550 §6.4.1 では「同 SR で報告する NTP 時点に対応する RTP timestamp」
+    ///   が要求されるが、 transcoder は frame 境界で `next` 払い出し → send を
+    ///   同期実行するため、 「直近送信した RTP の **次の** ts ≒ 現在の wall
+    ///   clock 時点の RTP ts」 として近似する。 (d) (timestamp NTP 基準
+    ///   の厳密同期、 Issue #182 残) は別 PR で扱う。
+    /// - `packet_count` / `octet_count`: `record_sent` で累積した値。
+    /// - `reports`: 本 egress は受信側 jitter buffer を共有しない (transcoder は
+    ///   入力レッグと出力レッグで SSRC を切り替えるため受信 stats は別系統)。
+    ///   よって RR ブロックは空配列 (`SR with RC=0`、 §6.4.1 で許可)。
+    fn build_sr(&self) -> SenderReport {
+        SenderReport {
+            ssrc: self.ssrc,
+            ntp: NtpTimestamp::now(),
+            rtp_timestamp: self.timestamp,
+            // u64 → u32: RFC 3550 §6.4.1 (sender's packet/octet count は 32-bit)。
+            // 5 秒間隔 × u32 packet limit ≒ 4G packets / 20 ms = 2700 年 over なので
+            // wrap は実害なし。 NGN 直収 117 通話の最長セッション (60 分) でも
+            // ~180K packets で u32 範囲のごく一部に収まる。
+            packet_count: self.sent_packets as u32,
+            octet_count: self.sent_octets as u32,
+            reports: Vec::new(),
+        }
+    }
 }
 
 /// 1 通話分のトランスコード ブリッジ。
 pub struct TranscodingBridge {
     ngn_to_web: Option<JoinHandle<()>>,
     web_to_ngn: Option<JoinHandle<()>>,
+    /// RFC 3550 §6.4.1 / RFC 5761 §3.3: NGN→WebRTC 方向の egress に対する
+    /// RTCP SR を 5 秒周期で WebRTC peer 宛 (web socket) へ送出するタスク
+    /// (Issue #182 (f) / #112)。
+    ngn_to_web_sr: Option<JoinHandle<()>>,
+    /// RFC 3550 §6.4.1 / RFC 5761 §3.3: WebRTC→NGN 方向の egress に対する
+    /// RTCP SR を 5 秒周期で NGN peer 宛 (ngn socket) へ送出するタスク。
+    web_to_ngn_sr: Option<JoinHandle<()>>,
     state: Arc<BridgeState>,
     /// NGN 側 socket / 学習済 peer。DTMF 注入 (Issue #69) で使う。
     ngn_socket: Arc<UdpSocket>,
@@ -248,9 +328,11 @@ struct BridgeState {
     transcode_errors: std::sync::atomic::AtomicU64,
     /// NGN→WebRTC 方向の送信 RTP egress 状態 (RFC 3550 §5.1)。
     /// bridge 起動時に random 初期化、 以降 worker loop が `&mut` で update。
-    ngn_to_web_egress: Mutex<RtpEgressState>,
+    /// `Arc<Mutex<_>>` で wrap しているのは RTCP SR 送出タスク (`rtcp_sr_sender_loop`)
+    /// が独立 spawn で同じ egress を読むため (Issue #182 (f) / #112)。
+    ngn_to_web_egress: Arc<Mutex<RtpEgressState>>,
     /// WebRTC→NGN 方向の送信 RTP egress 状態 (RFC 3550 §5.1)。
-    web_to_ngn_egress: Mutex<RtpEgressState>,
+    web_to_ngn_egress: Arc<Mutex<RtpEgressState>>,
 }
 
 impl Default for BridgeState {
@@ -259,8 +341,8 @@ impl Default for BridgeState {
             ngn_to_web_packets: std::sync::atomic::AtomicU64::new(0),
             web_to_ngn_packets: std::sync::atomic::AtomicU64::new(0),
             transcode_errors: std::sync::atomic::AtomicU64::new(0),
-            ngn_to_web_egress: Mutex::new(RtpEgressState::new_random()),
-            web_to_ngn_egress: Mutex::new(RtpEgressState::new_random()),
+            ngn_to_web_egress: Arc::new(Mutex::new(RtpEgressState::new_random())),
+            web_to_ngn_egress: Arc::new(Mutex::new(RtpEgressState::new_random())),
         }
     }
 }
@@ -308,12 +390,32 @@ impl TranscodingBridge {
             ngn_state.clone(),
             state.clone(),
             opus_payload_type,
+            metrics.clone(),
+        ));
+
+        // RFC 3550 §6.4.1 / RFC 5761 §3.3 / Issue #182 (f):
+        // 各方向の egress に対して 5 秒周期で RTCP SR を送出するタスクを spawn。
+        // 送信先は対向 peer の RTP 宛先と同 socket / 同 port (RTP/RTCP mux)。
+        let ngn_to_web_sr = tokio::spawn(rtcp_sr_sender_loop(
+            web_socket.clone(),
+            web_state.clone(),
+            state.ngn_to_web_egress.clone(),
+            metrics.clone(),
+            "ngn_to_web",
+        ));
+        let web_to_ngn_sr = tokio::spawn(rtcp_sr_sender_loop(
+            ngn_socket.clone(),
+            ngn_state.clone(),
+            state.web_to_ngn_egress.clone(),
             metrics,
+            "web_to_ngn",
         ));
 
         Ok(Self {
             ngn_to_web: Some(ngn_to_web),
             web_to_ngn: Some(web_to_ngn),
+            ngn_to_web_sr: Some(ngn_to_web_sr),
+            web_to_ngn_sr: Some(web_to_ngn_sr),
             state,
             ngn_socket,
             ngn_state,
@@ -345,13 +447,21 @@ impl TranscodingBridge {
         Ok(())
     }
 
-    /// 両ループを停止する。
+    /// 両ループ + RTCP SR タスクを停止する (Issue #182 (f))。
     pub async fn stop(mut self) {
         if let Some(h) = self.ngn_to_web.take() {
             h.abort();
             let _ = h.await;
         }
         if let Some(h) = self.web_to_ngn.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = self.ngn_to_web_sr.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = self.web_to_ngn_sr.take() {
             h.abort();
             let _ = h.await;
         }
@@ -386,6 +496,13 @@ impl Drop for TranscodingBridge {
             h.abort();
         }
         if let Some(h) = self.web_to_ngn.take() {
+            h.abort();
+        }
+        // RFC 3550 §6.4.1 / Issue #182 (f): SR タスクは bridge と同ライフサイクル。
+        if let Some(h) = self.ngn_to_web_sr.take() {
+            h.abort();
+        }
+        if let Some(h) = self.web_to_ngn_sr.take() {
             h.abort();
         }
     }
@@ -578,9 +695,17 @@ async fn ngn_to_web_loop(
                     payload: opus_payload,
                 };
 
+                let payload_len = out_pkt.payload.len();
                 if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
                     warn!(error=%e, "WebRTC へ RTP forward 失敗");
                     continue;
+                }
+                // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire に
+                // 出した packet のみ集計する。 send 失敗時は record_sent しない。
+                // Issue #182 (f) / #112。
+                {
+                    let mut eg = state.ngn_to_web_egress.lock().await;
+                    eg.record_sent(payload_len);
                 }
                 state.ngn_to_web_packets.fetch_add(1, Ordering::Relaxed);
                 if let Some(m) = metrics.as_ref() {
@@ -890,9 +1015,16 @@ async fn web_to_ngn_loop(
                         payload: ulaw,
                     };
 
+                    let payload_len = out_pkt.payload.len();
                     if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
                         warn!(error=%e, "NGN へ RTP forward 失敗");
                         break;
+                    }
+                    // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire
+                    // に出した分のみ集計 (Issue #182 (f) / #112)。
+                    {
+                        let mut eg = state.web_to_ngn_egress.lock().await;
+                        eg.record_sent(payload_len);
                     }
                     state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
                     if let Some(m) = metrics.as_ref() {
@@ -901,6 +1033,94 @@ async fn web_to_ngn_loop(
                 }
             }
         }
+    }
+}
+
+/// RFC 3550 §6.4.1 / RFC 5761 §3.3: transcoder の 1 egress 経路に対して、
+/// [`RTCP_SR_INTERVAL`] (= 5 秒) 周期で Sender Report を生成し、 RTP と
+/// **同じ UDP socket** に **同じ peer 宛**で送出するタスクのループ。
+///
+/// # RTP/RTCP mux (RFC 5761 §3.3)
+///
+/// SDP に `a=rtcp-mux` を明示しない場合 NGN 直収では P-CSCF が `m=audio` の
+/// port+1 に対する inbound を許可するかどうか不確実 (`docs/asterisk-real-invite.md`
+/// §5.2 で確証なし)。 本実装は RTP socket と同一 port に SR を載せる
+/// (= RTP/RTCP mux 前提)。 RFC 5761 §4 の demux ルール (RTP PT vs RTCP PT 範囲
+/// 64-95) で peer 側もパース可能。
+///
+/// # Peer 宛先の遅延学習
+///
+/// 上位 loop は `recv_from` の `src` を `LegState::peer` に書き込み学習する
+/// (late-binding)。 SR タスクは `to_state.peer` を周期的に snapshot し、
+/// `None` なら scheduling skip (送りようがない)、 `Some` なら送出する。 SDP
+/// から事前に学習済の場合は最初の tick から送出される。
+///
+/// # シャットダウン
+///
+/// 本タスクの JoinHandle は呼出側 (`TranscodingBridge` / `WebRtcAudioBridge`)
+/// の Drop で `abort()` される (`tokio::spawn` の慣用パターン)。 自前の
+/// shutdown signal は持たない (= bridge の他 loop と同じライフサイクル管理)。
+///
+/// # 観測
+///
+/// SR 送出成功時に `Metrics::add_rtcp_sr_sent(1)` で観測カウンタを上げる。
+/// Prometheus exposition では `sabiden_rtcp_sr_sent_total` として展開される。
+async fn rtcp_sr_sender_loop(
+    socket: Arc<UdpSocket>,
+    to_state: Arc<LegState>,
+    egress: Arc<Mutex<RtpEgressState>>,
+    metrics: Option<Arc<Metrics>>,
+    direction: &'static str,
+) {
+    let span = tracing::trace_span!("rtcp_sr_sender", direction);
+    let _enter = span.enter();
+
+    let mut tick = tokio::time::interval(RTCP_SR_INTERVAL);
+    // SR は 5 秒に 1 回。 tick lag (上位 task busy 等) で複数 tick が溜まっても
+    // RFC 3550 §6.2 minimum interval = 5 秒を破らないよう Skip 戦略を取る。
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 初回 tick は immediate (= bridge 起動直後に SR を出すと wire 上に packets=0
+    // の空 SR が乗る) を避けるため、 1 回目の tick を消費する。 受信側は
+    // sender が無送信なら SR を期待しないので、 5 秒待ってから初回送出にする。
+    tick.tick().await;
+
+    loop {
+        tick.tick().await;
+
+        // 宛先 peer が学習されていなければ、 今回はスキップして次 tick へ。
+        // (PWA 経由通話で SDP から事前に peer が分かるケースは最初から Some。
+        //  symmetric RTP の learn-on-receive ケースは受信が始まる頃には Some 化済。)
+        let dest = match *to_state.peer.lock().await {
+            Some(d) => d,
+            None => {
+                trace!("RTCP SR: peer 未確定 → スキップ");
+                continue;
+            }
+        };
+
+        // RFC 3550 §6.4.1: 自送信統計のスナップショットから SR を構築。
+        // egress lock は build_sr (NTP::now + 既存 counter 読み) のごく短時間のみ。
+        let sr = {
+            let eg = egress.lock().await;
+            eg.build_sr()
+        };
+
+        let bytes = sr.to_bytes();
+        if let Err(e) = socket.send_to(&bytes, dest).await {
+            // Network 一時障害 (ENETUNREACH 等) は次 tick で再送出するため、
+            // warn ログのみで継続する (5 秒後にリトライ)。
+            warn!(error=%e, "RTCP SR 送出失敗 → 次 tick へ");
+            continue;
+        }
+        if let Some(m) = metrics.as_ref() {
+            m.add_rtcp_sr_sent(1);
+        }
+        trace!(
+            ssrc = format!("0x{:08x}", sr.ssrc),
+            packets = sr.packet_count,
+            octets = sr.octet_count,
+            "RTCP SR 送出 (RFC 3550 §6.4.1 / RFC 5761 §3.3)"
+        );
     }
 }
 
@@ -963,6 +1183,14 @@ pub fn sdp_uses_opus(sdp_bytes: &[u8]) -> bool {
 pub struct WebRtcAudioBridge {
     ngn_to_peer: Option<JoinHandle<()>>,
     peer_to_ngn: Option<JoinHandle<()>>,
+    /// RFC 3550 §6.4.1 / RFC 5761 §3.3: peer→NGN 方向の egress に対する
+    /// RTCP SR を 5 秒周期で NGN peer 宛 (NGN socket) へ送出するタスク
+    /// (Issue #182 (f) / #112)。
+    ///
+    /// NGN→peer 方向は egress 先が `MediaFrame` mpsc (str0m が WebRTC レッグ上
+    /// で SSRC / seq を割り当てる) のため、 sabiden 側で RTCP を組まない。
+    /// str0m 自身が WebRTC SAVPF 経路で SR/RR を扱う設計 (RFC 8108 / RFC 8835)。
+    peer_to_ngn_sr: Option<JoinHandle<()>>,
     state: Arc<BridgeState>,
     /// NGN 側 socket / 学習済 peer。 DTMF 注入 (Issue #69) で使う。
     ngn_socket: Arc<UdpSocket>,
@@ -1052,12 +1280,23 @@ impl WebRtcAudioBridge {
             state.clone(),
             opus_payload_type,
             direct_pcmu_passthrough,
+            metrics.clone(),
+        ));
+
+        // RFC 3550 §6.4.1 / RFC 5761 §3.3 / Issue #182 (f):
+        // peer→NGN 方向の egress に対して 5 秒周期で NGN へ RTCP SR を送出する。
+        let peer_to_ngn_sr = tokio::spawn(rtcp_sr_sender_loop(
+            ngn_socket.clone(),
+            ngn_state.clone(),
+            state.web_to_ngn_egress.clone(),
             metrics,
+            "peer_to_ngn",
         ));
 
         Self {
             ngn_to_peer: Some(ngn_to_peer),
             peer_to_ngn: Some(peer_to_ngn),
+            peer_to_ngn_sr: Some(peer_to_ngn_sr),
             state,
             ngn_socket,
             ngn_state,
@@ -1072,13 +1311,17 @@ impl WebRtcAudioBridge {
         Ok(())
     }
 
-    /// 両ループを停止する。
+    /// 両ループ + RTCP SR タスクを停止する (Issue #182 (f))。
     pub async fn stop(mut self) {
         if let Some(h) = self.ngn_to_peer.take() {
             h.abort();
             let _ = h.await;
         }
         if let Some(h) = self.peer_to_ngn.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = self.peer_to_ngn_sr.take() {
             h.abort();
             let _ = h.await;
         }
@@ -1107,6 +1350,10 @@ impl Drop for WebRtcAudioBridge {
             h.abort();
         }
         if let Some(h) = self.peer_to_ngn.take() {
+            h.abort();
+        }
+        // RFC 3550 §6.4.1 / Issue #182 (f): SR タスクも bridge 同寿命。
+        if let Some(h) = self.peer_to_ngn_sr.take() {
             h.abort();
         }
     }
@@ -1447,9 +1694,16 @@ async fn peer_to_ngn_loop(
                 payload: ulaw,
             };
 
+            let payload_len = out_pkt.payload.len();
             if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
                 warn!(error=%e, "NGN へ RTP forward 失敗");
                 break;
+            }
+            // RFC 3550 §6.4.1: SR の sender's packet/octet count は wire に
+            // 出した分のみ集計 (Issue #182 (f) / #112)。
+            {
+                let mut eg = state.web_to_ngn_egress.lock().await;
+                eg.record_sent(payload_len);
             }
             state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = metrics.as_ref() {
@@ -2626,6 +2880,8 @@ mod tests {
             seq: 100,
             timestamp: 1_000_000,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         let (s0, t0, ssrc0) = eg.next(160);
         let (s1, t1, ssrc1) = eg.next(160);
@@ -2660,6 +2916,8 @@ mod tests {
             seq: u16::MAX,
             timestamp: u32::MAX,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         let (s0, t0, ssrc0) = eg.next(1);
         assert_eq!(s0, u16::MAX);
@@ -2685,6 +2943,8 @@ mod tests {
             seq: 0,
             timestamp: 0,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         let t0 = Instant::now();
         // 1 個目: 初回送信
@@ -2719,6 +2979,8 @@ mod tests {
             seq: 0,
             timestamp: 0,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         let t0 = Instant::now();
         assert!(eg.last_send_time.is_none(), "前提: 未送信は None");
@@ -2827,6 +3089,8 @@ mod tests {
             seq: 0,
             timestamp: 0,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         let t0 = Instant::now();
         let _ = eg.next_with_marker(160, t0);
@@ -2862,6 +3126,8 @@ mod tests {
             seq: 1,
             timestamp: 100,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         // ingress SSRC ≠ egress SSRC → rotate 不要
         let rotated = eg.check_and_rotate_on_collision(0xCCCC_DDDD);
@@ -2883,6 +3149,8 @@ mod tests {
             seq: 42,
             timestamp: 8000,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         // ingress SSRC == egress SSRC → 衝突 → rotate
         let rotated = eg.check_and_rotate_on_collision(old_ssrc);
@@ -2913,6 +3181,8 @@ mod tests {
             seq: 0,
             timestamp: 0,
             last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
         };
         // 1 回目: 衝突 → rotate
         assert!(eg.check_and_rotate_on_collision(old_ssrc));
@@ -3707,5 +3977,198 @@ mod tests {
         );
 
         bridge.stop().await;
+    }
+
+    // ====================================================================
+    // Issue #182 (f) / #112: RTCP Sender Report (RFC 3550 §6.4.1 / RFC 5761 §3.3)
+    // ====================================================================
+
+    use crate::rtp::rtcp::peek_packet_type;
+    use crate::rtp::rtcp::PT_SR;
+
+    /// RFC 3550 §6.4.1 (Sender Report Header): `RtpEgressState::build_sr` が
+    /// 自 egress 状態から組んだ SR の必須フィールド (sender's SSRC / packet
+    /// count / octet count / RTP timestamp) が、 直近の `record_sent` で集計
+    /// された値と一致することを確認する。
+    ///
+    /// シナリオ: SSRC=固定、 3 packet を payload_len=160 / 100 / 40 で記録 →
+    /// `build_sr` の `packet_count = 3` / `octet_count = 300` / `ssrc = 0xABCD_1234`
+    /// が観測される。 `rtp_timestamp` は現在の egress timestamp (= 払い出しを
+    /// していなければ初期値そのまま)。
+    ///
+    /// Issue #182 (f) 必要要件 (a): "build_sr_emits_correct_header"。
+    #[test]
+    fn rfc3550_6_4_1_build_sr_emits_correct_header() {
+        let mut eg = RtpEgressState {
+            ssrc: 0xABCD_1234,
+            seq: 100,
+            timestamp: 1_000_000,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+        };
+        // 3 packet を別 payload 長で記録 (実 wire に出した想定)
+        eg.record_sent(160);
+        eg.record_sent(100);
+        eg.record_sent(40);
+
+        let sr = eg.build_sr();
+
+        // RFC 3550 §6.4.1 SR header の必須フィールド
+        assert_eq!(sr.ssrc, 0xABCD_1234, "SR sender SSRC が egress と不一致");
+        assert_eq!(
+            sr.packet_count, 3,
+            "SR sender's packet count が record_sent 回数と不一致"
+        );
+        assert_eq!(
+            sr.octet_count, 300,
+            "SR sender's octet count が record_sent payload 合計と不一致 (160+100+40)"
+        );
+        // RFC 3550 §6.4.1: RTP timestamp は SR 生成時点の RTP 時計値。
+        // 本実装は egress.timestamp (= 次回送信予定の RTP ts) を読む。
+        assert_eq!(
+            sr.rtp_timestamp, 1_000_000,
+            "SR RTP timestamp が現在の egress.timestamp と不一致"
+        );
+        // RC=0 (transcoder egress は受信側 jitter buffer 統計を持たないため)
+        assert!(
+            sr.reports.is_empty(),
+            "transcoder egress SR は RC=0 のはず (受信統計を持たない)"
+        );
+
+        // バイト列としても妥当な SR (V=2, PT=200)
+        let bytes = sr.to_bytes();
+        assert_eq!(peek_packet_type(&bytes), Some(PT_SR));
+        // RC=0 の SR は 28 bytes 固定 (RFC 3550 §6.4.1)
+        assert_eq!(bytes.len(), 28, "RC=0 SR は 28 bytes ちょうど");
+    }
+
+    /// RFC 3550 §6.2 (Transmission Interval) / RFC 5761 §3.3 (RTP/RTCP mux):
+    /// `TranscodingBridge` 起動後、 SR タスクが 5 秒周期 (`RTCP_SR_INTERVAL`)
+    /// で対向 peer の **同じ socket** に SR を送出する。
+    ///
+    /// `start_paused = true` の auto-advance を駆動するため `tokio::time::sleep`
+    /// を使う。 SR タスクは 5 秒 interval なので、 仮想時計を 6 秒進めれば 1 回
+    /// SR が送出されているはず。 受信側 UDP socket は real time で動くため
+    /// `recv_from` で実際に受信できる。
+    ///
+    /// Issue #182 (f) 必要要件 (b): "sr_task_sends_at_5s_interval"。
+    #[tokio::test(start_paused = true)]
+    async fn rfc3550_6_2_sr_task_sends_at_5s_interval() {
+        // peer 側 socket = SR の受信先
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let metrics = Metrics::new();
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: Some(metrics.clone()),
+        })
+        .unwrap();
+
+        // 仮想時計を 6 秒進める (= 1 回目の 5 秒 interval を 1 秒過ぎる)。
+        // `tokio::time::sleep` が auto-advance を駆動して SR タスクの
+        // `interval.tick` を発火させる (start_paused 下のテストパターン:
+        // `src/webrtc/signaling.rs::keepalive_sends_ping_every_interval` 参照)。
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        // 仮想時計が進んでも、 UDP 受信は real time で動く。 spawned SR task が
+        // socket.send_to を完了してから少しの実時間待ちで recv_from が返る。
+        // ngn_to_web 方向の SR は web_peer (= web socket の対向) に届く。
+        let mut buf = vec![0u8; 1500];
+        let n2w = web_peer
+            .recv_from(&mut buf)
+            .await
+            .map(|(n, _)| n)
+            .expect("ngn_to_web SR が web_peer に届かない");
+        assert_eq!(
+            peek_packet_type(&buf[..n2w]),
+            Some(PT_SR),
+            "WebRTC 側に届いたのが SR でない (PT={:?})",
+            peek_packet_type(&buf[..n2w])
+        );
+
+        // web_to_ngn 方向の SR は ngn_peer に届く
+        let mut buf2 = vec![0u8; 1500];
+        let w2n = ngn_peer
+            .recv_from(&mut buf2)
+            .await
+            .map(|(n, _)| n)
+            .expect("web_to_ngn SR が ngn_peer に届かない");
+        assert_eq!(
+            peek_packet_type(&buf2[..w2n]),
+            Some(PT_SR),
+            "NGN 側に届いたのが SR でない (PT={:?})",
+            peek_packet_type(&buf2[..w2n])
+        );
+
+        // Prometheus counter にも反映されている (2 方向 × 1 tick = 2 件以上)
+        assert!(
+            metrics
+                .rtcp_sr_sent
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 2,
+            "rtcp_sr_sent カウンタが 2 件以上でない (2 方向 × 1 tick)"
+        );
+
+        bridge.stop().await;
+    }
+
+    /// RFC 3550 §6.4.1 (build_sr は SSRC を現在値から読む) / Issue #182 (e) との
+    /// 整合: SR タスクは spawn 時点ではなく **送出時点** の egress.ssrc を読む。
+    ///
+    /// SSRC collision rotate (PR #239 で別途実装) が走った後、 新 SSRC で SR が
+    /// 出ることを保証する。 PR #239 が未 merge の本ブランチでは、 テスト中に
+    /// 直接 `egress.ssrc` を書き換えてシナリオを再現する。
+    ///
+    /// Issue #182 (f) 必要要件 (c): "sr_task_uses_egress_ssrc_after_rotate"。
+    #[test]
+    fn rfc3550_6_4_1_build_sr_uses_current_egress_ssrc_after_rotate() {
+        let mut eg = RtpEgressState {
+            ssrc: 0x0000_AAAA,
+            seq: 0,
+            timestamp: 0,
+            last_send_time: None,
+            sent_packets: 0,
+            sent_octets: 0,
+        };
+        // 旧 SSRC で 2 packet 送ったていで record_sent
+        eg.record_sent(160);
+        eg.record_sent(160);
+        let sr_before = eg.build_sr();
+        assert_eq!(sr_before.ssrc, 0x0000_AAAA);
+        assert_eq!(sr_before.packet_count, 2);
+
+        // SSRC collision rotate を模擬 (PR #239 の `check_and_rotate_on_collision`
+        // 相当)。 seq / timestamp / sent_* counter は維持される (= 同 stream の
+        // 連続性を保つ、 §5.1 の SSRC change semantics)。
+        eg.ssrc = 0xFFFF_BBBB;
+
+        // rotate 後の send をさらに 1 件記録
+        eg.record_sent(160);
+
+        let sr_after = eg.build_sr();
+        // 新 SSRC で SR が組まれる (= SR タスクが spawn 時のキャッシュではなく
+        // 現在値を読んでいる契約)
+        assert_eq!(
+            sr_after.ssrc, 0xFFFF_BBBB,
+            "rotate 後の build_sr は新 SSRC を使うべき (Issue #182 (e) との整合)"
+        );
+        // counter は累積 (rotate でリセットされない、 § 5.1 SSRC change は
+        // 受信側で別 stream 扱いになるが、 sabiden 送信側は同一 process)
+        assert_eq!(
+            sr_after.packet_count, 3,
+            "record_sent counter は rotate を跨いで累積される"
+        );
+        assert_eq!(sr_after.octet_count, 160 * 3);
     }
 }

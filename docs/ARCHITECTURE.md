@@ -929,6 +929,50 @@ Opus DTX 復帰 (RFC 7587 §3.7) は silence packet 4 個 = 80 ms 以上の gap 
 `RtpBridge::forward_loop` (`src/call/bridge.rs` のバイト透過モード) は対向の
 M ビットをそのまま forward する。
 
+#### RTCP Sender Report の送出 (Issue #182 (f) / #112)
+
+RFC 3550 §6.4.1 は「自送信中の participant は周期的に Sender Report (SR) を
+送出して、 受信側に (a) sender SSRC、 (b) NTP 時刻 ↔ RTP timestamp の相関、
+(c) 累積 packet/octet 数を伝える」ことを規定する。 受信側は SR の NTP timestamp
+を用いて lip-sync (= RTP timestamp と wall clock の同期) と RTT 推定を行う。
+
+transcoder の 3 egress 経路に対し、 5 秒間隔で SR を送出するタスクを
+`rtcp_sr_sender_loop` (`src/call/transcoder.rs`) として spawn する。
+
+| egress 経路 | コード | SR 送出先 socket | SR 宛先 |
+|---|---|---|---|
+| `ngn_to_web_loop` (UDP→UDP transcode) | `TranscodingBridge::start` | `web_socket` | `web_state.peer` (WebRTC 側) |
+| `web_to_ngn_loop` (UDP→UDP transcode) | `TranscodingBridge::start` | `ngn_socket` | `ngn_state.peer` (NGN P-CSCF) |
+| `peer_to_ngn_loop` (str0m mpsc→UDP) | `WebRtcAudioBridge::start` | `ngn_socket` | `ngn_state.peer` (NGN P-CSCF) |
+
+`ngn_to_peer_loop` (UDP→str0m mpsc) は egress 先が `MediaFrame` mpsc であり、
+WebRTC レッグの RTCP は str0m 自身が SAVPF 経路 (RFC 8108 / RFC 8835) で扱う
+ため、 sabiden 側で SR を組まない。
+
+| 項目 | 値 | 根拠 |
+|---|---|---|
+| 送出間隔 | 5 秒固定 (`RTCP_SR_INTERVAL`) | RFC 3550 §6.2 minimum interval。 Adaptive interval (§6.3 `T_rr_interval`) と randomization (0.5x〜1.5x) は Phase R5/R6 で検討 |
+| RTP/RTCP mux | 有効 (= 同 UDP socket / 同 port で SR を送出) | RFC 5761 §3.3。 NGN P-CSCF は port+1 への inbound 許可が不確実 (`docs/asterisk-real-invite.md` §5.2 で確証なし) のため mux を採用 |
+| MissedTickBehavior | `Skip` | tick lag (上位 task busy 等) で複数 tick が溜まっても RFC 3550 §6.2 minimum interval = 5 秒を破らない |
+| 初回 SR 送出 | bridge 起動から **5 秒後** | 起動直後の `interval.tick()` (immediate) を 1 回消費して 5 秒待つ。 packet_count=0 の空 SR を wire に出さない実装 |
+| 送信統計 | `RtpEgressState.sent_packets` / `sent_octets` | 上位 loop が `to_socket.send_to` 成功時に `record_sent(payload_len)` を呼ぶ。 send 失敗時は集計しない (wire に出ていない packet を SR にカウントしないため) |
+| RC (report count) | 0 | transcoder egress は受信側 jitter buffer 統計を共有しないため (入力レッグの SSRC ≠ 出力レッグの SSRC)。 入力 RR/SR の集計は別 PR で対応 |
+| Peer 学習 | `LegState::peer` (late-binding) を周期 snapshot | 学習未了なら scheduling skip (次 tick で再判定)。 SDP 事前学習済なら最初の tick から送出 |
+| シャットダウン | bridge Drop で `JoinHandle::abort` | 他 loop と同ライフサイクル管理 (`tokio::spawn` の慣用パターン) |
+| 観測カウンタ | `Metrics::rtcp_sr_sent` (Prometheus `sabiden_rtcp_sr_sent_total`) | 全方向で集計 (将来 label 化で方向別に分解可) |
+
+##### 未実装 (Issue #182 残)
+
+- **(b) loss/reorder propagation** (RFC 3550 §6.4.1): 出力 seq は transcoder
+  内で内部生成のため入力 seq の loss/reorder を伝播していない。 別 PR。
+- **(d) timestamp NTP 基準**: 出力 timestamp 初期値が random で NTP 同期計算
+  の基準が不安定。 本 SR 送出は近似 (現在の egress.timestamp = 次回送信予定値
+  を SR の `rtp_timestamp` に使う) で動くが、 厳密な (NTP_now ↔ RTP_at_NTP_now)
+  対応は別 PR。
+- **(e) SSRC collision detection** (RFC 3550 §8.2): PR #239 で並行進行中。
+  `build_sr` は SR 生成時に `self.ssrc` を読むため、 rotate 後の新 SSRC で
+  自動的に SR が出る (本 PR と #239 のマージ順は独立)。
+
 #### orchestrator 配線
 
 ```text

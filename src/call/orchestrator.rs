@@ -98,17 +98,16 @@ const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
 /// - `OPTIONS`: keep-alive / capabilities probe (RFC 3261 §11)
 /// - `UPDATE`: Re-INVITE 代替の SDP / Session-Timer 更新 (RFC 3311)
 /// - `INFO`: DTMF (RFC 4733 / RFC 6086、 sabiden 実装済)
+/// - `PRACK` (RFC 3262 §4): 100rel reliable 18x への ACK 受信 (Issue #251 Phase B)
 ///
 /// **意図的除外**:
-/// - `PRACK` (RFC 3262): sabiden は現在 100rel 未実装 (audit Phase B、 Issue #251)、
-///   Allow に載せると capabilities 偽広告になる。
 /// - `NOTIFY` / `SUBSCRIBE` / `MESSAGE` / `REFER` / `PUBLISH`: 限定的処理のみ
 ///   (NOTIFY/SUBSCRIBE は 481、 MESSAGE は受け流し)。 carrier IMS が
 ///   「これらを使える」と誤認しないよう除外。
-const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, INFO";
+const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, INFO, PRACK";
 
-/// RFC 4028 §7 / RFC 3891 §3 (Issue #251 Phase A): NGN inbound INVITE 経路の
-/// 18x / 2xx 応答に常時付与する `Supported` ヘッダ値。 §20.37 によれば
+/// RFC 4028 §7 / RFC 3891 §3 / RFC 3262 §3 (Issue #251 Phase B): NGN inbound INVITE
+/// 経路の 18x / 2xx 応答に常時付与する `Supported` ヘッダ値。 §20.37 によれば
 /// `Supported` 不在は peer に「何の extension がサポートされているか不明」と
 /// 解釈され、 carrier IMS の機能 negotiate ロジックを混乱させる。
 ///
@@ -117,12 +116,10 @@ const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, 
 ///   経路があり、 `Require` を出すなら `Supported` にも明示するのが §7.4 整合。
 /// - `replaces` (RFC 3891): Call-Replace。 sabiden は将来の transfer 経路で
 ///   利用するため capability として常時広告 (受信処理は将来 Phase で実装)。
-///
-/// **意図的除外**:
-/// - `100rel` (RFC 3262): PRACK 経路未実装 (audit Phase B、 Issue #251)。
-///   `Supported: 100rel` を出すと carrier UAC が `Require: 100rel` で PRACK を
-///   期待し、 sabiden は対応できず即 BYE。 capabilities 偽広告防止。
-const UAS_INBOUND_2XX_SUPPORTED: &str = "timer, replaces";
+/// - `100rel` (RFC 3262 §3): Reliability of Provisional Responses。 NGN INVITE
+///   が `Supported: 100rel` を提示してきた場合、 sabiden は reliable 180 Ringing
+///   (Require: 100rel + RSeq) を送出し PRACK を待ち合わせる (Phase B)。
+const UAS_INBOUND_2XX_SUPPORTED: &str = "timer, replaces, 100rel";
 
 /// RFC 3261 §20.41 (Issue #251 Phase A): UAS 応答に載せる `Server` ヘッダ値。
 /// Asterisk 実機 (`docs/asterisk-real-invite.md` §3.1) は `Server: Asterisk PBX
@@ -231,11 +228,10 @@ fn resolve_response_refresher(request_refresher: Option<&str>) -> &'static str {
 ///   (現状は dialog 確立後に replaces を活用する dialog replacement は未実装、
 ///   ただし carrier が `Require: replaces` を送るケースは実機未確認)。
 ///
-/// **意図的非ホワイトリスト**:
-/// - `100rel` (RFC 3262): PRACK 未実装。 carrier が `Require: 100rel` を出して
-///   くる経路に対しては 420 で正直に拒否すべき (capability negotiate 失敗を
-///   carrier に伝えて UAC 側 fallback を促す、 §8.2.2.3 が想定する正規動作)。
-const KNOWN_OPTION_TAGS: &[&str] = &["timer", "replaces"];
+/// - `100rel` (RFC 3262 §3、 Issue #251 Phase B): PRACK 経路を実装したため
+///   `Require: 100rel` も受け入れる。 受け入れ後の挙動は orchestrator
+///   `handle_invite` 内で reliable 180 Ringing + RSeq 送出 + PRACK 待ちに分岐。
+const KNOWN_OPTION_TAGS: &[&str] = &["timer", "replaces", "100rel"];
 
 /// `Require` ヘッダ値 (例 `"timer, 100rel"`) をパースし、 `KNOWN_OPTION_TAGS` に
 /// 含まれない option-tag 一覧を返す (大文字小文字無視、 RFC 3261 §7.3.1)。
@@ -269,6 +265,148 @@ fn apply_uas_inbound_2xx_headers(resp: &mut SipResponse) {
     resp.headers.set("Supported", UAS_INBOUND_2XX_SUPPORTED);
     resp.headers.set("Date", http_date_now());
     resp.headers.set("Server", sabiden_server_header());
+}
+
+/// RFC 3262 §3 (Issue #251 Phase B): 100rel 用 option-tag の文字列。
+/// Supported / Require 両方で大文字小文字無視・comma 区切りで現れる。
+const OPTION_TAG_100REL: &str = "100rel";
+
+/// RFC 3262 §3 / §7.1 ABNF: `RSeq = "RSeq" HCOLON response-num`
+///   ここで `response-num = 1*DIGIT` (= 1..=2^32-1)。 32-bit 範囲で wrap せず
+///   monotonically increasing する必要があり、 連続する reliable provisional
+///   間で +1 で進める (§3 "increase by one for each provisional response sent
+///   reliably in this transaction")。
+///
+/// `RAck = "RAck" HCOLON response-num LWS CSeq-num LWS Method` (§7.2)。
+///
+/// 初期 RSeq は §3 で `between 1 and 2^31 - 1` の範囲のランダム値が SHOULD。
+/// sabiden は単純化のため `rand::thread_rng()` で uniform 抽出。
+fn random_initial_rseq() -> u32 {
+    // RFC 3262 §3: "It is RECOMMENDED that the initial value of RSeq be
+    // chosen so as to be unpredictable within the range of 1 to 2**31 - 1."
+    // OS-RNG を使い、 0 は除外する (§7.1 ABNF が 1 始まり)。
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    // 1..=2^31-1 (i32 max) の範囲。
+    rng.gen_range(1u32..=0x7FFF_FFFF)
+}
+
+/// RFC 3262 §7.2 ABNF: `RAck-value = response-num LWS CSeq-num LWS Method`。
+///
+/// 受信した PRACK の `RAck` ヘッダから (RSeq, CSeq-num, Method) を取り出す。
+/// パース失敗 (フィールド数 < 3 / 数値不正) は `None`。
+///
+/// 例: `"123 5 INVITE"` → `Some((123, 5, "INVITE"))`
+fn parse_rack_header(rack: &str) -> Option<(u32, u32, String)> {
+    let mut parts = rack.split_ascii_whitespace();
+    let rseq: u32 = parts.next()?.parse().ok()?;
+    let cseq: u32 = parts.next()?.parse().ok()?;
+    let method = parts.next()?.to_string();
+    if parts.next().is_some() {
+        // §7.2 ABNF は 3 トークン固定。 余剰トークンは保守的に reject (誤認 RAck 防止)。
+        return None;
+    }
+    Some((rseq, cseq, method))
+}
+
+/// `Supported` / `Require` の comma 区切り option-tag リストに指定 tag が
+/// 含まれるか (大文字小文字無視、 RFC 3261 §7.3.1)。 `header_value` が `None`
+/// なら `false`。
+fn header_has_option_tag(header_value: Option<&str>, tag: &str) -> bool {
+    let Some(value) = header_value else {
+        return false;
+    };
+    value
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case(tag))
+}
+
+/// RFC 3262 §3: 100rel 経路の状態。 NGN→sabiden 着信 INVITE 1 件につき
+/// 最大 1 つ生存し、 reliable provisional 送出 → PRACK 受信 / timeout で
+/// 消える。 `handle_invite` が「PRACK 待ちで 200 OK を保留」 するために
+/// `prack_received` Notify を await する。
+///
+/// **同時生存条件**: §3 "The UAS MUST NOT send a second reliable provisional
+/// response until the first is acknowledged." sabiden は **18x を 1 回しか
+/// 出さない** (180 Ringing のみ) ため、 in-flight reliable response は
+/// 高々 1 つ。 これにより RSeq の単一管理で十分。
+struct Rc100relState {
+    /// 待機中の `RSeq` 値 (= 直近送出した reliable 18x のもの)。
+    rseq: u32,
+    /// `Rc100relState` 紐づけ用の Call-ID。 PRACK の Call-ID と突合。
+    call_id: String,
+    /// `RAck` 突合用 INVITE の CSeq 番号 (= reliable 18x が応答する CSeq)。
+    invite_cseq: u32,
+    /// PRACK 受信時に `notify_one` する notifier。 `handle_invite` が
+    /// `notified()` で待ち合わせる。
+    prack_received: Arc<tokio::sync::Notify>,
+    /// reliable 18x 再送タスク (RFC 3262 §3 / §6: T1 起点で指数バックオフ、
+    /// PRACK 受信 / Timer 満了で停止)。 `Drop` で abort される。
+    retransmit_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rc100relState {
+    fn drop(&mut self) {
+        if let Some(h) = self.retransmit_task.take() {
+            h.abort();
+        }
+    }
+}
+
+/// RFC 3262 §3 / §6: reliable provisional response を T1 起点に指数バックオフ
+/// で再送するタイマタスクを spawn する。 `notify` が `notify_one` されると即終了。
+///
+/// §3 引用:
+/// > If a reliable provisional response is retransmitted, it MUST be sent
+/// > with the same RSeq.
+///
+/// §6 (RFC 3261 §17.2.1 互換): 初期 T1 = 500ms、 2*T1, 4*T1, ... と倍々で
+/// 増加し、 T2 (4s) で頭打ち、 合計時間 64*T1 (= 32 秒) で諦める。
+///
+/// 諦めた場合は §3 後段により「UAS は 5xx で INVITE トランザクションを終結」
+/// するが、 本タスク自体はその判定をせず単に終了する。 INVITE 側の
+/// `wait_for_prack` が timeout 検出して 5xx 応答経路に入る。
+fn spawn_reliable_provisional_retransmit(
+    socket: Arc<UdpSocket>,
+    dest: SocketAddr,
+    bytes: Vec<u8>,
+    notify: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    // RFC 3261 §17.1.1.2: T1 = 500ms (RTT 推定の出発点)、 T2 = 4s (上限)。
+    const T1: Duration = Duration::from_millis(500);
+    const T2: Duration = Duration::from_secs(4);
+    // 64 * T1 = 32 秒。 §3 で reliable 18x の PRACK 待ち上限と等価。
+    const TIMER_LIMIT: Duration = Duration::from_secs(32);
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let mut interval = T1;
+        loop {
+            // PRACK 受信通知 or タイマ到達のどちらかで分岐。
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = notify.notified() => {
+                    debug!("RFC 3262 §3: PRACK 受信通知 → reliable 18x 再送停止");
+                    return;
+                }
+                _ = &mut sleep => {
+                    if started.elapsed() >= TIMER_LIMIT {
+                        warn!(
+                            "RFC 3262 §3: reliable 18x PRACK 不到来で 32 秒経過 → 再送停止"
+                        );
+                        return;
+                    }
+                    if let Err(e) = socket.send_to(&bytes, dest).await {
+                        warn!(error=%e, "reliable 18x 再送失敗");
+                        return;
+                    }
+                    debug!(?interval, "RFC 3262 §3: reliable 18x 自発再送");
+                    // T1 → 2T1 → 4T1 → ... → T2 で頭打ち。
+                    interval = std::cmp::min(interval.saturating_mul(2), T2);
+                }
+            }
+        }
+    })
 }
 
 /// `webrtc_active` leak sweeper の最小 / フォールバック周期 (Issue #218)。
@@ -504,6 +642,15 @@ pub struct NgnInboundHandler {
     /// (RFC 3261 §9.1: NGN が CANCEL を出した時点で sabiden は内線フォークを
     /// 中止し、INVITE には 487 Request Terminated を返す)。
     in_flight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// RFC 3262 §3 / §4 (Issue #251 Phase B): 100rel reliable provisional
+    /// 経路の per-Call-ID 状態。 INVITE 受信時に `Supported: 100rel` があれば
+    /// reliable 180 Ringing を出して entry を作成し、 PRACK 受信時に entry
+    /// から `prack_received` を `notify_one` して INVITE 側の wait を解除する。
+    ///
+    /// entry の生存範囲: reliable 18x 送出時 → PRACK 受信 / 32 秒タイムアウト /
+    /// CANCEL / 200 OK 送出後の cleanup。 これにより `handle_inbound` の
+    /// PRACK 分岐から O(1) で対応 INVITE を引ける。
+    rc100rel: Arc<Mutex<HashMap<String, Arc<Mutex<Rc100relState>>>>>,
     /// RTP ブリッジを管理する Call Manager。`None` なら SDP 透過モードで動く
     /// (Issue #15 互換)。
     call_manager: Option<Arc<CallManager>>,
@@ -543,6 +690,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: None,
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -586,6 +734,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
@@ -614,6 +763,7 @@ impl NgnInboundHandler {
             webrtc_active: Arc::new(Mutex::new(HashMap::new())),
             webrtc_outbound_active,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            rc100rel: Arc::new(Mutex::new(HashMap::new())),
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,

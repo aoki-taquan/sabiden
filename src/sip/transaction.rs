@@ -1006,6 +1006,22 @@ impl ServerTransaction {
     pub fn request(&self) -> &SipRequest {
         &self.request
     }
+
+    /// RFC 3261 §18.2.1 / RFC 3581 §4 で算出した「応答の送信先 UDP socket」を
+    /// 返す。 RFC 3262 §3 の reliable provisional response 自発再送 (T1 起点
+    /// バックオフ) で同じ宛先に投げ直すために、 transaction 層の外 (orchestrator)
+    /// から読めるよう公開する (Issue #251 Phase B)。
+    pub fn response_dest(&self) -> SocketAddr {
+        self.response_dest
+    }
+
+    /// 同上、 応答に上書きすべき Via ヘッダ値 (received / rport 反映済) を返す。
+    /// reliable 18x 自発再送時に `build_response_skeleton` 由来の生の Via を
+    /// そのまま再送すると VPN/NAT 越えで届かないため、 transaction 層が確定した
+    /// `response_via` を読み出して bytes 生成時に上書きする。
+    pub fn response_via(&self) -> &str {
+        &self.response_via
+    }
 }
 
 /// トランザクション層。受信ループを駆動し、レスポンスをクライアント

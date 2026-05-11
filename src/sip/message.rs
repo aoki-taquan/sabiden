@@ -193,9 +193,23 @@ impl SipRequest {
         }
     }
 
+    /// RFC 3261 §7.3.1 / §20.14: `Content-Length` は単数フィールドであり、
+    /// 同一メッセージで複数行出現してはならない。 本実装の不変条件は
+    /// 「`Content-Length` は `to_bytes` 末尾で `self.body.len()` から
+    /// **正規生成** し、 ヘッダマップ側に並存していたらそれを **抑制** する」。
+    ///
+    /// この防御は、 `parse_message` が受信メッセージから `content-length` を
+    /// `headers` に取り込む (Issue #85) ため、 任意 SipRequest の透過再送出
+    /// (将来の proxy / relay 経路) で同じバイト列を二重に書き出す事故を防ぐ。
+    /// 一部の strict parser (Asterisk pjsip 等) は重複 `Content-Length` を
+    /// 400 Bad Request にし、 RFC 7230 §3.3.2 系の request smuggling
+    /// 経路にもなり得る (本 SIP 仕様の参考)。
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = format!("{} {} SIP/2.0\r\n", self.method, self.uri);
         for (k, v) in self.headers.iter() {
+            if k == "content-length" {
+                continue;
+            }
             let display_name = canonical_header_name(k);
             out.push_str(&format!("{}: {}\r\n", display_name, v));
         }
@@ -212,9 +226,14 @@ impl SipRequest {
 }
 
 impl SipResponse {
+    /// RFC 3261 §7.3.1 / §20.14: `Content-Length` は単数フィールド。
+    /// 詳細不変条件は [`SipRequest::to_bytes`] の docstring 参照 (Issue #85)。
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = format!("SIP/2.0 {} {}\r\n", self.status_code, self.reason);
         for (k, v) in self.headers.iter() {
+            if k == "content-length" {
+                continue;
+            }
             let display_name = canonical_header_name(k);
             out.push_str(&format!("{}: {}\r\n", display_name, v));
         }
@@ -833,6 +852,151 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("REGISTER sip:ntt-east.ne.jp SIP/2.0\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
+    }
+
+    /// RFC 3261 §7.3.1 / §20.14 (Issue #85): `Content-Length` は単数
+    /// フィールドであり、 to_bytes は self.body.len() から正規生成した値を
+    /// 1 行だけ出力しなければならない。
+    ///
+    /// 受信した SipRequest を そのまま再送出するパス (将来の proxy / relay、
+    /// 現状でも parse_message → to_bytes round-trip で発生) で、
+    /// ヘッダマップに既に `content-length` が入っていても重複行を吐かない
+    /// ことを検証する。
+    #[test]
+    fn rfc3261_20_14_request_to_bytes_emits_single_content_length() {
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:bob@x");
+        req.headers.set("From", "<sip:a@x>;tag=1");
+        req.headers.set("To", "<sip:b@x>");
+        req.headers.set("Call-ID", "cid@x");
+        req.headers.set("CSeq", "1 INVITE");
+        // 「直前で受信した値」をシミュレート: parser はこれを headers.add で投入する。
+        req.headers.set("Content-Length", "999");
+        let bytes = req.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let count = text.match_indices("Content-Length:").count();
+        assert_eq!(
+            count, 1,
+            "Content-Length は 1 行のみ (RFC 3261 §20.14)。 actual text:\n{}",
+            text
+        );
+        // body 空なので正規値は 0
+        assert!(
+            text.contains("Content-Length: 0\r\n"),
+            "正規 Content-Length 値 (body.len()=0) が採用されること。 actual:\n{}",
+            text
+        );
+        // 古い値 (999) は捨てられること
+        assert!(
+            !text.contains("Content-Length: 999"),
+            "ヘッダマップ側の古い Content-Length は抑制されること。 actual:\n{}",
+            text
+        );
+    }
+
+    /// RFC 3261 §20.14 (Issue #85): body 非空ケースでも、 ヘッダマップに
+    /// 入っていた旧 Content-Length 値 ではなく body.len() の正規値を採用する。
+    #[test]
+    fn rfc3261_20_14_request_to_bytes_uses_actual_body_len() {
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:bob@x");
+        req.headers.set("From", "<sip:a@x>;tag=1");
+        req.headers.set("To", "<sip:b@x>");
+        req.headers.set("Call-ID", "cid@x");
+        req.headers.set("CSeq", "1 INVITE");
+        // 古い (誤った) Content-Length が headers に存在
+        req.headers.set("Content-Length", "0");
+        req.body = b"v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\n".to_vec();
+        let bytes = req.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let count = text.match_indices("Content-Length:").count();
+        assert_eq!(count, 1, "Content-Length は 1 行のみ。 actual:\n{}", text);
+        let expected = format!("Content-Length: {}\r\n", req.body.len());
+        assert!(
+            text.contains(&expected),
+            "Content-Length は body.len()={} で正規生成される。 actual:\n{}",
+            req.body.len(),
+            text
+        );
+    }
+
+    /// RFC 3261 §20.14 (Issue #85): compact form `l` で投入された値も
+    /// 抑制対象になる (parser は `l` を `content-length` に正規化するため、
+    /// normalize_header_name の不変条件が機能していれば同じ key になる)。
+    #[test]
+    fn rfc3261_20_14_request_to_bytes_suppresses_compact_form_l() {
+        let mut req = SipRequest::new(SipMethod::Invite, "sip:bob@x");
+        req.headers.set("From", "<sip:a@x>;tag=1");
+        req.headers.set("To", "<sip:b@x>");
+        req.headers.set("Call-ID", "cid@x");
+        req.headers.set("CSeq", "1 INVITE");
+        // compact form で投入 — normalize_header_name により内部キーは "content-length"
+        req.headers.set("l", "12345");
+        let bytes = req.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let count = text.match_indices("Content-Length:").count();
+        assert_eq!(
+            count, 1,
+            "compact form 経由でも 1 行のみ。 actual:\n{}",
+            text
+        );
+        assert!(
+            !text.contains("12345"),
+            "compact form 経由でも古い値は抑制されること。 actual:\n{}",
+            text
+        );
+    }
+
+    /// RFC 3261 §20.14 (Issue #85): SipResponse でも同一不変条件。
+    #[test]
+    fn rfc3261_20_14_response_to_bytes_emits_single_content_length() {
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers: SipHeaders::new(),
+            body: Vec::new(),
+        };
+        resp.headers.set("CSeq", "1 INVITE");
+        resp.headers.set("Content-Length", "999");
+        let bytes = resp.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let count = text.match_indices("Content-Length:").count();
+        assert_eq!(
+            count, 1,
+            "Response でも Content-Length は 1 行のみ (RFC 3261 §20.14)。 actual:\n{}",
+            text
+        );
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(!text.contains("Content-Length: 999"));
+    }
+
+    /// RFC 3261 §20.14 (Issue #85): parse_message で取り込んだ受信メッセージを
+    /// to_bytes で再シリアライズしても Content-Length が重複しないこと。
+    /// (proxy / relay の透過パスを想定した round-trip 検証)
+    #[test]
+    fn rfc3261_20_14_parse_to_bytes_round_trip_single_content_length() {
+        let raw = b"INVITE sip:bob@x SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bKa\r\n\
+                    From: <sip:a@x>;tag=1\r\n\
+                    To: <sip:b@x>\r\n\
+                    Call-ID: cid@x\r\n\
+                    CSeq: 1 INVITE\r\n\
+                    Content-Length: 0\r\n\
+                    \r\n";
+        let parsed = parse_message(raw).expect("parse should succeed");
+        let req = match parsed {
+            SipMessage::Request(r) => r,
+            _ => panic!("expected request"),
+        };
+        // parse_message は Content-Length を headers に入れる (line 718)。
+        assert_eq!(req.headers.get("content-length"), Some("0"));
+        // 再シリアライズで重複しないこと
+        let bytes = req.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let count = text.match_indices("Content-Length:").count();
+        assert_eq!(
+            count, 1,
+            "parse → to_bytes round-trip で Content-Length 重複しないこと。 actual:\n{}",
+            text
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
@@ -22,6 +22,31 @@ use crate::rtp::jitter::{JitterBuffer, JitterStats, DEFAULT_DEPTH};
 use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW, SAMPLES_PER_FRAME};
 use crate::rtp::rtcp::{NtpTimestamp, ReceiverReport, ReportBlock, SenderReport};
 use crate::rtp::{set_rtp_dscp, RECV_BUF_SIZE};
+
+/// Talkspurt 境界判定の閾値 (RFC 3551 §4.1 / RFC 7587 §4.4)。
+///
+/// PCMU 1 フレーム = 20 ms (RFC 3551 §4.5.14) なので、 直前送信から
+/// 30 ms 以上経過 (= フレーム 1.5 本分) を「連続音声区間が途切れた」
+/// と判定し、 次のパケットに M=1 を立てる。 これは Issue #84 で要請された
+/// 「talkspurt 開始の M=1」の根本対処であり、 受信側 (NGN / WebRTC stack)
+/// の adaptive jitter buffer が talkspurt 境界を認識できるようにする。
+///
+/// 30 ms という値は RFC で明示されていないが、 (a) 20 ms (= 1 frame 周期)
+/// より長くないと jitter で false positive する、 (b) 40 ms (= silence
+/// 検出器の最短窓) より短くないと talkspurt 開始を逃す、 という両端の制約
+/// から PCMU の場合 30 ms を採用する。 Opus DTX 復帰 (RFC 7587 §3.7) も
+/// silence packet 4 個 = 80 ms 以上の gap で発火するので 30 ms で十分に
+/// 検出できる。
+///
+/// # 限界 (false positive の可能性)
+///
+/// 30 ms 閾値は近似値: PCMU 20 ms 周期で 1 frame loss (= 40 ms gap) を
+/// talkspurt 境界と誤判定する可能性がある。 ただし旧実装 (常に M=0) からは
+/// regression ではなく、 受信側 adaptive jitter buffer の微小な playout
+/// 再計算で吸収される。 将来 false-positive 抑制が必要なら 50 ms+ への
+/// 引き上げを別 Issue で検討する (PCMU 2 frame loss = 60 ms+ なら確実に
+/// talkspurt 境界扱い)。
+const TALKSPURT_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 
 /// RTP セッションの統計値スナップショット
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,6 +86,10 @@ pub struct RtpSession {
     depth: usize,
     /// 受信 SSRC を初めて見たときの最終直近 SR 時刻のメモ
     remote_last_sr_recv: Mutex<HashMap<u32, (u32, Instant)>>,
+    /// 直近 `send_ulaw` 送出時刻。 talkspurt 境界判定に使う (RFC 3551 §4.1)。
+    /// 初回送信 (= `None`) もしくは [`TALKSPURT_GAP_THRESHOLD`] 以上空いたら
+    /// 次パケットで M=1 を立てる (Issue #84)。
+    last_send_time: Mutex<Option<Instant>>,
 }
 
 impl RtpSession {
@@ -88,6 +117,7 @@ impl RtpSession {
             last_sr: Mutex::new(None),
             depth,
             remote_last_sr_recv: Mutex::new(HashMap::new()),
+            last_send_time: Mutex::new(None),
         })
     }
 
@@ -100,15 +130,45 @@ impl RtpSession {
     }
 
     /// G.711 μ-law 1 フレームを送る。`pcm_ulaw` の長さは通常 160 バイト。
+    ///
+    /// # Marker bit (RFC 3551 §4.1 / RFC 3550 §5.1)
+    ///
+    /// RFC 3551 §4.1: audio profile における marker bit semantics。 silence
+    /// suppression / DTX 復帰後の最初の talkspurt packet で M=1 を立て、
+    /// 受信側 jitter buffer に「ここから連続音声」と通知する。 marker bit の
+    /// 解釈そのものは RFC 3550 §5.1 が profile に委譲しており、 audio profile
+    /// (RFC 3551) では talkspurt の先頭マーキングが該当する。
+    ///
+    /// 本実装は `last_send_time` を保持し、 (a) 初回送信、 もしくは
+    /// (b) 直前送信から [`TALKSPURT_GAP_THRESHOLD`] (= 30 ms) 以上経過した場合に
+    /// M=1 を立てる。 30 ms は PCMU 1 frame 周期 (20 ms) と silence detector
+    /// の最短窓 (40 ms) の中間値であり、 false positive と false negative の
+    /// 両方を避ける (Issue #84)。
     pub async fn send_ulaw(&self, pcm_ulaw: &[u8]) -> Result<()> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let ts = self
             .timestamp
             .fetch_add(SAMPLES_PER_FRAME as u32, Ordering::SeqCst);
 
+        // talkspurt 境界判定: 直前送信からの経過時間で決める。
+        // mutex は本関数内のみで保持する短いスコープ。
+        let now = Instant::now();
+        let marker = {
+            let mut last = self
+                .last_send_time
+                .lock()
+                .expect("last_send_time mutex poisoned");
+            let is_talkspurt_start = match *last {
+                None => true,
+                Some(prev) => now.saturating_duration_since(prev) >= TALKSPURT_GAP_THRESHOLD,
+            };
+            *last = Some(now);
+            is_talkspurt_start
+        };
+
         let pkt = RtpPacket {
             payload_type: PAYLOAD_TYPE_ULAW,
-            marker: false,
+            marker,
             sequence: seq,
             timestamp: ts,
             ssrc: self.ssrc,
@@ -116,7 +176,13 @@ impl RtpSession {
         };
 
         let bytes = pkt.to_bytes();
-        trace!("RTP 送信: seq={} ts={} len={}", seq, ts, bytes.len());
+        trace!(
+            "RTP 送信: seq={} ts={} len={} M={}",
+            seq,
+            ts,
+            bytes.len(),
+            marker as u8
+        );
         self.socket.send_to(&bytes, self.remote).await?;
         self.sent_packets.fetch_add(1, Ordering::Relaxed);
         self.sent_octets
@@ -458,6 +524,94 @@ mod tests {
         assert_eq!(pkt.payload_type, PAYLOAD_TYPE_ULAW);
         assert_eq!(pkt.payload.len(), 160);
         assert_eq!(pkt.ssrc, s.ssrc());
+    }
+
+    /// RFC 3551 §4.1 (audio profile marker bit) — talkspurt 開始の最初の
+    /// パケットに M=1 が立つ。
+    ///
+    /// 初回 `send_ulaw` 呼び出しは「無音 → 音声」の遷移とみなされるため
+    /// (last_send_time が None)、 必ず M=1 となる。
+    /// Issue #84: 旧実装は常に M=0 を送っていたため、 対向 jitter buffer は
+    /// talkspurt 境界を検出できなかった。
+    #[tokio::test]
+    async fn rfc3551_4_1_send_ulaw_first_packet_has_marker() {
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s = Arc::new(RtpSession::new(Arc::new(send_sock), recv_addr).unwrap());
+
+        s.send_ulaw(&[0xff; 160]).await.unwrap();
+        let mut buf = vec![0u8; 1500];
+        let (n, _) = recv_sock.recv_from(&mut buf).await.unwrap();
+        let pkt = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert!(
+            pkt.marker,
+            "RFC 3551 §4.1: 初回 send_ulaw の M ビットは 1 (talkspurt 開始)"
+        );
+    }
+
+    /// RFC 3551 §4.1 — talkspurt 継続中 (frame 間隔 = 20 ms < 30 ms 閾値) では
+    /// M=0 を維持する。
+    ///
+    /// 連続した `send_ulaw` 呼び出しが PCMU の 1 frame 周期 (20 ms, RFC 3551
+    /// §4.5.14) 以内で行われる限り、 talkspurt 内の continuation packet として
+    /// M=0 で送出される (Issue #84)。
+    #[tokio::test]
+    async fn rfc3551_4_1_send_ulaw_continuation_packet_has_no_marker() {
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s = Arc::new(RtpSession::new(Arc::new(send_sock), recv_addr).unwrap());
+
+        // 1 個目 (M=1 を期待)
+        s.send_ulaw(&[0xff; 160]).await.unwrap();
+        // 即座に 2 個目 (gap = 数 µs ≪ 30 ms 閾値 → M=0 を期待)
+        s.send_ulaw(&[0xff; 160]).await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let (n1, _) = recv_sock.recv_from(&mut buf).await.unwrap();
+        let pkt1 = RtpPacket::from_bytes(&buf[..n1]).unwrap();
+        let (n2, _) = recv_sock.recv_from(&mut buf).await.unwrap();
+        let pkt2 = RtpPacket::from_bytes(&buf[..n2]).unwrap();
+
+        assert!(pkt1.marker, "1 個目は talkspurt 開始 (M=1) — RFC 3551 §4.1");
+        assert!(
+            !pkt2.marker,
+            "2 個目は talkspurt 継続 (M=0) — RFC 3551 §4.1"
+        );
+    }
+
+    /// RFC 3551 §4.1 / RFC 7587 §4.4 — silence / DTX 復帰後の最初のパケットに
+    /// M=1 が立つ。
+    ///
+    /// `TALKSPURT_GAP_THRESHOLD` (= 30 ms) 以上の gap を空けて再送信した場合、
+    /// 「無音区間が挟まった」とみなして M=1 を立てる。 これにより対向の
+    /// adaptive jitter buffer は talkspurt 境界を検出できる (Issue #84)。
+    #[tokio::test]
+    async fn rfc3551_4_1_send_ulaw_after_silence_gap_has_marker() {
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s = Arc::new(RtpSession::new(Arc::new(send_sock), recv_addr).unwrap());
+
+        // 第 1 talkspurt
+        s.send_ulaw(&[0xff; 160]).await.unwrap();
+        // silence gap (閾値 30 ms より大きく空ける)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 第 2 talkspurt 開始
+        s.send_ulaw(&[0xff; 160]).await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let (n1, _) = recv_sock.recv_from(&mut buf).await.unwrap();
+        let pkt1 = RtpPacket::from_bytes(&buf[..n1]).unwrap();
+        let (n2, _) = recv_sock.recv_from(&mut buf).await.unwrap();
+        let pkt2 = RtpPacket::from_bytes(&buf[..n2]).unwrap();
+
+        assert!(pkt1.marker, "第 1 talkspurt 開始の M=1");
+        assert!(
+            pkt2.marker,
+            "silence 後の第 2 talkspurt 開始の M=1 (RFC 3551 §4.1 / RFC 7587 §4.4)"
+        );
     }
 
     /// RFC 3550 §5.1 (extension 含む RTP packet) と §6.4 (compound RTCP) で

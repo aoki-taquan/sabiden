@@ -851,6 +851,31 @@ packet として NGN へ送出する。
 (transcoder で drop)。 これらは VoIP では稀で WebRTC ブラウザも生成しないため、
 内部累積バッファでの 20 ms 揃え直しは将来 Issue で扱う。
 
+#### Talkspurt 境界の M ビット (Issue #84)
+
+RFC 3550 §5.1 の RTP marker bit は profile 依存で解釈される。 RFC 3551 §4.1
+(audio profile) と RFC 7587 §4.4 (Opus payload format) はいずれも **talkspurt
+開始の最初の packet で M=1 を立てる** ことを規定する (silence suppression /
+DTX 復帰直後)。 対向の adaptive jitter buffer は M=1 を talkspurt 境界として
+受信深度をリセットし、 silence 後の playout 遅延を最小化する。
+
+sabiden の RTP 送信パスは 2 系統:
+
+| 経路 | コード | M=1 判定 |
+|---|---|---|
+| `RtpSession::send_ulaw` (低レベル UDP 送信) | `src/rtp/session.rs` | `last_send_time` 経過時間 ≥ `TALKSPURT_GAP_THRESHOLD` (= 30 ms) |
+| `TranscodingBridge` / `WebRtcAudioBridge` (transcoder の RTP egress) | `src/call/transcoder.rs::RtpEgressState::next_with_marker` | 同上、 seq / ts 払い出しと同一 critical section |
+
+30 ms 閾値は 20 ms (= 1 frame 周期) と 40 ms (= silence detector の最短窓) の
+中間値で、 jitter による false positive と silence 検出漏れの両方を避ける。
+Opus DTX 復帰 (RFC 7587 §3.7) は silence packet 4 個 = 80 ms 以上の gap を
+伴うため、 30 ms 閾値で確実に拾える。
+
+`WebRtcAudioBridge::ngn_to_peer_loop` は `MediaFrame` (str0m への mpsc) を
+出力し、 marker は str0m が WebRTC レッグ上で割当てるため sabiden 側で扱わない。
+`RtpBridge::forward_loop` (`src/call/bridge.rs` のバイト透過モード) は対向の
+M ビットをそのまま forward する。
+
 #### orchestrator 配線
 
 ```text

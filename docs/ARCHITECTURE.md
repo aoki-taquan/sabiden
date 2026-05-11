@@ -84,6 +84,13 @@ src/
   (RFC 3261 §7.4) として扱い、UTF-8 妥当性は要求しない。 ヘッダ部も
   `from_utf8_lossy` で U+FFFD 置換し、 不正バイト混入による DoS 経路を
   遮断する (詳細 → [`architecture.md`](./architecture.md) §11.6)。
+- **`to_bytes` シリアライズ不変条件 (RFC 3261 §7.3.1 / §20.14、 Issue #85)**:
+  `SipRequest::to_bytes` / `SipResponse::to_bytes` は `Content-Length` を
+  ヘッダマップから出力せず、 末尾で `self.body.len()` から **正規生成** した
+  1 行のみを書き出す。 `parse_message` は受信値を `headers` に格納するため、
+  この防御がないと proxy / relay 透過パスや `parse → to_bytes` round-trip で
+  `Content-Length` が二重に出力され、 strict parser (Asterisk pjsip 等) が
+  400 Bad Request にする / request smuggling 経路を作る恐れがある。
 
 ### SIP Transaction Layer (RFC 3261 §17)
 - トランザクション ID (branch + via-sent-by + cseq-method)

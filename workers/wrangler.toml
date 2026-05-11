@@ -10,7 +10,10 @@
 #   - `wrangler secret put SIGNAL_ORIGIN` で
 #     `https://home-sabiden.example.com` を投入
 #   - `wrangler secret put SIGNAL_HOST_HEADER` (任意) でアップストリームに
-#     送る Host ヘッダを上書き
+#     送る Host ヘッダを上書き (未指定なら SIGNAL_ORIGIN の host を使う)
+#   - `wrangler secret put CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` で
+#     上流 Tunnel の Cloudflare Access service token を投入 (production では必須。
+#     未設定だと Worker が 503 を返して fail-fast。 Issue #101)
 
 name = "sabiden-pwa"
 main = "signaling-proxy.ts"

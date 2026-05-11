@@ -1,6 +1,16 @@
 # wrangler dev 用ローカル環境変数 (`.dev.vars` にコピーして使う)
 # 実値はコミットしないこと。
 
+# `wrangler dev` では ENVIRONMENT=staging (wrangler.toml [env.staging]) で
+# 起動するか、 ここで明示的に設定する。 "production" 以外なら CF Access
+# service token なしで warn ログのみで通過する (Issue #101)。
+ENVIRONMENT=development
+
 SIGNAL_ORIGIN=https://home-sabiden.example.com
 # 必要なら:
 # SIGNAL_HOST_HEADER=home-sabiden.example.com
+
+# 本番デプロイ時には `wrangler secret put` で投入する (ローカル dev では不要)。
+# 未設定で ENVIRONMENT=production 起動すると Worker が 503 を返す (Issue #101)。
+# CF_ACCESS_CLIENT_ID=
+# CF_ACCESS_CLIENT_SECRET=

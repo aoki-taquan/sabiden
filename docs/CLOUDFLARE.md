@@ -152,6 +152,8 @@ Permissions-Policy: microphone=(self)
 | 症状 | 確認 |
 | --- | --- |
 | WS が 502 | `cloudflared tunnel info sabiden` で接続確認、`SIGNAL_ORIGIN` 値 |
+| WS が 503 (`Cloudflare Access service token not configured`) | Worker 自体が fail-fast (Issue #101)。 `npx wrangler secret list` で `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` の両方が登録されているか確認。 欠けていれば §2 の `wrangler secret put` を再実行する。 ENVIRONMENT=production 限定の挙動 (staging/dev では warn のみで通す) |
+| WS が 530 / 1016 (Origin DNS error) | 上流 Tunnel hostname と Worker の Host ヘッダが不一致。 `SIGNAL_HOST_HEADER` を `SIGNAL_ORIGIN` の host に揃えるか、 設定を外す (未指定なら SIGNAL_ORIGIN の host が自動採用される、 Issue #101) |
 | WS が 401 | HMAC トークンの `expiry` 過去 / `secret` 不一致 |
 | WS が 100 秒で切れる | Cloudflare Tunnel の **idle timeout = 100 秒** で切断される (cloudflared 既定動作)。 sabiden は 30 秒周期で WebSocket Ping (RFC 6455 §5.5.2) を送り続けて経路上の idle timer をリセットしている。 PWA 側 `SignalingClient` は close code 別に再接続するため通話継続は維持される (Issue #98 / #127)。 周期の調整は `[webrtc] keepalive_interval_secs` / `idle_timeout_secs` (Issue #131) |
 | 音が出ない | iOS Safari は user gesture 後でないと `audio.play()` できない (本 PWA は応答ボタンで起動) |

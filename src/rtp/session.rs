@@ -37,6 +37,15 @@ use crate::rtp::{set_rtp_dscp, RECV_BUF_SIZE};
 /// から PCMU の場合 30 ms を採用する。 Opus DTX 復帰 (RFC 7587 §3.7) も
 /// silence packet 4 個 = 80 ms 以上の gap で発火するので 30 ms で十分に
 /// 検出できる。
+///
+/// # 限界 (false positive の可能性)
+///
+/// 30 ms 閾値は近似値: PCMU 20 ms 周期で 1 frame loss (= 40 ms gap) を
+/// talkspurt 境界と誤判定する可能性がある。 ただし旧実装 (常に M=0) からは
+/// regression ではなく、 受信側 adaptive jitter buffer の微小な playout
+/// 再計算で吸収される。 将来 false-positive 抑制が必要なら 50 ms+ への
+/// 引き上げを別 Issue で検討する (PCMU 2 frame loss = 60 ms+ なら確実に
+/// talkspurt 境界扱い)。
 const TALKSPURT_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 
 /// RTP セッションの統計値スナップショット
@@ -124,13 +133,11 @@ impl RtpSession {
     ///
     /// # Marker bit (RFC 3551 §4.1 / RFC 3550 §5.1)
     ///
-    /// > RFC 3551 §4.1: "If the previous packet was marked discontinuous,
-    /// > the marker bit in the next packet is set to one."
-    /// >
-    /// > RFC 3550 §5.1 (M bit): "the interpretation of the marker is defined
-    /// > by a profile" / RFC 3551 §4.1 audio profile: M=1 marks the first
-    /// > packet of a talkspurt (silence suppression / DTX 復帰後の最初の
-    /// > 音声パケット)。
+    /// RFC 3551 §4.1: audio profile における marker bit semantics。 silence
+    /// suppression / DTX 復帰後の最初の talkspurt packet で M=1 を立て、
+    /// 受信側 jitter buffer に「ここから連続音声」と通知する。 marker bit の
+    /// 解釈そのものは RFC 3550 §5.1 が profile に委譲しており、 audio profile
+    /// (RFC 3551) では talkspurt の先頭マーキングが該当する。
     ///
     /// 本実装は `last_send_time` を保持し、 (a) 初回送信、 もしくは
     /// (b) 直前送信から [`TALKSPURT_GAP_THRESHOLD`] (= 30 ms) 以上経過した場合に

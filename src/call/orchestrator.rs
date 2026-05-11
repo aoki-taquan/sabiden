@@ -12650,8 +12650,9 @@ mod tests {
             .handle_pwa_outbound_offer("117", "v=0", &peer, &ws_sink)
             .await
             .expect("同期パスは成功 (NGN 失敗は background)");
-        // Issue #260 Phase 1-B: retry が ~2s 待つので timeout は 10s に拡張。
-        let bg = tokio::time::timeout(Duration::from_secs(10), outcome.completion)
+        // Issue #260 Phase 1-B.2: retry wait が 8s±1.5s (= ~9.5s upper) + INVITE 往復で
+        // 10s では足りない。 20s に拡張。
+        let bg = tokio::time::timeout(Duration::from_secs(20), outcome.completion)
             .await
             .expect("background timeout")
             .expect("background panic");
@@ -12779,8 +12780,9 @@ mod tests {
             .handle_pwa_outbound_offer("117", "v=0", &peer, &ws_sink)
             .await
             .expect("同期パスは成功");
-        // Issue #260 Phase 1-B: retry が ~2s 待つので timeout は 10s に拡張。
-        let bg = tokio::time::timeout(Duration::from_secs(10), outcome.completion)
+        // Issue #260 Phase 1-B.2: retry wait が 8s±1.5s (= ~9.5s upper) + INVITE 往復で
+        // 10s では足りない。 20s に拡張。
+        let bg = tokio::time::timeout(Duration::from_secs(20), outcome.completion)
             .await
             .expect("background timeout")
             .expect("background panic");

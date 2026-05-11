@@ -1056,3 +1056,192 @@ async fn rfc3261_8_1_1_5_consecutive_invites_use_cseq_1() {
     assert_ne!(cid2, cid3);
     assert_ne!(cid1, cid3);
 }
+
+/// Issue #260 Phase 1-B: NGN carrier intermittent reject (500) に対する
+/// 1 回限定 auto-retry が **2 回目の 200 OK で救済成立** することを E2E で確認。
+///
+/// シナリオ: 内線が INVITE 送出 → sabiden → fake NGN は 1 回目 500 を返す →
+/// sabiden は carrier_retry::decide_retry で Retry 判定 → ~2 秒 sleep 後に
+/// 新 Call-ID で再 INVITE → fake NGN は 2 回目に 200 OK を返す → 内線へ
+/// 200 OK が伝播し metrics に `RetriedSucceeded` が記録される。
+///
+/// RFC 3261 §20.33 (Retry-After 遵守) / §21.5 (5xx) / 3GPP TS 24.229 §5.2.7
+/// (500 = per-INVITE 内部失敗) / TTC JJ-90.24 §5.7.3 (Retry-After 内 retry 禁止
+/// + 過度な retry 回避) との整合を満たすため、 1 回限定 + default 2 秒待機。
+#[tokio::test]
+async fn phase_1b_e2e_inbound_500_then_200_succeeds_via_retry() {
+    use crate::sip::transaction::ServerTransaction;
+    use crate::sip::uas::UasEvent;
+    use std::sync::Mutex as StdMutex;
+
+    // 1) fake NGN: 1 回目は 500、 2 回目は 200 OK を返す。
+    let fake_ngn = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+    let ngn_peer_rtp = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let ngn_peer_rtp_addr = ngn_peer_rtp.local_addr().unwrap();
+
+    let invite_count: Arc<StdMutex<u32>> = Arc::new(StdMutex::new(0));
+    let invite_count_for_task = invite_count.clone();
+    let fake_ngn_clone = fake_ngn.clone();
+    async fn recv_next_invite(
+        sock: &UdpSocket,
+        buf: &mut [u8],
+    ) -> (SipRequest, std::net::SocketAddr) {
+        loop {
+            let (n, peer) = sock.recv_from(buf).await.unwrap();
+            if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n]) {
+                if matches!(req.method, SipMethod::Invite) {
+                    return (req, peer);
+                }
+            }
+        }
+    }
+    let ngn_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        // 1 回目 INVITE 受信 → 500。 retry 経路の ACK や 100 Trying 等は読み飛ばす。
+        let (req1, peer) = recv_next_invite(&fake_ngn_clone, &mut buf).await;
+        *invite_count_for_task.lock().unwrap() += 1;
+        let mut resp = build_response_skeleton(&req1, 500, "Server Internal Error");
+        resp.headers.set(
+            "To",
+            format!("{};tag=ngn-fail-tag", req1.headers.get("to").unwrap()),
+        );
+        let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
+
+        // ACK for 500 (RFC 3261 §17.1.1.3) は recv_next_invite の loop で素通り。
+
+        // 2 回目 INVITE 受信 → 200 OK
+        let (req2, peer) = recv_next_invite(&fake_ngn_clone, &mut buf).await;
+        *invite_count_for_task.lock().unwrap() += 1;
+        // RFC 3261 §8.1.1.5 / Issue #260 Phase 1-B: retry は新 Call-ID を使う。
+        assert_ne!(
+            req1.headers.get("call-id"),
+            req2.headers.get("call-id"),
+            "retry INVITE は新 Call-ID で送られるべき (RFC 3261 §8.1.1.5)"
+        );
+        let mut resp = build_response_skeleton(&req2, 200, "OK");
+        resp.headers.set(
+            "To",
+            format!("{};tag=ngn-ok-tag", req2.headers.get("to").unwrap()),
+        );
+        resp.headers
+            .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+        resp.headers.set("Content-Type", "application/sdp");
+        resp.body = fixtures::sdp_pcmu(ngn_peer_rtp_addr).into_bytes();
+        let _ = fake_ngn_clone.send_to(&resp.to_bytes(), peer).await;
+
+        // ACK / BYE は破棄 (本テストでは 2xx ACK が来ることだけ確認すれば十分)。
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            fake_ngn_clone.recv_from(&mut buf),
+        )
+        .await;
+    });
+
+    // 2) sabiden NGN UAC
+    let ngn_client_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+    let ngn_uac = Arc::new(Uac::new(
+        UacConfig {
+            local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            local_addr: ngn_client_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+            auth_username: None,
+            auth_password: None,
+        },
+        ngn_layer,
+        fake_ngn_addr,
+    ));
+
+    // 3) handler (metrics 注入で carrier_retry の counter を読めるようにする)
+    let mgr = CallManager::new(ExtensionRegistrar::new());
+    let metrics = Metrics::new();
+    let handler = UasEventHandler::with_call_manager_and_metrics(
+        ngn_uac,
+        mgr.clone(),
+        Some("127.0.0.1".parse().unwrap()),
+        Some("127.0.0.1".parse().unwrap()),
+        metrics.clone(),
+    );
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    handler.spawn(event_rx);
+
+    // 4) phone INVITE → sabiden UAS
+    let phone_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let phone_addr = phone_sock.local_addr().unwrap();
+    let sabiden_uas_sock = Arc::new(UdpSocket::bind(fixtures::loopback_any()).await.unwrap());
+    let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+
+    let ext_ua_rtp_addr: std::net::SocketAddr = "127.0.0.1:55230".parse().unwrap();
+    let ext_offer_sdp = fixtures::sdp_pcmu(ext_ua_rtp_addr);
+
+    let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
+    invite.headers.set(
+        "Via",
+        format!("SIP/2.0/UDP {};branch=z9hG4bKphase1b-retry", phone_addr),
+    );
+    invite
+        .headers
+        .set("From", "<sip:iphone@sabiden>;tag=phase1b-tag");
+    invite.headers.set("To", "<sip:0312345678@sabiden>");
+    invite.headers.set("Call-ID", "phase1b-retry-cid");
+    invite.headers.set("CSeq", "1 INVITE");
+    invite.headers.set("Content-Type", "application/sdp");
+    invite.body = ext_offer_sdp.into_bytes();
+    phone_sock
+        .send_to(&invite.to_bytes(), sabiden_uas_addr)
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let (n, remote) = timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+        .await
+        .expect("phone INVITE が UAS socket に来ない")
+        .unwrap();
+    let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() else {
+        panic!("INVITE 期待");
+    };
+    let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
+    let responder = builders::responder_handle_for_test(stx);
+    event_tx
+        .send(UasEvent::Invite {
+            from_aor: "iphone".to_string(),
+            request: req,
+            remote,
+            responder,
+        })
+        .unwrap();
+
+    // 5) NGN タスク完了を待つ (1 回目 500 → 2 秒 sleep → 2 回目 200 OK の流れ
+    //    で計 ~3 秒で完了)。 余裕を持って 10 秒上限。
+    timeout(Duration::from_secs(10), ngn_task)
+        .await
+        .expect("fake NGN タスクが終わらない (retry が動いていない可能性)")
+        .unwrap();
+
+    assert_eq!(
+        *invite_count.lock().unwrap(),
+        2,
+        "Phase 1-B: 1 回目 500 + 2 回目 retry = 計 2 回 INVITE が NGN に届くべき"
+    );
+
+    // metrics 検証: RetriedSucceeded が +1 されている。
+    assert_eq!(
+        metrics
+            .ngn_carrier_retry_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "Phase 1-B: retry 成功 metrics が記録されるべき"
+    );
+    assert_eq!(
+        metrics
+            .ngn_carrier_retry_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Phase 1-B: retry 失敗 metrics は 0 のはず"
+    );
+
+    drop(phone_sock);
+    drop(sabiden_uas_sock);
+}

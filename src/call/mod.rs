@@ -13,6 +13,7 @@
 //! Phase 1 の責務に絞り、トランスコードは Phase 3 (Issue #6 系) で実装する。
 
 pub mod bridge;
+pub mod carrier_retry;
 pub mod codec_pipeline;
 pub mod dtmf;
 pub mod manager;

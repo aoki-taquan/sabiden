@@ -641,6 +641,16 @@ pub mod pcsf {
         Accept { answer_sdp: Vec<u8> },
         /// 100 → 4xx で拒否 (例: 486 Busy Here)。
         Reject { code: u16, reason: String },
+        /// Issue #260 Phase 1-B 検証用: 1 回目は `first_code`、 2 回目以降は
+        /// 200 OK で `answer_sdp` を返す。 carrier intermittent reject の
+        /// auto-retry シナリオ (500/486 → wait → 200 OK 成功) を再現する。
+        /// 内部カウンタを Mutex で持ち、 INVITE 受信ごとに +1 する。
+        FailFirstThenAccept {
+            first_code: u16,
+            first_reason: String,
+            answer_sdp: Vec<u8>,
+            invite_count: Arc<std::sync::atomic::AtomicU32>,
+        },
     }
 
     /// Mock P-CSCF ハンドル。
@@ -800,6 +810,30 @@ pub mod pcsf {
                     let mut resp = build_response_skeleton(req, *code, reason);
                     ensure_to_tag(&mut resp);
                     let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
+                }
+                NgnInviteScript::FailFirstThenAccept {
+                    first_code,
+                    first_reason,
+                    answer_sdp,
+                    invite_count,
+                } => {
+                    // Issue #260 Phase 1-B: 1 回目は failure、 2 回目以降は accept。
+                    let nth = invite_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if nth == 0 {
+                        let mut resp = build_response_skeleton(req, *first_code, first_reason);
+                        ensure_to_tag(&mut resp);
+                        let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
+                    } else {
+                        let mut resp = build_response_skeleton(req, 200, "OK");
+                        ensure_to_tag(&mut resp);
+                        resp.headers
+                            .set("Contact", format!("<sip:ngn@{}>", self.addr));
+                        if !answer_sdp.is_empty() {
+                            resp.headers.set("Content-Type", "application/sdp");
+                            resp.body = answer_sdp.clone();
+                        }
+                        let _ = self.socket.send_to(&resp.to_bytes(), peer).await;
+                    }
                 }
             }
         }

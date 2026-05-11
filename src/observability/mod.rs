@@ -108,6 +108,14 @@ pub struct Metrics {
     pub ngn_5xx_500: AtomicU64,
     pub ngn_5xx_503: AtomicU64,
     pub ngn_5xx_other: AtomicU64,
+    /// Issue #260 Phase 1-B: NGN carrier intermittent reject (500/486/503) に
+    /// 対する自動 1 回 retry の結果別累計。 retry 経路に乗らなかった通常通話
+    /// (= 1 回目で確立) は `not_retried` に集計し、 retry 駆動された通話だけ
+    /// `succeeded` / `failed` / `aborted_by_cancel` に振り分ける。
+    pub ngn_carrier_retry_not_retried: AtomicU64,
+    pub ngn_carrier_retry_succeeded: AtomicU64,
+    pub ngn_carrier_retry_failed: AtomicU64,
+    pub ngn_carrier_retry_aborted_by_cancel: AtomicU64,
 }
 
 impl Metrics {
@@ -232,6 +240,27 @@ impl Metrics {
     /// と意味分けを規定するため、 状態コード毎に独立カウンタで記録し
     /// Prometheus へ `status` ラベルで公開する (RFC 3261 §21.5)。
     /// `invite_ngn_error` (4xx + 5xx 合算) とは別軸で 5xx 散発の頻度を観測する。
+    /// Issue #260 Phase 1-B: NGN carrier intermittent reject (500/486/503) に
+    /// 対する自動 retry の結果を 1 件記録する。
+    ///
+    /// `RetryOutcome::NotRetried` は **retry 判定経路を全く通らなかった通常
+    /// 通話** (元 status が 4xx 等の非対象、 または 1 回目で確立) を意味する。
+    /// 観測者は `succeeded / failed / aborted_by_cancel` の和を retry 試行
+    /// 回数として読む。
+    ///
+    /// RFC 3261 §20.33 (Retry-After) / 3GPP TS 24.229 §5.2.7 / TTC JJ-90.24
+    /// §5.7.3 の準拠状況を Prometheus で外形監視可能にする。
+    pub fn record_ngn_carrier_retry(&self, outcome: crate::call::carrier_retry::RetryOutcome) {
+        use crate::call::carrier_retry::RetryOutcome;
+        match outcome {
+            RetryOutcome::NotRetried => &self.ngn_carrier_retry_not_retried,
+            RetryOutcome::RetriedSucceeded => &self.ngn_carrier_retry_succeeded,
+            RetryOutcome::RetriedFailed => &self.ngn_carrier_retry_failed,
+            RetryOutcome::RetryAbortedByCancel => &self.ngn_carrier_retry_aborted_by_cancel,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_ngn_5xx(&self, status_code: u16) {
         let counter = match status_code {
             500 => &self.ngn_5xx_500,
@@ -413,6 +442,33 @@ impl Metrics {
         out.push_str(&format!(
             "sabiden_ngn_5xx_total{{status=\"other\"}} {}\n",
             self.ngn_5xx_other.load(Ordering::Relaxed)
+        ));
+
+        // Issue #260 Phase 1-B / RFC 3261 §20.33 / 3GPP TS 24.229 §5.2.7:
+        // NGN carrier intermittent reject (500/486/503) に対する 1 回 retry
+        // の outcome 別累計。 `succeeded + failed + aborted_by_cancel` の和が
+        // retry を実際に駆動した試行回数、 `not_retried` は intermittent 経路
+        // に乗らなかった通常通話 (= 既存 INVITE と 1:1)。
+        out.push_str(
+            "# HELP sabiden_ngn_carrier_retry_total NGN carrier intermittent reject (500/486/503) に対する 1 回 retry の結果別累計 (Issue #260 Phase 1-B / RFC 3261 §20.33 / 3GPP TS 24.229 §5.2.7 / TTC JJ-90.24 §5.7.3)\n",
+        );
+        out.push_str("# TYPE sabiden_ngn_carrier_retry_total counter\n");
+        out.push_str(&format!(
+            "sabiden_ngn_carrier_retry_total{{outcome=\"not_retried\"}} {}\n",
+            self.ngn_carrier_retry_not_retried.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_ngn_carrier_retry_total{{outcome=\"succeeded\"}} {}\n",
+            self.ngn_carrier_retry_succeeded.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_ngn_carrier_retry_total{{outcome=\"failed\"}} {}\n",
+            self.ngn_carrier_retry_failed.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "sabiden_ngn_carrier_retry_total{{outcome=\"aborted_by_cancel\"}} {}\n",
+            self.ngn_carrier_retry_aborted_by_cancel
+                .load(Ordering::Relaxed)
         ));
 
         out

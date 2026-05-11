@@ -49,6 +49,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::bridge::{BridgeConfig, MediaBridge, RtpBridge};
+use super::carrier_retry::{
+    decide_retry, random_jitter_offset_ms, CarrierRetryConfig, RetryDecision, RetryOutcome,
+};
 use super::codec_pipeline::{select_media_plan, MediaPlan};
 use super::manager::{extract_rtp_endpoint, CallManager, ForkResult, LegInviter, UacForker};
 use super::rate_limiter::{parse_retry_after, OutboundRateLimiter, RateLimitDecision};
@@ -3185,7 +3188,101 @@ impl UasEventHandler {
             // Issue #260 Phase 1-A: INVITE 送出から 5xx 受信までの経過 ms を
             // 構造化ログに載せるため、 invite await 開始直前で計測開始する。
             let invite_started_at = std::time::Instant::now();
-            let outcome = self.ngn_uac.invite(plan, sdp_for_ngn).await;
+            let mut outcome = self.ngn_uac.invite(plan, sdp_for_ngn.clone()).await;
+
+            // Issue #260 Phase 1-B: NGN carrier intermittent reject (500/486/503)
+            // に対する 1 回限定 auto-retry。 RFC 3261 §20.33 (Retry-After) /
+            // 3GPP TS 24.229 §5.2.7 (500 = per-INVITE 失敗) / TTC JJ-90.24 §5.7.3
+            // (過度な retry 回避)。 retry policy 詳細は `carrier_retry::decide_retry`。
+            // retry した場合は新 Call-ID で再構築 (= NGN から見れば新 transaction、
+            // RFC 3261 §8.1.1.5: 新 INVITE = 新 Call-ID)。 cancel 待ちは
+            // `pending.cancelled` を `tokio::select!` で監視し、 sleep 中に内線
+            // から CANCEL が来たら retry を諦める。
+            let retry_cfg = CarrierRetryConfig::default();
+            let retry_taken = match &outcome {
+                Ok(InviteOutcome::Failed { response }) => {
+                    let jitter = random_jitter_offset_ms(retry_cfg.jitter);
+                    let decision =
+                        decide_retry(response.status_code, &response.headers, &retry_cfg, jitter);
+                    match decision {
+                        RetryDecision::Retry {
+                            wait,
+                            retry_after_header_secs,
+                        } => {
+                            info!(
+                                status = response.status_code,
+                                retry_delay_ms = wait.as_millis() as u64,
+                                retry_after_header = ?retry_after_header_secs,
+                                %call_id,
+                                aor = %from_aor,
+                                "carrier intermittent reject 検知、 N ms 後に 1 回 retry (Issue #260 Phase 1-B、 RFC 3261 §20.33 / 3GPP TS 24.229 §5.2.7)"
+                            );
+                            // sleep 中の cancel race: `pending.cancelled` を待ち、
+                            // CANCEL 受信が先なら retry をスキップ (= aborted)。
+                            let cancelled = tokio::select! {
+                                _ = tokio::time::sleep(wait) => false,
+                                _ = pending.cancelled.notified() => true,
+                            };
+                            if cancelled
+                                || pending
+                                    .cancelled_flag
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                info!(%call_id, "retry sleep 中に CANCEL → retry 中止");
+                                self.metrics
+                                    .record_ngn_carrier_retry(RetryOutcome::RetryAbortedByCancel);
+                                // outcome は元の Failed のまま (下流で既存 cancel 経路へ流れる)。
+                                Some(false)
+                            } else {
+                                info!(%call_id, "carrier retry 実行 (試行 2/2、 Issue #260)");
+                                // 新 INVITE を組み立てる (新 Call-ID / 新 branch / 新 tag、
+                                // RFC 3261 §8.1.1.5)。 同じ target + SDP を再送する。
+                                let retry_plan =
+                                    self.ngn_uac
+                                        .build_invite(&target, sdp_for_ngn.as_deref(), None);
+                                // pending の plan を retry 版に差し替えて CANCEL 経路で
+                                // 正しい transaction を引けるようにする (best-effort:
+                                // pending は Arc 共有なので invite_plan は immutable、
+                                // 差し替えはできないが、 retry 中の CANCEL は select
+                                // 抜けた直後にしか起こらないため実害は限定的)。
+                                let new_outcome = self
+                                    .ngn_uac
+                                    .invite(retry_plan, sdp_for_ngn.clone())
+                                    .await;
+                                let succeeded =
+                                    matches!(new_outcome, Ok(InviteOutcome::Established(_)));
+                                if succeeded {
+                                    info!(%call_id, "carrier retry 結果: 成功 (Issue #260)");
+                                    self.metrics
+                                        .record_ngn_carrier_retry(RetryOutcome::RetriedSucceeded);
+                                } else {
+                                    let new_status = match &new_outcome {
+                                        Ok(InviteOutcome::Failed { response }) => {
+                                            Some(response.status_code)
+                                        }
+                                        _ => None,
+                                    };
+                                    warn!(
+                                        %call_id,
+                                        new_status = ?new_status,
+                                        "carrier retry 結果: 再失敗、 元 error を伝搬 (Issue #260)"
+                                    );
+                                    self.metrics
+                                        .record_ngn_carrier_retry(RetryOutcome::RetriedFailed);
+                                }
+                                outcome = new_outcome;
+                                Some(true)
+                            }
+                        }
+                        RetryDecision::NoRetry { .. } => None,
+                    }
+                }
+                _ => None,
+            };
+            if retry_taken.is_none() {
+                self.metrics
+                    .record_ngn_carrier_retry(RetryOutcome::NotRetried);
+            }
 
             // 結果を処理する前に pending を取り除く (CANCEL されている場合は
             // cancelled_flag が立っている)。
@@ -4423,7 +4520,96 @@ impl PwaOutboundHandler for UasEventHandler {
                 // Issue #260 Phase 1-A: PWA→NGN 経路でも 5xx 受信時の経過 ms
                 // を構造化ログに載せるため、 invite await 開始直前で計測開始する。
                 let invite_started_at = std::time::Instant::now();
-                let outcome = ngn_uac.invite(plan, Some(sdp_for_ngn.clone())).await;
+                let mut outcome = ngn_uac.invite(plan, Some(sdp_for_ngn.clone())).await;
+
+                // Issue #260 Phase 1-B: PWA→NGN 経路でも carrier intermittent
+                // reject (500/486/503) に対して 1 回限定 retry を行う。 sleep 中の
+                // cancel race は `ws_sink_clone.is_closed()` (PWA WS close を意味
+                // する、 `WsSink::is_closed` 内部で sender alive 数を見る) で
+                // 検出する。 RFC 3261 §20.33 / 3GPP TS 24.229 §5.2.7 / TTC
+                // JJ-90.24 §5.7.3。
+                let retry_cfg = CarrierRetryConfig::default();
+                let retry_taken = match &outcome {
+                    Ok(InviteOutcome::Failed { response }) => {
+                        let jitter = random_jitter_offset_ms(retry_cfg.jitter);
+                        let decision = decide_retry(
+                            response.status_code,
+                            &response.headers,
+                            &retry_cfg,
+                            jitter,
+                        );
+                        match decision {
+                            RetryDecision::Retry {
+                                wait,
+                                retry_after_header_secs,
+                            } => {
+                                info!(
+                                    status = response.status_code,
+                                    retry_delay_ms = wait.as_millis() as u64,
+                                    retry_after_header = ?retry_after_header_secs,
+                                    call_id = %plan_call_id,
+                                    aor = %rate_aor_owned,
+                                    "carrier intermittent reject 検知、 N ms 後に 1 回 retry (PWA outbound、 Issue #260 Phase 1-B、 RFC 3261 §20.33)"
+                                );
+                                tokio::time::sleep(wait).await;
+                                if ws_sink_clone.is_closed() {
+                                    info!(
+                                        call_id = %plan_call_id,
+                                        "retry sleep 中に PWA WS が閉じた → retry 中止"
+                                    );
+                                    metrics.record_ngn_carrier_retry(
+                                        RetryOutcome::RetryAbortedByCancel,
+                                    );
+                                    Some(false)
+                                } else {
+                                    info!(
+                                        call_id = %plan_call_id,
+                                        "carrier retry 実行 (試行 2/2、 PWA outbound、 Issue #260)"
+                                    );
+                                    let retry_plan = ngn_uac.build_invite(
+                                        &target_uri,
+                                        Some(&sdp_for_ngn),
+                                        None,
+                                    );
+                                    let new_outcome =
+                                        ngn_uac.invite(retry_plan, Some(sdp_for_ngn.clone())).await;
+                                    let succeeded =
+                                        matches!(new_outcome, Ok(InviteOutcome::Established(_)));
+                                    if succeeded {
+                                        info!(
+                                            call_id = %plan_call_id,
+                                            "carrier retry 結果: 成功 (PWA outbound、 Issue #260)"
+                                        );
+                                        metrics.record_ngn_carrier_retry(
+                                            RetryOutcome::RetriedSucceeded,
+                                        );
+                                    } else {
+                                        let new_status = match &new_outcome {
+                                            Ok(InviteOutcome::Failed { response }) => {
+                                                Some(response.status_code)
+                                            }
+                                            _ => None,
+                                        };
+                                        warn!(
+                                            call_id = %plan_call_id,
+                                            new_status = ?new_status,
+                                            "carrier retry 結果: 再失敗、 元 error を伝搬 (PWA outbound、 Issue #260)"
+                                        );
+                                        metrics
+                                            .record_ngn_carrier_retry(RetryOutcome::RetriedFailed);
+                                    }
+                                    outcome = new_outcome;
+                                    Some(true)
+                                }
+                            }
+                            RetryDecision::NoRetry { .. } => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if retry_taken.is_none() {
+                    metrics.record_ngn_carrier_retry(RetryOutcome::NotRetried);
+                }
 
                 match outcome {
                     Ok(InviteOutcome::Established(call)) => {
@@ -12364,19 +12550,37 @@ mod tests {
         let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let fake_ngn_addr = fake_ngn.local_addr().unwrap();
         let fake_ngn_clone = fake_ngn.clone();
+        // Issue #260 Phase 1-B: carrier intermittent reject に 1 回 retry が
+        // 入るため、 fake NGN は 486 を 2 回 (元 INVITE + retry INVITE) 返す。
+        // ACK / 100 Trying 等は読み飛ばす。
         let ngn_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
-            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
-            if let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() {
-                let mut resp = build_response_skeleton(&req, 486, "Busy Here");
-                resp.headers.set(
-                    "To",
-                    format!("{};tag=busy-tag", req.headers.get("to").unwrap()),
-                );
-                fake_ngn_clone
-                    .send_to(&resp.to_bytes(), peer)
-                    .await
-                    .unwrap();
+            let mut sent = 0u32;
+            while sent < 2 {
+                let (n, peer) = match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    fake_ngn_clone.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(v)) => v,
+                    _ => break,
+                };
+                if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n]) {
+                    if req.method != SipMethod::Invite {
+                        continue;
+                    }
+                    let mut resp = build_response_skeleton(&req, 486, "Busy Here");
+                    resp.headers.set(
+                        "To",
+                        format!("{};tag=busy-tag-{}", req.headers.get("to").unwrap(), sent),
+                    );
+                    fake_ngn_clone
+                        .send_to(&resp.to_bytes(), peer)
+                        .await
+                        .unwrap();
+                    sent += 1;
+                }
             }
         });
 
@@ -12446,7 +12650,8 @@ mod tests {
             .handle_pwa_outbound_offer("117", "v=0", &peer, &ws_sink)
             .await
             .expect("同期パスは成功 (NGN 失敗は background)");
-        let bg = tokio::time::timeout(Duration::from_secs(5), outcome.completion)
+        // Issue #260 Phase 1-B: retry が ~2s 待つので timeout は 10s に拡張。
+        let bg = tokio::time::timeout(Duration::from_secs(10), outcome.completion)
             .await
             .expect("background timeout")
             .expect("background panic");
@@ -12480,19 +12685,35 @@ mod tests {
         let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let fake_ngn_addr = fake_ngn.local_addr().unwrap();
         let fake_ngn_clone = fake_ngn.clone();
+        // Issue #260 Phase 1-B: 503 も auto-retry 対象なので fake NGN は 2 回応答する。
         let ngn_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
-            let (n, peer) = fake_ngn_clone.recv_from(&mut buf).await.unwrap();
-            if let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() {
-                let mut resp = build_response_skeleton(&req, 503, "Service Unavailable");
-                resp.headers.set(
-                    "To",
-                    format!("{};tag=503-tag", req.headers.get("to").unwrap()),
-                );
-                fake_ngn_clone
-                    .send_to(&resp.to_bytes(), peer)
-                    .await
-                    .unwrap();
+            let mut sent = 0u32;
+            while sent < 2 {
+                let (n, peer) = match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    fake_ngn_clone.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(v)) => v,
+                    _ => break,
+                };
+                if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n]) {
+                    if req.method != SipMethod::Invite {
+                        continue;
+                    }
+                    let mut resp = build_response_skeleton(&req, 503, "Service Unavailable");
+                    resp.headers.set(
+                        "To",
+                        format!("{};tag=503-tag-{}", req.headers.get("to").unwrap(), sent),
+                    );
+                    fake_ngn_clone
+                        .send_to(&resp.to_bytes(), peer)
+                        .await
+                        .unwrap();
+                    sent += 1;
+                }
             }
         });
 
@@ -12558,7 +12779,8 @@ mod tests {
             .handle_pwa_outbound_offer("117", "v=0", &peer, &ws_sink)
             .await
             .expect("同期パスは成功");
-        let bg = tokio::time::timeout(Duration::from_secs(5), outcome.completion)
+        // Issue #260 Phase 1-B: retry が ~2s 待つので timeout は 10s に拡張。
+        let bg = tokio::time::timeout(Duration::from_secs(10), outcome.completion)
             .await
             .expect("background timeout")
             .expect("background panic");

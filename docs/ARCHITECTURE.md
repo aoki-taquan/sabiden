@@ -596,6 +596,15 @@ struct OutboundRateLimiter {
   `Reason` (RFC 3326) / `Retry-After` (§20.33) / `Server` (§20.35) / `Warning` (§20.43) /
   Via `received` / `rport` (RFC 3581 §4) を `warn!` 構造化フィールドで dump し、
   carrier intermittent 解析の手がかりにする。
+- `sabiden_ngn_carrier_retry_total{outcome="not_retried"|"succeeded"|"failed"|"aborted_by_cancel"}`
+  — Issue #260 Phase 1-B: NGN carrier intermittent reject (500/486/503) に対する
+  1 回限定 auto-retry の結果別累計。 `decide_retry` (`src/call/carrier_retry.rs`) で
+  policy 判定: 500/486/503 のみ retry 対象、 default wait = 2s + ±0.5s jitter、
+  Retry-After ヘッダがあれば遵守 (RFC 3261 §20.33)、 Retry-After が 5s を超えるなら
+  諦め。 retry は新 Call-ID で再 INVITE (RFC 3261 §8.1.1.5)、 sleep 中の内線
+  CANCEL / PWA WS close は select / `WsSink::is_closed` で検出して
+  `aborted_by_cancel` に分類。 TTC JJ-90.24 §5.7.3 (Retry-After 遵守 + 過度な retry
+  回避) に整合。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

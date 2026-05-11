@@ -532,6 +532,101 @@ async fn ngn_to_web_loop(
     }
 }
 
+/// Opus デコード結果 (48 kHz PCM) を 20 ms 単位の μ-law payload に変換するための
+/// 累積バッファ。
+///
+/// # 必要性 (Issue #200)
+///
+/// RFC 7587 §4.1 (Frame Sizes): Opus は **2.5 / 5 / 10 / 20 / 40 / 60 ms** の
+/// 6 種のフレーム長を許す (= 120 / 240 / 480 / 960 / 1920 / 2880 samples @ 48 kHz)。
+/// RFC 7587 §4.2: "the receiver SHOULD NOT assume any particular frame size."
+///
+/// sabiden の出力レッグ (NGN PCMU) は RFC 3551 §4.5.14 で **20 ms 固定**
+/// (= 160 samples @ 8 kHz)。 そのため 20 ms 未満の短尺フレームは「単発では
+/// 20 ms 境界に揃わない」 → 累積して 20 ms 分溜まったら一括 emit する必要がある。
+///
+/// 旧実装 (PR #197) は `wb.samples.len() % WB_FRAME_SAMPLES == 0` を要求して
+/// 短尺フレームを silently drop していた。 本構造体はその drop を消し、
+/// 短尺フレームを溜めて 20 ms 境界で flush する。
+///
+/// # 設計選択
+///
+/// - **48 kHz (wideband) 側で累積** する。 [`DownsamplerWbToNb`] は
+///   `FastFixedIn` 固定入力長 960 で構築されているため (`src/rtp/codec/resample.rs`)、
+///   1 chunk = 960 samples 単位でしか resample できない。 8 kHz 側で累積する
+///   設計だと resample 入出力長が崩れる。
+/// - **20 ms 未満の余剰 (tail) は次フレームへ持ち越し**。 例: 2.5 ms (120 samples)
+///   フレームを 8 個累積 → 960 samples → 1 個 emit。 7 個目までは tail に残る。
+/// - 同様に 40/60 ms (1920/2880 samples) はそのまま 2/3 個の chunk に分割される
+///   ため、 旧 `chunks(WB_FRAME_SAMPLES)` 経路の挙動 (PR #197) を保つ。
+/// - **連続性**: 累積バッファは Opus decoder の出力連結であり、 サンプル境界が
+///   60 ms フレーム間で繋がる。 サブフレーム境界で 0 埋めしないため、 折返し
+///   位相が崩れて聴感上のクリックは出ない (libopus が境界を補間してデコード
+///   する前提)。
+struct OpusToPcmuAccum {
+    /// 48 kHz wideband 累積バッファ。 `WB_FRAME_SAMPLES` 単位で drain される。
+    buf: Vec<i16>,
+}
+
+impl OpusToPcmuAccum {
+    fn new() -> Self {
+        Self {
+            // RFC 6716 §3.2: 最大 packet duration = 120 ms (5760 samples)。
+            // ホットパスでの再アロケート回避のため、 5760 + 1 frame 余裕で確保。
+            buf: Vec::with_capacity(WB_FRAME_SAMPLES * 7),
+        }
+    }
+
+    /// Opus デコード結果 (48 kHz PCM) を流し込む。 内部累積長が
+    /// `WB_FRAME_SAMPLES` (= 960) に達したら以下が起きる:
+    /// 1. 先頭 960 samples を切り出して [`DownsamplerWbToNb`] へ流す
+    /// 2. 8 kHz NB フレーム (160 samples) を得る
+    /// 3. μ-law に変換して `Vec<Vec<u8>>` の 1 chunk として返す
+    ///
+    /// 入力長によっては複数 chunk を一度に返す (例: 60 ms = 2880 samples 投入で
+    /// 3 chunk emit)。 入力が短くて累積が `WB_FRAME_SAMPLES` 未満で終わる場合は
+    /// 空 `Vec` を返し、 余りは内部バッファに保持される。
+    ///
+    /// # エラー
+    ///
+    /// downsampler / 内部状態の異常時のみ。 RFC 7587 §4.1 で許される全フレーム長
+    /// (120/240/480/960/1920/2880 samples) と RFC 6716 §3.2 multi-frame
+    /// (合算 ≤ 5760 samples) は `Ok` で返す。
+    fn push(
+        &mut self,
+        decoded_wb: &[i16],
+        downsampler: &mut DownsamplerWbToNb,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.buf.extend_from_slice(decoded_wb);
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        while self.buf.len() >= WB_FRAME_SAMPLES {
+            // 先頭 WB_FRAME_SAMPLES を取り出して残りを左詰めで保持。
+            // `drain(..WB_FRAME_SAMPLES)` は内部で memmove するが、 通常ケース
+            // (20 ms 入力 → 残り 0) では即 no-op になる。
+            let chunk: Vec<i16> = self.buf.drain(..WB_FRAME_SAMPLES).collect();
+            let frame = AudioFrame::new(OPUS_SAMPLE_RATE, chunk);
+            let nb = downsampler.process(&frame)?;
+            if nb.samples.len() != NB_FRAME_SAMPLES {
+                anyhow::bail!(
+                    "NB フレーム長異常: {} samples (期待 {})",
+                    nb.samples.len(),
+                    NB_FRAME_SAMPLES
+                );
+            }
+            let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
+            chunks.push(ulaw);
+        }
+        Ok(chunks)
+    }
+
+    /// 内部に残っている tail サンプル数 (< `WB_FRAME_SAMPLES`)。
+    /// テスト / メトリクス用。
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 /// WebRTC (Opus 48k) → NGN (μ-law 8k) 方向の 1 ループ。
 ///
 /// # ジッタバッファ統合 (Issue #105)
@@ -574,6 +669,10 @@ async fn web_to_ngn_loop(
             return;
         }
     };
+    // RFC 7587 §4.1 / Issue #200: 2.5/5/10 ms 短尺フレームを 20 ms 境界に
+    // 揃えるための累積バッファ。 20/40/60 ms (= 960/1920/2880 samples) も
+    // 同じ経路で chunk 分割される (旧 PR #197 の chunks(960) と等価)。
+    let mut accum = OpusToPcmuAccum::new();
 
     // 出力 RTP egress 状態は `BridgeState::web_to_ngn_egress` を共有 (Issue #112)。
 
@@ -641,13 +740,10 @@ async fn web_to_ngn_loop(
                 // RFC 7587 §4.2: "the receiver SHOULD NOT assume any particular
                 // frame size" — 受信側は 20 ms 以外も処理する義務がある。
                 //
-                // Issue #89: 旧実装は 20 ms (960 samples) 固定で検査して
-                // それ以外を silently drop していた。 修正後は decode 出力を
-                // 20 ms chunk (= `WB_FRAME_SAMPLES`) ごとに分割し、 各 chunk を
-                // downsample → μ-law encode → RTP send する。
-                // `DownsamplerWbToNb` は `FastFixedIn` 固定入力長 960 で構築されて
-                // いる (`src/rtp/codec/resample.rs:81-90`) ため、 1920/2880 等を
-                // 一括投入できない。 必ず chunks(960) で分割処理する。
+                // Issue #89 (PR #197) で 40/60 ms 単発フレームの 20 ms 分割は実装済。
+                // Issue #200 (本 PR) で 2.5/5/10 ms 短尺フレームを `OpusToPcmuAccum`
+                // に累積し、 20 ms 境界 (= 960 samples @ 48 kHz) が満ちた時点で
+                // chunk を emit する経路に統一した。
                 let wb = match decoder.decode(&pkt.payload) {
                     Ok(v) => v,
                     Err(e) => {
@@ -656,19 +752,33 @@ async fn web_to_ngn_loop(
                         continue;
                     }
                 };
-                if wb.samples.is_empty() || !wb.samples.len().is_multiple_of(WB_FRAME_SAMPLES) {
-                    // RFC 7587 §4.1 で許される frame size は全て 20ms の整数倍
-                    // (20/40/60 ms)。 2.5/5/10 ms はインタオペ実績が稀で、
-                    // sabiden の出力レッグ (NGN PCMU 20ms 固定) ともフレーム境界が
-                    // 一致しない。 これらは現時点で未サポートとして drop する。
-                    // TODO(本流対応): 2.5/5/10 ms 対応は内部で 20ms 単位に
-                    //   累積するバッファを別途設けて Issue #89 fix の続きで扱う。
-                    trace!(
-                        samples = wb.samples.len(),
-                        wb_frame = WB_FRAME_SAMPLES,
-                        "WebRTC フレーム長が 20ms (960) の整数倍でない → drop"
-                    );
+                if wb.samples.is_empty() {
+                    // RFC 7587 §6.2 PLC は OpusDecoder::decode が 20 ms 分の
+                    // サンプルを返すため、 ここで空になるのは libopus 異常時のみ。
+                    trace!("Opus decode が空サンプルを返した → drop");
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // 累積 → 20 ms 境界が満ちるたびに μ-law chunk を取り出す。
+                // 短尺フレーム (2.5/5/10 ms) の場合、 単発投入では chunk が
+                // 出ない (累積が 960 未満)。 次の packet で 20 ms に達した時に emit。
+                let ulaw_chunks = match accum.push(&wb.samples, &mut downsampler) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        trace!(error=%e, "累積 / ダウンサンプル失敗");
+                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                if ulaw_chunks.is_empty() {
+                    // 短尺 (2.5/5/10 ms) フレームを単発受信した場合の正常経路。
+                    // 累積はバッファに残り、 次 packet で flush される。
+                    trace!(
+                        wb_samples = wb.samples.len(),
+                        pending = accum.buf.len(),
+                        "短尺 Opus フレーム → 累積バッファに保持 (RFC 7587 §4.1 / Issue #200)"
+                    );
                     continue;
                 }
 
@@ -684,34 +794,7 @@ async fn web_to_ngn_loop(
                 // 各 chunk は同じ SSRC を共有しつつ seq +1 / ts +160 (RFC 3551
                 // §4.5.14: PCMU 8 kHz × 20 ms) ずつ進む。 RFC 3550 §5.1 の
                 // 「同一 SSRC 内 seq は monotonically increasing」 を満たす。
-                let mut chunk_failed = false;
-                for chunk in wb.samples.chunks(WB_FRAME_SAMPLES) {
-                    // chunks() の最後が短くなることは上の % 検査で排除済みだが、
-                    // 念のため defensive check。
-                    if chunk.len() != WB_FRAME_SAMPLES {
-                        trace!(samples = chunk.len(), "chunk 長異常 → drop");
-                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                        chunk_failed = true;
-                        break;
-                    }
-                    let frame = AudioFrame::new(OPUS_SAMPLE_RATE, chunk.to_vec());
-                    let nb = match downsampler.process(&frame) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            trace!(error=%e, "ダウンサンプル失敗");
-                            state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                            chunk_failed = true;
-                            break;
-                        }
-                    };
-                    if nb.samples.len() != NB_FRAME_SAMPLES {
-                        trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
-                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                        chunk_failed = true;
-                        break;
-                    }
-                    let ulaw: Vec<u8> = nb.samples.iter().map(|s| encode_ulaw(*s)).collect();
-
+                for ulaw in ulaw_chunks {
                     // 共有 egress state から SSRC / seq / ts と M ビットを払い出す。
                     // RFC 3551 §4.5.14: PCMU clock = 8 kHz → 20ms = 160 samples。
                     // RFC 3551 §4.1 (M bit): talkspurt 開始の最初の packet に M=1。
@@ -734,7 +817,6 @@ async fn web_to_ngn_loop(
 
                     if let Err(e) = to_socket.send_to(&out_pkt.to_bytes(), dest).await {
                         warn!(error=%e, "NGN へ RTP forward 失敗");
-                        chunk_failed = true;
                         break;
                     }
                     state.web_to_ngn_packets.fetch_add(1, Ordering::Relaxed);
@@ -742,9 +824,6 @@ async fn web_to_ngn_loop(
                         m.add_rtp_ext_to_ngn(1);
                     }
                 }
-                // chunk_failed の場合は途中で break しているだけで、 上位ループ
-                // (受信再開) は継続する。 明示的に変数を読んで warning 回避。
-                let _ = chunk_failed;
             }
         }
     }
@@ -1158,6 +1237,10 @@ async fn peer_to_ngn_loop(
         };
         Some((down, dec))
     };
+    // RFC 7587 §4.1 / Issue #200: 2.5/5/10 ms 短尺フレームを 20 ms 境界に
+    // 揃えるための累積バッファ。 トランスコードモード (Opus → PCMU) でのみ
+    // 使い、 PCMU 直送モードでは使わない (PCMU は受信時点で既に 20 ms 単位)。
+    let mut accum = OpusToPcmuAccum::new();
 
     // RTP egress 状態は `BridgeState::web_to_ngn_egress` を共有 (Issue #112)。
     let expected_pt = if direct_pcmu_passthrough {
@@ -1181,15 +1264,12 @@ async fn peer_to_ngn_loop(
         // - PCMU 直送モード: 1 chunk (= frame.payload そのまま)。
         // - トランスコードモード: Opus decode 結果を 20ms ごとに分割して
         //   N chunk (N = frame_size_ms / 20、 RFC 7587 §4.1 で許される
-        //   20/40/60 ms 単体フレーム、 もしくは RFC 6716 §3.2 multi-frame
+        //   2.5/5/10/20/40/60 ms 単体フレーム、 もしくは RFC 6716 §3.2 multi-frame
         //   packet で合算 120 ms まで)。
         //
-        // Issue #89: 旧実装は 20 ms 固定 (`wb.samples.len() != WB_FRAME_SAMPLES`)
-        // で 40 ms / 60 ms フレームを silently drop していた。 修正後は
-        // chunks(WB_FRAME_SAMPLES) で分割して 各 chunk を個別に downsample →
-        // μ-law encode する。 `DownsamplerWbToNb` は `FastFixedIn` 固定入力長
-        // 960 で構築されている (`src/rtp/codec/resample.rs:81-90`) ため、
-        // 1920 / 2880 等を一括投入できない。
+        // Issue #89 (PR #197) で 40/60 ms 単発フレームの 20 ms 分割は実装済。
+        // Issue #200 (本 PR) で `OpusToPcmuAccum` を導入し、 2.5/5/10 ms 短尺
+        // フレームは 20 ms 境界が満ちるまで累積、 満ちた時点で chunk を emit する。
         let ulaw_chunks: Vec<Vec<u8>> = if direct_pcmu_passthrough {
             // PCMU 直送: peer からの μ-law payload をそのまま NGN へ。
             vec![frame.payload.clone()]
@@ -1213,50 +1293,36 @@ async fn peer_to_ngn_loop(
                     continue;
                 }
             };
-            if wb.samples.is_empty() || !wb.samples.len().is_multiple_of(WB_FRAME_SAMPLES) {
-                // 2.5/5/10 ms 等の 20ms 倍数でないフレーム長は現時点で未サポート
-                // (TODO(本流対応): Issue #89 fix の続きで内部累積バッファを設ける)。
-                trace!(
-                    samples = wb.samples.len(),
-                    wb_frame = WB_FRAME_SAMPLES,
-                    "WebRTC フレーム長が 20ms (960) の整数倍でない → drop"
-                );
+            if wb.samples.is_empty() {
+                // RFC 7587 §6.2 PLC は OpusDecoder::decode が 20 ms 分の
+                // サンプルを返すため、 ここで空になるのは libopus 異常時のみ。
+                trace!("Opus decode が空サンプルを返した → drop");
                 state.transcode_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
-            let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(wb.samples.len() / WB_FRAME_SAMPLES);
-            let mut chunk_err = false;
-            for chunk in wb.samples.chunks(WB_FRAME_SAMPLES) {
-                if chunk.len() != WB_FRAME_SAMPLES {
-                    trace!(samples = chunk.len(), "chunk 長異常 → drop");
+            // 累積 → 20 ms 境界が満ちるたびに μ-law chunk を取り出す。
+            // 短尺フレーム (2.5/5/10 ms) を単発受信した場合は空 Vec が返り、
+            // 累積バッファに保持され、 次の packet で flush される。
+            match accum.push(&wb.samples, downsampler) {
+                Ok(v) => v,
+                Err(e) => {
+                    trace!(error=%e, "累積 / ダウンサンプル失敗");
                     state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                    chunk_err = true;
-                    break;
+                    continue;
                 }
-                let wb_chunk = AudioFrame::new(OPUS_SAMPLE_RATE, chunk.to_vec());
-                let nb = match downsampler.process(&wb_chunk) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        trace!(error=%e, "ダウンサンプル失敗");
-                        state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                        chunk_err = true;
-                        break;
-                    }
-                };
-                if nb.samples.len() != NB_FRAME_SAMPLES {
-                    trace!(samples = nb.samples.len(), "NB フレーム長異常 → drop");
-                    state.transcode_errors.fetch_add(1, Ordering::Relaxed);
-                    chunk_err = true;
-                    break;
-                }
-                chunks.push(nb.samples.iter().map(|s| encode_ulaw(*s)).collect());
             }
-            if chunk_err {
-                continue;
-            }
-            chunks
         };
+
+        // 短尺フレーム単発で chunk が出ない場合は 1 packet skip (累積継続)。
+        // 直送モードでは frame.payload が必ず 1 chunk になるため empty は起きない。
+        if ulaw_chunks.is_empty() {
+            trace!(
+                pending = accum.buf.len(),
+                "短尺 Opus フレーム → 累積バッファに保持 (RFC 7587 §4.1 / Issue #200)"
+            );
+            continue;
+        }
 
         let dest = match *to_state.peer.lock().await {
             Some(d) => d,
@@ -3051,6 +3117,410 @@ mod tests {
                 i
             );
         }
+
+        bridge.stop().await;
+    }
+
+    // ====================================================================
+    // Issue #200: 2.5/5/10 ms Opus 短尺フレーム対応 (RFC 7587 §4.2)
+    // ====================================================================
+
+    /// RFC 7587 §4.1 (Frame Sizes): 2.5 ms Opus 単発フレーム (= 120 samples
+    /// @ 48 kHz) を [`OpusToPcmuAccum`] に投入しても、 累積が 20 ms 境界
+    /// (= 960 samples) に達しないため chunk は emit されない。 短尺フレームを
+    /// 単発で silently drop せず、 内部バッファに保持することを契約として固定する。
+    ///
+    /// Issue #200 / RFC 7587 §4.2: "the receiver SHOULD NOT assume any
+    /// particular frame size."
+    #[test]
+    fn rfc7587_4_1_accum_holds_2_5ms_short_frame_without_emit() {
+        let mut downsampler = DownsamplerWbToNb::new().unwrap();
+        let mut accum = OpusToPcmuAccum::new();
+
+        // 2.5 ms = 120 samples @ 48 kHz の無音 PCM
+        let short_wb: Vec<i16> = vec![0; 120];
+        let chunks = accum.push(&short_wb, &mut downsampler).unwrap();
+
+        assert!(
+            chunks.is_empty(),
+            "2.5 ms (120 samples) 単発で chunk が emit された: {} 個",
+            chunks.len()
+        );
+        assert_eq!(
+            accum.pending(),
+            120,
+            "2.5 ms 投入後の累積長が 120 samples でない: {}",
+            accum.pending()
+        );
+    }
+
+    /// RFC 7587 §4.1: 2.5 ms × 8 = 20 ms ぶん累積したら、 ちょうど 1 chunk
+    /// (160 byte μ-law payload) が emit され、 累積バッファは空になる。
+    /// 短尺フレームを 20 ms 境界で再構成する契約。
+    ///
+    /// Issue #200: 旧実装は 2.5/5/10 ms を全て drop していたため、
+    /// このテストは silently drop 撤去を回帰検査する。
+    #[test]
+    fn rfc7587_4_1_accum_emits_one_pcmu_chunk_after_8_x_2_5ms_frames() {
+        let mut downsampler = DownsamplerWbToNb::new().unwrap();
+        let mut accum = OpusToPcmuAccum::new();
+
+        // 2.5 ms × 7 投入: chunk 0 個 (累積 840 samples、 まだ 960 未満)
+        for i in 0..7 {
+            let short_wb: Vec<i16> = vec![0; 120];
+            let chunks = accum.push(&short_wb, &mut downsampler).unwrap();
+            assert!(
+                chunks.is_empty(),
+                "{} 回目 (累積 {} samples) で予期せず chunk が emit",
+                i + 1,
+                (i + 1) * 120
+            );
+        }
+        assert_eq!(accum.pending(), 7 * 120);
+
+        // 8 個目: 累積 960 samples → ちょうど 1 chunk
+        let short_wb: Vec<i16> = vec![0; 120];
+        let chunks = accum.push(&short_wb, &mut downsampler).unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "2.5 ms × 8 = 20 ms 境界で 1 chunk emit されていない"
+        );
+        assert_eq!(
+            chunks[0].len(),
+            SAMPLES_PER_FRAME,
+            "PCMU payload が 160 byte (RFC 3551 §4.5.14) でない: {}",
+            chunks[0].len()
+        );
+        assert_eq!(
+            accum.pending(),
+            0,
+            "20 ms ぴったり投入後の累積残りが 0 でない: {}",
+            accum.pending()
+        );
+    }
+
+    /// RFC 7587 §4.1: 5 ms / 10 ms 単発フレーム ⇒ accum で chunk 0 個
+    /// (累積 240 / 480 samples、 どちらも 960 未満)。 引き続き 20 ms 等の
+    /// フレームで累積が 960 を跨ぐと chunk が emit される。
+    ///
+    /// 5 ms × 4 = 20 ms 境界、 10 ms × 2 = 20 ms 境界もそれぞれ 1 chunk を
+    /// 出すことを確認する。
+    #[test]
+    fn rfc7587_4_1_accum_handles_5ms_and_10ms_short_frames() {
+        // 5 ms × 4 = 20 ms ジャスト → 1 chunk
+        {
+            let mut downsampler = DownsamplerWbToNb::new().unwrap();
+            let mut accum = OpusToPcmuAccum::new();
+            let mut total_chunks = 0usize;
+            for _ in 0..4 {
+                let wb: Vec<i16> = vec![0; 240]; // 5 ms @ 48 kHz
+                total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+            }
+            assert_eq!(
+                total_chunks, 1,
+                "5 ms × 4 で 1 chunk emit されていない: {}",
+                total_chunks
+            );
+            assert_eq!(accum.pending(), 0);
+        }
+
+        // 10 ms × 2 = 20 ms ジャスト → 1 chunk
+        {
+            let mut downsampler = DownsamplerWbToNb::new().unwrap();
+            let mut accum = OpusToPcmuAccum::new();
+            let mut total_chunks = 0usize;
+            for _ in 0..2 {
+                let wb: Vec<i16> = vec![0; 480]; // 10 ms @ 48 kHz
+                total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+            }
+            assert_eq!(
+                total_chunks, 1,
+                "10 ms × 2 で 1 chunk emit されていない: {}",
+                total_chunks
+            );
+            assert_eq!(accum.pending(), 0);
+        }
+    }
+
+    /// RFC 7587 §4.1: 既存 20/40/60 ms 経路 (PR #197) と短尺 2.5/5/10 ms 混在
+    /// シーケンスでも regression が無いこと。 chunk emit 数 = 累積サンプル合計 /
+    /// 960 で正確に一致する (端数は accum.buf に残る)。
+    ///
+    /// シーケンス: [10 ms, 10 ms, 40 ms, 2.5 ms × 8, 60 ms]
+    ///   累積 = 480 + 480 + 1920 + 8×120 + 2880 = 6720 samples
+    ///   期待 chunk 数 = 6720 / 960 = 7、 余り 0
+    #[test]
+    fn rfc7587_4_1_accum_mixed_frame_sizes_emit_correct_pcmu_count() {
+        let mut downsampler = DownsamplerWbToNb::new().unwrap();
+        let mut accum = OpusToPcmuAccum::new();
+
+        let mut total_chunks = 0usize;
+
+        // 10 ms × 2
+        for _ in 0..2 {
+            let wb: Vec<i16> = vec![0; 480];
+            total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+        }
+        // 40 ms × 1
+        {
+            let wb: Vec<i16> = vec![0; 1920];
+            total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+        }
+        // 2.5 ms × 8
+        for _ in 0..8 {
+            let wb: Vec<i16> = vec![0; 120];
+            total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+        }
+        // 60 ms × 1
+        {
+            let wb: Vec<i16> = vec![0; 2880];
+            total_chunks += accum.push(&wb, &mut downsampler).unwrap().len();
+        }
+
+        // 累積合計 = 480+480+1920+8*120+2880 = 6720、 6720/960 = 7
+        assert_eq!(
+            total_chunks, 7,
+            "混在 frame 長で chunk 数不一致: 期待 7、 実際 {}",
+            total_chunks
+        );
+        assert_eq!(
+            accum.pending(),
+            0,
+            "混在 sequence の余りが 0 でない: {}",
+            accum.pending()
+        );
+    }
+
+    /// Issue #200 / RFC 7587 §4.1: `WebRtcAudioBridge::peer_to_ngn_loop`
+    /// (str0m 経由 Opus → NGN PCMU トランスコード経路) が 10 ms 短尺
+    /// Opus フレーム × 2 を受信したとき、 NGN 側に **1 個** の 20 ms PCMU を emit
+    /// する (PR #197 まで silently drop だった 短尺対応の regression test)。
+    ///
+    /// 旧実装は `wb.samples.len() % WB_FRAME_SAMPLES != 0` で短尺を全 drop。
+    /// 修正後は 10 ms × 2 = 20 ms が累積された時点で 1 個の PCMU RTP が NGN に出る。
+    #[tokio::test]
+    async fn rfc7587_4_1_peer_to_ngn_accumulates_10ms_opus_into_one_pcmu() {
+        use std::sync::Arc as SArc;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, _: MediaFrame) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ngn_sock = SArc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ngn_peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer_sock.local_addr().unwrap();
+
+        let (peer_tx, peer_rx) = mpsc::channel::<MediaFrame>(16);
+
+        let bridge = WebRtcAudioBridge::start(WebRtcAudioConfig {
+            ngn_socket: ngn_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            peer: Arc::new(NoopPeer),
+            peer_media_rx: peer_rx,
+            opus_payload_type: DEFAULT_OPUS_PT,
+            direct_pcmu_passthrough: false,
+            metrics: None,
+        });
+
+        // 10 ms = 480 samples @ 48 kHz の 1 kHz サイン波を 2 packet 投入。
+        // libopus は frame_size=480 を受け取ると単体 10 ms フレームを生成する
+        // (RFC 6716 §3.2.1)。
+        let n_samples_10ms = (OPUS_SAMPLE_RATE as usize * 10) / 1000;
+        let mut samples = Vec::with_capacity(n_samples_10ms);
+        for i in 0..n_samples_10ms {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+        let mut enc = OpusEncoder::new().unwrap();
+        let pkt1 = enc.encode_test_variable_duration(&frame).unwrap();
+        let pkt2 = enc.encode_test_variable_duration(&frame).unwrap();
+
+        for (i, p) in [pkt1, pkt2].into_iter().enumerate() {
+            peer_tx
+                .send(MediaFrame {
+                    pt: DEFAULT_OPUS_PT,
+                    rtp_time: (i as u32) * (n_samples_10ms as u32),
+                    payload: p,
+                    network_time: std::time::Instant::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // 1 個目の 10 ms packet では NGN 側に何も出ない (累積 480 < 960)。
+        // 2 個目で 960 samples 到達 → 1 個の 20 ms PCMU が emit。
+        let mut buf = vec![0u8; 1500];
+        let (n, _) = timeout(Duration::from_secs(2), ngn_peer_sock.recv_from(&mut buf))
+            .await
+            .expect("10 ms × 2 投入後に NGN 側で PCMU が届かない (silently drop?)")
+            .unwrap();
+        let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(
+            recv.payload_type, PAYLOAD_TYPE_ULAW,
+            "PT が PCMU でない: {}",
+            recv.payload_type
+        );
+        assert_eq!(
+            recv.payload.len(),
+            SAMPLES_PER_FRAME,
+            "PCMU payload が 160 bytes (RFC 3551 §4.5.14) でない: {}",
+            recv.payload.len()
+        );
+
+        // 累積が空に戻ったため、 2 個目以降の packet が即時に追加で出ることはない。
+        // (短尺の単発投入で追加 emit が無いことを確認)
+        let extra = timeout(
+            Duration::from_millis(150),
+            ngn_peer_sock.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "10 ms × 2 投入で 2 個目の PCMU が誤って emit された (期待 1 個)"
+        );
+
+        // silently drop が消えているので transcode_errors は 0
+        let (_n2p, _p2n, err) = bridge.stats();
+        assert_eq!(
+            err, 0,
+            "短尺 10 ms 経路で transcode_errors が 0 でない: {}",
+            err
+        );
+
+        bridge.stop().await;
+    }
+
+    /// Issue #200 / RFC 7587 §4.1: `TranscodingBridge::web_to_ngn_loop`
+    /// (UDP-only 経路) も 10 ms 短尺 Opus フレームを累積して 20 ms 単位の PCMU を
+    /// emit する。 こちらは jitter buffer (`JITTER_DEPTH = 4`) を経由するため、
+    /// 投入数は `JITTER_DEPTH + 2 = 6` packet とし、 jitter pull 後の累積で
+    /// 最低 1 個の PCMU が NGN に届くことを確認する。
+    #[tokio::test]
+    async fn rfc7587_4_1_web_to_ngn_accumulates_10ms_opus_into_pcmu() {
+        let ngn_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let web_addr = web_sock.local_addr().unwrap();
+
+        let ngn_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let web_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ngn_peer_addr = ngn_peer.local_addr().unwrap();
+        let web_peer_addr = web_peer.local_addr().unwrap();
+
+        let bridge = TranscodingBridge::start(TranscodeConfig {
+            ngn_socket: ngn_sock,
+            web_socket: web_sock,
+            ngn_peer: Some(ngn_peer_addr),
+            web_peer: Some(web_peer_addr),
+            opus_payload_type: DEFAULT_OPUS_PT,
+            metrics: None,
+        })
+        .unwrap();
+
+        // 10 ms 1 kHz サイン波 (1 個あたり 480 samples @ 48 kHz)
+        let n_samples_10ms = (OPUS_SAMPLE_RATE as usize * 10) / 1000;
+        let mut samples = Vec::with_capacity(n_samples_10ms);
+        for i in 0..n_samples_10ms {
+            let t = i as f32 / OPUS_SAMPLE_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 8000.0;
+            samples.push(v as i16);
+        }
+        let frame = AudioFrame::new(OPUS_SAMPLE_RATE, samples);
+
+        // JITTER_DEPTH + 2 = 6 packet 投入 (= 60 ms 累積、 期待 PCMU 3 個)
+        let n_total = JITTER_DEPTH + 2;
+        let mut enc = OpusEncoder::new().unwrap();
+        for i in 0..n_total {
+            let opus_payload = enc.encode_test_variable_duration(&frame).unwrap();
+            let pkt = RtpPacket {
+                payload_type: DEFAULT_OPUS_PT,
+                marker: false,
+                sequence: (i as u16) + 1,
+                timestamp: (i as u32) * (n_samples_10ms as u32),
+                ssrc: 0xCAFE_BABE,
+                payload: opus_payload,
+            }
+            .to_bytes();
+            web_peer.send_to(&pkt, web_addr).await.unwrap();
+        }
+
+        // 6 × 10 ms = 60 ms → 60 / 20 = 3 個の PCMU が届く
+        // (jitter buffer pull は 5 個目以降で始まるため、 全 6 packet 分の pull が
+        //  完了するまで 5 × 20 ms ≒ 100 ms かかる)
+        let expected_pcmu = (n_total * 10) / 20;
+        let mut received: Vec<RtpPacket> = Vec::with_capacity(expected_pcmu);
+        for _ in 0..expected_pcmu {
+            let mut buf = vec![0u8; 1500];
+            let (n, _) = timeout(Duration::from_secs(3), ngn_peer.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "10 ms accum: NGN 側で {} 個目の PCMU を受信できない (期待 {})",
+                        received.len() + 1,
+                        expected_pcmu
+                    )
+                })
+                .unwrap();
+            let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
+            assert_eq!(recv.payload_type, PAYLOAD_TYPE_ULAW, "10 ms accum: PT 不正");
+            assert_eq!(
+                recv.payload.len(),
+                SAMPLES_PER_FRAME,
+                "10 ms accum: PCMU 長が 160 byte でない: {}",
+                recv.payload.len()
+            );
+            received.push(recv);
+        }
+
+        // 連続性 (RFC 3550 §5.1 / RFC 3551 §4.5.14)
+        for w in received.windows(2) {
+            assert_eq!(
+                w[1].sequence.wrapping_sub(w[0].sequence),
+                1,
+                "10 ms accum: 出力 seq 不連続"
+            );
+            assert_eq!(
+                w[1].timestamp.wrapping_sub(w[0].timestamp),
+                SAMPLES_PER_FRAME as u32,
+                "10 ms accum: 出力 ts 増分不正"
+            );
+        }
+
+        // silently drop が消えた契約: transcode_errors = 0
+        let (_n2w, w2n, err) = bridge.stats();
+        assert_eq!(
+            err, 0,
+            "10 ms accum: transcode_errors が 0 でない (silently drop 残存): {}",
+            err
+        );
+        assert!(
+            w2n >= expected_pcmu as u64,
+            "10 ms accum: PCMU 送信カウンタが {} 以上でない: {}",
+            expected_pcmu,
+            w2n
+        );
 
         bridge.stop().await;
     }

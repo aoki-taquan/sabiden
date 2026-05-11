@@ -86,10 +86,17 @@ impl OpusEncoder {
     /// テスト専用: 任意の Opus 有効フレーム長 (RFC 7587 §4.1: 2.5/5/10/20/40/60 ms)
     /// の PCM を直接 libopus に渡してエンコードする。 production 経路では
     /// [`Self::encode`] が 20 ms 固定で十分なため呼ばないが、 transcoder の
-    /// 40 ms / 60 ms 入力分割を契約として固定するテスト ([Issue #89]) でだけ使う。
+    /// 2.5/5/10 ms ([Issue #200]) / 40 ms / 60 ms ([Issue #89]) 入力分割を
+    /// 契約として固定するテストでだけ使う。
     ///
     /// CLAUDE.md §6.3 「production-side test hook 禁止」 と整合させるため
     /// `#[cfg(test)]` でゲートし、 production binary には含めない。
+    ///
+    /// RFC 6716 §3.2.1: libopus が受け付ける単体フレームの有効サンプル数は
+    /// `{120, 240, 480, 960, 1920, 2880}` (= 2.5/5/10/20/40/60 ms @ 48 kHz)。
+    /// 加えて RFC 6716 §3.2 (code-3 multi-frame) は 20 ms 単位の連結を許す
+    /// (合算最大 120 ms / 5760 samples)。 本関数は単体フレームと 20ms 連結の
+    /// 両方を受け付ける。
     #[cfg(test)]
     pub(crate) fn encode_test_variable_duration(&mut self, frame: &AudioFrame) -> Result<Vec<u8>> {
         if frame.sample_rate != OPUS_SAMPLE_RATE {
@@ -98,14 +105,21 @@ impl OpusEncoder {
                 frame.sample_rate
             );
         }
-        // RFC 6716 §3.2.1: 有効な frame_size は 120/240/480/960/1920/2880 samples。
-        // ここでは N×20ms (= N×960) のみ受け付け、 sabiden の出力 PCMU (20ms) と
-        // フレーム境界が一致する組合せに限定する。
+        // RFC 6716 §3.2.1: 有効な単体 frame_size は 120/240/480/960/1920/2880 samples。
+        // sabiden の出力 PCMU は 20ms 境界だが、 受信側 (transcoder accum バッファ)
+        // が 2.5/5/10 ms 短尺フレームを 20ms に揃えるテスト ([Issue #200]) のため、
+        // 短尺フレームと N×20ms (multi-frame concatenation) の両方を許可する。
         let len = frame.samples.len();
-        if len == 0 || !len.is_multiple_of(OPUS_FRAME_SAMPLES) {
+        const VALID_SINGLE_FRAME: [usize; 6] = [120, 240, 480, 960, 1920, 2880];
+        let is_valid_single = VALID_SINGLE_FRAME.contains(&len);
+        let is_valid_multi = len > 0 && len.is_multiple_of(OPUS_FRAME_SAMPLES);
+        if !is_valid_single && !is_valid_multi {
             anyhow::bail!(
-                "テスト用 encode: PCM 長が 20ms (960 samples) の整数倍でない: {}",
-                len
+                "テスト用 encode: PCM 長が Opus 有効フレーム長でない: {} \
+                 (許容 {:?} もしくは N×{} の連結)",
+                len,
+                VALID_SINGLE_FRAME,
+                OPUS_FRAME_SAMPLES
             );
         }
         let mut out = vec![0u8; OPUS_MAX_PACKET];

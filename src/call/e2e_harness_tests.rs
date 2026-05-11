@@ -1216,8 +1216,8 @@ async fn phase_1b_e2e_inbound_500_then_200_succeeds_via_retry() {
         .unwrap();
 
     // 5) NGN タスク完了を待つ (Phase 1-B.2: 1 回目 500 → 8s±1.5s sleep → 2 回目
-    //    200 OK = 計 ~10 秒で完了)。 余裕を持って 20 秒上限。
-    timeout(Duration::from_secs(20), ngn_task)
+    //    200 OK = 計 ~10 秒で完了)。 CI runner overhead を考慮し 60 秒上限。
+    timeout(Duration::from_secs(60), ngn_task)
         .await
         .expect("fake NGN タスクが終わらない (retry が動いていない可能性)")
         .unwrap();

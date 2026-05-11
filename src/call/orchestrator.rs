@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
@@ -86,6 +86,190 @@ use crate::webrtc::signaling::{
 /// 載せるのは「実装が実用的に処理する」method に限る (RFC 3261 §20.5
 /// 「a list of methods that the UA implementing this header supports」)。
 const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
+
+/// RFC 3261 §13.3.1.4 / §20.5 (Issue #251 Phase A): NGN inbound INVITE 経路の
+/// 18x / 2xx 応答に常時付与する `Allow` ヘッダ値。 carrier IMS は dialog 確立後の
+/// 機能 negotiate に Allow を見て「UPDATE / INFO 等が利用可能か」を判定する。
+/// Allow 不在は「機能不足端末」判定 → 即時 BYE の主原因として Asterisk 実機
+/// (`docs/asterisk-real-invite.md` §3.1) と差分が出ていた。
+///
+/// 列挙基準: sabiden の UAS が **実機経路として処理可能** な method。
+/// - `INVITE` / `ACK` / `BYE` / `CANCEL`: RFC 3261 通話基本
+/// - `OPTIONS`: keep-alive / capabilities probe (RFC 3261 §11)
+/// - `UPDATE`: Re-INVITE 代替の SDP / Session-Timer 更新 (RFC 3311)
+/// - `INFO`: DTMF (RFC 4733 / RFC 6086、 sabiden 実装済)
+///
+/// **意図的除外**:
+/// - `PRACK` (RFC 3262): sabiden は現在 100rel 未実装 (audit Phase B、 Issue #251)、
+///   Allow に載せると capabilities 偽広告になる。
+/// - `NOTIFY` / `SUBSCRIBE` / `MESSAGE` / `REFER` / `PUBLISH`: 限定的処理のみ
+///   (NOTIFY/SUBSCRIBE は 481、 MESSAGE は受け流し)。 carrier IMS が
+///   「これらを使える」と誤認しないよう除外。
+const UAS_INBOUND_2XX_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, INFO";
+
+/// RFC 4028 §7 / RFC 3891 §3 (Issue #251 Phase A): NGN inbound INVITE 経路の
+/// 18x / 2xx 応答に常時付与する `Supported` ヘッダ値。 §20.37 によれば
+/// `Supported` 不在は peer に「何の extension がサポートされているか不明」と
+/// 解釈され、 carrier IMS の機能 negotiate ロジックを混乱させる。
+///
+/// 列挙基準: sabiden が **実装済の option-tag** のみ。
+/// - `timer` (RFC 4028): Session-Timer。 既存 200 OK で `Require: timer` を出す
+///   経路があり、 `Require` を出すなら `Supported` にも明示するのが §7.4 整合。
+/// - `replaces` (RFC 3891): Call-Replace。 sabiden は将来の transfer 経路で
+///   利用するため capability として常時広告 (受信処理は将来 Phase で実装)。
+///
+/// **意図的除外**:
+/// - `100rel` (RFC 3262): PRACK 経路未実装 (audit Phase B、 Issue #251)。
+///   `Supported: 100rel` を出すと carrier UAC が `Require: 100rel` で PRACK を
+///   期待し、 sabiden は対応できず即 BYE。 capabilities 偽広告防止。
+const UAS_INBOUND_2XX_SUPPORTED: &str = "timer, replaces";
+
+/// RFC 3261 §20.41 (Issue #251 Phase A): UAS 応答に載せる `Server` ヘッダ値。
+/// Asterisk 実機 (`docs/asterisk-real-invite.md` §3.1) は `Server: Asterisk PBX
+/// 20.6.0` を載せる慣例で、 carrier 側障害解析時に「どの端末が応答したか」を
+/// 特定するために有用。
+fn sabiden_server_header() -> String {
+    format!("sabiden/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// RFC 7231 §7.1.1.1 (Issue #251 Phase A): HTTP-date = IMF-fixdate を
+/// SIP `Date` ヘッダ (RFC 3261 §20.17) 用に組み立てる。
+///
+/// IMF-fixdate ABNF:
+/// ```text
+/// IMF-fixdate  = day-name "," SP date1 SP time-of-day SP GMT
+/// day-name     = "Mon" / "Tue" / "Wed" / "Thu" / "Fri" / "Sat" / "Sun"
+/// date1        = day SP month SP year       ; e.g., 02 Jun 1982
+/// month        = "Jan" / "Feb" / "Mar" / ... / "Dec"
+/// time-of-day  = hour ":" minute ":" second
+/// ```
+///
+/// 例: `Wed, 11 May 2026 07:43:35 GMT`
+///
+/// 実装は std::time のみで完結し外部依存を増やさない (`chrono` / `httpdate`
+/// クレート不採用)。 グレゴリオ暦 (proleptic, 西暦 1970 以降) は Howard
+/// Hinnant の civil_from_days アルゴリズム
+/// (<https://howardhinnant.github.io/date_algorithms.html#civil_from_days>) を
+/// 使用。 SystemTime が UNIX_EPOCH より前を返すケース (= 端末時刻が壊れている)
+/// では `Thu, 01 Jan 1970 00:00:00 GMT` にフォールバック。
+fn http_date_now() -> String {
+    let secs_since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_http_date(secs_since_epoch)
+}
+
+/// `format_http_date` — UNIX 秒を IMF-fixdate 文字列に変換 (pure function、
+/// `http_date_now` から分離して unit test 可能にする)。
+fn format_http_date(secs_since_epoch: u64) -> String {
+    let day_seconds = (secs_since_epoch % 86_400) as u32;
+    let hour = day_seconds / 3600;
+    let minute = (day_seconds % 3600) / 60;
+    let second = day_seconds % 60;
+
+    let days_since_epoch = (secs_since_epoch / 86_400) as i64;
+    // 1970-01-01 (epoch) は Thursday。 DAY_NAMES は Monday=0 基準なので
+    // Thu = index 3。 day-of-week = (days_since_epoch + 3) mod 7。
+    let dow = ((days_since_epoch + 3).rem_euclid(7)) as usize;
+
+    // Howard Hinnant civil_from_days: epoch を 0000-03-01 基準にシフトして
+    // 月/日/年を逆算する。 1970-01-01 = epoch + 0 days → days_since_civil = 719468。
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32; // [0, 146097)
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+
+    const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTH_NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    // dow 計算は Monday=0 基準 (epoch Thursday=3 から (days+3) mod 7 で
+    // Monday=0 ベースに揃う)。
+    let dow_name = DAY_NAMES[dow];
+    let month_name = MONTH_NAMES[(m - 1) as usize];
+
+    format!("{dow_name}, {d:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+}
+
+/// RFC 4028 §9 (Issue #251 Phase A): 200 OK の `refresher` 値を決定する。
+///
+/// > the refresher parameter of the Session-Expires header field in the
+/// > response MUST equal to the value in the request, unless the UAS does
+/// > not want to be the refresher.
+///
+/// sabiden の方針: UAC (carrier) が `refresher=uac` を明示した場合は **そのまま
+/// echo** し、 carrier の意図を尊重する。 不明 / 不在の場合のみ `refresher=uas`
+/// にフォールバック (= sabiden 側が refresh を担当する、 内線レッグへの伝搬を
+/// 簡略化できる)。 旧実装は常に `uas` で書換えていたが (Issue #251 audit #6)、
+/// carrier 内部状態機械が `refresher=uac` で固定済の場合 dialog 確立後の
+/// timer expire 計算で不整合し、 確立直後の cleanup 経路 (= 即 BYE) に入る
+/// 可能性が指摘されていた。
+fn resolve_response_refresher(request_refresher: Option<&str>) -> &'static str {
+    match request_refresher {
+        Some(v) if v.eq_ignore_ascii_case("uac") => "uac",
+        // "uas" 明示 or 不在 / 不正値 → uas (sabiden が refresh 担当)
+        _ => "uas",
+    }
+}
+
+/// RFC 3261 §8.2.2.3 (Issue #251 Phase A): sabiden が **understand する**
+/// `Require` ヘッダ option-tag のホワイトリスト。 受信 INVITE に `Require` が
+/// あった場合、 ここに無い tag は 420 Bad Extension で reject する MUST。
+///
+/// **既知 tag** (sabiden 実装済 / capabilities 表明済):
+/// - `timer` (RFC 4028): Session-Timer。 200 OK 経路で echo 済。
+/// - `replaces` (RFC 3891): UAS 側は受信処理を将来実装するが、 capability
+///   として `Supported` に列挙済なので Require 経由でも受け入れ可とする
+///   (現状は dialog 確立後に replaces を活用する dialog replacement は未実装、
+///   ただし carrier が `Require: replaces` を送るケースは実機未確認)。
+///
+/// **意図的非ホワイトリスト**:
+/// - `100rel` (RFC 3262): PRACK 未実装。 carrier が `Require: 100rel` を出して
+///   くる経路に対しては 420 で正直に拒否すべき (capability negotiate 失敗を
+///   carrier に伝えて UAC 側 fallback を促す、 §8.2.2.3 が想定する正規動作)。
+const KNOWN_OPTION_TAGS: &[&str] = &["timer", "replaces"];
+
+/// `Require` ヘッダ値 (例 `"timer, 100rel"`) をパースし、 `KNOWN_OPTION_TAGS` に
+/// 含まれない option-tag 一覧を返す (大文字小文字無視、 RFC 3261 §7.3.1)。
+///
+/// 戻り値が空なら全て既知 → 通常処理を継続。 非空なら 420 + `Unsupported`
+/// ヘッダで reject する MUST (RFC 3261 §8.2.2.3)。
+fn unsupported_option_tags(require_value: &str) -> Vec<String> {
+    require_value
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            !KNOWN_OPTION_TAGS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(t))
+        })
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// `SipResponse` (= 18x / 2xx UAS 応答) に Issue #251 Phase A の RFC 互換ヘッダ集合
+/// (`Allow` / `Supported` / `Date` / `Server`) を **常時付与** する共通ヘルパ。
+///
+/// 100 Trying では呼ばないこと: §13.3.1.4 / §8.2.6.2 / §20.5 で 100 への
+/// 付与は要求されておらず、 sub-second 応答が優先される (Issue #251 audit #8)。
+///
+/// REGISTER 応答や 405 等のエラー応答とは独立に、 NGN inbound INVITE 経路の
+/// 18x / 2xx だけに付与する (orchestrator handle_invite 内から call される)。
+fn apply_uas_inbound_2xx_headers(resp: &mut SipResponse) {
+    resp.headers.set("Allow", UAS_INBOUND_2XX_ALLOW);
+    resp.headers.set("Supported", UAS_INBOUND_2XX_SUPPORTED);
+    resp.headers.set("Date", http_date_now());
+    resp.headers.set("Server", sabiden_server_header());
+}
 
 /// `webrtc_active` leak sweeper の最小 / フォールバック周期 (Issue #218)。
 ///
@@ -790,6 +974,41 @@ impl NgnInboundHandler {
                 tx.respond(trying).await?;
             }
 
+            // RFC 3261 §8.2.2.3 (Issue #251 Phase A): 受信 INVITE の `Require`
+            // ヘッダに sabiden が understand しない option-tag があれば、
+            // **420 Bad Extension + `Unsupported: <unknown-tags>` で reject MUST**。
+            // §8.2.2.3 引用:
+            //
+            // > If a UAS does not understand an option-tag listed in a Require
+            // > header field, it MUST respond by generating a response with
+            // > status code 420 (Bad Extension).  The UAS MUST add an
+            // > Unsupported header field, and list in it those options it does
+            // > not understand amongst those in the Require header field of
+            // > the request.
+            //
+            // KNOWN_OPTION_TAGS に列挙済の tag (`timer` / `replaces`) のみ通過し、
+            // それ以外 (例 `100rel` PRACK 未実装、 carrier 専用拡張 等) は 420。
+            // sabiden の `Supported: timer, replaces` 表明 (Phase A) と整合する。
+            if let Some(req_h) = request.headers.get("require") {
+                let unsupported = unsupported_option_tags(req_h);
+                if !unsupported.is_empty() {
+                    warn!(
+                        require = %req_h,
+                        unsupported = ?unsupported,
+                        "RFC 3261 §8.2.2.3: 未対応 option-tag → 420 Bad Extension"
+                    );
+                    let mut tx = stx.lock().await;
+                    let mut resp = build_response_skeleton(tx.request(), 420, "Bad Extension");
+                    resp.headers.set("Unsupported", unsupported.join(", "));
+                    ensure_to_tag(&mut resp);
+                    tx.respond(resp).await?;
+                    drop(tx);
+                    self.pending.lock().await.remove(&call_id);
+                    self.metrics.record_invite_ngn(InviteResult::Error);
+                    return Ok(());
+                }
+            }
+
             // RFC 4028 §10 (Issue #249): 初回 INVITE で要求された `Session-Expires`
             // 値が **sabiden Min-SE 未満** なら 422 Session Interval Too Small を
             // **Min-SE ヘッダ付き** で返し、 ここで打ち切る。 これにより carrier
@@ -925,6 +1144,11 @@ impl NgnInboundHandler {
                 ringing
                     .headers
                     .set("Contact", format!("<sip:sabiden@{}>", contact_addr));
+                // RFC 3261 §13.3.1.4 / §20.5 / §20.17 / §20.41 (Issue #251 Phase A):
+                // 18x 応答にも `Allow` / `Supported` / `Date` / `Server` を載せて
+                // 早期に carrier IMS へ capabilities を提示する。 Asterisk 実機
+                // (`docs/asterisk-real-invite.md` §3.1) と同等のヘッダ集合。
+                apply_uas_inbound_2xx_headers(&mut ringing);
                 // ensure_to_tag は has_to_tag を見て既存があれば二重付与しない。
                 // build_response_skeleton が自動付与した tag をそのまま使う。
                 ensure_to_tag(&mut ringing);
@@ -1097,23 +1321,39 @@ impl NgnInboundHandler {
                     // RFC 4028 §7 (Issue #249): UAS が Session-Timer をサポート
                     // する場合、 INVITE に Session-Expires が乗っていれば 2xx に
                     // **Session-Expires + Require: timer を echo MUST**。
-                    // refresher は sabiden (= UAS) が refresher を引き受ける形を
-                    // 推奨 (RFC 4028 §7.4 / §9): NGN UAC が `refresher=uac` を
-                    // 主張していても、 sabiden 側で refresh を担当することで
-                    // 内線 UA への refresh 伝搬を簡略化できる (内線レッグの
-                    //   Re-INVITE 経路は実装済、 outbound forwarder 経由の
-                    //   Min-SE relay と整合する: Issue #138)。
+                    //
+                    // RFC 4028 §9 (Issue #251 Phase A): refresher は UAC が
+                    // 要求した値を **echo** する (旧実装は常に `uas` に書換えて
+                    // いたが、 carrier 内部状態機械との不整合で即 BYE 経路に
+                    // 入る可能性を audit #6 で指摘済)。 不在 / 不正値の場合のみ
+                    // `uas` フォールバック (= sabiden が refresh 担当、 内線レッグ
+                    // への伝搬簡略化、 Issue #138 outbound forwarder 経路と整合)。
                     //
                     // INVITE に Session-Expires が無いケース (§7 後段): 何も
                     // しない (= UAS が timer をサポートしない応答と等価)。
                     if let Some(t) = &inbound_timer {
                         let se_value = t.session_expires.max(crate::sip::uac::MIN_SE);
-                        resp_to_ngn
-                            .headers
-                            .set("Session-Expires", format!("{};refresher=uas", se_value));
+                        let refresher = resolve_response_refresher(t.refresher.as_deref());
+                        resp_to_ngn.headers.set(
+                            "Session-Expires",
+                            format!("{};refresher={}", se_value, refresher),
+                        );
                         // RFC 4028 §7: Require: timer は timer negotiate 完了の明示。
                         resp_to_ngn.headers.set("Require", "timer");
                     }
+                    // RFC 3261 §13.3.1.4 / §20.5 / §20.17 / §20.41 (Issue #251 Phase A):
+                    // 2xx 応答に **`Allow` / `Supported` / `Date` / `Server` を
+                    // 常時付与**。 これらが欠落すると carrier IMS は「機能不足
+                    // 端末」「時刻同期不能」「capability negotiate 不可」と判定し
+                    // dialog 確立後即 BYE を返す経路に入る (audit top-3、
+                    // Issue #251 / `/tmp/sabiden-080-inbound-v4.pcap`)。
+                    // Asterisk 実機 (`docs/asterisk-real-invite.md` §3.1) と同等。
+                    //
+                    // Note: `Supported` は Session-Timer 個別 echo の後に呼ぶこと
+                    // (= apply_uas_inbound_2xx_headers が `Supported: timer,
+                    // replaces` で上書きするので、 Session-Timer negotiate 結果
+                    // としての `Require: timer` (上記) と整合する)。
+                    apply_uas_inbound_2xx_headers(&mut resp_to_ngn);
                     // sabiden の Contact (NGN 側ローカル) を載せる。
                     // SIP socket は `0.0.0.0:5060` bind なので `socket.local_addr()`
                     // をそのまま載せると NGN が ACK を `0.0.0.0` 宛に送ろうとして
@@ -12499,13 +12739,13 @@ mod tests {
         }
     }
 
-    /// Issue #249 / RFC 4028 §7: INVITE が `Session-Expires: 300;refresher=uac`
-    /// と `Supported: timer` を載せたら、 200 OK に **`Session-Expires` + refresher=uas
-    /// + `Require: timer`** を echo する。 実機 evidence:
-    /// `/tmp/sabiden-080-inbound.pcap` で NGN INVITE に `x: 300;refresher=uac`、
-    /// 我々の 200 OK に Session-Expires が無い → 28ms 後 BYE。
+    /// Issue #249 / RFC 4028 §7 / §9: INVITE が `Session-Expires: 300;refresher=uac`
+    /// と `Supported: timer` を載せたら、 200 OK に **`Session-Expires` + refresher
+    /// (UAC 要求を echo、 Issue #251 で旧 `uas` 強制を撤去) + `Require: timer`** を
+    /// echo する。 実機 evidence: `/tmp/sabiden-080-inbound.pcap` で NGN INVITE に
+    /// `x: 300;refresher=uac`、 我々の 200 OK に Session-Expires が無い → 28ms 後 BYE。
     #[tokio::test]
-    async fn rfc4028_7_session_expires_echoed_in_200_ok_with_refresher_uas() {
+    async fn rfc4028_7_session_expires_echoed_in_200_ok_with_refresher_echo() {
         let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let sabiden_addr = sabiden_sock.local_addr().unwrap();
         let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -12572,10 +12812,12 @@ mod tests {
             se.starts_with("300"),
             "Session-Expires は 300 を echo すべき: {se}"
         );
-        // refresher=uas (sabiden が UAS として refresh を引き受ける、 RFC 4028 §7.4 / §9)
+        // RFC 4028 §9 (Issue #251 Phase A): UAC が `refresher=uac` を要求したら
+        // 200 OK でも echo する (旧実装は強制 `uas` 書換)。 carrier の意図尊重で
+        // dialog 確立直後の即時 BYE を回避する。
         assert!(
-            se.to_ascii_lowercase().contains("refresher=uas"),
-            "RFC 4028 §7.4: refresher=uas で sabiden が refresh 担当: {se}"
+            se.to_ascii_lowercase().contains("refresher=uac"),
+            "RFC 4028 §9: UAC 要求 refresher=uac を 200 OK で echo すべき: {se}"
         );
         let require = r200
             .headers
@@ -12821,6 +13063,665 @@ mod tests {
         // 不正数値は None
         assert!(parse_session_expires_header("abc").is_none());
         assert!(parse_session_expires_header("").is_none());
+    }
+
+    // ====================================================================
+    // Issue #251 Phase A: UAS 18x/2xx に Allow/Supported/Date/Server 付与 +
+    //   refresher 尊重 + Require 検証
+    //   RFC 3261 §8.2.2.3 / §20.5 / §20.17 / §20.41 / RFC 4028 §9 / RFC 7231
+    // ====================================================================
+
+    /// RFC 7231 §7.1.1.1: IMF-fixdate のフォーマット規約。
+    /// 1970-01-01 00:00:00 UTC = epoch = Thursday。
+    #[test]
+    fn rfc7231_imf_fixdate_epoch_is_thursday_jan_01_1970() {
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    /// RFC 7231 §7.1.1.1: IMF-fixdate の桁数 (day = 2、 year = 4、
+    /// time = 8 = HH:MM:SS) と day-name / month-name 短縮形。
+    /// 全 UNIX 秒値は `date -u -d @<sec>` で独立検算済。
+    #[test]
+    fn rfc7231_imf_fixdate_formats_known_dates() {
+        // 2024-03-04 12:00:00 UTC = Monday、 UNIX 秒 = 1709553600
+        assert_eq!(
+            format_http_date(1_709_553_600),
+            "Mon, 04 Mar 2024 12:00:00 GMT"
+        );
+        // 1996-11-06 20:49:37 UTC (RFC 7231 §7.1.1.1 例の派生、 UNIX 秒で
+        // 直接検算: `date -u -d @847313377`) = Wednesday。
+        assert_eq!(
+            format_http_date(847_313_377),
+            "Wed, 06 Nov 1996 20:49:37 GMT"
+        );
+        // うるう年判定 (2000-02-29) = Tuesday、 UNIX 秒 = 951782400 (00:00:00 UTC)
+        assert_eq!(
+            format_http_date(951_782_400),
+            "Tue, 29 Feb 2000 00:00:00 GMT"
+        );
+        // 2026-01-01 00:00:00 UTC (= Issue #251 開発時の年、 `date -u` 検算済)。
+        assert_eq!(
+            format_http_date(1_767_225_600),
+            "Thu, 01 Jan 2026 00:00:00 GMT"
+        );
+    }
+
+    /// RFC 7231 §7.1.1.1: 月境界 / 年境界 / うるう年 / 4 年・100 年・400 年規則。
+    #[test]
+    fn rfc7231_imf_fixdate_boundary_cases() {
+        // 月末 (2024-01-31 23:59:59 UTC = Wednesday)
+        assert_eq!(
+            format_http_date(1_706_745_599),
+            "Wed, 31 Jan 2024 23:59:59 GMT"
+        );
+        // 月跨ぎ (2024-02-01 00:00:00 UTC = Thursday)
+        assert_eq!(
+            format_http_date(1_706_745_600),
+            "Thu, 01 Feb 2024 00:00:00 GMT"
+        );
+        // 年跨ぎ (2025-01-01 00:00:00 UTC = Wednesday)
+        assert_eq!(
+            format_http_date(1_735_689_600),
+            "Wed, 01 Jan 2025 00:00:00 GMT"
+        );
+        // 100 年規則 (2100 はうるう年ではない) は SystemTime 範囲外なので省略。
+    }
+
+    /// RFC 3261 §8.2.2.3: `Require` に未対応 option-tag があれば 420 を返す。
+    /// sabiden 既知 (`KNOWN_OPTION_TAGS`) = timer / replaces。
+    #[test]
+    fn rfc3261_8_2_2_3_unsupported_option_tags_detects_unknown() {
+        // 全て既知 → 空
+        assert!(unsupported_option_tags("timer").is_empty());
+        assert!(unsupported_option_tags("timer, replaces").is_empty());
+        // case-insensitive (RFC 3261 §7.3.1)
+        assert!(unsupported_option_tags("TIMER, Replaces").is_empty());
+        // 未知混入 → 未知 tag のみ列挙
+        let u = unsupported_option_tags("timer, 100rel");
+        assert_eq!(u, vec!["100rel".to_string()]);
+        // 全て未知
+        let u = unsupported_option_tags("100rel, precondition");
+        assert_eq!(u, vec!["100rel".to_string(), "precondition".to_string()]);
+        // 空ヘッダ → 空 (= 通常処理を継続)
+        assert!(unsupported_option_tags("").is_empty());
+    }
+
+    /// RFC 4028 §9: 200 OK の refresher は UAC が要求した値を echo する。
+    /// 旧実装 (常に `uas` 強制) を撤去し、 carrier 意図を尊重する。
+    #[test]
+    fn rfc4028_9_resolve_response_refresher_echoes_uac_when_requested() {
+        assert_eq!(resolve_response_refresher(Some("uac")), "uac");
+        // case-insensitive (RFC 3261 §7.3.1 / RFC 4028 §4 ABNF)
+        assert_eq!(resolve_response_refresher(Some("UAC")), "uac");
+        assert_eq!(resolve_response_refresher(Some("Uac")), "uac");
+    }
+
+    /// RFC 4028 §9: refresher 不在 / "uas" 明示 / 不正値は `uas` フォールバック。
+    #[test]
+    fn rfc4028_9_resolve_response_refresher_defaults_to_uas_when_absent() {
+        assert_eq!(resolve_response_refresher(None), "uas");
+        assert_eq!(resolve_response_refresher(Some("uas")), "uas");
+        // 不正値 (ABNF 外) も safe fallback で uas
+        assert_eq!(resolve_response_refresher(Some("none")), "uas");
+        assert_eq!(resolve_response_refresher(Some("")), "uas");
+    }
+
+    /// RFC 3261 §20.5 / §20.17 / §20.41 / RFC 4028 §7 (Issue #251 Phase A):
+    /// `apply_uas_inbound_2xx_headers` が Allow / Supported / Date / Server を
+    /// 必ず付与する。 値は Asterisk 実機 §3.1 と同等 (PRACK は除外、
+    /// `Supported: 100rel` は出さない = capability 偽広告防止)。
+    #[test]
+    fn rfc3261_20_5_apply_uas_inbound_2xx_headers_sets_allow_supported_date_server() {
+        let mut resp = SipResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers: SipHeaders::new(),
+            body: Vec::new(),
+        };
+        apply_uas_inbound_2xx_headers(&mut resp);
+
+        let allow = resp.headers.get("allow").expect("Allow 必須");
+        // INVITE/ACK/BYE/CANCEL/OPTIONS/UPDATE/INFO は含む
+        for m in [
+            "INVITE", "ACK", "BYE", "CANCEL", "OPTIONS", "UPDATE", "INFO",
+        ] {
+            assert!(allow.contains(m), "Allow に {m} を含むべき: {allow}");
+        }
+        // PRACK は除外 (sabiden が 100rel 未実装、 capability 偽広告防止)
+        assert!(
+            !allow.to_ascii_uppercase().contains("PRACK"),
+            "Allow に PRACK を含めるべきではない (未実装): {allow}"
+        );
+
+        let supported = resp.headers.get("supported").expect("Supported 必須");
+        assert!(
+            supported.to_ascii_lowercase().contains("timer"),
+            "Supported に timer を含むべき: {supported}"
+        );
+        // 100rel は出さない (PRACK 未実装)
+        assert!(
+            !supported.to_ascii_lowercase().contains("100rel"),
+            "Supported に 100rel を含めるべきではない: {supported}"
+        );
+
+        let date = resp.headers.get("date").expect("Date 必須");
+        // IMF-fixdate の構造: "Day, DD Mon YYYY HH:MM:SS GMT"
+        assert!(date.ends_with(" GMT"), "Date は GMT で終わるべき: {date}");
+        assert!(
+            date.len() == "Wed, 11 May 2026 07:43:35 GMT".len(),
+            "Date は固定長 29 chars であるべき (RFC 7231 §7.1.1.1): {date}"
+        );
+
+        let server = resp.headers.get("server").expect("Server 必須");
+        assert!(
+            server.starts_with("sabiden/"),
+            "Server は sabiden/<version>: {server}"
+        );
+    }
+
+    // ====================================================================
+    // E2E: NGN inbound INVITE で 180 / 200 OK の RFC 互換ヘッダ
+    // ====================================================================
+
+    /// RFC 3261 §20.5 (Issue #251 Phase A): NGN 着信 INVITE への 180 Ringing /
+    /// 200 OK 両方に `Allow` を付与する。 Allow 不在は carrier IMS に
+    /// 「機能不足端末」判定され即 BYE される (audit top-1)。
+    #[tokio::test]
+    async fn rfc3261_20_5_inbound_18x_and_2xx_include_allow_header() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6201".to_string(),
+                "127.0.0.1:6201".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30201 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-20-5-cid",
+            "z9hG4bK-allow",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20201 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r180 = responses
+            .iter()
+            .find(|r| r.status_code == 180)
+            .expect("180 Ringing が来るべき");
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+        for (label, resp) in [("180", r180), ("200", r200)] {
+            let allow = resp
+                .headers
+                .get("allow")
+                .unwrap_or_else(|| panic!("{label}: Allow 必須 (RFC 3261 §20.5)"));
+            assert!(
+                allow.contains("INVITE")
+                    && allow.contains("ACK")
+                    && allow.contains("BYE")
+                    && allow.contains("UPDATE"),
+                "{label}: Allow に INVITE/ACK/BYE/UPDATE 必須: {allow}"
+            );
+        }
+    }
+
+    /// RFC 3261 §20.17 / RFC 7231 §7.1.1.1 (Issue #251 Phase A): NGN inbound
+    /// 18x / 2xx 応答に `Date` を IMF-fixdate 形式で付与。 Date 不在は carrier
+    /// IMS の billing record 起票不能で dialog rollback (audit top-3)。
+    #[tokio::test]
+    async fn rfc3261_20_17_inbound_2xx_includes_date_header_rfc7231_format() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6202".to_string(),
+                "127.0.0.1:6202".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30202 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-20-17-cid",
+            "z9hG4bK-date",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20202 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+        let date = r200
+            .headers
+            .get("date")
+            .expect("Date 必須 (RFC 3261 §20.17)");
+        // IMF-fixdate ABNF (RFC 7231 §7.1.1.1): "Day, DD Mon YYYY HH:MM:SS GMT"
+        assert!(date.ends_with(" GMT"), "Date は GMT で終わる: {date}");
+        // day-name は 3 文字、 月名は 3 文字、 day は 2 桁、 year は 4 桁。
+        // 厳密検査は format_http_date のユニットテストに任せ、 ここでは形状のみ。
+        assert_eq!(
+            date.len(),
+            "Wed, 11 May 2026 07:43:35 GMT".len(),
+            "Date は IMF-fixdate (29 chars 固定): {date}"
+        );
+    }
+
+    /// RFC 3261 §20.41 (Issue #251 Phase A): NGN inbound 2xx 応答に
+    /// `Server: sabiden/<version>` を付与。 carrier 側障害解析時の端末特定に必須。
+    #[tokio::test]
+    async fn rfc3261_20_41_inbound_2xx_includes_server_header() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6203".to_string(),
+                "127.0.0.1:6203".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30203 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-20-41-cid",
+            "z9hG4bK-server",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20203 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+        let server = r200
+            .headers
+            .get("server")
+            .expect("Server 必須 (RFC 3261 §20.41)");
+        assert!(
+            server.starts_with("sabiden/"),
+            "Server は sabiden/<version>: {server}"
+        );
+    }
+
+    /// RFC 4028 §9 (Issue #251 Phase A): UAC が `refresher=uac` を要求したら
+    /// 200 OK でも `refresher=uac` を **echo** する (旧実装は強制 `uas` で
+    /// 書換えていた、 audit #6 で carrier 即 BYE 原因候補と指摘)。
+    #[tokio::test]
+    async fn rfc4028_9_session_expires_refresher_uac_preserved_in_2xx() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6204".to_string(),
+                "127.0.0.1:6204".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30204 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc4028-9-uac-cid",
+            "z9hG4bK-refresher-uac",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20204 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        invite.headers.set("Session-Expires", "300;refresher=uac");
+        invite.headers.set("Min-SE", "300");
+        invite.headers.set("Supported", "timer");
+
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+        let se = r200
+            .headers
+            .get("session-expires")
+            .expect("Session-Expires が必要");
+        assert!(
+            se.to_ascii_lowercase().contains("refresher=uac"),
+            "RFC 4028 §9: UAC 要求 refresher=uac を echo すべき (旧実装は uas 書換だった): {se}"
+        );
+    }
+
+    /// RFC 4028 §9 (Issue #251 Phase A): refresher 不在 / "uas" 明示の場合は
+    /// `refresher=uas` (sabiden が refresh 担当)。 既存 outbound forwarder 経路
+    /// (Issue #138) との整合が必要なため、 旧挙動を fallback として保持する。
+    #[tokio::test]
+    async fn rfc4028_9_session_expires_refresher_uas_default_when_absent() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6205".to_string(),
+                "127.0.0.1:6205".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30205 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc4028-9-uas-cid",
+            "z9hG4bK-refresher-uas",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20205 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        // refresher 不在 (delta-seconds のみ)
+        invite.headers.set("Session-Expires", "300");
+        invite.headers.set("Min-SE", "300");
+        invite.headers.set("Supported", "timer");
+
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r200 = responses
+            .iter()
+            .find(|r| r.status_code == 200)
+            .expect("200 OK が来るべき");
+        let se = r200
+            .headers
+            .get("session-expires")
+            .expect("Session-Expires が必要");
+        assert!(
+            se.to_ascii_lowercase().contains("refresher=uas"),
+            "RFC 4028 §9: refresher 不在なら uas にフォールバック: {se}"
+        );
+    }
+
+    /// RFC 3261 §8.2.2.3 (Issue #251 Phase A): 未対応 option-tag を含む `Require`
+    /// 付き INVITE は 420 Bad Extension + `Unsupported: <unknown>` で reject MUST。
+    #[tokio::test]
+    async fn rfc3261_8_2_2_3_require_unknown_option_tag_returns_420_with_unsupported() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6206".to_string(),
+                "127.0.0.1:6206".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30206 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-8-2-2-3-cid",
+            "z9hG4bK-require-100rel",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20206 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        // sabiden 未実装 (Phase B): 100rel
+        invite.headers.set("Require", "100rel");
+
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        let r420 = responses
+            .iter()
+            .find(|r| r.status_code == 420)
+            .expect("420 Bad Extension が来るべき (RFC 3261 §8.2.2.3)");
+        let unsupported = r420
+            .headers
+            .get("unsupported")
+            .expect("Unsupported ヘッダ MUST (§8.2.2.3)");
+        assert!(
+            unsupported.contains("100rel"),
+            "Unsupported に 100rel を含むべき: {unsupported}"
+        );
+        // 200 OK が来てはいけない (= 通常処理を継続してはいけない)
+        assert!(
+            !responses.iter().any(|r| r.status_code == 200),
+            "420 で打ち切ったので 200 OK は来ない: codes={:?}",
+            responses.iter().map(|r| r.status_code).collect::<Vec<_>>()
+        );
+    }
+
+    /// RFC 3261 §8.2.2.3 (Issue #251 Phase A): `Require` の option-tag が全て
+    /// 既知 (= `timer` / `replaces`) なら通常処理を継続し、 200 OK を返す。
+    #[tokio::test]
+    async fn rfc3261_8_2_2_3_require_known_option_tag_proceeds_normally() {
+        let sabiden_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_addr = sabiden_sock.local_addr().unwrap();
+        let ngn_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let extensions = ExtensionRegistrar::new();
+        extensions
+            .register(
+                "iphone",
+                "sip:iphone@127.0.0.1:6207".to_string(),
+                "127.0.0.1:6207".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let inviter = ScriptedInviter::builder()
+            .default_action(ScriptedAction::ok())
+            .default_body(
+                b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                  m=audio 30207 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    .to_vec(),
+            )
+            .build();
+
+        let (layer, inbound_rx) = TransactionLayer::spawn(sabiden_sock.clone());
+        let _handler = wire_ngn_inbound(
+            layer,
+            sabiden_sock.clone(),
+            inbound_rx,
+            inviter,
+            extensions,
+            NgnInboundConfig::default(),
+        );
+
+        let mut invite = builders::invite_from_ngn(
+            &ngn_sock.local_addr().unwrap(),
+            "sip:0191349809@sabiden",
+            "rfc3261-8-2-2-3-known-cid",
+            "z9hG4bK-require-timer",
+            b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+              m=audio 20207 RTP/AVP 0\r\na=ptime:20\r\na=rtpmap:0 PCMU/8000\r\n"
+                .to_vec(),
+        );
+        // 全て既知 (sabiden 実装済)
+        invite.headers.set("Require", "timer");
+        invite.headers.set("Session-Expires", "300;refresher=uac");
+        invite.headers.set("Min-SE", "300");
+
+        ngn_sock
+            .send_to(&invite.to_bytes(), sabiden_addr)
+            .await
+            .unwrap();
+
+        let responses = drain_responses(&ngn_sock, 8, Duration::from_secs(3)).await;
+        assert!(
+            !responses.iter().any(|r| r.status_code == 420),
+            "既知 option-tag のみなら 420 を返してはいけない: codes={:?}",
+            responses.iter().map(|r| r.status_code).collect::<Vec<_>>()
+        );
+        assert!(
+            responses.iter().any(|r| r.status_code == 200),
+            "既知 option-tag のみなら 200 OK が来るべき: codes={:?}",
+            responses.iter().map(|r| r.status_code).collect::<Vec<_>>()
+        );
     }
 
     /// `extract_to_tag` が name-addr 形式 / addr-spec 形式 / 大文字 tag /

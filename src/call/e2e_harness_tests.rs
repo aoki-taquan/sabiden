@@ -1057,17 +1057,19 @@ async fn rfc3261_8_1_1_5_consecutive_invites_use_cseq_1() {
     assert_ne!(cid1, cid3);
 }
 
-/// Issue #260 Phase 1-B: NGN carrier intermittent reject (500) に対する
+/// Issue #260 Phase 1-B / 1-B.2: NGN carrier intermittent reject (500) に対する
 /// 1 回限定 auto-retry が **2 回目の 200 OK で救済成立** することを E2E で確認。
 ///
 /// シナリオ: 内線が INVITE 送出 → sabiden → fake NGN は 1 回目 500 を返す →
-/// sabiden は carrier_retry::decide_retry で Retry 判定 → ~2 秒 sleep 後に
-/// 新 Call-ID で再 INVITE → fake NGN は 2 回目に 200 OK を返す → 内線へ
-/// 200 OK が伝播し metrics に `RetriedSucceeded` が記録される。
+/// sabiden は carrier_retry::decide_retry で Retry 判定 → ~8 秒 sleep 後 (Phase
+/// 1-B.2 で default 8s に tune) に新 Call-ID で再 INVITE → fake NGN は 2 回目に
+/// 200 OK を返す → 内線へ 200 OK が伝播し metrics に `RetriedSucceeded` が
+/// 記録される。
 ///
 /// RFC 3261 §20.33 (Retry-After 遵守) / §21.5 (5xx) / 3GPP TS 24.229 §5.2.7
 /// (500 = per-INVITE 内部失敗) / TTC JJ-90.24 §5.7.3 (Retry-After 内 retry 禁止
-/// + 過度な retry 回避) との整合を満たすため、 1 回限定 + default 2 秒待機。
+/// + 過度な retry 回避) との整合を満たすため、 1 回限定 + default 8 秒待機
+/// (NGN P-CSCF AOR state GC window 5-10s の中央値、 実機 evidence 2026-05-11)。
 #[tokio::test]
 async fn phase_1b_e2e_inbound_500_then_200_succeeds_via_retry() {
     use crate::sip::transaction::ServerTransaction;
@@ -1213,9 +1215,9 @@ async fn phase_1b_e2e_inbound_500_then_200_succeeds_via_retry() {
         })
         .unwrap();
 
-    // 5) NGN タスク完了を待つ (1 回目 500 → 2 秒 sleep → 2 回目 200 OK の流れ
-    //    で計 ~3 秒で完了)。 余裕を持って 10 秒上限。
-    timeout(Duration::from_secs(10), ngn_task)
+    // 5) NGN タスク完了を待つ (Phase 1-B.2: 1 回目 500 → 8s±1.5s sleep → 2 回目
+    //    200 OK = 計 ~10 秒で完了)。 CI runner overhead を考慮し 60 秒上限。
+    timeout(Duration::from_secs(60), ngn_task)
         .await
         .expect("fake NGN タスクが終わらない (retry が動いていない可能性)")
         .unwrap();

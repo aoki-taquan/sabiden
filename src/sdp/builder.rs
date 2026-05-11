@@ -471,12 +471,25 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     // collision で 486 Busy Here を返す。 RFC 4566 §5.2 は uint64 を許すが、
     // Asterisk 実機は小さい NTP 風数値 (例 397958033) を使っており確認済。
     // 安全側で UNIX epoch 秒を採用 (32-bit に収まる、 単調増加、 衝突可能性低)。
+    //
+    // RFC 4566 §5.2: session-id は「session のグローバル一意 ID」であり、
+    // 同一セッション内 (= 同一 Call-ID 内の re-INVITE 連) では **不変** で
+    // あるべき。 入力 SDP の session-id が 32-bit に収まるなら踏襲し、 64-bit
+    // (= ブラウザ生成等) なら NGN 互換のため UNIX epoch 秒に置換する。
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    sdp.origin.session_id = now_secs;
-    sdp.origin.session_version = now_secs;
+    if sdp.origin.session_id > u32::MAX as u64 {
+        sdp.origin.session_id = now_secs;
+    }
+    // RFC 3264 §8 (Modifying the Session):
+    //   "For each offer or answer, the session version in the origin field
+    //    MUST increment by one if the session description changes."
+    // 本関数は c= / m= port / o= IP / o= username を必ず書換える (= session
+    // description が変わる) ので、 sess-version は入力値 + 1 する義務がある。
+    // `wrapping_add` で u64 上限 (RFC 4566 §5.2 は uint64) の循環を安全に扱う。
+    sdp.origin.session_version = sdp.origin.session_version.wrapping_add(1);
     // セッションレベル c= は必ず sabiden を指すようにする
     sdp.connection = Some(Connection { address: addr });
 
@@ -1320,6 +1333,85 @@ mod tests {
         let original = b"not an sdp at all";
         let new_addr: IpAddr = "127.0.0.1".parse().unwrap();
         assert!(rewrite_rtp_endpoint(original, new_addr, 1234).is_err());
+    }
+
+    /// RFC 3264 §8 (Modifying the Session):
+    ///   "For each offer or answer, the session version in the origin field
+    ///    MUST increment by one if the session description changes."
+    ///
+    /// `rewrite_rtp_endpoint` は c= / m= port / o= IP / o= username を必ず
+    /// 書換えるので sess-version は **入力値 + 1** にならなければならない。
+    /// re-INVITE で同 Call-ID に同 sess-version を載せると、 ピア (NGN P-CSCF /
+    /// 内線 UA) は「内容変わってない」と判定し RTP socket を再 bind しない
+    /// (Issue #77 / `docs/asterisk-real-invite.md` §2 で実機証拠)。
+    #[test]
+    fn rfc3264_section8_rewrite_increments_session_version() {
+        let original = b"v=0\r\n\
+                         o=- 1 42 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         c=IN IP4 192.0.2.1\r\n\
+                         t=0 0\r\n\
+                         m=audio 30000 RTP/AVP 0\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(original, new_addr, 40000).unwrap();
+        let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
+        // 入力 sess-version=42 → 出力 sess-version=43 (RFC 3264 §8: +1)
+        assert_eq!(
+            parsed.origin.session_version, 43,
+            "RFC 3264 §8 violation: sess-version は入力値 +1 でなければならない (got {})",
+            parsed.origin.session_version
+        );
+    }
+
+    /// RFC 4566 §5.2: session-id は session のグローバル一意 ID であり、
+    /// 同一 session (= 同一 Call-ID の re-INVITE 連) では **不変** であるべき。
+    /// 32-bit に収まる小さい値 (Asterisk pcap 由来の現実値) は踏襲する。
+    #[test]
+    fn rfc4566_section5_2_rewrite_preserves_small_session_id() {
+        let original = b"v=0\r\n\
+                         o=- 397958033 1 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         c=IN IP4 192.0.2.1\r\n\
+                         t=0 0\r\n\
+                         m=audio 30000 RTP/AVP 0\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(original, new_addr, 40000).unwrap();
+        let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
+        // 入力 sess-id=397958033 (32-bit OK) → そのまま踏襲
+        assert_eq!(parsed.origin.session_id, 397_958_033);
+        // sess-version は +1
+        assert_eq!(parsed.origin.session_version, 2);
+    }
+
+    /// 64-bit (= ブラウザ生成、 RFC 4566 §5.2 は uint64 を許すが NGN P-CSCF は
+    /// 32-bit 期待で 486 を返す事例あり、 `src/sdp/builder.rs::rewrite_rtp_endpoint`
+    /// docstring 参照) は UNIX epoch 秒に置換する。 sess-version は **入力値 +1**。
+    #[test]
+    fn rfc3264_section8_rewrite_increments_even_when_session_id_normalized() {
+        // ブラウザ風: session-id = 64-bit、 session-version = 2 (Firefox 既定)
+        let original = b"v=0\r\n\
+                         o=mozilla 12345678901234567890 2 IN IP4 192.0.2.1\r\n\
+                         s=-\r\n\
+                         c=IN IP4 192.0.2.1\r\n\
+                         t=0 0\r\n\
+                         m=audio 30000 RTP/AVP 0\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n";
+        // SessionDescription::parse が u64 を解釈できることを確認するため別途解析
+        // (ここでは parse 結果から入力 sess-version を取り出して期待値を作る)
+        let parsed_in = SessionDescription::parse(std::str::from_utf8(original).unwrap()).unwrap();
+        let expected_version = parsed_in.origin.session_version.wrapping_add(1);
+
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(original, new_addr, 40000).unwrap();
+        let parsed = SessionDescription::parse(std::str::from_utf8(&rewritten).unwrap()).unwrap();
+
+        // sess-version は +1 されている (RFC 3264 §8)
+        assert_eq!(parsed.origin.session_version, expected_version);
+        // sess-id は 32-bit 超過のため NGN 互換に正規化 (元の 64-bit 値ではない)
+        assert_ne!(parsed.origin.session_id, parsed_in.origin.session_id);
+        assert!(parsed.origin.session_id <= u32::MAX as u64);
     }
 
     fn make_dtls_params() -> DtlsIceParams {

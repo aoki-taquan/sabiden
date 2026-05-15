@@ -1650,7 +1650,7 @@ RFC 3605 (`a=rtcp:<port>`) で explicit signal すれば §11 3 段目 "MAY disr
 #### sabiden 側の対応
 
 `src/call/orchestrator.rs::bind_ngn_rtp_socket` で **even-only round-robin
-allocator** (30000-30998、 `AtomicU16::fetch_add(2)` で even guarantee + last-resort
+allocator** (30000-30998、 `AtomicU32::fetch_add(2)` を span 1000 で modulo + even mask で even guarantee + last-resort
 ephemeral も even のみ accept) を採用。 OS ephemeral (`UdpSocket::bind(*, 0)`)
 は uniform random で 50% odd を引いていたのが過去 baseline 20-70% success rate
 variance の真因。

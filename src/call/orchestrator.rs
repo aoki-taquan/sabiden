@@ -63,13 +63,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// port を払い出す。 OS ephemeral (`bind(*, 0)`) は uniform random で 50%
 /// odd を引いていたのが過去 baseline 20-70% success rate variance の真因。
 async fn bind_ngn_rtp_socket(ip: IpAddr) -> Result<Arc<UdpSocket>> {
-    const NGN_RTP_PORT_MIN: u16 = 30000; // even start
-    const NGN_RTP_PORT_MAX: u16 = 30998; // even end, span 500 attempts
-    // Monotonic counter (AtomicU32)。 `AtomicU16` だと約 17k INVITE で
-    // wrap して `raw - NGN_RTP_PORT_MIN` が overflow し debug build panic
-    // + release build silent wrap (CLAUDE.md §6.5 違反、 PR #264 2 巡目
-    // review agent 指摘)。 U32 なら 2 billion 回 (= 65 年 @ 1 call/sec)
-    // で wrap、 実質無限。
+    // Even-port allocator range (RFC 3550 §11 SHOULD even):
+    const NGN_RTP_PORT_MIN: u16 = 30000;
+    const NGN_RTP_PORT_MAX: u16 = 30998;
+    // Monotonic counter は `AtomicU32` を使う。 `AtomicU16` だと約 17k INVITE で
+    // wrap して `raw - NGN_RTP_PORT_MIN` が overflow し debug build panic +
+    // release silent wrap (CLAUDE.md §6.5 違反、 PR #264 2 巡目 review 指摘)。
+    // `AtomicU32` なら ~2 billion 回 (= 65 年 @ 1 call/sec) で wrap、 実質無限。
     static NGN_RTP_PORT_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let span: u32 = (NGN_RTP_PORT_MAX - NGN_RTP_PORT_MIN + 2) as u32;
     for _ in 0..500 {

@@ -40,8 +40,61 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// NGN outbound RTP port even-only round-robin allocator (Issue #260 Phase 1-D)。
+///
+/// 真因: NTT NGN P-CSCF / N-ACT は SDP `m=audio` port の parity (even/odd) を
+/// 入口で hard-classify し、 奇数 port を degraded route に sticky bind する
+/// (500 fast-fail 35-48ms)。 RFC 3550 §11 は "RTP SHOULD use an even
+/// destination port" と SHOULD レベル、 同 §11 3 段目で `a=rtcp:` 等で
+/// RTCP port を explicit signal すれば MAY disregard と規定されているが、
+/// **NGN 実機 (2026-05-15 falsification test、 16/16 全 500) は RFC 3605
+/// `a=rtcp:` を honor せず m=audio port parity だけを hardcoded check** している。
+/// よって client 側 (sabiden) は even-only allocator で対応するのが唯一解。
+///
+/// Evidence:
+/// - mixed-parity 44 dial 横断: even → 200 (14/14)、 odd → 500 (30/30)、 p≈1e-10
+/// - falsification (odd + a=rtcp:port+1) 16 INVITE: 全 500
+///
+/// fix: `fetch_add(2)` を even start (30000) から積み上げ、 全 dial に even
+/// port を払い出す。 OS ephemeral (`bind(*, 0)`) は uniform random で 50%
+/// odd を引いていたのが過去 baseline 20-70% success rate variance の真因。
+async fn bind_ngn_rtp_socket(ip: IpAddr) -> Result<Arc<UdpSocket>> {
+    // Even-port allocator range (RFC 3550 §11 SHOULD even):
+    const NGN_RTP_PORT_MIN: u16 = 30000;
+    const NGN_RTP_PORT_MAX: u16 = 30998;
+    // Monotonic counter は `AtomicU32` を使う。 `AtomicU16` だと約 17k INVITE で
+    // wrap して `raw - NGN_RTP_PORT_MIN` が overflow し debug build panic +
+    // release silent wrap (CLAUDE.md §6.5 違反、 PR #264 2 巡目 review 指摘)。
+    // `AtomicU32` なら ~2 billion 回 (= 65 年 @ 1 call/sec) で wrap、 実質無限。
+    static NGN_RTP_PORT_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let span: u32 = (NGN_RTP_PORT_MAX - NGN_RTP_PORT_MIN + 2) as u32;
+    for _ in 0..500 {
+        let raw = NGN_RTP_PORT_NEXT.fetch_add(2, AtomicOrdering::SeqCst);
+        // raw は monotonic、 span (= 1000) で modulo してから even mask。
+        // u32 でも wrap は ~2^32 回後だが、 wrap した時も `raw % span` で
+        // 0-(span-1) の範囲に収まり port が正しく循環する。
+        let offset = ((raw % span) & !1) as u16;
+        let port = NGN_RTP_PORT_MIN + offset;
+        match UdpSocket::bind(SocketAddr::new(ip, port)).await {
+            Ok(s) => return Ok(Arc::new(s)),
+            Err(_) => continue,
+        }
+    }
+    // last resort: ephemeral but force even (re-bind until even port drawn)
+    for _ in 0..50 {
+        let s = UdpSocket::bind(SocketAddr::new(ip, 0)).await?;
+        if s.local_addr()?.port() % 2 == 0 {
+            return Ok(Arc::new(s));
+        }
+    }
+    Err(anyhow!(
+        "could not bind even RTP port after 500 allocator + 50 ephemeral attempts"
+    ))
+}
 
 use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
@@ -2249,7 +2302,8 @@ impl NgnInboundHandler {
         let ngn_peer = extract_rtp_endpoint(ngn_offer)?;
 
         let ngn_bind_ip = self.bridge_ngn_ip();
-        let ngn_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse による P-CSCF ghost binding 衝突回避。
+        let ngn_bridge_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
 
         // Issue #87 / #121: WebRTC 内線レッグは UDP socket を持たない (peer
@@ -4227,7 +4281,8 @@ impl UasEventHandler {
             .bridge_ngn_bind_ip
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let ext_bind_ip = self.bridge_ext_bind_ip.unwrap_or(ngn_bind_ip);
-        let ngn_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse 回避
+        let ngn_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let ext_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await?);
         let sabiden_ngn_addr = ngn_sock.local_addr()?;
         let rewritten =
@@ -4454,7 +4509,8 @@ impl PwaOutboundHandler for UasEventHandler {
         let ngn_bind_ip = self
             .bridge_ngn_bind_ip
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let ngn_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse による P-CSCF ghost binding 衝突回避。
+        let ngn_bridge_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
 
         // (e) NGN へ送る AVP/PCMU SDP を組み立てる (RFC 4566, `docs/asterisk-real-invite.md` §5.2)。
@@ -15865,5 +15921,31 @@ mod tests {
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"500\"} 2"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"503\"} 1"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"other\"} 1"));
+    }
+
+    /// RFC 3550 §11 / Issue #260 Phase 1-D: `bind_ngn_rtp_socket` は必ず
+    /// **偶数 port** を払い出す (NGN P-CSCF が奇数 port を 500 で reject するため、
+    /// `project_ngn_500_FINAL.md` 真因 + falsification evidence、 16/16 odd→500)。
+    /// allocator は 30000-30998 even round-robin、 fallback でも even のみ accept。
+    #[tokio::test]
+    async fn rfc3550_11_bind_ngn_rtp_socket_always_returns_even_port() {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // 連続 16 回 bind して全 even を確認 (Phase 1-D allocator の round-robin
+        // step=2 + even start で、 odd を引く分岐は仕様上 fallback path のみ。
+        // fallback でも parity check で even のみ accept)。
+        let mut sockets = Vec::new();
+        for _ in 0..16 {
+            let s = super::bind_ngn_rtp_socket(ip)
+                .await
+                .expect("bind_ngn_rtp_socket should succeed");
+            let port = s.local_addr().expect("local_addr").port();
+            assert_eq!(
+                port % 2,
+                0,
+                "bind_ngn_rtp_socket は偶数 port のみ払い出すべき (got {})",
+                port
+            );
+            sockets.push(s);
+        }
     }
 }

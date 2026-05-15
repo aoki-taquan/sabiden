@@ -56,7 +56,7 @@ src/
 ├── call/             # 通話制御 (Call Manager)
 │   ├── manager.rs    # 着信フォーク・通話状態管理
 │   ├── bridge.rs     # RTPブリッジ
-│   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound)
+│   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound) + NGN even-port RTP allocator (Issue #260 Phase 1-D)
 │   └── rate_limiter.rs # outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1, Issue #157)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
 ├── health/           # ヘルスチェック HTTP サーバ
@@ -1636,3 +1636,68 @@ test 雛形」 として機能する)。
 - IPv6 接続性必須
 - DHCPv6-PD で /56 取得済み (ひかり電話契約必須)
 - DHCP Option 120 で SIP サーバ取得
+
+### NGN 直収 RTP port allocator (Issue #260 Phase 1-D Final、 PR #264)
+
+NTT NGN P-CSCF / N-ACT は SDP `m=audio <port>` の **parity (even/odd) を入口で
+hardcoded check** し、 **奇数 port を 500 Server Internal Error で reject** する。
+RFC 3550 §11 は "RTP SHOULD use an even destination port" と SHOULD レベル、
+RFC 3605 (`a=rtcp:<port>`) で explicit signal すれば §11 3 段目 "MAY disregard"
+と規定されているが、 **NGN 実機 (2026-05-15 falsification test、 16/16 odd→500)
+は RFC 3605 を honor しない** ことを実機 evidence で確認済 (memory
+`project_ngn_500_FINAL.md`)。
+
+#### sabiden 側の対応
+
+`src/call/orchestrator.rs::bind_ngn_rtp_socket` で **even-only round-robin
+allocator** (30000-30998、 `AtomicU32::fetch_add(2)` を span 1000 で modulo + even mask で even guarantee + last-resort
+ephemeral も even のみ accept) を採用。 OS ephemeral (`UdpSocket::bind(*, 0)`)
+は uniform random で 50% odd を引いていたのが過去 baseline 20-70% success rate
+variance の真因。
+
+#### Evidence
+
+- 5/13-5/15 累積 13 pcap 横断、 mixed-parity 44 dial で完全相関:
+  - even → 200 OK: 14/14 (100%)
+  - odd  → 500   : 30/30 (100%)
+  - p-value (null = parity 無関係): `1 / C(44, 14) ≈ 1e-10`
+- 5/15 evenfix pcap (production fix deploy 後 10 dial): 全 even (30000-30018)、
+  全 200 OK
+- 5/15 falsification (odd + a=rtcp:port+1 明示) 16 INVITE: 全 500 = NGN は
+  RFC 3605 を honor しない
+
+#### 関連 RFC / 仕様
+
+- RFC 3550 §11 (RTP over Network and Transport Protocols、 even-port SHOULD)
+- RFC 3605 §2.1 (SDP `a=rtcp:<port>` 属性、 explicit RTCP port signaling)
+- RFC 3261 §21.5.1 (500 Server Internal Error 用途)
+- 3GPP TS 24.229 §6.1 (UE shall comply with RFC 3550)
+- NTT 公開仕様 ひかり電話タイプ2 第13.1版 (2025-07-01) §2.6 (準拠規格に
+  TTC JF-IETF-STD64 = RFC 3550、 ただし RFC 3605 は未掲載)
+
+#### Sequence: NGN outbound INVITE (Phase 1-D 後)
+
+```
+sabiden                        NGN P-CSCF
+  |                              |
+  | bind_ngn_rtp_socket(eth1_ip) | (内部: even port 30000+2n を allocate)
+  |                              |
+  | INVITE sip:117@p-cscf:5060   |
+  |   m=audio 30000 RTP/AVP 0 101| ← even port
+  |   a=rtcp:30001               | ← RFC 3605 explicit (modern peer 互換)
+  |   ...                        |
+  |----------------------------->|
+  |       100 Trying             |
+  |<-----------------------------|
+  |       200 OK                 | ← even なら通る
+  |<-----------------------------|
+  | ACK ...                      |
+  |----------------------------->|
+  | RTP (PCMU 20ms)              |
+  |<================== bidir ===>|
+```
+
+奇数 port では 35-48ms 内に **500 Server Internal Error fast-fail**。 これは
+RFC 3261 §21.5.1 の 500 用途 (internal failure) ではなく SDP shape reject、
+NTT 自身の最新仕様 §4.2.3 が指す「488 + Warning」 の正しい code を使っていない。
+client (sabiden) 側で even-only allocator が唯一の現実解。

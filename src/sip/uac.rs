@@ -141,23 +141,66 @@ impl Uac {
             ),
         );
         req.headers.set("Max-Forwards", "70");
+        // Asterisk pcap 互換 (memory `project_ngn_500_resolved.md` 2026-05-12):
+        // From に display-name `"Anonymous"` を追加 (NTT NGN inbound では発信者名 strip
+        // されるが outbound の最低限 form として Asterisk が常用)。
         req.headers.set(
             "From",
-            format!("<{}>;tag={}", self.config.local_addr_of_record(), local_tag),
+            format!(
+                "\"Anonymous\" <{}>;tag={}",
+                self.config.local_addr_of_record(),
+                local_tag
+            ),
         );
-        req.headers.set("To", format!("<{}>", target_uri));
+        // RFC 3261 §8.1.1.2: To header は identity (called party)、 transport endpoint
+        // ではない。 Asterisk 互換 (`docs/asterisk-real-invite.md` / memory) では
+        // To URI から `:port` を削除して identity-only にする。
+        // ただし Request-URI には port を残す (carrier 必須: P-CSCF 直送)。
+        let to_uri = if let Some(at_pos) = target_uri.find('@') {
+            // Strip :port and any trailing ;params from host portion only
+            let (prefix, host_part) = target_uri.split_at(at_pos + 1);
+            let host_no_port = host_part.split(':').next().unwrap_or(host_part);
+            format!("{}{}", prefix, host_no_port)
+        } else {
+            target_uri.to_string()
+        };
+        req.headers.set("To", format!("<{}>", to_uri));
         req.headers.set("Call-ID", &call_id);
         req.headers.set("CSeq", format!("{} INVITE", cseq));
         req.headers
             .set("Contact", format!("<{}>", self.config.contact_uri()));
+        // RFC 3261 §20.5: Allow は **UA generating the message が実装する method**
+        // を列挙する。 sabiden の NGN-side UAS が実際に処理経路を持つのは
+        // INVITE / ACK / BYE / CANCEL / OPTIONS のみ (`SUPPORTED_METHODS_ALLOW`
+        // in `src/call/orchestrator.rs`)。 outbound INVITE の Allow も同じ集合
+        // で宣言して honest にする (Issue #260 PR #264 2 巡目 review 指摘、
+        // CLAUDE.md §6.1 band-aid 禁止)。
         req.headers
-            .set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, NOTIFY");
-        req.headers.set("Supported", "timer");
+            .set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS");
+        // RFC 4028 §3 / RFC 3261 §20.32: Session-Timer。 Supported に "timer"
+        // を含めることで carrier 側が Session-Expires を honor する。
+        // 加えて `100rel` (RFC 3262) を宣言、 carrier が PRACK 経路を選ぶ場合に
+        // 1xx provisional の reliable transport を許可する。
+        req.headers.set("Supported", "100rel, timer");
+        // RFC 4028 §4: `Session-Expires: <secs>;refresher=uac`。 sabiden は
+        // UAC 側で refresh する想定 (caller が timer 駆動で re-INVITE する)。
         req.headers.set(
             "Session-Expires",
             format!("{};refresher=uac", session_expires),
         );
         req.headers.set("Min-SE", MIN_SE.to_string());
+        // RFC 3608 §3.2 / RFC 3261 §16.4: REGISTER 200 OK の Service-Route を
+        // Route ヘッダとして echo (IMS MUST)。
+        // ただし NTT NGN 直収では Asterisk pcap 比較で **P-CSCF IP** を使うのが
+        // 実機適合 (`<sip:118.177.125.1:5060;lr>`、 `outbound_proxy` 相当)。
+        // Service-Route の domain (`<sip:ntt-east.ne.jp;lr>`) では 500 率改善限定的
+        // (実機評価 2026-05-12 60% にとどまる) → outbound_proxy style に切替。
+        // 多段 Route が必要なら今後 Service-Route も後続に追加検討。
+        let route_value =
+            crate::sip::current_outbound_proxy_route().or_else(crate::sip::current_service_route);
+        if let Some(route) = route_value {
+            req.headers.set("Route", &route);
+        }
         req.headers.set("User-Agent", &self.config.user_agent);
         // P-Preferred-Identity / Privacy は付けない (Asterisk 実機キャプチャ準拠、
         // `docs/asterisk-real-invite.md` §5.3): Asterisk 20 が同一 NGN 線で両方
@@ -915,6 +958,47 @@ mod tests {
         assert!(via.contains(";rport"), "Via に rport が必要: {}", via);
     }
 
+    /// RFC 3261 §8.1.1.2: To header は **identity (called party)** であって
+    /// transport endpoint ではない。 sabiden は Request-URI には port を残し
+    /// (P-CSCF 直送)、 To URI からは port を剥がす Asterisk pcap 互換 shape を
+    /// 採用 (`docs/asterisk-real-invite.md` §5.1)。 PR #264 2 巡目 review 指摘
+    /// (CLAUDE.md §7 重要パス 100% カバー)。
+    #[tokio::test]
+    async fn rfc3261_8_1_1_2_to_uri_drops_port_request_uri_keeps_port() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(socket);
+        let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let uac = Uac::new(cfg(), layer, server);
+        // case 1: target に :port あり (NGN 直収パス)
+        let plan = uac.build_invite("sip:117@118.177.125.1:5060", None, None);
+        let req = &plan.request;
+        // Request-URI は port 保持 (= P-CSCF 直送用)
+        assert!(
+            req.uri.contains(":5060"),
+            "Request-URI には port を保持すべき (P-CSCF 直送): {}",
+            req.uri
+        );
+        let to = req.headers.get("to").expect("To header");
+        assert!(
+            !to.contains(":5060"),
+            "To URI から port は剥がすべき (RFC 3261 §8.1.1.2 identity): {}",
+            to
+        );
+        assert!(
+            to.contains("117@118.177.125.1"),
+            "To URI には identity (user@host) が残るべき: {}",
+            to
+        );
+        // case 2: target に :port 無し → To もそのまま (idempotent)
+        let plan2 = uac.build_invite("sip:foo@example.com", None, None);
+        let to2 = plan2.request.headers.get("to").expect("To header");
+        assert!(
+            to2.contains("foo@example.com"),
+            "port 無しの target は To もそのまま (no-op): {}",
+            to2
+        );
+    }
+
     #[test]
     fn invite_plan_includes_session_timer_and_rport() {
         let socket_layer_addr: SocketAddr = "[::1]:1".parse().unwrap();
@@ -1008,12 +1092,17 @@ mod tests {
         // P-Preferred-Identity / Privacy は付けない (Asterisk は無しで 200 OK 取得、§5.3)。
         assert!(plan.request.headers.get("p-preferred-identity").is_none());
         assert!(plan.request.headers.get("privacy").is_none());
-        // Session Timer ヘッダ
+        // RFC 4028 §4: Session-Expires は `build_invite` の引数を honor + UAC が refresher。
         assert_eq!(
             plan.request.headers.get("session-expires").unwrap(),
             "300;refresher=uac"
         );
         assert_eq!(plan.request.headers.get("min-se").unwrap(), "90");
+        // RFC 3261 §20.5: Allow は sabiden UAS が実装する method のみ。
+        assert_eq!(
+            plan.request.headers.get("allow").unwrap(),
+            "INVITE, ACK, BYE, CANCEL, OPTIONS"
+        );
 
         let outcome = uac.invite(plan, None).await.expect("invite");
         let mut dlg = match outcome {

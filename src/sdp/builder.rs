@@ -853,6 +853,74 @@ a=sendrecv\r\n";
         assert!(s.contains("a=ptime:20\r\n"));
         assert!(s.contains("a=sendrecv\r\n"));
     }
+
+    /// RFC 3605 §2.1: `restrict_audio_to_pcmu_with_dtmf` は `a=rtcp:<port+1>` を
+    /// m=audio port に基づいて inject する (RTCP port を explicit signal、 modern
+    /// peer 互換)。 Issue #260 / PR #264 真因 (NGN parity reject) の
+    /// falsification test で NGN は honor しないと確認済だが、 SHOULD-level
+    /// compliance + WebRTC 等 modern peer interop に有効。
+    #[test]
+    fn rfc3605_restrict_audio_to_pcmu_with_dtmf_injects_a_rtcp() {
+        let sdp_with_port = b"v=0\r\n\
+o=- 0 0 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendrecv\r\n";
+        let restricted = restrict_audio_to_pcmu_with_dtmf(sdp_with_port);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(
+            s.contains("a=rtcp:30001\r\n"),
+            "a=rtcp:<port+1> が m=audio 30000 から派生して inject されるべき:\n{}",
+            s
+        );
+    }
+
+    /// `a=rtcp:` が既に SDP に含まれていれば idempotent (二重 inject しない)。
+    #[test]
+    fn rfc3605_restrict_audio_idempotent_with_existing_a_rtcp() {
+        let sdp = b"v=0\r\n\
+o=- 0 0 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtcp:40000\r\n\
+a=sendrecv\r\n";
+        let restricted = restrict_audio_to_pcmu_with_dtmf(sdp);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(s.contains("a=rtcp:40000\r\n"));
+        assert!(
+            !s.contains("a=rtcp:30001\r\n"),
+            "既存 a=rtcp:40000 がある時に a=rtcp:30001 を二重に inject すべきでない:\n{}",
+            s
+        );
+    }
+
+    /// RFC 4566 §5.3: `restrict_audio_to_pcmu_with_dtmf` は空 / `-` の `s=` を
+    /// 非空に置換する (厳格な registrar が `s=-` を reject する事例対応、
+    /// Asterisk 互換 `docs/asterisk-real-invite.md` §2)。
+    #[test]
+    fn rfc4566_session_name_replaced_when_empty_or_dash() {
+        let sdp = b"v=0\r\n\
+o=- 0 0 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        let restricted = restrict_audio_to_pcmu_with_dtmf(sdp);
+        let s = std::str::from_utf8(&restricted).expect("utf8");
+        assert!(
+            s.contains("s=sabiden\r\n"),
+            "s=- は s=sabiden に置換されるべき:\n{}",
+            s
+        );
+        assert!(!s.contains("s=-\r\n"));
+    }
 }
 
 /// DTMF 用 telephone-event の RTP payload type 番号 (動的だが de-facto 101)。
@@ -1082,6 +1150,42 @@ pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
                 value: format!("{} 0-15", DTMF_PAYLOAD_TYPE),
             });
         }
+        // RFC 4566 §6 + Asterisk pcap 互換 (memory `project_ngn_500_resolved.md`
+        // 2026-05-12): `a=ptime:20` は NGN の media QoS path 設定で参照される。
+        let has_ptime = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "ptime"));
+        if !has_ptime {
+            audio.attributes.push(Attribute::Value {
+                key: "ptime".to_string(),
+                value: "20".to_string(),
+            });
+        }
+        // RFC 3605 §2.1: `a=rtcp:<port>` で RTCP port を媒体レベルに explicit
+        // signal する。 sabiden は RTP/RTCP を separate port で bind しており
+        // (rtcp-mux 不使用)、 m=audio port + 1 が RTCP port (RFC 3550 §11 default
+        // convention)。 explicit signal は modern peer (WebRTC 等) との
+        // interop に有効。 なお NTT NGN P-CSCF は a=rtcp 行を honor しない
+        // (2026-05-15 falsification test、 odd RTP + a=rtcp 16/16 全 500)
+        // ため、 NGN 経路では bind_ngn_rtp_socket の even-only allocator が
+        // 真の workaround となる。
+        let has_a_rtcp = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "rtcp"));
+        if !has_a_rtcp {
+            let rtcp_port = audio.port.saturating_add(1);
+            audio.attributes.push(Attribute::Value {
+                key: "rtcp".to_string(),
+                value: rtcp_port.to_string(),
+            });
+        }
+    }
+    // RFC 4566 §5.3: `s=` MUST be non-empty。 多くの client は `-` を入れるが
+    // 厳格な registrar は reject する事例あり。 Asterisk pcap は `s=Asterisk` 使用。
+    if sdp.session_name.is_empty() || sdp.session_name == "-" {
+        sdp.session_name = "sabiden".to_string();
     }
     sdp.to_string_crlf().into_bytes()
 }

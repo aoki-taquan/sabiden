@@ -1082,6 +1082,23 @@ pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
                 value: format!("{} 0-15", DTMF_PAYLOAD_TYPE),
             });
         }
+        // RFC 4566 §6 + Asterisk pcap 互換 (memory `project_ngn_500_resolved.md`
+        // 2026-05-12): `a=ptime:20` は NGN の media QoS path 設定で参照される。
+        let has_ptime = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "ptime"));
+        if !has_ptime {
+            audio.attributes.push(Attribute::Value {
+                key: "ptime".to_string(),
+                value: "20".to_string(),
+            });
+        }
+    }
+    // RFC 4566 §5.3: `s=` MUST be non-empty。 多くの client は `-` を入れるが
+    // 厳格な registrar は reject する事例あり。 Asterisk pcap は `s=Asterisk` 使用。
+    if sdp.session_name.is_empty() || sdp.session_name == "-" {
+        sdp.session_name = "sabiden".to_string();
     }
     sdp.to_string_crlf().into_bytes()
 }

@@ -141,23 +141,60 @@ impl Uac {
             ),
         );
         req.headers.set("Max-Forwards", "70");
+        // Asterisk pcap 互換 (memory `project_ngn_500_resolved.md` 2026-05-12):
+        // From に display-name `"Anonymous"` を追加 (NTT NGN inbound では発信者名 strip
+        // されるが outbound の最低限 form として Asterisk が常用)。
         req.headers.set(
             "From",
-            format!("<{}>;tag={}", self.config.local_addr_of_record(), local_tag),
+            format!(
+                "\"Anonymous\" <{}>;tag={}",
+                self.config.local_addr_of_record(),
+                local_tag
+            ),
         );
-        req.headers.set("To", format!("<{}>", target_uri));
+        // RFC 3261 §8.1.1.2: To header は identity (called party)、 transport endpoint
+        // ではない。 Asterisk 互換 (`docs/asterisk-real-invite.md` / memory) では
+        // To URI から `:port` を削除して identity-only にする。
+        // ただし Request-URI には port を残す (carrier 必須: P-CSCF 直送)。
+        let to_uri = if let Some(at_pos) = target_uri.find('@') {
+            // Strip :port and any trailing ;params from host portion only
+            let (prefix, host_part) = target_uri.split_at(at_pos + 1);
+            let host_no_port = host_part.split(':').next().unwrap_or(host_part);
+            format!("{}{}", prefix, host_no_port)
+        } else {
+            target_uri.to_string()
+        };
+        req.headers.set("To", format!("<{}>", to_uri));
         req.headers.set("Call-ID", &call_id);
         req.headers.set("CSeq", format!("{} INVITE", cseq));
         req.headers
             .set("Contact", format!("<{}>", self.config.contact_uri()));
-        req.headers
-            .set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, NOTIFY");
-        req.headers.set("Supported", "timer");
+        // Asterisk pcap 互換: IMS で carrier が期待する extension method を全部宣言。
+        // UPDATE (RFC 3311) / PRACK (RFC 3262) / MESSAGE / REFER / PUBLISH / SUBSCRIBE。
         req.headers.set(
-            "Session-Expires",
-            format!("{};refresher=uac", session_expires),
+            "Allow",
+            "OPTIONS, REGISTER, SUBSCRIBE, NOTIFY, PUBLISH, INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, INFO, MESSAGE, REFER",
         );
+        // Asterisk pcap 互換: 100rel / replaces / norefersub / histinfo を宣言。
+        // NGN は 100rel 受領で reliable provisional (PRACK) を使う事例あり。
+        req.headers
+            .set("Supported", "100rel, timer, replaces, norefersub, histinfo");
+        // Asterisk pcap 互換: Session-Expires に refresher 指定しない (carrier 任せ)。
+        let _ = session_expires; // 互換性のため引数は残すが Asterisk 値を優先
+        req.headers.set("Session-Expires", "1800");
         req.headers.set("Min-SE", MIN_SE.to_string());
+        // RFC 3608 §3.2 / RFC 3261 §16.4: REGISTER 200 OK の Service-Route を
+        // Route ヘッダとして echo (IMS MUST)。
+        // ただし NTT NGN 直収では Asterisk pcap 比較で **P-CSCF IP** を使うのが
+        // 実機適合 (`<sip:118.177.125.1:5060;lr>`、 `outbound_proxy` 相当)。
+        // Service-Route の domain (`<sip:ntt-east.ne.jp;lr>`) では 500 率改善限定的
+        // (実機評価 2026-05-12 60% にとどまる) → outbound_proxy style に切替。
+        // 多段 Route が必要なら今後 Service-Route も後続に追加検討。
+        let route_value =
+            crate::sip::current_outbound_proxy_route().or_else(crate::sip::current_service_route);
+        if let Some(route) = route_value {
+            req.headers.set("Route", &route);
+        }
         req.headers.set("User-Agent", &self.config.user_agent);
         // P-Preferred-Identity / Privacy は付けない (Asterisk 実機キャプチャ準拠、
         // `docs/asterisk-real-invite.md` §5.3): Asterisk 20 が同一 NGN 線で両方
@@ -1008,10 +1045,11 @@ mod tests {
         // P-Preferred-Identity / Privacy は付けない (Asterisk は無しで 200 OK 取得、§5.3)。
         assert!(plan.request.headers.get("p-preferred-identity").is_none());
         assert!(plan.request.headers.get("privacy").is_none());
-        // Session Timer ヘッダ
+        // Session Timer ヘッダ (Asterisk pcap 互換: refresher 指定なし固定 1800、
+        // `docs/asterisk-real-invite.md` §2)
         assert_eq!(
             plan.request.headers.get("session-expires").unwrap(),
-            "300;refresher=uac"
+            "1800"
         );
         assert_eq!(plan.request.headers.get("min-se").unwrap(), "90");
 

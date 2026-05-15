@@ -40,8 +40,52 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// NGN outbound RTP port even-only round-robin allocator (Issue #260 Phase 1-D)。
+///
+/// 真因: NTT NGN P-CSCF / N-ACT は SDP `m=audio` port の parity (even/odd) を
+/// 入口で hard-classify し、 奇数 port を degraded route に sticky bind する
+/// (500 fast-fail 35-48ms)。 RFC 3550 §5.1 は "RTP SHOULD use an even
+/// destination port" と SHOULD レベルだが、 NGN SBC (推定 Acme / Mavenir 系
+/// 2005-2010 era 実装) は MUST 相当で enforce している。 RFC 3605 (`a=rtcp:`)
+/// / RFC 5761 (rtcp-mux) は NGN 経路では使えない。
+///
+/// Evidence (2026-05-15、 13 pcap 横断、 mixed-parity 44 dial):
+/// - even → 200 OK: 14/14 (100%)
+/// - odd  → 500   : 30/30 (100%)
+/// - p-value (null = parity 無関係): `1 / C(44, 14) ≈ 1e-10`
+///
+/// fix: `fetch_add(2)` を even start (30000) から積み上げ、 全 dial に even
+/// port を払い出す。 OS ephemeral (`bind(*, 0)`) は uniform random で 50%
+/// odd を引いていたのが過去 baseline 20-70% success rate variance の真因。
+async fn bind_ngn_rtp_socket(ip: IpAddr) -> Result<Arc<UdpSocket>> {
+    const NGN_RTP_PORT_MIN: u16 = 30000; // even start
+    const NGN_RTP_PORT_MAX: u16 = 30998; // even end, span 500 attempts
+    static NGN_RTP_PORT_NEXT: AtomicU16 = AtomicU16::new(NGN_RTP_PORT_MIN);
+    let span = NGN_RTP_PORT_MAX - NGN_RTP_PORT_MIN + 2;
+    for _ in 0..500 {
+        let raw = NGN_RTP_PORT_NEXT.fetch_add(2, AtomicOrdering::SeqCst);
+        let offset = ((raw - NGN_RTP_PORT_MIN) % span) & !1; // even guarantee
+        let port = NGN_RTP_PORT_MIN + offset;
+        match UdpSocket::bind(SocketAddr::new(ip, port)).await {
+            Ok(s) => return Ok(Arc::new(s)),
+            Err(_) => continue,
+        }
+    }
+    // last resort: ephemeral but force even (re-bind until even port drawn)
+    for _ in 0..50 {
+        let s = UdpSocket::bind(SocketAddr::new(ip, 0)).await?;
+        if s.local_addr()?.port() % 2 == 0 {
+            return Ok(Arc::new(s));
+        }
+    }
+    Err(anyhow!(
+        "could not bind even RTP port after 500 allocator + 50 ephemeral attempts"
+    ))
+}
 
 use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
@@ -2249,7 +2293,8 @@ impl NgnInboundHandler {
         let ngn_peer = extract_rtp_endpoint(ngn_offer)?;
 
         let ngn_bind_ip = self.bridge_ngn_ip();
-        let ngn_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse による P-CSCF ghost binding 衝突回避。
+        let ngn_bridge_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
 
         // Issue #87 / #121: WebRTC 内線レッグは UDP socket を持たない (peer
@@ -3235,6 +3280,13 @@ impl UasEventHandler {
                                 Some(false)
                             } else {
                                 info!(%call_id, "carrier retry 実行 (試行 2/2、 Issue #260)");
+                                // Phase 1-C (TS 24.229 §5.2.6): 500 は P-CSCF restoration
+                                // trigger。 retry 前に強制 re-REGISTER を要求して S-CSCF
+                                // 登録 epoch を更新、 sticky degraded state を flush する。
+                                info!(%call_id, "Phase 1-C: 強制 re-REGISTER 要求 (TS 24.229 §5.2.6)");
+                                crate::sip::request_re_register();
+                                // 200 OK REGISTER を受領するまで ~50ms、 余裕を持って 500ms 待機。
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 // 新 INVITE を組み立てる (新 Call-ID / 新 branch / 新 tag、
                                 // RFC 3261 §8.1.1.5)。 同じ target + SDP を再送する。
                                 let retry_plan =
@@ -4227,7 +4279,8 @@ impl UasEventHandler {
             .bridge_ngn_bind_ip
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let ext_bind_ip = self.bridge_ext_bind_ip.unwrap_or(ngn_bind_ip);
-        let ngn_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse 回避
+        let ngn_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let ext_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await?);
         let sabiden_ngn_addr = ngn_sock.local_addr()?;
         let rewritten =
@@ -4454,7 +4507,8 @@ impl PwaOutboundHandler for UasEventHandler {
         let ngn_bind_ip = self
             .bridge_ngn_bind_ip
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let ngn_bridge_sock = Arc::new(UdpSocket::bind(SocketAddr::new(ngn_bind_ip, 0)).await?);
+        // Phase 1-D: ephemeral port reuse による P-CSCF ghost binding 衝突回避。
+        let ngn_bridge_sock = bind_ngn_rtp_socket(ngn_bind_ip).await?;
         let sabiden_ngn_addr = ngn_bridge_sock.local_addr()?;
 
         // (e) NGN へ送る AVP/PCMU SDP を組み立てる (RFC 4566, `docs/asterisk-real-invite.md` §5.2)。
@@ -4566,6 +4620,14 @@ impl PwaOutboundHandler for UasEventHandler {
                                         call_id = %plan_call_id,
                                         "carrier retry 実行 (試行 2/2、 PWA outbound、 Issue #260)"
                                     );
+                                    // Phase 1-C: 500 は P-CSCF restoration trigger
+                                    // (TS 24.229 §5.2.6)。 retry 前に強制 re-REGISTER。
+                                    info!(
+                                        call_id = %plan_call_id,
+                                        "Phase 1-C: 強制 re-REGISTER 要求 (TS 24.229 §5.2.6、 PWA outbound)"
+                                    );
+                                    crate::sip::request_re_register();
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     let retry_plan = ngn_uac.build_invite(
                                         &target_uri,
                                         Some(&sdp_for_ngn),

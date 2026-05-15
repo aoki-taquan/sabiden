@@ -81,7 +81,15 @@ impl Registrar {
                         self.metrics.record_register(true);
                         let refresh = Duration::from_secs((expires as f64 * 0.9) as u64);
                         info!("REGISTER 成功 次回更新まで {}秒", refresh.as_secs());
-                        time::sleep(refresh).await;
+                        // Phase 1-C: 通常 refresh timer + 強制 re-REGISTER notify を併走監視。
+                        // 500 受領で orchestrator が `request_re_register()` を call すると
+                        // refresh sleep を抜けて即時 re-REGISTER (TS 24.229 §5.2.6 restoration)。
+                        tokio::select! {
+                            _ = time::sleep(refresh) => {},
+                            _ = crate::sip::re_register_notify().notified() => {
+                                info!("Phase 1-C: 強制 re-REGISTER 要求受信 (500 受領由来)、 refresh 即時実行");
+                            }
+                        }
                     }
                     Err(e) => {
                         self.registered.store(false, Ordering::SeqCst);
@@ -112,7 +120,20 @@ impl Registrar {
         let req = self.build_register(cseq, None);
         let resp = self.layer.send_request(req, self.server_addr).await?;
         match resp.status_code {
-            200 => Ok(parse_expires(&resp.headers)),
+            200 => {
+                // RFC 3608 §3.2: REGISTER 200 OK の Service-Route を保存し
+                // 以降の dialog-creating request (INVITE 等) の Route ヘッダに echo する。
+                // IMS では MUST。 NGN は `Service-Route: <sip:ntt-east.ne.jp;lr>` を返す。
+                let sr = resp.headers.get("service-route").map(|s| s.to_string());
+                tracing::debug!(service_route=?sr, "REGISTER 200 OK: Service-Route 保存 (RFC 3608)");
+                crate::sip::store_service_route(sr);
+                // outbound_proxy style: NGN P-CSCF IP を Route として固定使用
+                // (Asterisk pcap 互換、 NTT 直収で実機適合確認 2026-05-12)。
+                let op = format!("<sip:{};lr>", self.server_addr);
+                tracing::debug!(outbound_proxy_route=%op, "outbound_proxy Route 保存");
+                crate::sip::store_outbound_proxy_route(Some(op));
+                Ok(parse_expires(&resp.headers))
+            }
             401 => {
                 // password が無い (NGN 直収モード) で 401 が返るのは、
                 // 回線認証側 (HGW WAN MAC spoof / DHCPv4 vendor class) の問題。
@@ -138,6 +159,10 @@ impl Registrar {
                 let req2 = self.build_register(cseq2, Some(&digest.header_value));
                 let resp2 = self.layer.send_request(req2, self.server_addr).await?;
                 if resp2.status_code == 200 {
+                    // RFC 3608 §3.2: 同上、 challenge 後の REGISTER 200 OK でも保存
+                    let sr = resp2.headers.get("service-route").map(|s| s.to_string());
+                    tracing::debug!(service_route=?sr, "REGISTER (auth) 200 OK: Service-Route 保存 (RFC 3608)");
+                    crate::sip::store_service_route(sr);
                     Ok(parse_expires(&resp2.headers))
                 } else {
                     anyhow::bail!("REGISTER 失敗: {} {}", resp2.status_code, resp2.reason)

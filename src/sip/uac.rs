@@ -97,6 +97,14 @@ impl UacConfig {
 /// endpoint ではない。 Asterisk 互換 (`docs/asterisk-real-invite.md` §5.1)
 /// では To URI から `:port` を削除して identity-only にする。
 ///
+/// # Scope (実装制限)
+///
+/// - **IPv4 host のみ想定** (RFC 3986 §3.2.2 bracket form `[v6::1]:port` は未対応)。
+///   NGN は IPv4 only (`118.177.72.242`、 memory `project_ngn_dhcp_result.md`)
+///   なので現状実害なし。 IPv6 対応は本 helper の TODO。
+/// - **`?headers` (RFC 3261 §19.1.1) は host 側に残る**。 sabiden の callsite
+///   (target_uri) には `?headers` 形式無し。 必要になったら helper を拡張。
+///
 /// # 例
 ///
 /// - `sip:117@118.177.125.1:5060` → `sip:117@118.177.125.1`

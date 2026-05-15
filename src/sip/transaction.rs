@@ -727,7 +727,7 @@ impl ClientTransaction {
 /// を内部で起動し、ACK 受信や Timer 満了で Terminated に遷移する。
 ///
 /// 同一リクエストの再送に対しては、最後に送った final response を
-/// 自動的に再送する ([`handle_retransmit`])。これは [`TransactionLayer`]
+/// 自動的に再送する ([`Self::handle_retransmit`])。これは [`TransactionLayer`]
 /// が ID マッチで呼び出すか、外部から直接呼び出す。
 pub struct ServerTransaction {
     id: TransactionId,

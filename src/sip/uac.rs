@@ -59,7 +59,7 @@ pub struct UacConfig {
     pub local_uri: String,
     /// SIP ドメイン
     pub domain: String,
-    /// ローカル Contact ホスト ("[2001:db8::1]:5060")
+    /// ローカル Contact ホスト (例: `[2001:db8::1]:5060`)
     pub local_addr: SocketAddr,
     /// User-Agent ヘッダ値
     pub user_agent: String,

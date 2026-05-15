@@ -92,7 +92,7 @@ impl ExtensionRegistrar {
         Arc::new(Self::default())
     }
 
-    /// AOR に SIP Binding を上書き登録する。expires が 0 のときは [`unregister`]
+    /// AOR に SIP Binding を上書き登録する。expires が 0 のときは [`Self::unregister`]
     /// と等価 (RFC 3261 §10.2.1.1)。
     /// 既定の transport は [`ExtTransport::Sip`]。
     pub async fn register(

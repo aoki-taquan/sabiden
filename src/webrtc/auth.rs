@@ -68,7 +68,7 @@ impl std::error::Error for AuthError {}
 
 /// HMAC 検証器。共有秘密鍵と現在時刻クロックを束ねる。
 ///
-/// テストでは [`Verifier::with_now`] で時計を注入できる。
+/// テストでは `Self::with_now` (cfg=test) で時計を注入できる。
 pub struct Verifier {
     secret: Vec<u8>,
     now: Box<dyn Fn() -> u64 + Send + Sync>,

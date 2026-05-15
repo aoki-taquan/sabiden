@@ -23,7 +23,7 @@
 //!
 //! `UasEvent::Invite` を受け取り、内線の SDP オファをそのまま `Uac::invite`
 //! に渡して NGN に転送する (B2BUA だが SDP は穴開けなしで透過)。NGN の
-//! 200 OK が来たら内線側の [`ResponderHandle`] で 200 OK を返し、両側の
+//! 200 OK が来たら内線側の [`crate::sip::uas::ResponderHandle`] で 200 OK を返し、両側の
 //! ダイアログを保持する。
 //!
 //! # RTP ブリッジ

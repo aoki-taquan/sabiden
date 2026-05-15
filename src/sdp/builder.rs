@@ -4,7 +4,7 @@
 //! 行終端は CRLF。SIP 経由で送信されるため UTF-8 ではなく US-ASCII を想定。
 //!
 //! また、NTT ひかり電話 (NGN) で頻出する G.711 μ-law のオファーを
-//! 簡単に作れるヘルパ [`Sdpoffer`] 系コンストラクタを提供する。
+//! 簡単に作れるヘルパ ([`SessionDescription::pcmu_offer`] 系コンストラクタ) を提供する。
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -91,8 +91,8 @@ fn format_attr(a: &Attribute) -> String {
 /// [RFC 5576 §4.1](https://www.rfc-editor.org/rfc/rfc5576#section-4.1) /
 /// [RFC 8830 §2](https://www.rfc-editor.org/rfc/rfc8830#section-2) /
 /// [W3C webrtc-pc §5.7] に基づき RTP 受信側 track binding を行うため必要。
-/// 未指定 (`None`) なら [`DtlsIceParams::ssrc_or_default`] / [`Self::cname_or_default`]
-/// 等が `o=` の session-id 由来の安定値を返す。
+/// 未指定 (`None`) なら `DtlsIceParams::ssrc_or_default` / `Self::cname_or_default`
+/// 等が `o=` の session-id 由来の安定値を返す (private helper、 internal use only)。
 #[derive(Debug, Clone)]
 pub struct DtlsIceParams {
     /// `a=ice-ufrag:<v>` の値

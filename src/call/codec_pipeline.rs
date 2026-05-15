@@ -1,8 +1,8 @@
 //! コーデックパイプライン選択 (Issue #29)
 //!
 //! NGN レッグと内線レッグの SDP からそれぞれの音声コーデックを判定し、
-//! 「素通し ([`RtpBridge`]) で済むのか」「Opus↔G.711 トランスコード
-//! ([`TranscodingBridge`]) が要るのか」を選ぶための判断ロジックを集約する。
+//! 「素通し ([`crate::call::bridge::RtpBridge`]) で済むのか」「Opus↔G.711 トランスコード
+//! ([`crate::call::transcoder::TranscodingBridge`]) が要るのか」を選ぶための判断ロジックを集約する。
 //!
 //! ## 判定方針 (RFC 3264 §5.1 / RFC 4566 §6 / RFC 7587 §7)
 //!
@@ -20,7 +20,7 @@
 //!
 //! Phase 1〜Phase 4 で実機検証済みの **PCMU↔PCMU 既存パス** (Linphone↔NGN /
 //! 117 時報通話) を絶対に壊さないため、`select_media_plan` は両側 PCMU の
-//! ときに必ず `MediaPlan::Relay` を返す (= 既存 [`RtpBridge`] にフォールバック)。
+//! ときに必ず `MediaPlan::Relay` を返す (= 既存 [`crate::call::bridge::RtpBridge`] にフォールバック)。
 //!
 //! ## NGN 制約 (CLAUDE.md §5)
 //!

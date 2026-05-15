@@ -145,7 +145,7 @@ impl RtpSession {
     /// (RFC 3551) では talkspurt の先頭マーキングが該当する。
     ///
     /// 本実装は `last_send_time` を保持し、 (a) 初回送信、 もしくは
-    /// (b) 直前送信から [`TALKSPURT_GAP_THRESHOLD`] (= 30 ms) 以上経過した場合に
+    /// (b) 直前送信から `TALKSPURT_GAP_THRESHOLD` (= 30 ms) 以上経過した場合に
     /// M=1 を立てる。 30 ms は PCMU 1 frame 周期 (20 ms) と silence detector
     /// の最短窓 (40 ms) の中間値であり、 false positive と false negative の
     /// 両方を避ける (Issue #84)。

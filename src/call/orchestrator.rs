@@ -23,7 +23,7 @@
 //! - 内線→NGN INVITE: 200 OK 受信時に NGN レッグの [`UacDialog`] と内線レッグの
 //!   sabiden=UAS [`Dialog`] の両方を [`OutboundCallRegistry`] に保存。
 //! - 内線→sabiden BYE: [`UasEvent::Bye`] → 内線へ 200 OK + NGN UacDialog 経由で BYE 送出。
-//! - NGN→sabiden BYE: [`NgnInboundHandler::handle_bye`] → registry を引いて内線レッグの
+//! - NGN→sabiden BYE: `NgnInboundHandler::handle_bye` → registry を引いて内線レッグの
 //!   sabiden=UAS Dialog から build_bye → ext_layer.send_request で内線へ送出。
 //! - 内線 CANCEL: [`UasEvent::Cancel`] → NGN へ CANCEL (RFC 3261 §9.1) → 内線へ 487。
 //!
@@ -627,7 +627,7 @@ impl OutboundDialogForwarder for UasEventHandler {
 /// [`OutboundCallEntry`] (= `ext_dialog` 必須) は使えない。 専用テーブル
 /// [`WebRtcOutboundActive`] にこのエントリを保存することで:
 ///
-/// - **NGN→PWA BYE**: [`NgnInboundHandler::handle_bye`] が NGN 側 Call-ID で
+/// - **NGN→PWA BYE**: `NgnInboundHandler::handle_bye` が NGN 側 Call-ID で
 ///   このテーブルを引き、 `bridge_call_id` で `CallManager::terminate` →
 ///   `metrics.dec_call_active` → `WsSink` に `ServerMessage::Bye` を push。
 /// - **PWA→NGN BYE**: シグナリング層が `ClientMessage::Bye` または WS close
@@ -2702,7 +2702,7 @@ fn extract_via_received_rport(via: &str) -> (Option<String>, Option<String>) {
 /// - `ext_call_id` (内線が送った INVITE の Call-ID): 内線側からの BYE/CANCEL の
 ///   ルックアップに使う。
 /// - `ngn_call_id` (sabiden が NGN へ発行した INVITE の Call-ID): NGN 側からの
-///   BYE のルックアップに使う ([`NgnInboundHandler::handle_bye`] が参照)。
+///   BYE のルックアップに使う (`NgnInboundHandler::handle_bye` が参照)。
 ///
 /// 並行アクセスは [`Mutex`] 1 つでガードする (1 通話あたり数イベント程度なので
 /// 競合は少ない)。確立済みエントリは `Arc<OutboundCallEntry>` で共有する。

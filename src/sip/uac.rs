@@ -90,6 +90,46 @@ impl UacConfig {
     }
 }
 
+/// SIP URI から host portion の `:port` だけを剥がす (transport / lr / 他の
+/// URI parameters は保持)。
+///
+/// RFC 3261 §8.1.1.2: To header は identity (called party) であり transport
+/// endpoint ではない。 Asterisk 互換 (`docs/asterisk-real-invite.md` §5.1)
+/// では To URI から `:port` を削除して identity-only にする。
+///
+/// # Scope (実装制限)
+///
+/// - **IPv4 host のみ想定** (RFC 3986 §3.2.2 bracket form `[v6::1]:port` は未対応)。
+///   NGN は IPv4 only (`118.177.72.242`、 memory `project_ngn_dhcp_result.md`)
+///   なので現状実害なし。 IPv6 対応は本 helper の TODO。
+/// - **`?headers` (RFC 3261 §19.1.1) は host 側に残る**。 sabiden の callsite
+///   (target_uri) には `?headers` 形式無し。 必要になったら helper を拡張。
+///
+/// # 例
+///
+/// - `sip:117@118.177.125.1:5060` → `sip:117@118.177.125.1`
+/// - `sip:117@p-cscf:5060;transport=udp` → `sip:117@p-cscf;transport=udp`
+///   (transport param は保持)
+/// - `sip:117@p-cscf;transport=udp` → no-op (port なし)
+/// - `sip:117@p-cscf` → no-op
+pub(crate) fn strip_port_from_sip_uri(target_uri: &str) -> String {
+    let Some(at_pos) = target_uri.find('@') else {
+        return target_uri.to_string();
+    };
+    let (prefix, host_part) = target_uri.split_at(at_pos + 1);
+    // host_part may be: "host", "host:port", "host;params", "host:port;params"
+    // Find optional ';' first to preserve URI params.
+    let (host_with_optional_port, params) = match host_part.find(';') {
+        Some(p) => (&host_part[..p], &host_part[p..]),
+        None => (host_part, ""),
+    };
+    let host_no_port = host_with_optional_port
+        .split(':')
+        .next()
+        .unwrap_or(host_with_optional_port);
+    format!("{}{}{}", prefix, host_no_port, params)
+}
+
 /// UAC コンテキスト。下層トランザクション層への参照と発信時の共通設定を持つ。
 pub struct Uac {
     config: UacConfig,
@@ -156,14 +196,7 @@ impl Uac {
         // ではない。 Asterisk 互換 (`docs/asterisk-real-invite.md` / memory) では
         // To URI から `:port` を削除して identity-only にする。
         // ただし Request-URI には port を残す (carrier 必須: P-CSCF 直送)。
-        let to_uri = if let Some(at_pos) = target_uri.find('@') {
-            // Strip :port and any trailing ;params from host portion only
-            let (prefix, host_part) = target_uri.split_at(at_pos + 1);
-            let host_no_port = host_part.split(':').next().unwrap_or(host_part);
-            format!("{}{}", prefix, host_no_port)
-        } else {
-            target_uri.to_string()
-        };
+        let to_uri = strip_port_from_sip_uri(target_uri);
         req.headers.set("To", format!("<{}>", to_uri));
         req.headers.set("Call-ID", &call_id);
         req.headers.set("CSeq", format!("{} INVITE", cseq));
@@ -956,6 +989,43 @@ mod tests {
         // Via に `;rport` が含まれること (RFC 3581 / Asterisk 実機準拠)
         let via = req.headers.get("via").unwrap();
         assert!(via.contains(";rport"), "Via に rport が必要: {}", via);
+    }
+
+    /// RFC 3261 §8.1.1.2: `strip_port_from_sip_uri` の挙動を unit test。
+    /// host portion の `:port` だけを剥がし、 URI parameters (`;transport=udp` 等)
+    /// は保持する。
+    #[test]
+    fn rfc3261_8_1_1_2_strip_port_keeps_transport_params() {
+        // case 1: port のみ → 剥がす
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:117@118.177.125.1:5060"),
+            "sip:117@118.177.125.1"
+        );
+        // case 2: port + transport param → port のみ剥がす
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:117@p-cscf:5060;transport=udp"),
+            "sip:117@p-cscf;transport=udp"
+        );
+        // case 3: port + lr param → port のみ剥がす
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:foo@host:5060;lr"),
+            "sip:foo@host;lr"
+        );
+        // case 4: port なし、 params あり → no-op
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:117@p-cscf;transport=udp"),
+            "sip:117@p-cscf;transport=udp"
+        );
+        // case 5: port なし、 params なし → no-op
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:foo@example.com"),
+            "sip:foo@example.com"
+        );
+        // case 6: @ なし → no-op (defensive)
+        assert_eq!(
+            super::strip_port_from_sip_uri("sip:118.177.125.1:5060"),
+            "sip:118.177.125.1:5060"
+        );
     }
 
     /// RFC 3261 §8.1.1.2: To header は **identity (called party)** であって

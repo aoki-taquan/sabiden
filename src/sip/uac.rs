@@ -1047,10 +1047,7 @@ mod tests {
         assert!(plan.request.headers.get("privacy").is_none());
         // Session Timer ヘッダ (Asterisk pcap 互換: refresher 指定なし固定 1800、
         // `docs/asterisk-real-invite.md` §2)
-        assert_eq!(
-            plan.request.headers.get("session-expires").unwrap(),
-            "1800"
-        );
+        assert_eq!(plan.request.headers.get("session-expires").unwrap(), "1800");
         assert_eq!(plan.request.headers.get("min-se").unwrap(), "90");
 
         let outcome = uac.invite(plan, None).await.expect("invite");

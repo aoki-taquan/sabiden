@@ -48,15 +48,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 ///
 /// 真因: NTT NGN P-CSCF / N-ACT は SDP `m=audio` port の parity (even/odd) を
 /// 入口で hard-classify し、 奇数 port を degraded route に sticky bind する
-/// (500 fast-fail 35-48ms)。 RFC 3550 §5.1 は "RTP SHOULD use an even
-/// destination port" と SHOULD レベルだが、 NGN SBC (推定 Acme / Mavenir 系
-/// 2005-2010 era 実装) は MUST 相当で enforce している。 RFC 3605 (`a=rtcp:`)
-/// / RFC 5761 (rtcp-mux) は NGN 経路では使えない。
+/// (500 fast-fail 35-48ms)。 RFC 3550 §11 は "RTP SHOULD use an even
+/// destination port" と SHOULD レベル、 同 §11 3 段目で `a=rtcp:` 等で
+/// RTCP port を explicit signal すれば MAY disregard と規定されているが、
+/// **NGN 実機 (2026-05-15 falsification test、 16/16 全 500) は RFC 3605
+/// `a=rtcp:` を honor せず m=audio port parity だけを hardcoded check** している。
+/// よって client 側 (sabiden) は even-only allocator で対応するのが唯一解。
 ///
-/// Evidence (2026-05-15、 13 pcap 横断、 mixed-parity 44 dial):
-/// - even → 200 OK: 14/14 (100%)
-/// - odd  → 500   : 30/30 (100%)
-/// - p-value (null = parity 無関係): `1 / C(44, 14) ≈ 1e-10`
+/// Evidence:
+/// - mixed-parity 44 dial 横断: even → 200 (14/14)、 odd → 500 (30/30)、 p≈1e-10
+/// - falsification (odd + a=rtcp:port+1) 16 INVITE: 全 500
 ///
 /// fix: `fetch_add(2)` を even start (30000) から積み上げ、 全 dial に even
 /// port を払い出す。 OS ephemeral (`bind(*, 0)`) は uniform random で 50%

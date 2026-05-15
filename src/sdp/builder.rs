@@ -1094,6 +1094,25 @@ pub fn restrict_audio_to_pcmu_with_dtmf(sdp_bytes: &[u8]) -> Vec<u8> {
                 value: "20".to_string(),
             });
         }
+        // RFC 3605 §2.1: `a=rtcp:<port>` で RTCP port を媒体レベルに explicit
+        // signal する。 sabiden は RTP/RTCP を separate port で bind しており
+        // (rtcp-mux 不使用)、 m=audio port + 1 が RTCP port (RFC 3550 §11 default
+        // convention)。 explicit signal は modern peer (WebRTC 等) との
+        // interop に有効。 なお NTT NGN P-CSCF は a=rtcp 行を honor しない
+        // (2026-05-15 falsification test、 odd RTP + a=rtcp 16/16 全 500)
+        // ため、 NGN 経路では bind_ngn_rtp_socket の even-only allocator が
+        // 真の workaround となる。
+        let has_a_rtcp = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "rtcp"));
+        if !has_a_rtcp {
+            let rtcp_port = audio.port.saturating_add(1);
+            audio.attributes.push(Attribute::Value {
+                key: "rtcp".to_string(),
+                value: rtcp_port.to_string(),
+            });
+        }
     }
     // RFC 4566 §5.3: `s=` MUST be non-empty。 多くの client は `-` を入れるが
     // 厳格な registrar は reject する事例あり。 Asterisk pcap は `s=Asterisk` 使用。

@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,11 +65,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 async fn bind_ngn_rtp_socket(ip: IpAddr) -> Result<Arc<UdpSocket>> {
     const NGN_RTP_PORT_MIN: u16 = 30000; // even start
     const NGN_RTP_PORT_MAX: u16 = 30998; // even end, span 500 attempts
-    static NGN_RTP_PORT_NEXT: AtomicU16 = AtomicU16::new(NGN_RTP_PORT_MIN);
-    let span = NGN_RTP_PORT_MAX - NGN_RTP_PORT_MIN + 2;
+    // Monotonic counter (AtomicU32)。 `AtomicU16` だと約 17k INVITE で
+    // wrap して `raw - NGN_RTP_PORT_MIN` が overflow し debug build panic
+    // + release build silent wrap (CLAUDE.md §6.5 違反、 PR #264 2 巡目
+    // review agent 指摘)。 U32 なら 2 billion 回 (= 65 年 @ 1 call/sec)
+    // で wrap、 実質無限。
+    static NGN_RTP_PORT_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let span: u32 = (NGN_RTP_PORT_MAX - NGN_RTP_PORT_MIN + 2) as u32;
     for _ in 0..500 {
         let raw = NGN_RTP_PORT_NEXT.fetch_add(2, AtomicOrdering::SeqCst);
-        let offset = ((raw - NGN_RTP_PORT_MIN) % span) & !1; // even guarantee
+        // raw は monotonic、 span (= 1000) で modulo してから even mask。
+        // u32 でも wrap は ~2^32 回後だが、 wrap した時も `raw % span` で
+        // 0-(span-1) の範囲に収まり port が正しく循環する。
+        let offset = ((raw % span) & !1) as u16;
         let port = NGN_RTP_PORT_MIN + offset;
         match UdpSocket::bind(SocketAddr::new(ip, port)).await {
             Ok(s) => return Ok(Arc::new(s)),

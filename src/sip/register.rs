@@ -81,15 +81,7 @@ impl Registrar {
                         self.metrics.record_register(true);
                         let refresh = Duration::from_secs((expires as f64 * 0.9) as u64);
                         info!("REGISTER 成功 次回更新まで {}秒", refresh.as_secs());
-                        // Phase 1-C: 通常 refresh timer + 強制 re-REGISTER notify を併走監視。
-                        // 500 受領で orchestrator が `request_re_register()` を call すると
-                        // refresh sleep を抜けて即時 re-REGISTER (TS 24.229 §5.2.6 restoration)。
-                        tokio::select! {
-                            _ = time::sleep(refresh) => {},
-                            _ = crate::sip::re_register_notify().notified() => {
-                                info!("Phase 1-C: 強制 re-REGISTER 要求受信 (500 受領由来)、 refresh 即時実行");
-                            }
-                        }
+                        time::sleep(refresh).await;
                     }
                     Err(e) => {
                         self.registered.store(false, Ordering::SeqCst);
@@ -163,6 +155,12 @@ impl Registrar {
                     let sr = resp2.headers.get("service-route").map(|s| s.to_string());
                     tracing::debug!(service_route=?sr, "REGISTER (auth) 200 OK: Service-Route 保存 (RFC 3608)");
                     crate::sip::store_service_route(sr);
+                    // auth path も outbound_proxy_route を保存 (200-direct path との
+                    // consistency、 将来 HGW emulation で password 設定時に Route が
+                    // 空にならないようにする)。
+                    let op = format!("<sip:{};lr>", self.server_addr);
+                    tracing::debug!(outbound_proxy_route=%op, "outbound_proxy Route 保存 (auth path)");
+                    crate::sip::store_outbound_proxy_route(Some(op));
                     Ok(parse_expires(&resp2.headers))
                 } else {
                     anyhow::bail!("REGISTER 失敗: {} {}", resp2.status_code, resp2.reason)

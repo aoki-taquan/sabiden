@@ -13,7 +13,10 @@ use std::sync::{OnceLock, RwLock};
 
 /// REGISTER 200 OK で受領した Service-Route (RFC 3608 §3.2)。
 /// IMS では subsequent request の Route ヘッダに echo MUST。
-/// 複数 AOR 対応するなら per-AOR HashMap 化が必要 (現在は単一 AOR 前提)。
+///
+/// TODO(本流対応): 複数 AOR 対応時は per-AOR HashMap 化が必要
+/// (CLAUDE.md §9 既知の `static CSEQ` と同種パターン、 単一 AOR 前提)。
+/// `docs/refactor-plan.md` §4 に追記。 follow-up Issue 起票予定。
 static SERVICE_ROUTE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 fn service_route_cell() -> &'static RwLock<Option<String>> {
@@ -33,8 +36,13 @@ pub fn current_service_route() -> Option<String> {
     service_route_cell().read().ok().and_then(|g| g.clone())
 }
 
-/// NGN P-CSCF を直指定する outbound_proxy 風 Route (Asterisk pcap 互換)。
-/// REGISTER server_addr を Route として固定使用。
+/// NGN P-CSCF を直指定する outbound_proxy 風 Route (Asterisk pcap 互換、
+/// `docs/asterisk-real-invite.md` §5.5)。 REGISTER server_addr を保存し
+/// subsequent INVITE の Route として固定使用 (Service-Route の domain だけでは
+/// 解決経路に多段 hop が入り NGN 実機適合に劣るため)。
+///
+/// TODO(本流対応): 複数 AOR / 複数 P-CSCF 対応時は per-AOR map 化必要
+/// (CLAUDE.md §9 既知の静的 mutable singleton パターンと同種)。
 static OUTBOUND_PROXY_ROUTE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 fn outbound_proxy_route_cell() -> &'static RwLock<Option<String>> {
     OUTBOUND_PROXY_ROUTE.get_or_init(|| RwLock::new(None))
@@ -49,19 +57,4 @@ pub fn current_outbound_proxy_route() -> Option<String> {
         .read()
         .ok()
         .and_then(|g| g.clone())
-}
-
-/// Phase 1-C: 500 受領時に強制 re-REGISTER を要求するシグナル。
-/// 3GPP TS 24.229 §5.2.6 (P-CSCF restoration) で 500 は "registration を作り直せ"
-/// の indication。 orchestrator が 500 検知時に notify、 Registrar が次の register
-/// cycle を即時実行する (refresh sleep を抜ける)。
-static RE_REGISTER_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
-
-pub fn re_register_notify() -> &'static tokio::sync::Notify {
-    RE_REGISTER_NOTIFY.get_or_init(tokio::sync::Notify::new)
-}
-
-/// 強制 re-REGISTER を要求する (orchestrator から 500 検知時にコール)。
-pub fn request_re_register() {
-    re_register_notify().notify_one();
 }

@@ -3281,13 +3281,6 @@ impl UasEventHandler {
                                 Some(false)
                             } else {
                                 info!(%call_id, "carrier retry 実行 (試行 2/2、 Issue #260)");
-                                // Phase 1-C (TS 24.229 §5.2.6): 500 は P-CSCF restoration
-                                // trigger。 retry 前に強制 re-REGISTER を要求して S-CSCF
-                                // 登録 epoch を更新、 sticky degraded state を flush する。
-                                info!(%call_id, "Phase 1-C: 強制 re-REGISTER 要求 (TS 24.229 §5.2.6)");
-                                crate::sip::request_re_register();
-                                // 200 OK REGISTER を受領するまで ~50ms、 余裕を持って 500ms 待機。
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 // 新 INVITE を組み立てる (新 Call-ID / 新 branch / 新 tag、
                                 // RFC 3261 §8.1.1.5)。 同じ target + SDP を再送する。
                                 let retry_plan =
@@ -4621,14 +4614,6 @@ impl PwaOutboundHandler for UasEventHandler {
                                         call_id = %plan_call_id,
                                         "carrier retry 実行 (試行 2/2、 PWA outbound、 Issue #260)"
                                     );
-                                    // Phase 1-C: 500 は P-CSCF restoration trigger
-                                    // (TS 24.229 §5.2.6)。 retry 前に強制 re-REGISTER。
-                                    info!(
-                                        call_id = %plan_call_id,
-                                        "Phase 1-C: 強制 re-REGISTER 要求 (TS 24.229 §5.2.6、 PWA outbound)"
-                                    );
-                                    crate::sip::request_re_register();
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     let retry_plan = ngn_uac.build_invite(
                                         &target_uri,
                                         Some(&sdp_for_ngn),
@@ -15928,5 +15913,31 @@ mod tests {
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"500\"} 2"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"503\"} 1"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"other\"} 1"));
+    }
+
+    /// RFC 3550 §11 / Issue #260 Phase 1-D: `bind_ngn_rtp_socket` は必ず
+    /// **偶数 port** を払い出す (NGN P-CSCF が奇数 port を 500 で reject するため、
+    /// `project_ngn_500_FINAL.md` 真因 + falsification evidence、 16/16 odd→500)。
+    /// allocator は 30000-30998 even round-robin、 fallback でも even のみ accept。
+    #[tokio::test]
+    async fn rfc3550_11_bind_ngn_rtp_socket_always_returns_even_port() {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // 連続 16 回 bind して全 even を確認 (Phase 1-D allocator の round-robin
+        // step=2 + even start で、 odd を引く分岐は仕様上 fallback path のみ。
+        // fallback でも parity check で even のみ accept)。
+        let mut sockets = Vec::new();
+        for _ in 0..16 {
+            let s = super::bind_ngn_rtp_socket(ip)
+                .await
+                .expect("bind_ngn_rtp_socket should succeed");
+            let port = s.local_addr().expect("local_addr").port();
+            assert_eq!(
+                port % 2,
+                0,
+                "bind_ngn_rtp_socket は偶数 port のみ払い出すべき (got {})",
+                port
+            );
+            sockets.push(s);
+        }
     }
 }

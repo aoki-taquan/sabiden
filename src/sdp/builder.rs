@@ -680,6 +680,35 @@ pub fn restrict_audio_to_pcmu(sdp_bytes: &[u8]) -> Vec<u8> {
                 },
             );
         }
+        // RFC 4566 §6: `a=ptime:20` を NGN の media QoS path に明示。
+        let has_ptime = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "ptime"));
+        if !has_ptime {
+            audio.attributes.push(Attribute::Value {
+                key: "ptime".to_string(),
+                value: "20".to_string(),
+            });
+        }
+        // RFC 3605 §2.1: `a=rtcp:<port+1>` で RTCP port を explicit signal
+        // (modern peer interop。 NGN P-CSCF は honor しないが他経路では有効)。
+        let has_a_rtcp = audio
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Value { key, .. } if key == "rtcp"));
+        if !has_a_rtcp {
+            let rtcp_port = audio.port.saturating_add(1);
+            audio.attributes.push(Attribute::Value {
+                key: "rtcp".to_string(),
+                value: rtcp_port.to_string(),
+            });
+        }
+    }
+    // RFC 4566 §5.3: `s=` MUST be non-empty。 PWA outbound 経路でも厳格な
+    // registrar 互換のため `s=sabiden` に置換 (`_with_dtmf` 版と同じ処理)。
+    if sdp.session_name.is_empty() || sdp.session_name == "-" {
+        sdp.session_name = "sabiden".to_string();
     }
     sdp.to_string_crlf().into_bytes()
 }

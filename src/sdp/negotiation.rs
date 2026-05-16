@@ -392,6 +392,95 @@ fn pt_of_rtpmap_or_fmtp(value: &str) -> Option<u8> {
     value.split_whitespace().next().and_then(|p| p.parse().ok())
 }
 
+/// SDP media-level direction attribute (RFC 4566 §6 / RFC 3264 §6.1).
+///
+/// 通話保留 / 再開 (RFC 3264 §8.4 "Putting a Unicast Media Stream on Hold") では
+/// Re-INVITE の SDP offer に以下の direction を載せて相手 UA に伝える:
+///
+/// - [`MediaDirection::SendRecv`]: 通常 (双方向)。 RFC 4566 §6 既定。
+/// - [`MediaDirection::SendOnly`]: offerer は送るだけ、 answerer は受けるだけ。
+///   PWA が「保留」したケース。 RFC 3264 §8.4: "An agent puts a stream on hold by
+///   setting the value of this attribute to `sendonly`."
+/// - [`MediaDirection::RecvOnly`]: offerer は受けるだけ、 answerer は送るだけ。
+///   B2BUA から見ると inactive と等価な経路は使わない。
+/// - [`MediaDirection::Inactive`]: 双方向停止。 hold tone も流さないとき。
+///
+/// 本 enum は SDP rewrite 用の純粋データであり、 socket I/O は伴わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDirection {
+    /// `a=sendrecv` (RFC 4566 §6 既定 / RFC 3264 §6.1 / §8.4 un-hold)。
+    SendRecv,
+    /// `a=sendonly` (RFC 3264 §8.4: hold semantics, offerer 送るのみ)。
+    SendOnly,
+    /// `a=recvonly` (RFC 3264 §8.4: 受けるのみ、 answerer 視点の hold)。
+    RecvOnly,
+    /// `a=inactive` (RFC 4566 §6: 送受信とも停止)。
+    Inactive,
+}
+
+impl MediaDirection {
+    /// `a=<key>` の key 部分を返す (`Property` 属性として書き出すための文字列)。
+    pub fn as_attr_key(self) -> &'static str {
+        match self {
+            MediaDirection::SendRecv => "sendrecv",
+            MediaDirection::SendOnly => "sendonly",
+            MediaDirection::RecvOnly => "recvonly",
+            MediaDirection::Inactive => "inactive",
+        }
+    }
+}
+
+/// 最初の `m=audio` の direction 属性を `direction` に書換える
+/// (RFC 3264 §8.4 hold/un-hold、 RFC 4566 §6 direction attribute)。
+///
+/// # 挙動
+///
+/// - 既存の `a=sendrecv` / `a=sendonly` / `a=recvonly` / `a=inactive` を全て除去
+///   してから、 指定 direction を **1 行だけ** 追加する。 RFC 4566 §6 は
+///   direction を「at most one」と規定するため、 二重化は許されない。
+/// - audio media が無い SDP / parse 不能な SDP は入力をそのまま返す
+///   (ベストエフォート、 `Negotiator::rewrite_offer` と同じ縮退方針)。
+///
+/// # RFC 引用
+///
+/// - RFC 4566 §6: "The 'sendrecv', 'sendonly', 'recvonly', and 'inactive'
+///   attributes apply to streams of media." direction は session-level と
+///   media-level の両方に置けるが、 media-level が session-level を override する。
+///   本関数は **media-level のみ** を書換える (PWA hold は audio stream
+///   単独制御で十分、 session-level 既定の sendrecv は触らない)。
+/// - RFC 3264 §8.4: "An agent puts a stream on hold by setting the value of
+///   the 'sendrecv' attribute associated with that stream to either
+///   'sendonly' or 'inactive'."
+///
+/// # 用途
+///
+/// PWA から `{ "type": "hold", "call_id": ... }` を受けたとき、 sabiden は
+/// 既存の NGN レッグ offer SDP に対し `apply_audio_direction(&sdp,
+/// MediaDirection::SendOnly)` を適用し、 Re-INVITE で NGN に送る (Issue #279)。
+pub fn apply_audio_direction(sdp_bytes: &[u8], direction: MediaDirection) -> Vec<u8> {
+    let text = match std::str::from_utf8(sdp_bytes) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+    let mut sdp = match SessionDescription::parse(text) {
+        Ok(s) => s,
+        Err(_) => return sdp_bytes.to_vec(),
+    };
+
+    if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
+        // RFC 4566 §6: direction は media-level に at most one。 既存の
+        // sendrecv/sendonly/recvonly/inactive を全部消してから指定値を 1 行追加。
+        audio
+            .attributes
+            .retain(|a| !matches!(a.key(), "sendrecv" | "sendonly" | "recvonly" | "inactive"));
+        audio
+            .attributes
+            .push(Attribute::Property(direction.as_attr_key().to_string()));
+    }
+
+    sdp.to_string_crlf().into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +710,96 @@ a=sendrecv\r\n";
 
         let bad_sdp = b"not a valid sdp";
         assert_eq!(neg.rewrite_offer(bad_sdp), bad_sdp.to_vec());
+    }
+
+    /// RFC 3264 §8.4 + RFC 4566 §6: `sendrecv` 入力に対して `sendonly` を適用
+    /// すると、 既存 direction が削除され `a=sendonly` 1 行のみが残る (hold 投入)。
+    #[test]
+    fn rfc3264_8_4_apply_audio_direction_sendrecv_to_sendonly() {
+        let sdp = b"v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.10\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.10\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n\
+a=sendrecv\r\n";
+
+        let out = apply_audio_direction(sdp, MediaDirection::SendOnly);
+        let s = std::str::from_utf8(&out).expect("utf8");
+
+        assert!(
+            s.contains("a=sendonly\r\n"),
+            "sendonly が入っていない:\n{s}"
+        );
+        assert!(!s.contains("a=sendrecv\r\n"), "旧 sendrecv が残存:\n{s}");
+        // direction は 1 行のみ。
+        let direction_count = s
+            .lines()
+            .filter(|l| {
+                matches!(
+                    l.trim_end(),
+                    "a=sendrecv" | "a=sendonly" | "a=recvonly" | "a=inactive"
+                )
+            })
+            .count();
+        assert_eq!(direction_count, 1, "direction が複数行:\n{s}");
+        // 既存の他属性 (rtpmap / ptime) は保持される。
+        assert!(s.contains("a=rtpmap:0 PCMU/8000\r\n"));
+        assert!(s.contains("a=ptime:20\r\n"));
+    }
+
+    /// RFC 3264 §8.4: `sendonly` 入力に対して `sendrecv` を適用すると un-hold
+    /// (= 元に戻す) になる。
+    #[test]
+    fn rfc3264_8_4_apply_audio_direction_sendonly_to_sendrecv_unhold() {
+        let sdp = b"v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.10\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.10\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendonly\r\n";
+
+        let out = apply_audio_direction(sdp, MediaDirection::SendRecv);
+        let s = std::str::from_utf8(&out).expect("utf8");
+
+        assert!(s.contains("a=sendrecv\r\n"), "{s}");
+        assert!(!s.contains("a=sendonly\r\n"), "{s}");
+    }
+
+    /// RFC 4566 §6: direction 未指定 (= sendrecv 既定) の SDP にも適用できる。
+    /// 既存属性が無くても sendonly を追加するだけ。
+    #[test]
+    fn rfc4566_6_apply_audio_direction_to_sdp_without_existing_direction() {
+        let sdp = b"v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.10\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.10\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+
+        let out = apply_audio_direction(sdp, MediaDirection::SendOnly);
+        let s = std::str::from_utf8(&out).expect("utf8");
+
+        assert!(s.contains("a=sendonly\r\n"), "{s}");
+    }
+
+    /// 不正な SDP / UTF-8 はそのまま返す (`Negotiator` と同じ縮退方針)。
+    #[test]
+    fn apply_audio_direction_invalid_input_passthrough() {
+        let bad_utf8: &[u8] = &[0xff, 0xfe, 0x00];
+        assert_eq!(
+            apply_audio_direction(bad_utf8, MediaDirection::SendOnly),
+            bad_utf8.to_vec()
+        );
+        let bad_sdp = b"not a valid sdp";
+        assert_eq!(
+            apply_audio_direction(bad_sdp, MediaDirection::SendOnly),
+            bad_sdp.to_vec()
+        );
     }
 }

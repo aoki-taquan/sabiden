@@ -324,6 +324,9 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // BYE を撃つ cleanup ハンドラ (= 同じ `UasEventHandler`)。
     let uas_handler_for_pwa_closer: Arc<dyn webrtc::signaling::PwaOutboundCloser> =
         uas_handler.clone();
+    // Issue #279: PWA UI hold / unhold 経路で NGN レッグへ Re-INVITE を発行する
+    // ハンドラ (= 同じ `UasEventHandler`)。 RFC 3264 §8.4 + RFC 3261 §14.1。
+    let uas_handler_for_pwa_hold: Arc<dyn webrtc::signaling::PwaHoldHandler> = uas_handler.clone();
 
     // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup ハンドラを
     // SignalingState (`with_pwa_inbound_closer`) に渡すため、 `ngn_handler` を
@@ -452,7 +455,8 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                     let mut state = webrtc::SignalingState::new(verifier, ext_registrar, ttl)
                         .with_keepalive(keepalive_interval, idle_timeout)
                         .with_pwa_outbound(uas_handler_for_pwa_outbound.clone())
-                        .with_pwa_outbound_closer(uas_handler_for_pwa_closer.clone());
+                        .with_pwa_outbound_closer(uas_handler_for_pwa_closer.clone())
+                        .with_pwa_hold_handler(uas_handler_for_pwa_hold.clone());
                     // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup を
                     // 結線する (`NgnInboundHandler` が `PwaInboundCloser` を実装)。
                     if let Some(h) = ngn_inbound_handler_for_signaling.clone() {

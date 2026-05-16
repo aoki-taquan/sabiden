@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use call::manager::{CallManager, UacForker};
-use call::orchestrator::{NgnInboundConfig, UasEventHandler};
+use call::orchestrator::{ExtInviter, NgnInboundConfig, UasEventHandler};
 use config::Config;
 use observability::call_log::CallLog;
 use observability::{Metrics, SipTraceWriter};
@@ -404,6 +404,15 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             uac: ext_uac,
             targets: HashMap::new(),
         });
+        // Issue #289: REFER (call transfer) 経路で transferee 内線へ INVITE を
+        // 送るため、 NGN inbound と同じ `forker` を `UasEventHandler` にも注入。
+        // 内線レッグ向け INVITE という意味は両者共通なので 1 つの `Arc<UacForker>`
+        // を共有してよい。 同時に `ext_registrar` (binding lookup) も渡す。
+        let forker_for_refer: ExtInviter = forker.clone();
+        let ext_registrar_for_refer = ext_registrar.clone();
+        uas_handler
+            .attach_ext_inviter(forker_for_refer, ext_registrar_for_refer)
+            .await;
         let cfg = NgnInboundConfig {
             fork_timeout: std::time::Duration::from_secs(20),
             realm: "sabiden".to_string(),

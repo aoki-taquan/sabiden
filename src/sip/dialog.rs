@@ -315,6 +315,43 @@ impl Dialog {
         req
     }
 
+    /// REFER implicit subscription 用 NOTIFY (RFC 3515 §2.4.5 / §2.4.6 + RFC 3265 §3.2)。
+    ///
+    /// REFER を受け取った UAS が transferor へ進捗を伝える `message/sipfrag` 形式の
+    /// NOTIFY を本ダイアログ上で組み立てる。 RFC 3515 §2.4.5:
+    /// > "Each NOTIFY MUST contain a body of type "message/sipfrag" ... The
+    /// >  Subscription-State header field ... indicates the state of the
+    /// >  implicit subscription."
+    ///
+    /// 引数:
+    /// - `sipfrag_status_line`: `SIP/2.0 100 Trying` / `SIP/2.0 200 OK` のような
+    ///   sipfrag のステータス行 (RFC 3420 §2)。 末尾 CRLF はビルダ側で付与する。
+    /// - `subscription_state`: `active;expires=<n>` / `terminated;reason=noresource`
+    ///   等 (RFC 3265 §3.2.4 / RFC 3515 §2.4.6)。 final NOTIFY (= 2xx/3xx-6xx
+    ///   通知後) では `terminated;reason=noresource` を使う。
+    pub fn build_notify_refer_sipfrag(
+        &self,
+        sipfrag_status_line: &str,
+        subscription_state: &str,
+    ) -> SipRequest {
+        let cseq = self.local_cseq.fetch_add(1, Ordering::SeqCst);
+        let (request_uri, route_headers) = self.compute_request_uri_and_route();
+        let mut req = SipRequest::new(SipMethod::Notify, request_uri);
+        self.fill_common_headers(&mut req, "NOTIFY", cseq, &route_headers, true);
+        // RFC 3515 §2.4.4: implicit subscription の event は `refer` 固定。
+        req.headers.set("Event", "refer");
+        // RFC 3265 §3.2.4: Subscription-State は MUST 付与。
+        req.headers.set("Subscription-State", subscription_state);
+        // RFC 3420 §2.1: sipfrag は `message/sipfrag;version=2.0`。
+        req.headers
+            .set("Content-Type", "message/sipfrag;version=2.0");
+        // sipfrag body = ステータス行 + CRLF (Reason-Phrase 末尾)。 SIP メッセージは
+        // 末尾 CRLF が必要 (RFC 3261 §7.1)。
+        let body = format!("{}\r\n", sipfrag_status_line);
+        req.body = body.into_bytes();
+        req
+    }
+
     /// Re-INVITE。Session Timer (RFC 4028) の更新用にも使う。
     ///
     /// - `sdp_body`: Offer SDP (なければ空)
@@ -752,6 +789,52 @@ mod tests {
         assert_eq!(bye.uri, "sip:0312345678@[2001:db8::99]:5060");
         let routes = bye.headers.get_all("route");
         assert_eq!(routes.len(), 2);
+    }
+
+    /// RFC 3515 §2.4.5 / RFC 3265 §3.2.4 / RFC 3420 §2.1 / Issue #289:
+    /// REFER implicit subscription 用 NOTIFY (sipfrag) は:
+    /// - Method = NOTIFY
+    /// - `Event: refer` ヘッダ必須
+    /// - `Subscription-State` ヘッダ必須
+    /// - `Content-Type: message/sipfrag;version=2.0`
+    /// - 本文 = sipfrag のステータス行 + CRLF
+    /// - CSeq は local_cseq から払い出され、 BYE と同じ単調増加列を共有する
+    #[test]
+    fn rfc3515_2_4_5_build_notify_refer_sipfrag_emits_required_headers_and_body() {
+        let inv = invite_request();
+        let resp = ok_response_with_route();
+        let dlg = Dialog::from_uac_response(&inv, &resp, cfg()).unwrap();
+        let notify = dlg.build_notify_refer_sipfrag("SIP/2.0 100 Trying", "active;expires=60");
+        assert_eq!(notify.method, SipMethod::Notify);
+        assert_eq!(notify.headers.get("event").unwrap(), "refer");
+        assert_eq!(
+            notify.headers.get("subscription-state").unwrap(),
+            "active;expires=60"
+        );
+        assert_eq!(
+            notify.headers.get("content-type").unwrap(),
+            "message/sipfrag;version=2.0"
+        );
+        assert_eq!(notify.body, b"SIP/2.0 100 Trying\r\n".to_vec());
+        // CSeq は INVITE+1 (= 101) から消費されているはず
+        let cseq = notify.headers.get("cseq").unwrap();
+        assert!(cseq.ends_with(" NOTIFY"), "CSeq method は NOTIFY: {}", cseq);
+
+        // 2 度目の NOTIFY は CSeq が 1 増える
+        let notify2 =
+            dlg.build_notify_refer_sipfrag("SIP/2.0 200 OK", "terminated;reason=noresource");
+        let cseq1: u32 = cseq.split_whitespace().next().unwrap().parse().unwrap();
+        let cseq2: u32 = notify2
+            .headers
+            .get("cseq")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cseq2, cseq1 + 1, "2 度目の NOTIFY CSeq は +1");
+        assert_eq!(notify2.body, b"SIP/2.0 200 OK\r\n".to_vec());
     }
 
     #[test]

@@ -113,9 +113,9 @@ use super::CallId;
 use crate::observability::{InviteResult, Metrics, OutboundDirection};
 use crate::sdp::builder::{
     convert_savpf_to_avp, ensure_ptime_in_answer, extract_ptime_from_offer,
-    restrict_answer_to_ngn_offer_subset, restrict_audio_to_pcmu, restrict_audio_to_pcmu_with_dtmf,
-    rewrite_rtp_endpoint,
+    restrict_answer_to_ngn_offer_subset, rewrite_rtp_endpoint,
 };
+use crate::sdp::negotiation::Negotiator;
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
@@ -3221,7 +3221,10 @@ impl UasEventHandler {
             // させる。NGN 側の SIP プロキシ (Asterisk 等) は telephone-event を
             // 素通しするので、PCMU + telephone-event だけ残せば 200 OK が返る。
             // Opus / Speex / G.729 等は引き続き削除する。
-            let sdp_for_ngn = sdp_for_ngn.map(|s| restrict_audio_to_pcmu_with_dtmf(&s));
+            // Phase R3 (Issue #272): Negotiator が「PCMU+DTMF subset / WebRTC attr
+            // 剥離 / s=ptime/rtcp 補完」を一括正規化する。 旧
+            // `restrict_audio_to_pcmu_with_dtmf` は同 Negotiator への薄い alias。
+            let sdp_for_ngn = sdp_for_ngn.map(|s| Negotiator::for_ngn_with_dtmf().rewrite_offer(&s));
 
             let plan = self
                 .ngn_uac
@@ -3706,7 +3709,7 @@ impl UasEventHandler {
                 None
             } else {
                 let rewritten = force_rewrite_sdp_for_ngn(&request.body, ngn_local_ip)
-                    .map(|s| restrict_audio_to_pcmu_with_dtmf(&s));
+                    .map(|s| Negotiator::for_ngn_with_dtmf().rewrite_offer(&s));
                 if rewritten.is_none() {
                     debug!(%call_id, "Re-INVITE: SDP 書換が None (空) → SDP 無しで送信");
                 }
@@ -4519,7 +4522,9 @@ impl PwaOutboundHandler for UasEventHandler {
         // パターンは PT 0 only)。 outbound INVITE でも PT 0 only に絞る。
         let avp_sdp = convert_savpf_to_avp(browser_answer.as_bytes())
             .map_err(|e| anyhow!("SAVPF→AVP 変換失敗: {}", e))?;
-        let pcmu_only = restrict_audio_to_pcmu(&avp_sdp);
+        // Phase R3 (Issue #272): Negotiator::for_ngn() = PCMU only subset +
+        // WebRTC attr 剥離 + s=ptime/rtcp 補完。 旧 `restrict_audio_to_pcmu` は alias。
+        let pcmu_only = Negotiator::for_ngn().rewrite_offer(&avp_sdp);
         let sdp_for_ngn =
             rewrite_rtp_endpoint(&pcmu_only, sabiden_ngn_addr.ip(), sabiden_ngn_addr.port())
                 .map_err(|e| anyhow!("NGN 向け SDP rewrite 失敗: {}", e))?;

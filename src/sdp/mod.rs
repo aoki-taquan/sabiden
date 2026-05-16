@@ -6,6 +6,7 @@
 //! NTT ひかり電話 (NGN) の場合 IPv6 + G.711 μ-law (PT=0) が中心。
 
 pub mod builder;
+pub mod negotiation;
 pub mod parser;
 
 use std::fmt;

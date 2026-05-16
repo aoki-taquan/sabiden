@@ -46,6 +46,9 @@ src/
 │   ├── invite.rs     # INVITE/BYE/ACK (UAC)
 │   └── uas.rs        # UAS (内線受付)
 ├── sdp/              # SDP パーサ (RFC 4566)
+│   ├── parser.rs    # 入力パース
+│   ├── builder.rs   # シリアライズ + AVP↔SAVPF 変換 + restrict_audio_to_pcmu (Negotiator alias)
+│   └── negotiation.rs # Negotiator: codec subset + WebRTC attr 剥離 + NGN 媒体正規化 (Phase R3, Issue #272)
 ├── rtp/              # RTP/RTCP (RFC 3550)
 │   ├── packet.rs
 │   ├── session.rs
@@ -927,6 +930,43 @@ SSRC / CNAME / msid は `DtlsIceParams::with_ssrc()` / `with_cname()` /
 ICE / msid / ssrc / extmap 等の NGN が解釈しない属性を全て剥がし、
 `m=audio <port> RTP/AVP 0` + PCMU rtpmap だけに正規化する (RFC 5853 §3.2、
 NGN 制約は CLAUDE.md §5)。
+
+### SDP `Negotiator` (Phase R3、 Issue #272、 `src/sdp/negotiation.rs`)
+
+`Negotiator` は NGN レッグへ流す SDP の **codec subset + WebRTC 属性剥離 +
+NGN 媒体正規化** を一括で行うレイヤ (`docs/refactor-plan.md` §1.4 / §4.2)。
+旧 `crate::sdp::builder::restrict_audio_to_pcmu` / `_with_dtmf` の 1 関数に
+同居していた以下 4 つの責務を分割し、 設定可能な型に集約する:
+
+| 責務 | 根拠 RFC | 設定 |
+|---|---|---|
+| Codec subset (PCMU / telephone-event) | RFC 3264 §6.1 / RFC 3551 §6 / RFC 4733 §3.2 | `allowed_audio` |
+| WebRTC SAVPF 属性剥離 (DTLS-SRTP / ICE / BUNDLE / msid / ssrc / extmap / rtcp-mux / rtcp-fb / rtcp-xr 等) | RFC 5763 §5 / RFC 8839 §5.4 / RFC 8843 §7.2 / RFC 5576 §4 / RFC 8285 §6 / RFC 5761 §5 | `strip_webrtc_attrs` |
+| NGN 媒体正規化 (`s=` / `a=ptime:20` / `a=rtcp:<port+1>` 補完) | RFC 4566 §5.3 / §6 / RFC 3605 §2.1 | `normalize_for_ngn` |
+| 欠落 rtpmap / fmtp 補完 | RFC 3551 §6 / RFC 4733 §3.2 | `allowed_audio` の `rtpmap_value` / `fmtp_value` |
+
+ファクトリ:
+
+| Factory | allowed_audio | 用途 |
+|---|---|---|
+| `Negotiator::for_ngn()` | `[PCMU(0)]` | PCMU only INVITE (PR #264 までの 117 通話 / PWA→NGN 発信 SDP) |
+| `Negotiator::for_ngn_with_dtmf()` | `[PCMU(0), TELEPHONE_EVENT(101)]` | NGN INVITE + in-band DTMF (Issue #69、 Re-INVITE 経路) |
+
+API:
+
+| メソッド | 入力 | 出力 | 用途 |
+|---|---|---|---|
+| `rewrite_offer(&[u8])` | offer SDP | 正規化 SDP | 内線 → NGN 発信 / PWA → NGN 発信 / Re-INVITE 伝搬 |
+| `rewrite_answer(_ext_offer, ngn_answer)` | NGN 由来 answer (= 200 OK SDP) | 内線 relay 用 SDP | NGN inbound → 内線 relay (将来 intersection 計算と統合予定、 現状は PCMU only 正規化のみ) |
+
+旧 `crate::sdp::builder::restrict_audio_to_pcmu` / `_with_dtmf` は本モジュールへの
+薄い alias として残置 (backwards compat)。 production callsite は順次
+`Negotiator::for_ngn().rewrite_offer(...)` に切替済 (`src/call/orchestrator.rs`
+3 箇所 — PWA outbound INVITE / Re-INVITE 伝搬 / PWA INVITE 再構築)。
+
+実機未検証で属性を追加 / 削除しないルール (CLAUDE.md §6.1) は引き続き適用される。
+Negotiator の `strip_webrtc_attrs` 対象セットは `docs/asterisk-real-invite.md`
+§2 の pcap 由来確定事項に基づく。
 
 ### WebRtcAudioBridge メディア経路 (PWA ↔ NGN、 Issue #148 / #153)
 

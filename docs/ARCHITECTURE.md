@@ -62,7 +62,10 @@ src/
 │   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound) + NGN even-port RTP allocator (Issue #260 Phase 1-D)
 │   └── rate_limiter.rs # outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1, Issue #157)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
-├── health/           # ヘルスチェック HTTP サーバ
+├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278)
+├── observability/    # メトリクス (Prometheus) + SIP トレース + call_log ring buffer (Issue #278)
+│   ├── mod.rs        # Metrics (atomic counter 群) + SipTraceWriter
+│   └── call_log.rs   # 通話履歴 ring buffer (Direction / Outcome / CallLogEntry / CallLog)
 └── main.rs
 ```
 
@@ -634,6 +637,82 @@ struct OutboundRateLimiter {
   CANCEL / PWA WS close は select / `WsSink::is_closed` で検出して
   `aborted_by_cancel` に分類。 TTC JJ-90.24 §5.7.3 (Retry-After 遵守 + 過度な retry
   回避) に整合。
+
+### Observability / Call history (Issue #278、 `src/observability/call_log.rs`)
+
+Prometheus 累積カウンタ (`/metrics`) は集計値しか持たず、 1 件ずつの通話を
+特定する用途には使えない。 PWA「最近の通話」 UI のように **個別通話の方向 /
+相手番号 / 開始時刻 / 通話時間 / 結果** を表示するため、 `CallLog` という
+in-memory ring buffer を導入する (永続化は別 Issue)。
+
+**データ構造**:
+
+- `CallLogEntry { direction, remote_number, start_time, duration, outcome, call_id }`
+  - `direction`: `Outbound` (内線→NGN / PWA→NGN) or `Inbound` (NGN→内線 / NGN→PWA)
+  - `remote_number`: 相手番号 (発信時 = ダイヤル先、 着信時 = `From` の user 部)
+  - `start_time`: 通話試行開始時刻 (`SystemTime`、 JSON 出力は Unix epoch ms)
+  - `duration`: `record_end` 時に確定する経過時間 (秒、 `Outcome` が確定する前は `None`)
+  - `outcome`: `Answered` / `Missed` / `Failed { status }` / `Cancelled`
+- `CallLog { entries: Mutex<VecDeque<CallLogEntry>>, max_size }` — FIFO ring buffer。
+  `max_size` (production = 200 件) を超えたら `pop_front` で古い方から evict。
+- `record_start(Direction, remote, call_id)` で開始時刻を残し、 `record_end(call_id, Outcome)`
+  で `outcome` と `duration` を確定 (Call-ID 線形検索、 ring buffer から evict 済なら no-op)。
+
+**hook ポイント** (`src/call/orchestrator.rs` 内、 各経路 start/end 計 8 箇所):
+
+- NGN inbound INVITE (`NgnInboundHandler::handle_invite`)
+  - 100 Trying 直後 → `record_start(Inbound, from-user, call_id)`
+  - `ForkResult::FirstSuccess` → 確立 (record_end は BYE 時)
+  - `ForkResult::AllFailed` → `record_end(Missed)`
+  - `ForkResult::Timeout` → `record_end(Missed)`
+- NGN inbound BYE (`NgnInboundHandler::handle_bye`)
+  - SIP 内線 path 1: `active` から removed → `record_end(Answered)`
+  - PWA outbound BYE path (NGN 始動): `record_end(Answered)` (Outbound 側の終了)
+- PWA disconnect (`close_pwa_inbound_for_ws`) → `record_end(Answered)`
+- 内線→NGN INVITE (`UasEventHandler::handle_invite`)
+  - rate-limit / 422 通過後、 build_invite 直前 → `record_start(Outbound, dialed-number, call_id)`
+  - `Ok(InviteOutcome::Established)` → 確立 (record_end は BYE 時)
+  - `Ok(InviteOutcome::Failed { response })` → `record_end(Failed { status })`
+  - `Err(_)` (was_cancelled = true) → `record_end(Cancelled)`
+  - `Err(_)` (was_cancelled = false) → `record_end(Failed { status: 503 })`
+- 内線→NGN BYE (`UasEventHandler::handle_ext_bye`) → `record_end(Answered)`
+- PWA→NGN INVITE (`UasEventHandler::handle_pwa_outbound_offer`、 spawn 内)
+  - plan 生成後 → `record_start(Outbound, target, call_id)`
+  - `Ok(InviteOutcome::Failed)` → `record_end(Failed { status })`
+  - `Err(_)` → `record_end(Failed { status: 503 })`
+- PWA→NGN WS close (`close_pwa_outbound_for_ws`) → `record_end(Answered)`
+
+**JSON API**: `GET /api/call-log/recent?n=20` (`src/health/mod.rs`)
+
+- `n` 省略時は 20 件、 ring buffer 容量超過時は内部で打ち切り。
+- レスポンス例:
+  ```json
+  [
+    {
+      "direction": "outbound",
+      "remote_number": "117",
+      "start_unix_ms": 1747567890123,
+      "duration_secs": 12.345,
+      "outcome": { "kind": "answered" },
+      "call_id": "abc@host"
+    },
+    {
+      "direction": "inbound",
+      "remote_number": "anonymous",
+      "start_unix_ms": 1747567880000,
+      "duration_secs": 4.2,
+      "outcome": { "kind": "missed" },
+      "call_id": "xyz@host"
+    }
+  ]
+  ```
+- 新しい順 (= 最新通話が配列先頭)。 `outcome.kind` は `answered` / `missed` /
+  `failed` / `cancelled`、 `failed` のみ `status` (u16) フィールドが追加される。
+
+**結線**: `main.rs` で `Arc<CallLog>` を 1 個生成し、 `HealthState` と
+`NgnInboundHandler::set_call_log` / `UasEventHandler::set_call_log` の全経路に
+同じ Arc を渡す (= record_start / record_end が突合する)。 setter は `Mutex<Option<_>>`
+ベースで spawn 後 (= shared) でも安全に呼べる (`outbound_forwarder` と同じ pattern)。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

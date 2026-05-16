@@ -33,6 +33,11 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Issue #278: 通話履歴 ring buffer + JSON API。 PWA「最近の通話」 UI が利用する。
+/// `Metrics` (atomic counter 群) とは独立した責務なので別モジュールに分けた上で
+/// `Arc<CallLog>` として各 handler に渡す。
+pub mod call_log;
+
 /// SIP メッセージの送信方向。トレースのファイル名に埋め込む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceDir {

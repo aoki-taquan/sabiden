@@ -20,16 +20,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::Json;
 use axum::Router;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::observability::call_log::CallLog;
 use crate::observability::Metrics;
 use crate::webrtc::signaling::{signal_ws_handler, SignalingState};
+
+/// `GET /api/call-log/recent?n=20` のクエリパラメータ (Issue #278)。
+///
+/// `n` は最新通話件数の上限。 省略時は [`DEFAULT_CALL_LOG_LIMIT`]、 過大値は
+/// `CallLog` 側の ring buffer 容量で打ち切られる。
+#[derive(Debug, Deserialize)]
+pub struct CallLogQuery {
+    pub n: Option<usize>,
+}
+
+/// `n` 省略時のデフォルト件数 (PWA UI で同時表示する想定の数)。
+pub const DEFAULT_CALL_LOG_LIMIT: usize = 20;
 
 /// ヘルスサーバが参照する共有状態
 #[derive(Clone)]
@@ -38,23 +53,27 @@ pub struct HealthState {
     pub registered: Arc<AtomicBool>,
     /// 観測カウンタ。各層と Arc 共有する。
     pub metrics: Arc<Metrics>,
+    /// Issue #278: 通話履歴 ring buffer。 `/api/call-log/recent` で公開する。
+    pub call_log: Arc<CallLog>,
 }
 
 impl HealthState {
-    pub fn new(registered: Arc<AtomicBool>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(registered: Arc<AtomicBool>, metrics: Arc<Metrics>, call_log: Arc<CallLog>) -> Self {
         Self {
             registered,
             metrics,
+            call_log,
         }
     }
 }
 
-/// `/healthz` `/readyz` `/metrics` を提供する `Router` を構築する
+/// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` を提供する `Router` を構築する
 pub fn router(state: HealthState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/api/call-log/recent", get(call_log_recent))
         .with_state(state)
 }
 
@@ -133,6 +152,19 @@ async fn metrics(State(state): State<HealthState>) -> impl IntoResponse {
     )
 }
 
+/// `GET /api/call-log/recent?n=20` — Issue #278 PWA「最近の通話」 UI 向け JSON API。
+///
+/// `n` を省略すると [`DEFAULT_CALL_LOG_LIMIT`] 件、 ring buffer 容量を超える `n` は
+/// 内部で打ち切られる。 レスポンスは新しい順 (= 最新通話が先頭) の配列。
+async fn call_log_recent(
+    State(state): State<HealthState>,
+    Query(q): Query<CallLogQuery>,
+) -> impl IntoResponse {
+    let n = q.n.unwrap_or(DEFAULT_CALL_LOG_LIMIT);
+    let entries = state.call_log.recent(n);
+    (StatusCode::OK, Json(entries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +175,11 @@ mod tests {
     use tower::ServiceExt; // for `oneshot`
 
     fn make_state(registered: bool) -> HealthState {
-        HealthState::new(Arc::new(AtomicBool::new(registered)), Metrics::new())
+        HealthState::new(
+            Arc::new(AtomicBool::new(registered)),
+            Metrics::new(),
+            Arc::new(CallLog::new(100)),
+        )
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -259,5 +295,104 @@ mod tests {
         assert!(body.contains("sabiden_rtp_bridge_packets_total{direction=\"ngn_to_ext\"} 3"));
         assert!(body.contains("sabiden_extension_registered 2"));
         assert!(body.contains("sabiden_call_active 1"));
+    }
+
+    /// Issue #278: `GET /api/call-log/recent` が JSON で履歴を返す。
+    ///
+    /// `record_start` / `record_end` で 2 件の通話 (outbound + inbound) を
+    /// CallLog に書き込んでから endpoint を叩く。 返値が新しい順かつ outcome /
+    /// remote_number / direction が正しいことを assert する。
+    #[tokio::test]
+    async fn call_log_recent_returns_entries_in_newest_first_order() {
+        use crate::observability::call_log::{Direction, Outcome};
+
+        let state = make_state(true);
+        // 1 件目: outbound (発信) → Answered。
+        state
+            .call_log
+            .record_start(Direction::Outbound, "117".into(), "cid-1".into());
+        state.call_log.record_end("cid-1", Outcome::Answered);
+        // 2 件目: inbound (着信) → Missed。
+        state
+            .call_log
+            .record_start(Direction::Inbound, "0312345678".into(), "cid-2".into());
+        state.call_log.record_end("cid-2", Outcome::Missed);
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/call-log/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        // axum::Json は JSON 配列をそのまま返す。 検索しやすいキーで内容を確認。
+        // 新しい順 = cid-2 が先頭、 cid-1 が末尾。
+        let pos_2 = body.find("cid-2").expect("cid-2 should appear");
+        let pos_1 = body.find("cid-1").expect("cid-1 should appear");
+        assert!(pos_2 < pos_1, "newest entry must come first: {body}");
+        assert!(body.contains("\"direction\":\"inbound\""));
+        assert!(body.contains("\"direction\":\"outbound\""));
+        assert!(body.contains("\"kind\":\"answered\""));
+        assert!(body.contains("\"kind\":\"missed\""));
+        assert!(body.contains("\"remote_number\":\"117\""));
+        assert!(body.contains("\"remote_number\":\"0312345678\""));
+    }
+
+    /// Issue #278: `?n=1` で件数を絞れる。
+    #[tokio::test]
+    async fn call_log_recent_respects_n_query_parameter() {
+        use crate::observability::call_log::{Direction, Outcome};
+
+        let state = make_state(true);
+        for i in 0..3 {
+            state.call_log.record_start(
+                Direction::Outbound,
+                format!("117-{i}"),
+                format!("cid-{i}"),
+            );
+            state
+                .call_log
+                .record_end(&format!("cid-{i}"), Outcome::Answered);
+        }
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/call-log/recent?n=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        // 最新 1 件 (= cid-2) のみ。 他は出ない。
+        assert!(body.contains("cid-2"));
+        assert!(!body.contains("cid-1"));
+        assert!(!body.contains("cid-0"));
+    }
+
+    /// Issue #278: 空 ring buffer でも 200 + `[]` を返す。
+    #[tokio::test]
+    async fn call_log_recent_returns_empty_array_when_no_calls() {
+        let app = router(make_state(true));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/call-log/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert_eq!(body.trim(), "[]");
     }
 }

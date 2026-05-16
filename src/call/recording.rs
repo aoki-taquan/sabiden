@@ -48,6 +48,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::rtp::{decode_ulaw, RtpPacket, PAYLOAD_TYPE_ULAW};
+use crate::webrtc::signaling::{
+    PwaRecordHandler, RecordingControlError, RecordingStartedInfo, RecordingStoppedInfo,
+};
 
 use super::voicemail::{sanitize_id, WavWriter};
 
@@ -652,6 +655,87 @@ async fn load_list(storage_dir: &Path) -> Result<Vec<RecordingFile>> {
     Ok(out)
 }
 
+/// PWA WS `ClientMessage::RecordStart` / `RecordStop` を [`CallRecorder`] に
+/// 取り次ぐ [`PwaRecordHandler`] 実装 (Issue #296)。
+///
+/// `SignalingState::with_pwa_record` に注入することで、 signaling 層が
+/// `recording_unavailable` を返さずに本ハンドラへ dispatch される。 リモート
+/// 番号 (PSTN E.164) は PWA からは見えないため、 `remote_number` プレースホルダ
+/// を sidecar JSON に書き出し、 PWA UI / `/api/recording/list` 表示時に
+/// 別経路 (call-log) で補完する想定。
+///
+/// このハンドラは「recording 専用、 stop 経路で `RecordingControlError::UnknownCallId`
+/// を返さないと PWA が無限待ちになる」 ため、 `CallRecorder::stop` の
+/// `NotFound` を `UnknownCallId` に、 `AlreadyRecording` を `AlreadyRecording`
+/// にそれぞれ map する (`recording.rs::RecordingError` → signaling
+/// `RecordingControlError` の単純変換)。
+pub struct PwaRecordHandlerImpl {
+    recorder: Arc<CallRecorder>,
+}
+
+impl PwaRecordHandlerImpl {
+    /// `Arc<CallRecorder>` から新しいハンドラを作る。 同じ recorder を
+    /// `HealthState::with_recording` と共有することで、 開始した録音が即座に
+    /// `GET /api/recording/list` で見えるようになる (Issue #296)。
+    pub fn new(recorder: Arc<CallRecorder>) -> Arc<Self> {
+        Arc::new(Self { recorder })
+    }
+}
+
+/// PWA が知らないリモート番号 (PSTN E.164) のプレースホルダ。 signaling 層は
+/// `call_id` だけを送り、 着信元 / 発信先番号は別経路 (call-log) でしか
+/// 観測できないため、 sidecar JSON にはこの sentinel を入れる。
+const RECORDING_REMOTE_UNKNOWN: &str = "unknown";
+
+#[async_trait::async_trait]
+impl PwaRecordHandler for PwaRecordHandlerImpl {
+    async fn start_recording(
+        &self,
+        call_id: &str,
+    ) -> Result<RecordingStartedInfo, RecordingControlError> {
+        match self.recorder.start(call_id, RECORDING_REMOTE_UNKNOWN).await {
+            Ok((_sender, recording_id, started_at_unix_ms)) => Ok(RecordingStartedInfo {
+                recording_id,
+                started_at_unix_ms,
+            }),
+            Err(RecordingError::AlreadyRecording { .. }) => {
+                Err(RecordingControlError::AlreadyRecording)
+            }
+            Err(RecordingError::Setup { reason }) => {
+                Err(RecordingControlError::Internal { reason })
+            }
+            // `start` は NotFound を返さないので発生しないが、 enum を網羅。
+            Err(RecordingError::NotFound { call_id }) => Err(RecordingControlError::Internal {
+                reason: format!("unexpected NotFound on start: call_id={call_id}"),
+            }),
+        }
+    }
+
+    async fn stop_recording(
+        &self,
+        call_id: &str,
+    ) -> Result<RecordingStoppedInfo, RecordingControlError> {
+        match self.recorder.stop(call_id).await {
+            Ok(file) => Ok(RecordingStoppedInfo {
+                recording_id: file.recording_id,
+                duration_ms: file.duration_ms,
+            }),
+            Err(RecordingError::NotFound { .. }) => Err(RecordingControlError::UnknownCallId),
+            Err(RecordingError::AlreadyRecording { .. }) => {
+                // stop で AlreadyRecording は出ない (`active` table から remove
+                // した直後に同 call_id の handle を join するため)。 念のため
+                // Internal にマップして panic 回避。
+                Err(RecordingControlError::Internal {
+                    reason: "unexpected AlreadyRecording on stop".to_string(),
+                })
+            }
+            Err(RecordingError::Setup { reason }) => {
+                Err(RecordingControlError::Internal { reason })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1081,130 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("call-x-"));
         assert!(b.starts_with("call-x-"));
+    }
+
+    /// Issue #296 integration: PWA WS `ClientMessage::RecordStart` を
+    /// `PwaRecordHandlerImpl::start_recording` 経由で受けると、
+    /// `RecordingStartedInfo` が返り、 後段の `stop_recording` で
+    /// `RecordingStoppedInfo` (= duration_ms 確定) が返る。 二重 start は
+    /// `AlreadyRecording`、 未知 call_id の stop は `UnknownCallId`。
+    ///
+    /// RFC 3261 §15.1.1 BYE → recorder.stop の対称形 (signaling 層の
+    /// `ClientMessage::RecordStop` が PWA UI からの明示停止、 BYE 経由の
+    /// orchestrator cleanup は同じ `CallRecorder::stop` を呼ぶため、 本テスト
+    /// で PwaRecordHandlerImpl→CallRecorder→sidecar JSON finalize の経路を
+    /// カバーする)。
+    #[tokio::test]
+    async fn rfc3261_15_1_1_pwa_record_handler_start_stop_finalizes_via_callrecorder() {
+        let tmp = tempdir();
+        // 短い max_duration はテスト時間を縛る保険 (Notify::notify_waiters
+        // race を deadline で確実に解消する。 詳細は
+        // `rfc5853_3_2_2_bye_path_directly_stops_recording_without_pwa_signaling`
+        // のコメント参照)。 stop_recording 経路では `Arc<CallRecorder>` 外に
+        // sender は無いため race は起きないが、 念のため短めに設定する。
+        let recorder = Arc::new(
+            CallRecorder::new(tmp.path().to_path_buf(), Duration::from_millis(200))
+                .await
+                .expect("new"),
+        );
+        let handler: Arc<dyn PwaRecordHandler> = PwaRecordHandlerImpl::new(recorder.clone());
+
+        // PWA RecordStart → handler.start_recording → RecordingStartedInfo
+        let started = handler
+            .start_recording("call-pwa-1")
+            .await
+            .expect("start_recording");
+        assert!(!started.recording_id.is_empty());
+        assert!(started.started_at_unix_ms > 0);
+
+        // 二重 start → AlreadyRecording (RecordingControlError マップ確認)
+        let double = handler.start_recording("call-pwa-1").await;
+        assert!(
+            matches!(double, Err(RecordingControlError::AlreadyRecording)),
+            "double start should map to AlreadyRecording, got {:?}",
+            double.as_ref().err()
+        );
+
+        // PWA RecordStop → handler.stop_recording → RecordingStoppedInfo
+        let stopped = handler
+            .stop_recording("call-pwa-1")
+            .await
+            .expect("stop_recording");
+        assert_eq!(stopped.recording_id, started.recording_id);
+
+        // sidecar JSON が `/api/recording/list` で見える状態になっている。
+        let listed = recorder.list().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].recording_id, started.recording_id);
+
+        // 未知 call_id の stop → UnknownCallId
+        let err = handler
+            .stop_recording("call-unknown")
+            .await
+            .expect_err("unknown stop");
+        assert!(
+            matches!(err, RecordingControlError::UnknownCallId),
+            "unknown stop should map to UnknownCallId, got {err:?}"
+        );
+    }
+
+    /// Issue #296 integration (BYE 経路の cleanup):
+    /// signaling 層からではなく orchestrator (BYE handler) が
+    /// `CallRecorder::stop` を直接呼ぶ経路でも recording が finalize される。
+    ///
+    /// RFC 5853 §3.2.2 B2BUA は片側 dialog 終了 (NGN BYE / PWA→NGN BYE) で
+    /// 付随リソース (= recording) を自動 cleanup する責務がある。 BYE handler
+    /// は recorder.stop を呼んで WAV finalize させる。 `NotFound` は録音中で
+    /// ない call_id (= 通常の BYE) を意味するので silent OK 扱い。
+    ///
+    /// NOTE: テスト内で test scope の `sender` を `stop` より前に明示 drop
+    /// するのは、 `RecordingHandle::stop` の `Notify::notify_waiters` が
+    /// 「現在 waiter が居なければ通知を落とす」 仕様 (tokio doc) で race する
+    /// ためのテストハーネス側対処。 production 配線 (`UasEventHandler` /
+    /// `NgnInboundHandler` の recording_recorder hook) では sender は recorder
+    /// 内部の `ActiveEntry` しか持たないので、 `stop` の冒頭で remove + drop
+    /// した時点で task は `rx.recv()` が None を返して即 finalize する (race
+    /// しない)。 短い max_duration はテスト時間を縛る保険でもある。
+    #[tokio::test]
+    async fn rfc5853_3_2_2_bye_path_directly_stops_recording_without_pwa_signaling() {
+        let tmp = tempdir();
+        let recorder = Arc::new(
+            CallRecorder::new(tmp.path().to_path_buf(), Duration::from_millis(200))
+                .await
+                .expect("new"),
+        );
+
+        // PWA RecordStart で recorder 内に active entry を作る (handler を経由
+        // しないテストでも CallRecorder::start を直接呼ぶ)。
+        let (sender, recording_id, _) = recorder
+            .start("call-bye-cleanup", "0312345678")
+            .await
+            .expect("start");
+        // テスト scope の sender を drop して、 `recorder.stop` 内の sender
+        // drop と合わせて全 sender drop → task の `rx.recv()` が即 `None` を
+        // 返す状態にする (= notify_waiters race を回避、 production 経路と
+        // 同じ「sender が active table 外に居ない」 状況を模擬)。
+        drop(sender);
+
+        // BYE 経路を模して orchestrator が recorder.stop を呼ぶ。 PWA WS
+        // からの `ClientMessage::RecordStop` ではなく、 NGN/内線 BYE 受信時に
+        // 自動 cleanup する経路 (RFC 5853 §3.2.2)。
+        let meta = recorder
+            .stop("call-bye-cleanup")
+            .await
+            .expect("bye-path stop");
+        assert_eq!(meta.recording_id, recording_id);
+
+        // 録音されていない call_id の stop は NotFound (orchestrator は
+        // silent ignore する想定)。
+        let err = recorder
+            .stop("never-recorded")
+            .await
+            .expect_err("not found");
+        assert!(matches!(err, RecordingError::NotFound { .. }));
+
+        // sidecar JSON が `/api/recording/list` で見える。
+        let listed = recorder.list().await.expect("list");
+        assert_eq!(listed.len(), 1);
     }
 }

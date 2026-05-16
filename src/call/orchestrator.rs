@@ -899,6 +899,16 @@ pub struct NgnInboundHandler {
     /// NGN BYE 受信時 (`handle_bye`) は `stop()` で task を停止し、
     /// `record_end` を [`Outcome::Voicemail`] で書く (call_log 連動)。
     voicemail_active: Arc<Mutex<HashMap<String, super::voicemail::VoicemailHandle>>>,
+    /// Issue #296: active call recording recorder。 NGN BYE 受信時 (`handle_bye`)
+    /// に該当 call_id の録音を停止して WAV を finalize させる責務を持つ。
+    /// PWA `ClientMessage::RecordStop` で既に停止済の場合は `NotFound` が返るが、
+    /// silent ignore する。 未注入 (= 機能無効) なら hook は no-op。
+    ///
+    /// RFC 5853 §3.2.2: B2BUA は片側 dialog 終了 (NGN BYE) で付随リソース
+    /// (= recording task) を cleanup する責務がある。 `Mutex<Option<_>>` は
+    /// `set_call_log` / `outbound_forwarder` と同じ pattern (Arc::clone 後に
+    /// 注入できるようにする)。
+    recording_recorder: Mutex<Option<Arc<super::recording::CallRecorder>>>,
 }
 
 impl NgnInboundHandler {
@@ -936,6 +946,7 @@ impl NgnInboundHandler {
             metrics,
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -983,6 +994,7 @@ impl NgnInboundHandler {
             metrics,
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -1015,6 +1027,7 @@ impl NgnInboundHandler {
             metrics,
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -1050,6 +1063,7 @@ impl NgnInboundHandler {
             metrics,
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -1090,6 +1104,27 @@ impl NgnInboundHandler {
     /// `UasEventHandler` を `Arc::clone` して渡せば B2BUA 双方向 BYE が成立する。
     pub async fn set_outbound_forwarder(&self, forwarder: Arc<dyn OutboundDialogForwarder>) {
         *self.outbound_forwarder.lock().await = Some(forwarder);
+    }
+
+    /// Issue #296: active call recording recorder を注入する (setter)。
+    ///
+    /// `set_call_log` と同じ pattern (`Mutex<Option<_>>` ベース) で、 `spawn`
+    /// 後に呼んでも安全。 注入後、 NGN BYE 受信時 (`handle_bye`) に該当
+    /// call_id の録音を自動 finalize する。 未注入なら hook 全体 no-op。
+    ///
+    /// RFC 5853 §3.2.2: B2BUA は片側 dialog 終了で付随リソースを cleanup する。
+    pub async fn set_recording_recorder(
+        self: &Arc<Self>,
+        recorder: Arc<super::recording::CallRecorder>,
+    ) {
+        let mut slot = self.recording_recorder.lock().await;
+        *slot = Some(recorder);
+    }
+
+    /// Issue #296: 注入済 recording recorder の Arc clone (BYE 経路から呼ぶ
+    /// helper)。 未注入なら `None` で、 呼出側は silent no-op する。
+    async fn recording_recorder_clone(&self) -> Option<Arc<super::recording::CallRecorder>> {
+        self.recording_recorder.lock().await.clone()
     }
 
     /// `inbound_rx` を駆動するループを spawn する。
@@ -2534,6 +2569,29 @@ impl NgnInboundHandler {
             }
             info!(call_id=%cid, "voicemail: NGN BYE 受信 → 録音停止 (Issue #288)");
         }
+        // Issue #296: active call recording 中だった通話なら recorder.stop で
+        // WAV を finalize させる (RFC 5853 §3.2.2 B2BUA cleanup)。 録音中で
+        // なければ `NotFound` が返るので silent ignore する (通常 BYE のホット
+        // パス)。 stop は handle 内で `join().await` を含むため最大 max_duration
+        // 待つ可能性があるが、 packet 流入が停止していれば 即時 finalize する。
+        if let Some(recorder) = self.recording_recorder_clone().await {
+            match recorder.stop(&cid).await {
+                Ok(file) => {
+                    info!(
+                        call_id = %cid,
+                        recording_id = %file.recording_id,
+                        duration_ms = file.duration_ms,
+                        "active call recording: NGN BYE 受信 → finalize (Issue #296)"
+                    );
+                }
+                Err(super::recording::RecordingError::NotFound { .. }) => {
+                    // 通常 BYE (録音していない通話) — silent OK。
+                }
+                Err(e) => {
+                    warn!(call_id=%cid, error=%e, "recording stop 失敗 (Issue #296)");
+                }
+            }
+        }
         if let (Some(Some(call_id)), Some(mgr)) = (removed, self.call_manager.as_ref()) {
             if let Err(e) = mgr.terminate(call_id).await {
                 warn!(error=%e, "BYE 受信時の通話終了に失敗");
@@ -3293,6 +3351,12 @@ pub struct UasEventHandler {
     /// `ExtensionRegistrar`。 `ext_inviter` と組で注入する。 `None` なら
     /// REFER は 404 (転送先不在) で拒否する。
     ext_registrar: Mutex<Option<Arc<ExtensionRegistrar>>>,
+    /// Issue #296: active call recording recorder。 PWA WS close 経由の cleanup
+    /// (`close_pwa_outbound_for_ws`) で該当 call_id の録音を finalize する。
+    /// 未注入なら hook は no-op。 RFC 5853 §3.2.2 B2BUA は片側 dialog 終了で
+    /// 付随リソースを cleanup する責務。 `Mutex<Option<_>>` は `set_call_log` /
+    /// `ext_inviter` と同じ pattern (spawn 後の注入を許す)。
+    recording_recorder: Mutex<Option<Arc<super::recording::CallRecorder>>>,
 }
 
 impl UasEventHandler {
@@ -3316,6 +3380,7 @@ impl UasEventHandler {
             call_log: Mutex::new(None),
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -3357,6 +3422,7 @@ impl UasEventHandler {
             call_log: Mutex::new(None),
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -3386,6 +3452,7 @@ impl UasEventHandler {
             call_log: Mutex::new(None),
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -3421,6 +3488,25 @@ impl UasEventHandler {
     /// 呼ぶときの helper として使う。 未注入なら `None` で hook 全体を skip する。
     async fn call_log_clone(&self) -> Option<Arc<crate::observability::call_log::CallLog>> {
         self.call_log.lock().await.clone()
+    }
+
+    /// Issue #296: active call recording recorder を注入する (setter)。
+    /// `NgnInboundHandler::set_recording_recorder` と同じ pattern で、 PWA WS
+    /// close 経由の cleanup (`close_pwa_outbound_for_ws`) から自動 finalize する。
+    ///
+    /// RFC 5853 §3.2.2: B2BUA は片側 dialog 終了で付随リソースを cleanup する。
+    pub async fn set_recording_recorder(
+        self: &Arc<Self>,
+        recorder: Arc<super::recording::CallRecorder>,
+    ) {
+        let mut slot = self.recording_recorder.lock().await;
+        *slot = Some(recorder);
+    }
+
+    /// Issue #296: 注入済 recording recorder の Arc clone (BYE / WS close 経路
+    /// から呼ぶ helper)。 未注入なら `None` で hook 全体 no-op。
+    async fn recording_recorder_clone(&self) -> Option<Arc<super::recording::CallRecorder>> {
+        self.recording_recorder.lock().await.clone()
     }
 
     /// `webrtc_outbound_active` の Arc を返す (Issue #147)。
@@ -3493,6 +3579,7 @@ impl UasEventHandler {
             call_log: Mutex::new(None),
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
+            recording_recorder: Mutex::new(None),
         })
     }
 
@@ -5897,6 +5984,28 @@ impl PwaOutboundCloser for UasEventHandler {
             // record_start は `handle_pwa_outbound_offer` の spawn 内で書き込まれている。
             if let Some(call_log) = self.call_log_clone().await {
                 call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
+            // Issue #296: active call recording 中なら finalize する
+            // (RFC 5853 §3.2.2 B2BUA cleanup)。 録音中でなければ NotFound で
+            // silent ignore。 PWA `ClientMessage::RecordStop` が先行している場合
+            // も NotFound なので二重 stop にはならない (idempotent)。
+            if let Some(recorder) = self.recording_recorder_clone().await {
+                match recorder.stop(&cid).await {
+                    Ok(file) => {
+                        info!(
+                            call_id = %cid,
+                            recording_id = %file.recording_id,
+                            duration_ms = file.duration_ms,
+                            "active call recording: PWA WS close → finalize (Issue #296)"
+                        );
+                    }
+                    Err(super::recording::RecordingError::NotFound { .. }) => {
+                        // 通常 BYE (録音していない通話) — silent OK。
+                    }
+                    Err(e) => {
+                        warn!(call_id=%cid, error=%e, "PWA close: recording stop 失敗 (Issue #296)");
+                    }
+                }
             }
             debug!(ngn_call_id=%cid, "PWA→NGN BYE 完了 (Issue #147)");
         }
@@ -12702,6 +12811,7 @@ mod tests {
             metrics: metrics.clone(),
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
+            recording_recorder: Mutex::new(None),
         });
         // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
         drop(sabiden_inbound_rx);

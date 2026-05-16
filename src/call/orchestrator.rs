@@ -1443,6 +1443,17 @@ impl NgnInboundHandler {
                     drop(tx);
                     self.pending.lock().await.remove(&call_id);
                     self.metrics.record_invite_ngn(InviteResult::Error);
+                    // Issue #278 (PR #286 review #2): record_start (line ~1408) は
+                    // 全 reject 経路の前で発火しているため、 reject paths でも
+                    // record_end を呼ばないと orphan entry が ring buffer に残る。
+                    // RFC 3261 §21.4.16: 420 Bad Extension は「未対応 option-tag」
+                    // による拒否で status code を保持して履歴に残す。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed { status: 420 },
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -1495,6 +1506,16 @@ impl NgnInboundHandler {
                         tx.respond(resp).await?;
                         drop(tx);
                         self.pending.lock().await.remove(&call_id);
+                        // Issue #278 (PR #286 review #2): RFC 3261 §21.4.18 / RFC 4028 §10
+                        // 422 Session Interval Too Small は Session-Timer 折衝失敗による
+                        // 拒否 (carrier UAC は Min-SE 整合値で再 INVITE する)、 history
+                        // 上は Failed{422} として保持する。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Failed { status: 422 },
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -1538,6 +1559,18 @@ impl NgnInboundHandler {
                     self.respond(&stx, 481, "Call/Transaction Does Not Exist")
                         .await?;
                     self.pending.lock().await.remove(&call_id);
+                    // Issue #278 (PR #286 review #2): RFC 3261 §21.4.20 481 は dialog
+                    // 不在による拒否。 通常は in-dialog Re-INVITE で fresh Call-ID は
+                    // 来ない (= record_start dedup で no-op) が、 万一新規 Call-ID +
+                    // to-tag の異常パターンで orphan entry が残らないように record_end
+                    // を呼ぶ。 同 Call-ID が既に終端済なら線形検索でヒットしないだけ
+                    // の no-op。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed { status: 481 },
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -1550,6 +1583,14 @@ impl NgnInboundHandler {
                 self.pending.lock().await.remove(&call_id);
                 // 着信は受け付けたが内線不在で確立に至らず → error 計上
                 self.metrics.record_invite_ngn(InviteResult::Error);
+                // Issue #278 (PR #286 review #2): RFC 3261 §21.4.18 480 Temporarily
+                // Unavailable は「callee は一時的に応答できない (= 内線不在)」 で、
+                // ユーザ視点では「鳴らせる端末が無かった」 = Missed と扱うのが
+                // 妥当 (`ForkResult::AllFailed` / `ForkResult::Timeout` と同じ
+                // Missed カテゴリ、 PR #286 既存実装と整合)。
+                if let Some(call_log) = self.call_log_clone().await {
+                    call_log.record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                }
                 return Ok::<(), anyhow::Error>(());
             }
 
@@ -1698,6 +1739,17 @@ impl NgnInboundHandler {
                     self.in_flight.lock().await.remove(&call_id);
                     self.metrics.record_invite_extension(InviteResult::Error);
                     self.metrics.record_invite_ngn(InviteResult::Error);
+                    // Issue #278 (PR #286 review #1): 着信側が応答する前に NGN UAC が
+                    // CANCEL を出した = ユーザ視点での「不在着信」。 record_start
+                    // (line ~1408) に対する record_end を必ず呼んで orphan entry を
+                    // 防ぐ。 RFC 3261 §21.4.27 によれば 487 Request Terminated は
+                    // 「PASSIVE な cancellation でリクエストが終了した」状態を意味し、
+                    // 通話履歴上は Missed として扱う (`Outcome::Missed` の
+                    // 「応答前に終了した着信」 セマンティクスと整合)。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log
+                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                    }
                     return Ok(());
                 }
                 r = fork_fut => r,
@@ -1730,6 +1782,16 @@ impl NgnInboundHandler {
                         self.pending.lock().await.remove(&call_id);
                         self.metrics.record_invite_extension(InviteResult::Timeout);
                         self.metrics.record_invite_ngn(InviteResult::Timeout);
+                        // Issue #278 (PR #286 review #3): RFC 3262 §3 / RFC 3261
+                        // §21.4.8 408 は UAC が reliable 18x に PRACK を返さなかった
+                        // ことによる timeout 終結。 status code を残して PWA UI で
+                        // 「reliable provisional ACK 不在」を区別可能にする。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Failed { status: 408 },
+                            );
+                        }
                         return Ok(());
                     }
                     PrackOutcome::NoState => {
@@ -3482,6 +3544,17 @@ impl UasEventHandler {
                             warn!(error=%e, "競合 BYE の送出失敗");
                         }
                         self.metrics.record_invite_ngn(InviteResult::Error);
+                        // Issue #278 (PR #286 review #4): RFC 3261 §15.1.1 競合 BYE 経路。
+                        // 内線が CANCEL した直後に NGN 200 OK が到着した場合、 sabiden は
+                        // 即 BYE で閉じるため通話としては「発信側 CANCEL で終了」。
+                        // 既存の `Err(_) + was_cancelled` 経路 (line ~3651) と整合させて
+                        // `Outcome::Cancelled` で record_end する (orphan 防止)。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Cancelled,
+                            );
+                        }
                         return Ok(());
                     }
                     // NGN 側 200 OK の SDP answer を内線に返す。

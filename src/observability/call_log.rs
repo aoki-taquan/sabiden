@@ -364,4 +364,44 @@ mod tests {
         assert!(matches!(recent[0].outcome, Some(Outcome::Missed)));
         assert!(recent[0].duration.is_some());
     }
+
+    /// PR #286 review 🟡#3: record_start のみで record_end が未到達の "進行中通話"
+    /// entry が `recent()` で観測されるとき、 `outcome` と `duration` がともに
+    /// `None` のまま JSON にシリアライズされ、 (a) `outcome` フィールドは `null`、
+    /// (b) `duration_secs` フィールドも `null` で出ることを保証する。 これは PWA
+    /// UI が「通話中 / 結果未確定」を判別するための contract であり、 silent な
+    /// 構造変化 (例えば `outcome` フィールド欠落) を regression として弾く。
+    #[test]
+    fn orphan_entry_serializes_with_null_outcome_and_duration() {
+        let log = CallLog::new(4);
+        log.record_start(Direction::Inbound, "0312345678".into(), "cid-orphan".into());
+
+        let recent = log.recent(1);
+        assert_eq!(recent.len(), 1);
+        let entry = &recent[0];
+        // メモリ上は `outcome: None` / `duration: None`。
+        assert!(entry.outcome.is_none(), "outcome must be None pre-end");
+        assert!(entry.duration.is_none(), "duration must be None pre-end");
+
+        let json: serde_json::Value =
+            serde_json::to_value(entry).expect("entry must serialize to JSON");
+        // JSON 側: outcome / duration_secs ともに null として出る。
+        assert!(
+            json.get("outcome")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(false),
+            "JSON outcome must be null, got {json}"
+        );
+        assert!(
+            json.get("duration_secs")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(false),
+            "JSON duration_secs must be null, got {json}"
+        );
+        // start_unix_ms は有効な数値。
+        assert!(json["start_unix_ms"].is_u64(), "start_unix_ms must be u64");
+        assert_eq!(json["call_id"], "cid-orphan");
+        assert_eq!(json["direction"], "inbound");
+        assert_eq!(json["remote_number"], "0312345678");
+    }
 }

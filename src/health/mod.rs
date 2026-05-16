@@ -302,6 +302,11 @@ mod tests {
     /// `record_start` / `record_end` で 2 件の通話 (outbound + inbound) を
     /// CallLog に書き込んでから endpoint を叩く。 返値が新しい順かつ outcome /
     /// remote_number / direction が正しいことを assert する。
+    ///
+    /// PR #286 review 🟡#2: 旧実装は `body.contains("...")` による文字列検索だった
+    /// ため、 (a) JSON 構造の検証になっていない (b) key/value 取り違えに気付け
+    /// ない、 という弱点があった。 serde_json で実際に `Vec<Value>` にパースし、
+    /// array indexing で fields を検証する。
     #[tokio::test]
     async fn call_log_recent_returns_entries_in_newest_first_order() {
         use crate::observability::call_log::{Direction, Outcome};
@@ -330,17 +335,20 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
-        // axum::Json は JSON 配列をそのまま返す。 検索しやすいキーで内容を確認。
-        // 新しい順 = cid-2 が先頭、 cid-1 が末尾。
-        let pos_2 = body.find("cid-2").expect("cid-2 should appear");
-        let pos_1 = body.find("cid-1").expect("cid-1 should appear");
-        assert!(pos_2 < pos_1, "newest entry must come first: {body}");
-        assert!(body.contains("\"direction\":\"inbound\""));
-        assert!(body.contains("\"direction\":\"outbound\""));
-        assert!(body.contains("\"kind\":\"answered\""));
-        assert!(body.contains("\"kind\":\"missed\""));
-        assert!(body.contains("\"remote_number\":\"117\""));
-        assert!(body.contains("\"remote_number\":\"0312345678\""));
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("response must be a JSON array");
+        assert_eq!(arr.len(), 2, "expected 2 entries, body = {body}");
+
+        // [0] = 新しい方 (cid-2、 inbound, missed)
+        assert_eq!(arr[0]["call_id"], "cid-2");
+        assert_eq!(arr[0]["direction"], "inbound");
+        assert_eq!(arr[0]["remote_number"], "0312345678");
+        assert_eq!(arr[0]["outcome"]["kind"], "missed");
+        // [1] = 古い方 (cid-1、 outbound, answered)
+        assert_eq!(arr[1]["call_id"], "cid-1");
+        assert_eq!(arr[1]["direction"], "outbound");
+        assert_eq!(arr[1]["remote_number"], "117");
+        assert_eq!(arr[1]["outcome"]["kind"], "answered");
     }
 
     /// Issue #278: `?n=1` で件数を絞れる。
@@ -372,10 +380,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
-        // 最新 1 件 (= cid-2) のみ。 他は出ない。
-        assert!(body.contains("cid-2"));
-        assert!(!body.contains("cid-1"));
-        assert!(!body.contains("cid-0"));
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("response must be a JSON array");
+        // 最新 1 件 (= cid-2) のみ。
+        assert_eq!(arr.len(), 1, "expected 1 entry with n=1, body = {body}");
+        assert_eq!(arr[0]["call_id"], "cid-2");
+        assert_eq!(arr[0]["remote_number"], "117-2");
     }
 
     /// Issue #278: 空 ring buffer でも 200 + `[]` を返す。
@@ -393,6 +403,57 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
-        assert_eq!(body.trim(), "[]");
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("response must be a JSON array");
+        assert!(arr.is_empty(), "expected empty array, got {body}");
+    }
+
+    /// Issue #278 (PR #286 review 🟡#3): record_start のみ実施された
+    /// "進行中通話" (= record_end が未到達) が `GET /api/call-log/recent`
+    /// で **`outcome=null` + `duration_secs=null`** として正しくシリアライズ
+    /// されることを確認する。 PWA UI 側はこの形を「通話中 / 結果未確定」として
+    /// 描画するため、 silent な構造変化 (例えば `outcome` フィールド欠落) が
+    /// regression にならないように JSON 構造で assert する。
+    #[tokio::test]
+    async fn call_log_recent_serializes_orphan_entry_with_null_outcome_and_duration() {
+        use crate::observability::call_log::Direction;
+
+        let state = make_state(true);
+        // record_start だけで record_end は呼ばない (= まだ通話中、 または
+        // 例外で record_end ホップが落ちた orphan)。
+        state
+            .call_log
+            .record_start(Direction::Inbound, "0312345678".into(), "cid-orphan".into());
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/call-log/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(&body).expect("response must be a JSON array");
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(entry["call_id"], "cid-orphan");
+        assert_eq!(entry["direction"], "inbound");
+        assert_eq!(entry["remote_number"], "0312345678");
+        // 進行中なので outcome / duration_secs は null
+        assert!(
+            entry["outcome"].is_null(),
+            "outcome must be null for in-progress call, got {entry:?}"
+        );
+        assert!(
+            entry["duration_secs"].is_null(),
+            "duration_secs must be null for in-progress call, got {entry:?}"
+        );
+        // start_unix_ms は有効値 (u64)。
+        assert!(entry["start_unix_ms"].is_u64());
     }
 }

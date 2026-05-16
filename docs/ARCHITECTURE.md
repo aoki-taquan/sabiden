@@ -658,23 +658,39 @@ in-memory ring buffer を導入する (永続化は別 Issue)。
 - `record_start(Direction, remote, call_id)` で開始時刻を残し、 `record_end(call_id, Outcome)`
   で `outcome` と `duration` を確定 (Call-ID 線形検索、 ring buffer から evict 済なら no-op)。
 
-**hook ポイント** (`src/call/orchestrator.rs` 内、 各経路 start/end 計 8 箇所):
+**hook ポイント** (`src/call/orchestrator.rs` 内、 各経路 record_start / record_end を
+**対称に発火**。 PR #286 review #1〜#4 の orphan entry 修正で全 reject 経路に record_end 付与済):
 
 - NGN inbound INVITE (`NgnInboundHandler::handle_invite`)
   - 100 Trying 直後 → `record_start(Inbound, from-user, call_id)`
+  - **420 Bad Extension** (RFC 3261 §8.2.2.3、 未対応 option-tag) → `record_end(Failed { status: 420 })`
+  - **422 Session Interval Too Small** (RFC 4028 §10、 SE < Min-SE) → `record_end(Failed { status: 422 })`
+  - **481 Call/Transaction Does Not Exist** (RFC 3261 §12.2.2、 in-dialog INVITE で該当 dialog 無し) →
+    `record_end(Failed { status: 481 })`
+  - **480 Temporarily Unavailable** (登録内線無し) → `record_end(Missed)` (鳴らせる端末が無い = Missed カテゴリ、
+    RFC 3261 §21.4.18 と整合)
+  - NGN **CANCEL → 487 Request Terminated** (応答前 NGN UAC 中断) → `record_end(Missed)` (RFC 3261 §21.4.27、
+    PASSIVE 中断 = 着信側視点での不在着信)
+  - **PRACK 32 秒不到来 → 408 Request Timeout** (RFC 3262 §3 reliable 18x の PRACK 不到来) →
+    `record_end(Failed { status: 408 })`
   - `ForkResult::FirstSuccess` → 確立 (record_end は BYE 時)
-  - `ForkResult::AllFailed` → `record_end(Missed)`
-  - `ForkResult::Timeout` → `record_end(Missed)`
+  - `ForkResult::AllFailed` (内線全敗、 486 / 603 等) → `record_end(Missed)`
+  - `ForkResult::Timeout` (内線 fork timeout) → `record_end(Missed)`
 - NGN inbound BYE (`NgnInboundHandler::handle_bye`)
   - SIP 内線 path 1: `active` から removed → `record_end(Answered)`
   - PWA outbound BYE path (NGN 始動): `record_end(Answered)` (Outbound 側の終了)
 - PWA disconnect (`close_pwa_inbound_for_ws`) → `record_end(Answered)`
 - 内線→NGN INVITE (`UasEventHandler::handle_invite`)
   - rate-limit / 422 通過後、 build_invite 直前 → `record_start(Outbound, dialed-number, call_id)`
-  - `Ok(InviteOutcome::Established)` → 確立 (record_end は BYE 時)
+  - **`Ok(InviteOutcome::Established)` + `was_cancelled = true`** (RFC 3261 §15.1.1 CANCEL と 200 OK の競合
+    glare、 sabiden 即 BYE) → `record_end(Cancelled)`
+  - `Ok(InviteOutcome::Established)` (通常確立) → 確立 (record_end は BYE 時)
   - `Ok(InviteOutcome::Failed { response })` → `record_end(Failed { status })`
   - `Err(_)` (was_cancelled = true) → `record_end(Cancelled)`
   - `Err(_)` (was_cancelled = false) → `record_end(Failed { status: 503 })`
+  - 注: `InviteOutcome` は `Established` / `Failed { response }` の 2 variant のみ
+    (`src/sip/uac.rs::InviteOutcome`)。 487 は `Failed { response.status_code = 487 }` 経路に乗り、
+    `was_cancelled` 由来の 487 は `Err(_)` の Timer B / CANCEL race 経路に乗ることもある。
 - 内線→NGN BYE (`UasEventHandler::handle_ext_bye`) → `record_end(Answered)`
 - PWA→NGN INVITE (`UasEventHandler::handle_pwa_outbound_offer`、 spawn 内)
   - plan 生成後 → `record_start(Outbound, target, call_id)`

@@ -45,7 +45,7 @@
 | `src/sip/transaction.rs` | RFC 3261 §17 トランザクション層 (Timer A/B/D/E/F/G/H/I/J/K) | 1125 | ▲ | UAC 側 Timer A/B/D は実装。**Timer E/F (non-INVITE 再送)** は `ClientState::Trying` 分岐で実装済だが INVITE と同じ "倍々 → T2 cap" のみ。**Timer G/H/I/J/K (server tx)** は未実装 (`ServerTransaction::handle_retransmit` は呼ばれるだけで自動駆動なし)。INVITE 2xx ACK 単発送出は `Uac` 側に実装され dialog 層責務として分離されているが、これは §13.2.2.4 では正しい。 |
 | `src/sip/dialog.rs` | RFC 3261 §12, §13 ダイアログ・in-dialog request 構築 | 816 | ◎ | UAC/UAS 双方の dialog 構築まである。`build_reinvite` は実装済だが UAC 側だけで、**UAS 側 Re-INVITE 受信ハンドラは未実装** (`uas.rs::handle_request` の Invite 分岐が dialog の有無を見ない)。Route ヘッダ name-addr 判定 (line 406) は heuristic で `<` の出現位置のみ見ている。 |
 | `src/sip/uac.rs` | RFC 3261 §8 / §13 UAC | 626 | ▲ | INVITE は `TransactionLayer::send_request` (Timer B 1 本) に投げるだけで、ACK 後の Timer L (RFC 6026 §7.1) は無い。`build_invite` 内で `Allow` ヘッダに NOTIFY / INFO を含めるが、UAS 側で 405 を返す `SipMethod::Other` 経路と矛盾。Re-INVITE では `parse_cseq_number` を `dialog.rs` と二重管理 (line 347 vs `dialog.rs:451`)。 |
-| `src/sip/uas.rs` | RFC 3261 §8.2 UAS + §10 内線 Registrar 統合 | 883 | ▲ | `_layer: Arc<TransactionLayer>` を保持しているが、`ServerTransaction` を `tx_table` に登録する処理が無い。同一リクエストの再送 (Timer J 内) を `last_response` から自動再送する経路が無い。Auth は In-line で write されており §22 Authentication Framework の責務を `auth.rs` に分離しきれていない。`SipMethod::Other` を全部 405 で返している (line 314)。 |
+| `src/sip/uas.rs` | RFC 3261 §8.2 UAS + §10 内線 Registrar 統合 | 883 | ▲ | `_layer: Arc<TransactionLayer>` を保持しているが、`ServerTransaction` を `tx_table` に登録する処理が無い。同一リクエストの再送 (Timer J 内) を `last_response` から自動再送する経路が無い。Auth は In-line で write されており §22 Authentication Framework の責務を `auth.rs` に分離しきれていない。~~`SipMethod::Other` を全部 405 で返している (line 314)~~ → 解消済 (Issue #273、 §4.4)。 |
 | `src/sip/register.rs` | RFC 3261 §10 (UAC 側 REGISTER) + RFC 4028 (なし) | 323 | ◎ | NGN 直収 (auth=none) を綺麗に分岐済。だが `static CSEQ` (line 23) は **プロセス全体で 1 つ**: 多回線対応時に衝突する。Session Timer (RFC 4028) は REGISTER に乗らないので不要だが、コメントが誤誘導。再送 30 秒固定は §10.3 step 6 の "min interval" を考慮していない。 |
 | `src/sip/registrar.rs` | RFC 3261 §10.3 (内線側 Registrar) | 238 | ◎ | API が `register` と `register_with_transport` の二重化 (line 98 vs 110)。**`register` 側は内部で `register_with_transport` を呼ぶラッパなので統合可能**。`Binding` に `transport: ExtTransport` を持ったため `contact_uri` が WebRTC では意味を持たない (`webrtc.peer` ダミー)。 |
 | `src/sip/auth.rs` | RFC 2617 / RFC 7616 Digest | 339 | ◎ | MD5 only (RFC 7616 SHA-256 / SHA-512-256 未対応)。`auth-int` 未対応。`build_www_authenticate` の nonce が `new_call_id()` 由来で **再利用検出 (stale=true)** が実装されていない (常に固定 nonce 形式)。 |
@@ -224,7 +224,7 @@ impl Negotiator {
 | §8.1.3 | Processing Responses | △ | UAC は最終応答を受信して終了 | 3xx redirect (Contact follow) 未対応 |
 | §8.1.3.5 | Processing 4xx Responses | △ | 401 → Authorization 再送 (REGISTER のみ) | INVITE で 401/407 を受けた場合の再送経路なし (`Uac::invite` は Failed として返すだけ) |
 | §8.2 | UAS Behavior | △ | uas.rs / orchestrator.rs::NgnInboundHandler | 100 Trying は INVITE のみ (REGISTER でも要らないので OK)。merged request 検出 §8.2.2.2 未対応。 |
-| §8.2.1 | Method Inspection | ✗ | uas.rs::handle_request の `SipMethod::Other → 405` | NOTIFY / PRACK / UPDATE を全て 405 にしているのは **不適切**。NOTIFY は Subscribe と対で必要 (UA からの BLF 等で来る)、PRACK は 100rel 受け入れ時に必須。UPDATE (RFC 3311) は Re-INVITE 代替で必要。 |
+| §8.2.1 | Method Inspection | ✓ | uas.rs::handle_request で method 別 status | Issue #273 で解消。 NOTIFY→481 / SUBSCRIBE→489 / PRACK→481 / PUBLISH→200 / UPDATE→481 / MESSAGE→200 / REFER→405 / Other→405、 すべて `Allow` ヘッダ付き (§4.4 参照)。 |
 | §8.2.2.1 | To/From/Call-ID/CSeq | ✓ | build_response_skeleton | |
 | §8.2.2.2 | Merged Requests | ✗ | なし | 同一 (Request-URI, From-tag, Call-ID, CSeq) の重複検出 |
 | §8.2.3 | Adjusting the Header Field Values | △ | dialog.rs Record-Route reverse 等 | sabiden は Proxy ではなく UA なので Record-Route 自身が記録する経路は無い |
@@ -431,24 +431,26 @@ pub enum Scenario {
 
 §1.5 で詳述。`normalize_header_key` (in→canonical) と `canonical_header_name` (canonical→display) の 2 表が独立。
 
-### 4.4 `SipMethod::Other(String)` で 405 化
+### 4.4 `SipMethod::Other(String)` で 405 化 [**解消済**]
 
-`src/sip/uas.rs:314`:
-```rust
-other => {
-    warn!(?other, "未対応メソッド → 405");
-    let _ = responder.quick(405, "Method Not Allowed").await;
-}
-```
+**NGN inbound 側**: Issue #110 / PR #154 で `src/call/orchestrator.rs::handle_inbound` を method 別 status に整理済。
 
-問題:
-- **NOTIFY** は presence (BLF) や reg-event で来る。即 405 ではなく、対応する dialog があれば 200 OK、無ければ 481 Call/Transaction Does Not Exist が標準的 (RFC 3265 §3.2)
-- **PRACK** は INVITE で 100rel を Require した場合のみ来るので、本来 INVITE 側で `Require: 100rel` をオファに含めなければ来ないが、相手が `Supported: 100rel` を見て 1xx に reliable を立ててきたら PRACK が来る (RFC 3262 §4)
-- **PUBLISH** は presence 用。Linphone が定期送信するため 405 でも害はないが、警告ログが増える
-- **UPDATE** は RFC 3311。Re-INVITE の代替で session refresh に使われる。NGN では発生しない可能性が高いが、SBC 経由で来うる
-- **MESSAGE** (RFC 3428): SMS 風の即時メッセージ。受け流すなら 200 OK が安全 (UA が再送し続けるのを止める)
+**内線 UAS 側**: Issue #273 / PR #XXX で `src/sip/uas.rs::handle_request` を以下の通り個別 status に整理済 (RFC 引用付き):
 
-→ Phase R2 で `SipMethod::{Notify, Subscribe, Publish, Update, Prack, Refer, Message}` を網羅的に列挙し、`Other(String)` は IANA 未登録メソッド専用にする。各メソッドに最低限の応答 (200/202/481) を返す。
+| Method | 応答 | 根拠 |
+|---|---|---|
+| `NOTIFY` | 481 Subscription Does Not Exist + `Allow` | RFC 3265 §3.2 / RFC 6665 §3.2 |
+| `SUBSCRIBE` | 489 Bad Event + `Allow` | RFC 6665 §4.1.4 |
+| `PRACK` | 481 Call/Transaction Does Not Exist + `Allow` | RFC 3262 §4 / §7.1 |
+| `PUBLISH` | 200 OK + `Allow` (本文破棄、 受け流し) | RFC 3903 §6 |
+| `UPDATE` | 481 + `Allow` | RFC 3311 §5.2 |
+| `MESSAGE` | 200 OK + `Allow` (本文破棄、 再送ストーム抑止) | RFC 3428 §7 |
+| `REFER` | 405 Method Not Allowed + `Allow` | RFC 3515 §4.5 |
+| `Other(_)` | 405 + `Allow` | RFC 3261 §8.2.1 |
+
+`Allow` ヘッダは sabiden が処理経路を持つ method (`INVITE, ACK, BYE, CANCEL, OPTIONS`) のみ列挙する (定数 `SUPPORTED_METHODS_ALLOW` in `src/sip/uas.rs`)。
+
+PUBLISH が NGN 側 (489) と内線側 (200 OK) で異なるのは: NGN 側は carrier IMS が EventStateCompositor を期待する一方、 内線側 UA は presence publish を盲目的に 200 OK で吸って再送を止めるのが推奨されるため (RFC 3903 §6、 Issue #273 DoD)。
 
 ### 4.5 Timer A/B/D/E/F/G/H/I/J/K の実装漏れ
 

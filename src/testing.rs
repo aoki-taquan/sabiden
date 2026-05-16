@@ -319,6 +319,35 @@ pub mod builders {
         req
     }
 
+    /// 内線 UA → sabiden UAS 向けの任意メソッドのリクエスト (Issue #273)。
+    ///
+    /// `ExtensionUas::handle_request` が NOTIFY / SUBSCRIBE / PRACK / PUBLISH /
+    /// UPDATE / MESSAGE / REFER / 未知メソッド を個別 status (RFC 別) で
+    /// 応答するかを検証するためのビルダ。 `invite_from_phone` と同じ
+    /// 最小ヘッダ集合 (Via / From / To / Call-ID / CSeq / Max-Forwards /
+    /// Contact) を載せる。
+    pub fn request_from_phone(
+        local: &SocketAddr,
+        user: &str,
+        method: SipMethod,
+        request_uri: &str,
+        branch: &str,
+    ) -> SipRequest {
+        let method_str = method.as_str().to_string();
+        let mut req = SipRequest::new(method, request_uri);
+        req.headers
+            .set("Via", format!("SIP/2.0/UDP {};branch={}", local, branch));
+        req.headers.set("Max-Forwards", "70");
+        req.headers
+            .set("From", format!("<sip:{}@sabiden>;tag={}", user, new_tag()));
+        req.headers.set("To", format!("<{}>", request_uri));
+        req.headers.set("Call-ID", new_call_id());
+        req.headers.set("CSeq", format!("1 {}", method_str));
+        req.headers
+            .set("Contact", format!("<sip:{}@{}>", user, local));
+        req
+    }
+
     /// 既存ダイアログを終了する BYE (RFC 3261 §15.1.1)。
     pub fn bye(
         from_addr: &SocketAddr,

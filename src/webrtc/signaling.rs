@@ -471,6 +471,86 @@ pub trait PwaDtmfHandler: Send + Sync {
     async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool>;
 }
 
+/// active call recording (Issue #296) のハンドラ。
+///
+/// `ClientMessage::RecordStart { call_id }` / `RecordStop { call_id }` 受信時に
+/// signaling 層がこの trait を呼ぶ。 実装側
+/// ([`crate::call::orchestrator::UasEventHandler`] 等) は:
+///
+/// 1. orchestrator が保持する `CallRecorder` で recorder task を spawn
+///    (start_recording) / 停止 (stop_recording) する。
+/// 2. start 時、 bridge tap 経由で RTP packet を recorder の
+///    `RecordingSender` に流す紐付けを行う (実装は orchestrator の責務)。
+/// 3. stop 時、 recorder task が WAV finalize + sidecar JSON を書き出す。
+///
+/// 戻り値:
+/// - 成功時は `RecordingStartedInfo` を返す。
+/// - 失敗 (機能未設定 / 二重 start / call_id 不在) は [`RecordingControlError`]。
+///
+/// trait は signaling 層 → orchestrator 一方向の依存。 orchestrator は内部の
+/// `CallRecorder` table の存在を signaling 層から隠蔽するためにこれを介する。
+#[async_trait::async_trait]
+pub trait PwaRecordHandler: Send + Sync {
+    /// `call_id` の通話に対する録音を開始する。 詳細は trait docstring。
+    async fn start_recording(
+        &self,
+        call_id: &str,
+    ) -> Result<RecordingStartedInfo, RecordingControlError>;
+
+    /// `call_id` の通話の録音を停止する。 戻り値の duration_ms は WAV に
+    /// 書き込まれた音声長 (= 開始からの経過時刻ではなく、 実 PCMU sample 数
+    /// ベース、 RFC 3551 §4.5.14)。
+    async fn stop_recording(
+        &self,
+        call_id: &str,
+    ) -> Result<RecordingStoppedInfo, RecordingControlError>;
+}
+
+/// recording 開始成功時の戻り値 (Issue #296)。
+#[derive(Debug, Clone)]
+pub struct RecordingStartedInfo {
+    pub recording_id: String,
+    pub started_at_unix_ms: u64,
+}
+
+/// recording 停止成功時の戻り値 (Issue #296)。
+#[derive(Debug, Clone)]
+pub struct RecordingStoppedInfo {
+    pub recording_id: String,
+    pub duration_ms: u64,
+}
+
+/// recording 操作の失敗種別 (Issue #296)。 signaling 層は本 enum を
+/// `ServerMessage::Error` の `code` 文字列にマップする (PWA UI の判定材料)。
+#[derive(Debug)]
+pub enum RecordingControlError {
+    /// recording 機能が未配線 (= `recording.enabled = false` / orchestrator
+    /// に recorder 未注入)。
+    Unavailable,
+    /// 同一 `call_id` で既に録音中 (= start 二重発行)。
+    AlreadyRecording,
+    /// `call_id` に対応する active call / 録音が見つからない。
+    UnknownCallId,
+    /// recorder の準備 (storage_dir 作成 / WAV file create) に失敗、 もしくは
+    /// task の join error。
+    Internal { reason: String },
+}
+
+impl std::fmt::Display for RecordingControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordingControlError::Unavailable => write!(f, "recording_unavailable"),
+            RecordingControlError::AlreadyRecording => write!(f, "already_recording"),
+            RecordingControlError::UnknownCallId => write!(f, "unknown_call_id"),
+            RecordingControlError::Internal { reason } => {
+                write!(f, "recording_internal: {}", reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecordingControlError {}
+
 /// 発信先 `target` の文字種ホワイトリスト (Issue #145, PR #146 review #1 🔴#1)。
 ///
 /// browser からの任意文字列が NGN INVITE の Request-URI user 部に流れる
@@ -540,6 +620,10 @@ pub struct SignalingState {
     /// 順に lookup する想定)。 `None` のときは DTMF を silent drop (= error は
     /// 返さず browser の dial pad 押下は no-op になる)。
     pub pwa_dtmf: Option<Arc<dyn PwaDtmfHandler>>,
+    /// active call recording (Issue #296)。 `ClientMessage::RecordStart` /
+    /// `RecordStop` 受信時に呼ぶ。 `None` のときは recording 機能無効 = PWA
+    /// 側に `code:"recording_unavailable"` を返す。
+    pub pwa_record: Option<Arc<dyn PwaRecordHandler>>,
 }
 
 impl SignalingState {
@@ -561,6 +645,7 @@ impl SignalingState {
             pwa_inbound_closer: None,
             pwa_hold_handler: None,
             pwa_dtmf: None,
+            pwa_record: None,
         }
     }
 
@@ -607,6 +692,12 @@ impl SignalingState {
     /// 通話中 DTMF 注入ハンドラを差し込む (Issue #277、 RFC 4733)。
     pub fn with_pwa_dtmf(mut self, h: Arc<dyn PwaDtmfHandler>) -> Self {
         self.pwa_dtmf = Some(h);
+        self
+    }
+
+    /// active call recording ハンドラを差し込む (Issue #296)。
+    pub fn with_pwa_record(mut self, h: Arc<dyn PwaRecordHandler>) -> Self {
+        self.pwa_record = Some(h);
         self
     }
 }
@@ -698,6 +789,30 @@ pub enum ClientMessage {
         call_id: String,
         digit: String,
     },
+    /// Issue #296: active call recording 開始要求 (PWA → sabiden)。
+    ///
+    /// `call_id` は録音対象通話の識別子。 PWA→NGN 発信の場合は NGN レッグ
+    /// Call-ID、 NGN→PWA 着信の場合は NGN INVITE Call-ID を期待する (DTMF と
+    /// 同じ semantics)。 実装は orchestrator 側 `CallRecorder` で task spawn し、
+    /// bridge tap 経由で観測する RTP packet を WAV に書き込む。
+    ///
+    /// 成功時は `ServerMessage::RecordingStarted { call_id, recording_id }` を
+    /// 返す。 失敗時 (= recorder 未配線 / 二重 start / call_id 不在 / 内部エラー)
+    /// は `ServerMessage::Error { code: <...>, message }`。
+    ///
+    /// PushSubscribe (Issue #294) とは **完全に別 message type**。 並列実装
+    /// との競合を避けるためロジック共有しない。
+    RecordStart {
+        call_id: String,
+    },
+    /// Issue #296: active call recording 停止要求 (PWA → sabiden)。
+    ///
+    /// `call_id` で recorder の active table から entry を引いて停止する。
+    /// 成功時は `ServerMessage::RecordingStopped { recording_id, duration_ms }`。
+    /// 失敗時は `ServerMessage::Error { code: <...>, message }`。
+    RecordStop {
+        call_id: String,
+    },
     Bye,
 }
 
@@ -738,6 +853,20 @@ pub enum ServerMessage {
     /// `call_id` は要求と同じ。 PWA UI は「通話中」 UI に戻す。
     Unheld {
         call_id: String,
+    },
+    /// Issue #296: active call recording 開始通知。 PWA UI は本 message を
+    /// 観測して「録音中」 UI に遷移する。 `recording_id` は後続の
+    /// `GET /api/recording/{id}/audio` の path 識別子。
+    RecordingStarted {
+        call_id: String,
+        recording_id: String,
+    },
+    /// Issue #296: active call recording 停止通知。 `duration_ms` は WAV に
+    /// 書き込まれた音声長 (= 開始時刻からの経過ではなく、 PCMU sample 数
+    /// ベース、 RFC 3551 §4.5.14)。
+    RecordingStopped {
+        recording_id: String,
+        duration_ms: u64,
     },
     Bye,
 }
@@ -1617,6 +1746,86 @@ pub async fn process_client_message(
                         "DTMF: NGN 注入失敗"
                     );
                     SessionAction::Continue
+                }
+            }
+        }
+        ClientMessage::RecordStart { call_id } => {
+            // Issue #296: PWA UI で「録音開始」を押したとき。 orchestrator 側
+            // `CallRecorder` で recorder task を spawn する。 ハンドラ未配線
+            // (= recording.enabled = false / NGN UAC 無し構成) は
+            // `recording_unavailable` で拒否。
+            let Some(handler) = state.pwa_record.as_ref() else {
+                debug!(%call_id, "PWA record start ハンドラ未配線 → recording_unavailable");
+                return SessionAction::Reply(ServerMessage::error(
+                    "recording_unavailable",
+                    "PWA record ハンドラが未配線",
+                ));
+            };
+            match handler.start_recording(&call_id).await {
+                Ok(info) => SessionAction::Reply(ServerMessage::RecordingStarted {
+                    call_id,
+                    recording_id: info.recording_id,
+                }),
+                Err(RecordingControlError::Unavailable) => SessionAction::Reply(
+                    ServerMessage::error("recording_unavailable", "recording 機能が無効"),
+                ),
+                Err(RecordingControlError::AlreadyRecording) => {
+                    warn!(%call_id, "PWA record start: 既に録音中");
+                    SessionAction::Reply(ServerMessage::error(
+                        "already_recording",
+                        format!("call_id={} は既に録音中", call_id),
+                    ))
+                }
+                Err(RecordingControlError::UnknownCallId) => {
+                    warn!(%call_id, "PWA record start: 対応 active call 無し");
+                    SessionAction::Reply(ServerMessage::error(
+                        "unknown_call_id",
+                        format!("no active call for call_id={}", call_id),
+                    ))
+                }
+                Err(RecordingControlError::Internal { reason }) => {
+                    warn!(%call_id, %reason, "PWA record start: 内部エラー");
+                    SessionAction::Reply(ServerMessage::error("recording_failed", reason))
+                }
+            }
+        }
+        ClientMessage::RecordStop { call_id } => {
+            // Issue #296: PWA UI で「録音停止」を押したとき。 orchestrator 側
+            // `CallRecorder::stop` で WAV finalize + sidecar JSON 書き出し。
+            let Some(handler) = state.pwa_record.as_ref() else {
+                debug!(%call_id, "PWA record stop ハンドラ未配線 → recording_unavailable");
+                return SessionAction::Reply(ServerMessage::error(
+                    "recording_unavailable",
+                    "PWA record ハンドラが未配線",
+                ));
+            };
+            match handler.stop_recording(&call_id).await {
+                Ok(info) => SessionAction::Reply(ServerMessage::RecordingStopped {
+                    recording_id: info.recording_id,
+                    duration_ms: info.duration_ms,
+                }),
+                Err(RecordingControlError::Unavailable) => SessionAction::Reply(
+                    ServerMessage::error("recording_unavailable", "recording 機能が無効"),
+                ),
+                Err(RecordingControlError::UnknownCallId) => {
+                    warn!(%call_id, "PWA record stop: 対応 active recording 無し");
+                    SessionAction::Reply(ServerMessage::error(
+                        "unknown_call_id",
+                        format!("no active recording for call_id={}", call_id),
+                    ))
+                }
+                Err(RecordingControlError::AlreadyRecording) => {
+                    // stop 経路で AlreadyRecording が出ることは無いが、
+                    // 念のため Internal 扱いで通知 (panic させない)。
+                    warn!(%call_id, "PWA record stop: 想定外 AlreadyRecording");
+                    SessionAction::Reply(ServerMessage::error(
+                        "recording_failed",
+                        "unexpected already_recording on stop",
+                    ))
+                }
+                Err(RecordingControlError::Internal { reason }) => {
+                    warn!(%call_id, %reason, "PWA record stop: 内部エラー");
+                    SessionAction::Reply(ServerMessage::error("recording_failed", reason))
                 }
             }
         }

@@ -37,6 +37,11 @@ pub struct Config {
     /// 場合は registrar 全 binding に fork する従来挙動を維持する (後方互換)。
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// active call recording (Issue #296)。 通話確立中に PWA からのトリガで
+    /// RTP 音声を WAV に保存する。 voicemail とは別ディレクトリで運用。
+    /// 既定 disabled (= 完全に既存挙動)。
+    #[serde(default)]
+    pub recording: crate::call::recording::RecordingConfig,
 }
 
 /// 着信ルーティング設定 (Issue #295)。
@@ -71,7 +76,6 @@ impl RoutingConfig {
             rules: self.rule.clone(),
         }
     }
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SipConfig {
@@ -475,6 +479,7 @@ impl Config {
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
+            recording: crate::call::recording::RecordingConfig::default(),
         })
     }
 
@@ -733,6 +738,7 @@ mod tests {
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
+            recording: crate::call::recording::RecordingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -755,6 +761,7 @@ mod tests {
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
+            recording: crate::call::recording::RecordingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -777,6 +784,7 @@ mod tests {
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
+            recording: crate::call::recording::RecordingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);

@@ -40,9 +40,10 @@
 //! これにより NGN 着信フォークの対象になる。WS 切断 (もしくは `bye`) で
 //! AOR は失効する。
 //!
-//! 発信 (WebRTC → NGN) は本 PR では offer 受信時に SDP answer を返す
-//! 動作のみを実装し、実 INVITE 送信は Issue #25 (Opus 並行) と協調しつつ
-//! 別 PR で結線する (TODO)。
+//! 発信 (WebRTC → NGN) は [`PwaOutboundHandler`] (`src/call/orchestrator.rs`)
+//! が `place_call` メッセージを受領して NGN への INVITE を組み立てる。
+//! PWA → NGN 経路は Issue #145 / #147 で結線済、 双方向音声 + PCMU
+//! トランスコード対応 (`docs/ARCHITECTURE.md` § "発信 (PWA → NGN)")。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

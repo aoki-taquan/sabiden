@@ -225,7 +225,7 @@ Asterisk ソース解析 (どこで何を組み立てているか) → [`docs/as
 | `SipMethod::Other(String)` を全部 405 で返す | NOTIFY / PRACK / UPDATE / MESSAGE をまとめて拒否していた | **未対応 (Phase R2 で個別バリアント化)**。NOTIFY は 481、PRACK は INVITE 側 100rel 受け入れ判断、MESSAGE は 200 OK 安全。`docs/refactor-plan.md` §4.4。 |
 | `restrict_audio_to_pcmu` の attribute ブラックリスト混在 | PCMU only 化と「WebRTC 由来属性の剥離」を 1 関数で実装 | **未対応 (Phase R3 で `Negotiator` 分離)**。`docs/refactor-plan.md` §1.4 / §4.2。 |
 | `static CSEQ` (`src/sip/register.rs:23`) | プロセス全体で 1 つの REGISTER CSeq | **未対応**。多回線対応時に衝突。`docs/refactor-plan.md` §1.1 register.rs 行。 |
-| `normalize_request_uri_for_ngn` 定義のみで callsite なし | commit `cba1cd2` の主機能が結線されていない | **未対応**。`docs/refactor-plan.md` §4.1。 |
+| `normalize_request_uri_for_ngn` 定義のみで callsite なし | commit `cba1cd2` の主機能が結線されていない | **解消済** (2026-05-15)。 `src/call/orchestrator.rs:3182` (NGN inbound) と `:4532` (PWA outbound) で結線済、 NGN 直収 Request-URI = P-CSCF IP rewrite が動作中。 `docs/refactor-plan.md` §4.1 の note は古い。 |
 
 ---
 

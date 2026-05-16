@@ -156,6 +156,43 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // 永続化 (sqlite) は別 issue で扱う。
     let call_log = Arc::new(CallLog::new(200));
 
+    // Issue #296: active call recording recorder を有効ならば up-front で構築。
+    // 同じ `Arc<CallRecorder>` を `HealthState::with_recording` (REST API) と
+    // `SignalingState::with_pwa_record` (PWA WS RecordStart/RecordStop の
+    // dispatch 先) と orchestrator (BYE 経路の cleanup) で共有することで、
+    // 開始した録音が即座に `/api/recording/list` で見え、 通話終了で自動
+    // finalize される (RFC 5853 §3.2.2 B2BUA cleanup)。
+    //
+    // NOTE: bridge tap (= RTP packet を WAV に流し込む経路) は別 PR で扱う
+    // (Issue #296 follow-up)。 本 PR では PWA WS RecordStart →
+    // CallRecorder::start (WAV 作成) / RecordStop → CallRecorder::stop
+    // (WAV finalize + sidecar JSON) の制御パスのみ完成しており、 実 RTP
+    // packet を WAV に流し込む `RecordingSender::try_send` 経路は未配線。
+    let recording_recorder: Option<Arc<call::recording::CallRecorder>> = if full_config
+        .recording
+        .enabled
+    {
+        match call::recording::CallRecorder::from_config(&full_config.recording).await {
+            Ok(r) => {
+                info!(
+                    storage_dir = %full_config.recording.storage_dir.display(),
+                    max_duration_secs = full_config.recording.max_duration_secs,
+                    "active call recording (Issue #296) 有効: /api/recording/{{list,id/audio,id}}"
+                );
+                Some(Arc::new(r))
+            }
+            Err(e) => {
+                tracing::error!(
+                    error=%e,
+                    "active call recording storage 初期化失敗 → 機能無効化"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Issue #288: 留守録 recorder を有効ならば up-front で構築する。
     // `NgnInboundHandler` (orchestrator) と `health::HealthState` (REST API) が
     // 同じ `Arc<VoicemailRecorder>` を共有することで、 録音した WAV が即座に
@@ -477,6 +514,17 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         drop(ngn_inbound_rx);
         info!("内線が無いため NGN 着信ハンドラはスキップ");
     }
+    // Issue #296: NGN BYE / PWA WS close 経由で active 録音が finalize される
+    // よう、 NgnInboundHandler / UasEventHandler の双方に同じ recorder を注入
+    // する (RFC 5853 §3.2.2 B2BUA cleanup)。 spawn より前に注入することで、
+    // event loop が走り始めた時点で hook が有効になる。 未注入時は hook 全体
+    // no-op で旧挙動と同一。
+    if let Some(rec) = recording_recorder.clone() {
+        if let Some(h) = ngn_inbound_handler_for_signaling.clone() {
+            h.set_recording_recorder(rec.clone()).await;
+        }
+        uas_handler.set_recording_recorder(rec).await;
+    }
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ
@@ -497,6 +545,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // Issue #288: 同じ Arc を up-front で構築済 (前段) → REST API 側に attach。
     if let Some(rec) = voicemail_recorder.clone() {
         health_state = health_state.with_voicemail(rec);
+    }
+    // Issue #296: recording recorder は §1.5 で up-front 構築済み。 ここでは
+    // REST API (HealthState) に attach するのみ。 orchestrator (UasEventHandler /
+    // NgnInboundHandler) への注入は spawn 前に済んでいる。
+    if let Some(rec) = recording_recorder.clone() {
+        health_state = health_state.with_recording(rec);
     }
     let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
         match hex::decode(&secret_hex) {
@@ -544,6 +598,16 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                             call::orchestrator::CompositePwaDtmfHandler::new(outbound, inbound);
                         state = state
                             .with_pwa_dtmf(composite as Arc<dyn webrtc::signaling::PwaDtmfHandler>);
+                    }
+                    // Issue #296: PWA WS の RecordStart/RecordStop を
+                    // `CallRecorder` (= recording_recorder) に取り次ぐハンドラを
+                    // 差し込む。 recording 未有効 (`recording.enabled = false`)
+                    // なら handler 無しで「recording_unavailable」 を返す既定挙動。
+                    if let Some(rec) = recording_recorder.clone() {
+                        let handler = call::recording::PwaRecordHandlerImpl::new(rec);
+                        state = state.with_pwa_record(
+                            handler as Arc<dyn webrtc::signaling::PwaRecordHandler>,
+                        );
                     }
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {

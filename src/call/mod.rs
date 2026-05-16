@@ -19,6 +19,7 @@ pub mod dtmf;
 pub mod manager;
 pub mod orchestrator;
 pub mod rate_limiter;
+pub mod recording;
 /// Issue #295: 着信ルーティングルールエンジン (時間帯 / 曜日 / 発信者番号)。
 pub mod routing;
 pub mod transcoder;

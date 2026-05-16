@@ -31,6 +31,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::call::recording::CallRecorder;
 use crate::call::voicemail::{sanitize_id, VoicemailRecorder};
 use crate::observability::call_log::CallLog;
 use crate::observability::Metrics;
@@ -61,6 +62,10 @@ pub struct HealthState {
     /// (config で `voicemail.enabled = false` のとき)、 `/api/voicemail/*`
     /// は 503 Service Unavailable を返す。
     pub voicemail: Option<Arc<VoicemailRecorder>>,
+    /// Issue #296: active call recording recorder。 `None` の場合
+    /// `/api/recording/*` は 503 Service Unavailable を返す (voicemail と
+    /// 別 path + 別 storage_dir)。
+    pub recording: Option<Arc<CallRecorder>>,
 }
 
 impl HealthState {
@@ -70,6 +75,7 @@ impl HealthState {
             metrics,
             call_log,
             voicemail: None,
+            recording: None,
         }
     }
 
@@ -78,10 +84,17 @@ impl HealthState {
         self.voicemail = Some(recorder);
         self
     }
+
+    /// Issue #296: active call recording recorder を attach する。
+    pub fn with_recording(mut self, recorder: Arc<CallRecorder>) -> Self {
+        self.recording = Some(recorder);
+        self
+    }
 }
 
-/// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` `/api/voicemail/*` を
-/// 提供する `Router` を構築する (Issue #288 voicemail エンドポイント追加)。
+/// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` `/api/voicemail/*`
+/// `/api/recording/*` を提供する `Router` を構築する (Issue #288 voicemail +
+/// Issue #296 active call recording エンドポイント追加)。
 pub fn router(state: HealthState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -91,6 +104,9 @@ pub fn router(state: HealthState) -> Router {
         .route("/api/voicemail/list", get(voicemail_list))
         .route("/api/voicemail/:id/audio", get(voicemail_audio))
         .route("/api/voicemail/:id", delete(voicemail_delete))
+        .route("/api/recording/list", get(recording_list))
+        .route("/api/recording/:id/audio", get(recording_audio))
+        .route("/api/recording/:id", delete(recording_delete))
         .with_state(state)
 }
 
@@ -241,6 +257,69 @@ async fn voicemail_delete(State(state): State<HealthState>, Path(id): Path<Strin
         Ok(false) => (StatusCode::NOT_FOUND, "voicemail not found\n").into_response(),
         Err(e) => {
             warn!(error=%e, "voicemail delete 失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #296: `GET /api/recording/list` — 保存済 active call recording を
+/// 新しい順 (`started_at_unix_ms` 降順) で返す。 録音機能未有効
+/// (`recording.enabled = false`) の場合は 503。
+async fn recording_list(State(state): State<HealthState>) -> Response {
+    let Some(recorder) = state.recording.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "recording disabled\n").into_response();
+    };
+    match recorder.list().await {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(e) => {
+            warn!(error=%e, "recording list 取得失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #296: `GET /api/recording/{id}/audio` — WAV 本体を `audio/wav` で
+/// 返す。 未知 ID は 404。 ID は [`sanitize_id`] で path-traversal 防止。
+async fn recording_audio(State(state): State<HealthState>, Path(id): Path<String>) -> Response {
+    let Some(recorder) = state.recording.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "recording disabled\n").into_response();
+    };
+    let safe_id = sanitize_id(&id);
+    match recorder.get(&safe_id).await {
+        Ok(Some((_meta, wav_path))) => match tokio::fs::read(&wav_path).await {
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "audio/wav")
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "build response failed\n").into_response()
+                }),
+            Err(e) => {
+                warn!(error=%e, "recording wav 読込失敗");
+                (StatusCode::INTERNAL_SERVER_ERROR, "read wav failed\n").into_response()
+            }
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "recording not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "recording metadata 読込失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #296: `DELETE /api/recording/{id}` — WAV + JSON sidecar を削除。
+/// 成功は 204 No Content、 未知 ID は 404。
+async fn recording_delete(State(state): State<HealthState>, Path(id): Path<String>) -> Response {
+    let Some(recorder) = state.recording.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "recording disabled\n").into_response();
+    };
+    let safe_id = sanitize_id(&id);
+    match recorder.delete(&safe_id).await {
+        Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "recording not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "recording delete 失敗");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
         }
     }

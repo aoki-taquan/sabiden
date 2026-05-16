@@ -76,6 +76,7 @@ impl RoutingConfig {
             rules: self.rule.clone(),
         }
     }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SipConfig {

@@ -115,7 +115,7 @@ use crate::sdp::builder::{
     convert_savpf_to_avp, ensure_ptime_in_answer, extract_ptime_from_offer,
     restrict_answer_to_ngn_offer_subset, rewrite_rtp_endpoint,
 };
-use crate::sdp::negotiation::Negotiator;
+use crate::sdp::negotiation::{apply_audio_direction, MediaDirection, Negotiator};
 use crate::sip::dialog::{Dialog, DialogConfig};
 use crate::sip::message::{SipHeaders, SipMethod, SipRequest, SipResponse};
 use crate::sip::registrar::{Binding, ExtTransport, ExtensionRegistrar};
@@ -126,8 +126,8 @@ use crate::sip::uac::{CancelOutcome, EstablishedCall, InviteOutcome, InvitePlan,
 use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
 use crate::webrtc::signaling::{
-    PendingAnswers, PwaInboundCloser, PwaOutboundCloser, PwaOutboundHandler, PwaOutboundOutcome,
-    ServerMessage, WsSink,
+    HoldError, PendingAnswers, PwaHoldHandler, PwaInboundCloser, PwaOutboundCloser,
+    PwaOutboundHandler, PwaOutboundOutcome, ServerMessage, WsSink,
 };
 
 /// RFC 3261 §8.2.1 / §20.5: 405 / 489 / 481 等の拒否応答に必ず添える
@@ -647,6 +647,18 @@ pub struct WebRtcOutboundEntry {
     pub ws: WsSink,
     /// `CallManager` 内のブリッジ ID。 BYE で `terminate` するために保持する。
     pub bridge_call_id: CallId,
+    /// 初回 INVITE で NGN に送った offer SDP (Issue #279)。 hold/unhold Re-INVITE で
+    /// SDP direction (`a=sendrecv` ↔ `a=sendonly`) を切替えて再送する起点として
+    /// 保持する。 RFC 3264 §8.4 は direction 以外の SDP を変更しない再 offer を
+    /// 想定し、 sabiden は元 offer の `m=` port / `c=` IP / codec / ptime を不変
+    /// のまま direction だけ書換える。 `tokio::sync::Mutex` は hold 状態切替時に
+    /// 取って書き戻すための async-aware ロック (短期 critical section)。
+    pub last_ngn_offer_sdp: Mutex<Vec<u8>>,
+    /// 現在の hold 状態 (Issue #279)。 true = sendonly (hold 中)、 false =
+    /// sendrecv (通話中)。 RFC 3264 §8.4: hold semantics。 同一状態への再投入は
+    /// 冪等で副作用無し (= 同 direction の Re-INVITE を再送して NGN が 200 OK を
+    /// 返すだけ)。
+    pub hold_state: Mutex<bool>,
 }
 
 /// PWA→NGN 発信通話の双方向 BYE 連動テーブル (Issue #147)。
@@ -4788,10 +4800,15 @@ impl PwaOutboundHandler for UasEventHandler {
                         // attach 済 = 通話確立。 失敗 branch (上の各 `return Err`)
                         // はテーブルに insert しないので leak 防止 (Issue #147 DoD)。
                         let ngn_call_id = ngn_dialog.dialog().id().call_id.clone();
+                        // Issue #279: 初回 INVITE で送出した NGN 向け offer SDP を
+                        // 保持し、 後段の hold/unhold Re-INVITE で direction だけ
+                        // 切替えて再 offer する起点にする (RFC 3264 §8.4)。
                         let entry = Arc::new(WebRtcOutboundEntry {
                             ngn_dialog: Mutex::new(ngn_dialog),
                             ws: ws_sink_clone.clone(),
                             bridge_call_id: cid,
+                            last_ngn_offer_sdp: Mutex::new(sdp_for_ngn.clone()),
+                            hold_state: Mutex::new(false),
                         });
                         webrtc_outbound_active
                             .lock()
@@ -4960,6 +4977,127 @@ impl PwaOutboundCloser for UasEventHandler {
         }
 
         count
+    }
+}
+
+/// Issue #279: PWA UI から「保留」 / 「再開」 を受けたときに、 NGN レッグへ
+/// Re-INVITE を発行して SDP direction (`a=sendrecv` ↔ `a=sendonly`) を切替える。
+///
+/// # シーケンス (RFC 3264 §8.4 + RFC 3261 §14.1)
+///
+/// 1. `webrtc_outbound_active` テーブルから `call_id` (= NGN レッグ Call-ID) で
+///    entry を引く。 該当無し = `HoldError::UnknownCallId`。
+/// 2. entry の `last_ngn_offer_sdp` を取り、 [`apply_audio_direction`] で
+///    `a=sendrecv` ↔ `a=sendonly` を切替える。 元 SDP の port / c=/o= / codec /
+///    ptime はそのまま保持 (RFC 3264 §8.4: direction 以外の SDP 変更は不要)。
+/// 3. NGN レッグの [`UacDialog::send_reinvite`] を呼ぶ。 これは RFC 3261 §14.1
+///    に従い:
+///    - CSeq を単調増加 (`Dialog::local_cseq.fetch_add(1)`)。
+///    - Call-ID は確立時のまま (`Dialog::id().call_id`)。
+///    - From-tag / To-tag (= local-tag / remote-tag) は確立時のまま。
+///    - Request-URI は dialog の `remote_target`、 Route ヘッダは `route_set`。
+///    - Session-Timer (RFC 4028) ヘッダも `build_reinvite` で自動付与。
+/// 4. 2xx 受領で hold 状態を確定し、 entry の `hold_state` / `last_ngn_offer_sdp`
+///    を更新。 4xx/5xx は **state 変更せず** `HoldError::Rejected { status }` を
+///    返す (RFC 3264 §8: 失敗時 session state 不変)。
+///
+/// # RTP 取扱 (透過モード / B2BUA 制限)
+///
+/// 現状の sabiden は Phase R3 完了前で、 hold 時に RTP bridge を停止する path は
+/// 持たない (= sabiden→NGN は引続き silence 相当の RTP を送る)。 RFC 3264 §8.4 の
+/// `sendonly` semantics は **NGN 側 (= remote UA) が sabiden への送信を止める**
+/// ことを要求する規定であり、 sabiden 側送信停止は MAY 動作。 PWA→sabiden の
+/// RTP は str0m peer から続いており、 そのまま NGN へ転送される。 hold tone 注入
+/// (option 4 of Issue body) は将来 Issue で扱う (RFC 3264 §8.4 footnote)。
+///
+/// # 並行性
+///
+/// 同一 `call_id` への並行 `set_hold` 呼出は、 `ngn_dialog` mutex で直列化される。
+/// 2 呼目は 1 呼目の Re-INVITE 完了後に走り、 最終 state は最後に成功した呼出の
+/// hold 値になる (last-writer-wins、 RFC 3264 §8.4 は idempotent 再申請を妨げない)。
+#[async_trait::async_trait]
+impl PwaHoldHandler for UasEventHandler {
+    async fn set_hold(&self, call_id: &str, hold: bool) -> Result<(), HoldError> {
+        // (1) NGN レッグ Call-ID で entry 引き当て。 race で BYE 済みなら
+        //     UnknownCallId を返す (RFC 3261 §12.2.2 相当の対応 dialog 不在)。
+        let entry = {
+            let tbl = self.webrtc_outbound_active.lock().await;
+            tbl.get(call_id).cloned()
+        };
+        let Some(entry) = entry else {
+            warn!(
+                %call_id,
+                hold,
+                "PWA hold/unhold: 対応する outbound 通話無し (BYE 済み or 不正 call_id)"
+            );
+            return Err(HoldError::UnknownCallId);
+        };
+
+        // (2) entry が保持する初回 NGN offer SDP に direction を適用する。
+        //     RFC 3264 §8.4: hold = sendonly、 unhold = sendrecv。 元 SDP の
+        //     port / c= / codec / ptime は変更しない (= direction だけ書換える)。
+        let new_offer: Vec<u8> = {
+            let last = entry.last_ngn_offer_sdp.lock().await;
+            let dir = if hold {
+                MediaDirection::SendOnly
+            } else {
+                MediaDirection::SendRecv
+            };
+            apply_audio_direction(&last, dir)
+        };
+
+        // (3) NGN レッグ Re-INVITE 送出 (RFC 3261 §14.1 + RFC 3264 §8.4)。
+        //     `send_reinvite` が build_reinvite → CSeq 単調増加 → 送出 → 2xx
+        //     なら ACK 送出 (RFC 3261 §13.2.2.4) まで担当する。
+        let resp = {
+            let mut dlg = entry.ngn_dialog.lock().await;
+            match dlg.send_reinvite(Some(&new_offer)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        %call_id,
+                        hold,
+                        error = %e,
+                        "PWA hold/unhold: NGN Re-INVITE transport 失敗 (RFC 3261 §14.1)"
+                    );
+                    return Err(HoldError::TransportFailed {
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        };
+
+        // (4) 応答評価。 4xx/5xx/6xx は session state 不変で返す
+        //     (RFC 3264 §8: "If the offerer/answerer cannot complete the
+        //     modification, ... the previous session description applies.")。
+        if !(200..300).contains(&resp.status_code) {
+            warn!(
+                %call_id,
+                hold,
+                status = resp.status_code,
+                reason = %resp.reason,
+                "PWA hold/unhold: NGN が Re-INVITE を拒否 (RFC 3264 §8: state 維持)"
+            );
+            return Err(HoldError::Rejected {
+                status: resp.status_code,
+            });
+        }
+
+        // 成功時のみ entry 状態を更新 (last-writer-wins、 RFC 3264 §8.4 idempotent)。
+        {
+            let mut state = entry.hold_state.lock().await;
+            *state = hold;
+        }
+        {
+            let mut last = entry.last_ngn_offer_sdp.lock().await;
+            *last = new_offer;
+        }
+        info!(
+            %call_id,
+            hold,
+            "PWA hold/unhold 確定 (RFC 3264 §8.4 + RFC 3261 §14.1)"
+        );
+        Ok(())
     }
 }
 

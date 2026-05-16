@@ -325,6 +325,66 @@ pub trait PwaInboundCloser: Send + Sync {
     async fn close_pwa_inbound_for_ws(&self, ws: &WsSink) -> usize;
 }
 
+/// PWA→NGN 通話の hold / unhold ハンドラ (Issue #279)。
+///
+/// PWA UI が「保留」/「再開」を押した直後、 シグナリング層 [`ClientMessage::Hold`]
+/// / [`ClientMessage::Unhold`] がこの trait の `set_hold` を呼ぶ。 実装
+/// ([`crate::call::orchestrator::UasEventHandler`]) は:
+///
+/// 1. `webrtc_outbound_active` テーブルから `call_id` で entry を引く
+///    (= NGN レッグ Call-ID。 RFC 3261 §12: dialog identifier の一部)。
+/// 2. entry が保持する最新 offer SDP を `apply_audio_direction` で
+///    `sendrecv` ↔ `sendonly` 切替え (RFC 3264 §8.4)。
+/// 3. NGN レッグの [`crate::sip::uac::UacDialog::send_reinvite`] を呼ぶ
+///    (RFC 3261 §14.1: in-dialog INVITE は CSeq 単調増加、 Call-ID / From-tag /
+///    To-tag は同一)。
+/// 4. 2xx 受領で hold/unhold 状態を確定。 4xx/5xx は **元 state 維持** で
+///    `HoldError::Rejected { status }` を返す (RFC 3264 §8: 失敗時は session
+///    state を変更しない)。
+///
+/// `WebRtcOutboundActive` テーブル本体は orchestrator 内部に閉じ、 シグナ
+/// リング層からは本 trait 経由でしか触らない (依存方向: signaling → orchestrator)。
+#[async_trait::async_trait]
+pub trait PwaHoldHandler: Send + Sync {
+    /// `call_id` で識別される PWA→NGN 通話を hold (true) / unhold (false) する。
+    ///
+    /// 戻り値:
+    /// - `Ok(())`: NGN から 2xx 応答を受領し、 hold/unhold 状態が確定した。
+    /// - `Err(HoldError::UnknownCallId)`: `call_id` に対応する確立済み outbound
+    ///   通話が無い (race で既に BYE 済み / 不正 call_id)。 RFC 3261 §12.2.2
+    ///   相当 (in-dialog request の対応 dialog 不在)。
+    /// - `Err(HoldError::Rejected { status })`: NGN が 4xx/5xx で Re-INVITE を
+    ///   拒否した。 sabiden 側 state は変更しない (RFC 3264 §8)。
+    /// - `Err(HoldError::TransportFailed)`: NGN 到達不能 / transaction timeout。
+    async fn set_hold(&self, call_id: &str, hold: bool) -> Result<(), HoldError>;
+}
+
+/// PWA hold / unhold 操作の失敗種別 (Issue #279)。
+///
+/// シグナリング層は本 enum を観測して `ServerMessage::Error` の `code` 文字列に
+/// マップする (PWA UI 側のリトライ判断材料)。
+#[derive(Debug)]
+pub enum HoldError {
+    /// `call_id` に対応する確立済み outbound 通話が見つからない。
+    UnknownCallId,
+    /// NGN が Re-INVITE を 4xx/5xx で拒否 (RFC 3264 §8: state 維持)。
+    Rejected { status: u16 },
+    /// transport 層エラー (UDP 到達不能 / transaction timeout)。
+    TransportFailed { reason: String },
+}
+
+impl std::fmt::Display for HoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HoldError::UnknownCallId => write!(f, "unknown_call_id"),
+            HoldError::Rejected { status } => write!(f, "hold_rejected_{}", status),
+            HoldError::TransportFailed { reason } => write!(f, "transport_failed: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for HoldError {}
+
 /// PWA→NGN 発信ハンドラ (Issue #145)。
 ///
 /// `ClientMessage::Offer { target, sdp }` を受けたとき、 sabiden が
@@ -437,6 +497,12 @@ pub struct SignalingState {
     /// 互換 (= NGN タイムアウト BYE 待ち、 5-10 秒)。 通常 `NgnInboundHandler`
     /// を `Arc::clone` で渡す。
     pub pwa_inbound_closer: Option<Arc<dyn PwaInboundCloser>>,
+    /// PWA→NGN 通話の hold / unhold ハンドラ (Issue #279)。 `ClientMessage::Hold`
+    /// / `Unhold` を受領した際に呼び出され、 NGN レッグへ Re-INVITE で SDP
+    /// direction 切替を伝搬する (RFC 3264 §8.4)。 `None` のときは hold 機能無効
+    /// (PWA 側に `code:"hold_unavailable"` を返す)。 通常 `UasEventHandler` を
+    /// `Arc::clone` で渡す (`PwaOutboundHandler` / `PwaOutboundCloser` と同じ Arc)。
+    pub pwa_hold_handler: Option<Arc<dyn PwaHoldHandler>>,
 }
 
 impl SignalingState {
@@ -456,6 +522,7 @@ impl SignalingState {
             pwa_outbound: None,
             pwa_outbound_closer: None,
             pwa_inbound_closer: None,
+            pwa_hold_handler: None,
         }
     }
 
@@ -489,6 +556,13 @@ impl SignalingState {
     /// 通常 `NgnInboundHandler` を `Arc::clone` で渡す。
     pub fn with_pwa_inbound_closer(mut self, h: Arc<dyn PwaInboundCloser>) -> Self {
         self.pwa_inbound_closer = Some(h);
+        self
+    }
+
+    /// PWA→NGN 通話の hold/unhold ハンドラを差し込む (Issue #279)。
+    /// 通常 `with_pwa_outbound` と同じ `UasEventHandler` を渡す。
+    pub fn with_pwa_hold_handler(mut self, h: Arc<dyn PwaHoldHandler>) -> Self {
+        self.pwa_hold_handler = Some(h);
         self
     }
 }
@@ -535,6 +609,29 @@ pub enum ClientMessage {
     Ice {
         candidate: String,
     },
+    /// 通話 hold (= 保留) を要求する (RFC 3264 §8.4 / RFC 3261 §14.1)。
+    ///
+    /// PWA UI の「保留」ボタンで送信される。 sabiden は当該 PWA→NGN 発信通話の
+    /// NGN レッグに対し Re-INVITE を発行し、 SDP direction を `a=sendonly` に
+    /// 切替える (= sabiden→NGN は引続き silence/comfort noise を送るが、
+    /// NGN→sabiden の RTP は相手 UA が停止することを期待する)。
+    ///
+    /// `call_id` は **NGN レッグの Call-ID** (= `webrtc_outbound_active` の
+    /// テーブルキー、 browser に push された `ServerMessage::Offer` の call_id
+    /// と同じ semantics の **outbound 版**)。 該当 entry が見つからなければ
+    /// `ServerMessage::Error{code:"unknown_call_id"}` を返す。
+    ///
+    /// Issue #279。
+    Hold {
+        call_id: String,
+    },
+    /// 通話 unhold (= 保留解除) を要求する (RFC 3264 §8.4 / RFC 3261 §14.1)。
+    ///
+    /// Re-INVITE で SDP direction を `a=sendrecv` に戻す。 詳細は [`Hold`] と同じ。
+    /// Issue #279。
+    Unhold {
+        call_id: String,
+    },
     Bye,
 }
 
@@ -565,6 +662,16 @@ pub enum ServerMessage {
     Error {
         code: String,
         message: String,
+    },
+    /// PWA からの hold 要求が成功したことを通知する (Issue #279)。
+    /// `call_id` は要求と同じ。 PWA UI は本メッセージで「保留中」 UI に遷移する。
+    Held {
+        call_id: String,
+    },
+    /// PWA からの unhold 要求が成功したことを通知する (Issue #279)。
+    /// `call_id` は要求と同じ。 PWA UI は「通話中」 UI に戻す。
+    Unheld {
+        call_id: String,
     },
     Bye,
 }
@@ -1316,6 +1423,78 @@ pub async fn process_client_message(
                 Err(e) => {
                     tracing::warn!(error=%e, candidate=%candidate, "ICE add_candidate failed");
                     SessionAction::Reply(ServerMessage::error("ice_failed", e.to_string()))
+                }
+            }
+        }
+        ClientMessage::Hold { call_id } => {
+            // Issue #279 / RFC 3264 §8.4: PWA UI で「保留」を押したとき、
+            // 該当 PWA→NGN 通話に対し NGN レッグ Re-INVITE で SDP direction を
+            // `a=sendonly` に切替える。 RFC 3261 §14.1 (Modifying an Existing
+            // Session) は in-dialog INVITE の CSeq 単調増加 / Call-ID 不変を要求し、
+            // `UacDialog::send_reinvite` がそれを担う (本ハンドラ実装側 で結線)。
+            //
+            // ハンドラ未配線 (= sabiden NGN UAC 無し構成 / pwa_hold_handler 未設定) は
+            // `hold_unavailable` で拒否。 PWA UI は「保留」ボタンを失敗表示にする。
+            let Some(handler) = state.pwa_hold_handler.as_ref() else {
+                warn!(%call_id, "PWA hold ハンドラ未配線 (sabiden NGN UAC 無し設定?)");
+                return SessionAction::Reply(ServerMessage::error(
+                    "hold_unavailable",
+                    "PWA hold ハンドラが未配線",
+                ));
+            };
+            match handler.set_hold(&call_id, true).await {
+                Ok(()) => SessionAction::Reply(ServerMessage::Held { call_id }),
+                Err(HoldError::UnknownCallId) => {
+                    warn!(%call_id, "PWA hold: 対応する outbound 通話無し");
+                    SessionAction::Reply(ServerMessage::error(
+                        "unknown_call_id",
+                        format!("no active outbound call for call_id={}", call_id),
+                    ))
+                }
+                Err(HoldError::Rejected { status }) => {
+                    // RFC 3264 §8: Re-INVITE 失敗時は session state を変更しない。
+                    warn!(%call_id, status, "PWA hold: NGN が Re-INVITE を拒否");
+                    SessionAction::Reply(ServerMessage::error(
+                        "hold_rejected",
+                        format!("NGN rejected hold Re-INVITE with status {}", status),
+                    ))
+                }
+                Err(HoldError::TransportFailed { reason }) => {
+                    warn!(%call_id, %reason, "PWA hold: transport 失敗");
+                    SessionAction::Reply(ServerMessage::error("hold_failed", reason))
+                }
+            }
+        }
+        ClientMessage::Unhold { call_id } => {
+            // Issue #279 / RFC 3264 §8.4: PWA UI で「再開」を押したとき、
+            // `a=sendrecv` に戻す Re-INVITE を NGN へ発行する。 失敗 semantics は
+            // `Hold` と同じ (RFC 3264 §8: 失敗時 state 維持)。
+            let Some(handler) = state.pwa_hold_handler.as_ref() else {
+                warn!(%call_id, "PWA unhold ハンドラ未配線");
+                return SessionAction::Reply(ServerMessage::error(
+                    "hold_unavailable",
+                    "PWA hold ハンドラが未配線",
+                ));
+            };
+            match handler.set_hold(&call_id, false).await {
+                Ok(()) => SessionAction::Reply(ServerMessage::Unheld { call_id }),
+                Err(HoldError::UnknownCallId) => {
+                    warn!(%call_id, "PWA unhold: 対応する outbound 通話無し");
+                    SessionAction::Reply(ServerMessage::error(
+                        "unknown_call_id",
+                        format!("no active outbound call for call_id={}", call_id),
+                    ))
+                }
+                Err(HoldError::Rejected { status }) => {
+                    warn!(%call_id, status, "PWA unhold: NGN が Re-INVITE を拒否");
+                    SessionAction::Reply(ServerMessage::error(
+                        "unhold_rejected",
+                        format!("NGN rejected unhold Re-INVITE with status {}", status),
+                    ))
+                }
+                Err(HoldError::TransportFailed { reason }) => {
+                    warn!(%call_id, %reason, "PWA unhold: transport 失敗");
+                    SessionAction::Reply(ServerMessage::error("unhold_failed", reason))
                 }
             }
         }
@@ -3451,5 +3630,353 @@ mod tests {
         assert!(!sink.is_closed(), "receiver 生存中は false");
         drop(rx);
         assert!(sink.is_closed(), "receiver drop 後は true");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #279: PWA hold / unhold (RFC 3264 §8.4 / RFC 3261 §14.1) の
+    // process_client_message レイヤ単体テスト。 PwaHoldHandler を mock 実装し、
+    // ClientMessage → ServerMessage 変換と handler 呼出引数を検証する。
+    // Re-INVITE 送出と SDP 書換は orchestrator 側で結線 / 別 unit test 範囲。
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
+
+    /// テスト用 hold ハンドラ: `set_hold` の呼出回数と引数を記録し、
+    /// 設定された `next_result` を返す。
+    struct MockHoldHandler {
+        calls: AtomicU32,
+        last_hold: AtomicBool,
+        last_call_id: std::sync::Mutex<Option<String>>,
+        result: std::sync::Mutex<Result<(), HoldError>>,
+    }
+
+    impl MockHoldHandler {
+        fn new_ok() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU32::new(0),
+                last_hold: AtomicBool::new(false),
+                last_call_id: std::sync::Mutex::new(None),
+                result: std::sync::Mutex::new(Ok(())),
+            })
+        }
+
+        fn new_with(result: Result<(), HoldError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU32::new(0),
+                last_hold: AtomicBool::new(false),
+                last_call_id: std::sync::Mutex::new(None),
+                result: std::sync::Mutex::new(result),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PwaHoldHandler for MockHoldHandler {
+        async fn set_hold(&self, call_id: &str, hold: bool) -> Result<(), HoldError> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.last_hold.store(hold, AtomicOrdering::SeqCst);
+            *self.last_call_id.lock().unwrap() = Some(call_id.to_string());
+            // 呼出毎に取り出す (1 回の test ケースで 1 結果)。
+            std::mem::replace(&mut *self.result.lock().unwrap(), Ok(()))
+        }
+    }
+
+    /// RFC 3264 §8.4 + RFC 3261 §14.1: `ClientMessage::Hold { call_id }` が
+    /// `PwaHoldHandler::set_hold(call_id, true)` を呼び、 成功で
+    /// `ServerMessage::Held { call_id }` を返す。
+    #[tokio::test]
+    async fn rfc3264_8_4_hold_message_invokes_handler_and_returns_held() {
+        let (mut state, _reg) = make_state(b"k");
+        let handler = MockHoldHandler::new_ok();
+        state.pwa_hold_handler = Some(handler.clone() as Arc<dyn PwaHoldHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Hold {
+                call_id: "ngn-call-123".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Held { call_id }) => {
+                assert_eq!(call_id, "ngn-call-123");
+            }
+            other => panic!(
+                "Held 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+        assert_eq!(handler.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            handler.last_hold.load(AtomicOrdering::SeqCst),
+            "hold=true で呼ばれる (Hold message → set_hold(_, true))"
+        );
+        assert_eq!(
+            handler.last_call_id.lock().unwrap().as_deref(),
+            Some("ngn-call-123")
+        );
+    }
+
+    /// RFC 3264 §8.4: `ClientMessage::Unhold { call_id }` が
+    /// `set_hold(call_id, false)` を呼び、 成功で `ServerMessage::Unheld` を返す
+    /// (= 通話再開)。
+    #[tokio::test]
+    async fn rfc3264_8_4_unhold_message_invokes_handler_and_returns_unheld() {
+        let (mut state, _reg) = make_state(b"k");
+        let handler = MockHoldHandler::new_ok();
+        state.pwa_hold_handler = Some(handler.clone() as Arc<dyn PwaHoldHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Unhold {
+                call_id: "ngn-call-456".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Unheld { call_id }) => {
+                assert_eq!(call_id, "ngn-call-456");
+            }
+            other => panic!(
+                "Unheld 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+        assert_eq!(handler.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            !handler.last_hold.load(AtomicOrdering::SeqCst),
+            "hold=false で呼ばれる (Unhold message → set_hold(_, false))"
+        );
+    }
+
+    /// 連続ホールド: hold → unhold → hold が呼出回数 3、 結果が交互に
+    /// `Held` / `Unheld` / `Held` で揃う (RFC 3264 §8.4 Re-INVITE の繰返し可能性)。
+    #[tokio::test]
+    async fn rfc3264_8_4_hold_then_unhold_then_hold_sequence() {
+        // 呼出毎に Ok を返し続けるカウンタ式 mock。 result mutex は何度呼ばれても
+        // 常に `Ok(())` を返すよう、 swap で空に置き換えない wrapper を別途作る。
+        struct AlwaysOk {
+            calls: AtomicU32,
+            seq: std::sync::Mutex<Vec<bool>>,
+        }
+        #[async_trait::async_trait]
+        impl PwaHoldHandler for AlwaysOk {
+            async fn set_hold(&self, _call_id: &str, hold: bool) -> Result<(), HoldError> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.seq.lock().unwrap().push(hold);
+                Ok(())
+            }
+        }
+        let handler = Arc::new(AlwaysOk {
+            calls: AtomicU32::new(0),
+            seq: std::sync::Mutex::new(Vec::new()),
+        });
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_hold_handler = Some(handler.clone() as Arc<dyn PwaHoldHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        // 1. hold
+        let a1 = process_client_message(
+            ClientMessage::Hold {
+                call_id: "c-1".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            a1,
+            SessionAction::Reply(ServerMessage::Held { .. })
+        ));
+
+        // 2. unhold
+        let a2 = process_client_message(
+            ClientMessage::Unhold {
+                call_id: "c-1".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            a2,
+            SessionAction::Reply(ServerMessage::Unheld { .. })
+        ));
+
+        // 3. hold (中で再保留 = RFC 3264 §8.4 は idempotent な再申請を妨げない)
+        let a3 = process_client_message(
+            ClientMessage::Hold {
+                call_id: "c-1".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            a3,
+            SessionAction::Reply(ServerMessage::Held { .. })
+        ));
+
+        assert_eq!(handler.calls.load(AtomicOrdering::SeqCst), 3);
+        let seq = handler.seq.lock().unwrap().clone();
+        assert_eq!(
+            seq,
+            vec![true, false, true],
+            "hold → unhold → hold 順で set_hold が呼ばれる"
+        );
+    }
+
+    /// RFC 3264 §8: Re-INVITE 失敗時は **session state を変更しない**。
+    /// handler が `HoldError::Rejected { status: 488 }` を返した場合、
+    /// `Held` は出ず、 `ServerMessage::Error{code:"hold_rejected"}` を返す。
+    #[tokio::test]
+    async fn rfc3264_8_hold_rejected_keeps_state_and_returns_error() {
+        let (mut state, _reg) = make_state(b"k");
+        let handler = MockHoldHandler::new_with(Err(HoldError::Rejected { status: 488 }));
+        state.pwa_hold_handler = Some(handler.clone() as Arc<dyn PwaHoldHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Hold {
+                call_id: "c-r".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, message }) => {
+                assert_eq!(code, "hold_rejected");
+                assert!(message.contains("488"));
+            }
+            other => panic!(
+                "Error 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+    }
+
+    /// `pwa_hold_handler` 未配線 (= sabiden NGN UAC 無し構成) では
+    /// `ServerMessage::Error{code:"hold_unavailable"}` を即返す。 handler は
+    /// 呼ばれない。
+    #[tokio::test]
+    async fn hold_without_handler_returns_unavailable() {
+        let (state, _reg) = make_state(b"k");
+        // pwa_hold_handler を設定しない (= None)
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Hold {
+                call_id: "c-x".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "hold_unavailable");
+            }
+            other => panic!(
+                "Error 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+    }
+
+    /// 未知の `call_id` に対する hold は `HoldError::UnknownCallId` →
+    /// `ServerMessage::Error{code:"unknown_call_id"}` を返す (RFC 3261 §12.2.2
+    /// 相当: 対応 dialog 不在)。
+    #[tokio::test]
+    async fn hold_with_unknown_call_id_returns_unknown_call_id_error() {
+        let (mut state, _reg) = make_state(b"k");
+        let handler = MockHoldHandler::new_with(Err(HoldError::UnknownCallId));
+        state.pwa_hold_handler = Some(handler.clone() as Arc<dyn PwaHoldHandler>);
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Hold {
+                call_id: "missing".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "unknown_call_id");
+            }
+            other => panic!(
+                "Error 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
     }
 }

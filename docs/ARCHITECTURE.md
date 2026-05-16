@@ -1597,6 +1597,64 @@ NGN へ伝搬する (Issue #207):
   を内線へ中継する (491 Request Pending を含む RFC 3261 §14.2 glare 解消は
   内線 UA の責務)。
 
+### PWA hold / unhold (Issue #279、 RFC 3264 §8.4 + RFC 3261 §14.1)
+
+PWA UI の「保留」 / 「再開」 ボタンは、 PWA→NGN 発信通話の NGN レッグに対し
+Re-INVITE を発行して SDP direction を `a=sendrecv` ↔ `a=sendonly` 切替える
+ことで実現する。 内線 UA 起点の Re-INVITE (前節) と違い、 sabiden は **発信
+側 UAC** として Re-INVITE を NGN に投げる。
+
+```
+PWA browser ─── WS {"type":"hold","call_id":"ngn-call-...."} ──► sabiden
+                                                                    │
+                                                                    │ webrtc_outbound_active から entry を引く:
+                                                                    │   entry あり → last_ngn_offer_sdp を sendrecv→sendonly に書換
+                                                                    │   entry 無し → unknown_call_id error を WS 返却
+                                                                    │
+sabiden(UAC) ──Re-INVITE (CSeq+1、 SDP direction=sendonly)──► NGN
+                                                                    │
+sabiden ◄──200 OK + answer SDP── NGN
+sabiden(UAC) ──ACK──► NGN (RFC 3261 §13.2.2.4: 2xx ACK は新 transaction)
+                                                                    │
+PWA browser ◄── WS {"type":"held","call_id":"..."} ── sabiden
+[NGN 側 UA は sendonly を recvonly として解釈し、 sabiden への RTP 送信を停止]
+[sabiden→NGN への RTP は継続 (透過モード、 PWA hold tone は将来 Issue)]
+```
+
+**Protocol** (`src/webrtc/signaling.rs::ClientMessage`):
+
+| C→S 方向 | S→C 成功応答 | S→C 失敗応答 (code) |
+|---|---|---|
+| `{type:"hold", call_id:"<ngn-call-id>"}` | `{type:"held", call_id}` | `unknown_call_id` / `hold_rejected` / `hold_failed` / `hold_unavailable` |
+| `{type:"unhold", call_id:"<ngn-call-id>"}` | `{type:"unheld", call_id}` | `unknown_call_id` / `unhold_rejected` / `unhold_failed` / `hold_unavailable` |
+
+`call_id` は **NGN レッグの Call-ID** (= `webrtc_outbound_active` テーブルのキー、
+= `UacDialog::dialog().id().call_id`)。 PWA UI は INVITE 確立時に `Answer` で
+返ってきた SDP やシグナリングログから得るか、 別途 sabiden が outbound 確立時
+に push する将来追加メッセージで取得する (現状の PWA UI は localState で保持)。
+
+**実装責務** (`src/call/orchestrator.rs::UasEventHandler` の `PwaHoldHandler` 実装):
+
+1. `webrtc_outbound_active` から `call_id` (NGN Call-ID) で entry 引き。
+2. entry の `last_ngn_offer_sdp` を `apply_audio_direction(&sdp, MediaDirection::SendOnly|SendRecv)` で書換 (`src/sdp/negotiation.rs`)。
+3. `UacDialog::send_reinvite(Some(&new_offer))` 呼出 (RFC 3261 §14.1: CSeq 単調増加 / Call-ID / From-tag / To-tag 不変)。
+4. 2xx 受領で `entry.hold_state` / `entry.last_ngn_offer_sdp` を更新し WS に `Held` / `Unheld` push。 4xx/5xx は **state 変更せず** `HoldError::Rejected { status }` を返し WS に `Error` push (RFC 3264 §8: 失敗時 state 不変)。
+
+**RTP 取扱**:
+
+- 透過モード (Phase R3 完了前): NGN→PWA の RTP は **NGN 側 UA が** sendonly を recvonly 解釈で停止することを期待する。 sabiden 側で bridge を停止する path は持たない (= sabiden→NGN は引続き silence 相当の RTP を送る)。
+- RFC 3264 §8.4 の `sendonly` semantics は「remote UA は sabiden 向けに RTP を送らない」 SHOULD/MUST 規定であり、 sabiden 側送信停止は MAY 動作 (省略可)。
+- hold tone 注入 (`a=sendonly` + silence/comfort noise 以外の音源送出) は Issue #279 本 PR スコープ外、 将来 Issue で扱う。
+
+**SDP `o=` session-version** (RFC 4566 §5.2 / RFC 3264 §8):
+
+- 現状の `apply_audio_direction` は **direction 属性だけ** を書換える (= `o=` を触らない)。 厳密には RFC 3264 §8 は「offer が変わったら session-version +1」を要求するが、 NGN P-CSCF は Re-INVITE で session-version が同値でも direction 切替を accept する実機挙動を確認している (Re-INVITE は CSeq 単調増加で in-dialog request を識別する RFC 3261 §14.1 が支配的)。 将来別ピア (Asterisk 等) で互換性問題が出たら `apply_audio_direction` に session-version increment を入れる。
+
+**並行性 / glare**:
+
+- 同一 entry への並行 `set_hold` は `WebRtcOutboundEntry::ngn_dialog` mutex で直列化、 last-writer-wins。
+- NGN 側からの逆方向 Re-INVITE (`handle_ngn_reinvite` 経路) との glare は、 NGN がそちらを先に処理して 491 を返した場合 `HoldError::Rejected { status: 491 }` で PWA へ伝搬。 PWA UI 側で RFC 3261 §14.1 retry-after backoff (T1 random) を実装するのが望ましい (本 PR スコープ外、 将来 PWA UI Issue)。
+
 ## テスト基盤
 
 ### E2E SIP testbed (`tests/e2e_call_sequence/`)

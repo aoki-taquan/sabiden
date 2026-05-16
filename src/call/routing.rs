@@ -50,9 +50,9 @@
 //!   (= `now >= start || now < end`)。 同値 (`09:00-09:00`) は 24h 全マッチ
 //!   ではなく 0 秒幅扱い (= match しない、 退化形)。
 
-use chrono::{DateTime, Datelike, Local, NaiveTime, Weekday};
 #[cfg(test)]
 use chrono::TimeZone;
+use chrono::{DateTime, Datelike, Local, NaiveTime, Weekday};
 use serde::{Deserialize, Serialize};
 
 use crate::sip::registrar::Binding;

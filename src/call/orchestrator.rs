@@ -126,7 +126,7 @@ use crate::sip::uac::{CancelOutcome, EstablishedCall, InviteOutcome, InvitePlan,
 use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
 use crate::webrtc::signaling::{
-    HoldError, PendingAnswers, PwaHoldHandler, PwaInboundCloser, PwaOutboundCloser,
+    HoldError, PendingAnswers, PwaDtmfHandler, PwaHoldHandler, PwaInboundCloser, PwaOutboundCloser,
     PwaOutboundHandler, PwaOutboundOutcome, ServerMessage, WsSink,
 };
 
@@ -4168,52 +4168,7 @@ impl UasEventHandler {
             return Ok(());
         };
 
-        // RFC 4733 §2.5.1.1: 同 1 押下で timestamp は固定。sabiden は
-        // bridge 内の audio timestamp 系列と独立に DTMF 用 timestamp / SSRC を
-        // 払い出す (RFC 4733 §2.4 が許容する)。簡易実装として:
-        // - timestamp は当該イベント発生時刻のミリ秒下位 32 bit
-        // - SSRC は call-id ベースのハッシュ (1 通話で固定)
-        let now_ts = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-            & 0xFFFF_FFFF) as u32;
-        let ssrc = {
-            // 衝突を最小化する単純な FNV-1a 風ハッシュ
-            let mut h: u32 = 0x811c_9dc5;
-            for &b in call_id.as_bytes() {
-                h ^= b as u32;
-                h = h.wrapping_mul(0x0100_0193);
-            }
-            // SSRC=0 を避ける
-            if h == 0 {
-                0xCAFE_BABE
-            } else {
-                h
-            }
-        };
-        // start_seq はランダムでよいが時刻下位 16bit で十分 (1 通話で重複しない範囲)。
-        let start_seq = (now_ts & 0xFFFF) as u16;
-
-        // RFC 4733 §2.5.1.1: 50ms 区切りで重複 packet を送り、終端は triplet。
-        // duration は 100ms (DTMF として最低限聞こえる長さ)。
-        let seq = super::dtmf::build_dtmf_packet_sequence(
-            event, start_seq, now_ts, ssrc, /* duration_ms */ 100, /* period_ms */ 50,
-            /* volume */ 10,
-        );
-        debug!(
-            %call_id,
-            digit = %digit,
-            packets = seq.packets.len(),
-            "INFO→RFC 4733 telephone-event 変換 → NGN へ注入"
-        );
-        for pkt in seq.packets {
-            let bytes = pkt.to_bytes();
-            if let Err(e) = mgr.inject_to_ngn(bridge_id, &bytes).await {
-                warn!(error=%e, "DTMF RTP 注入失敗");
-                break;
-            }
-        }
+        inject_dtmf_event_to_ngn(mgr, bridge_id, &call_id, event, digit).await;
         Ok(())
     }
 
@@ -5167,6 +5122,90 @@ impl PwaOutboundHandler for UasEventHandler {
     }
 }
 
+/// RFC 4733 §2.5 telephone-event RTP packet 列を NGN レッグへ送出する共通
+/// ヘルパ (Issue #69 SIP INFO 経路 / Issue #277 PWA WS 経路 双方から呼ばれる)。
+///
+/// # RFC 引用
+///
+/// - RFC 4733 §2.5.1.1 (Use of the Marker Bit and Timestamp): 同一押下 (single
+///   key press) を構成する全 RTP packet で **timestamp は不変**。 sabiden は
+///   `now_ts` を 1 押下分の packet 列で固定する。 また 50ms 区切りで重複
+///   packet を送り、 終端は §2.5.1.2 に従って end=true triplet で送る。
+/// - RFC 4733 §2.4 (RTP Header): SSRC は audio とは独立して払い出して良い。
+///   sabiden は call-id ベースの FNV-1a 風ハッシュで 1 通話で固定する。
+/// - RFC 4733 §3.2 (Use of `events`): event 値の解釈は payload type で決まる。
+///   sabiden の SDP は `a=rtpmap:101 telephone-event/8000` を offer 済
+///   (`Negotiator::for_ngn_with_dtmf`) なので PT=101 で送出する。
+///
+/// # パラメータ
+///
+/// - `call_id`: SSRC ハッシュの seed。 1 通話で同じ SSRC を払い出すための識別子で
+///   あれば良い (内線 Call-ID / NGN Call-ID どちらでも可)。
+/// - `event`: RFC 4733 §3.2 event 番号 (`digit_to_event` の戻り値)。
+/// - `digit`: ログ用の元 digit 文字 (`event` から逆引き可能だが trace の可読性
+///   向上のため引数で受け取る)。
+///
+/// # 動作
+///
+/// `build_dtmf_packet_sequence` で 5 packet 列 (start + 1 中間 + end triplet 3)
+/// を生成し、 1 つずつ `CallManager::inject_to_ngn` で NGN socket へ送る。
+/// `inject_to_ngn` が `Err` を返した時点で残りはスキップする (= bridge 停止 /
+/// NGN peer 未学習 / NGN unreachable のいずれか、 続行しても無駄)。
+async fn inject_dtmf_event_to_ngn(
+    mgr: &CallManager,
+    bridge_id: CallId,
+    call_id: &str,
+    event: u8,
+    digit: char,
+) {
+    // RFC 4733 §2.5.1.1: 同 1 押下で timestamp は固定。sabiden は
+    // bridge 内の audio timestamp 系列と独立に DTMF 用 timestamp / SSRC を
+    // 払い出す (RFC 4733 §2.4 が許容する)。簡易実装として:
+    // - timestamp は当該イベント発生時刻のミリ秒下位 32 bit
+    // - SSRC は call-id ベースのハッシュ (1 通話で固定)
+    let now_ts = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        & 0xFFFF_FFFF) as u32;
+    let ssrc = {
+        // 衝突を最小化する単純な FNV-1a 風ハッシュ
+        let mut h: u32 = 0x811c_9dc5;
+        for &b in call_id.as_bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        // SSRC=0 を避ける
+        if h == 0 {
+            0xCAFE_BABE
+        } else {
+            h
+        }
+    };
+    // start_seq はランダムでよいが時刻下位 16bit で十分 (1 通話で重複しない範囲)。
+    let start_seq = (now_ts & 0xFFFF) as u16;
+
+    // RFC 4733 §2.5.1.1: 50ms 区切りで重複 packet を送り、終端は triplet。
+    // duration は 100ms (DTMF として最低限聞こえる長さ)。
+    let seq = super::dtmf::build_dtmf_packet_sequence(
+        event, start_seq, now_ts, ssrc, /* duration_ms */ 100, /* period_ms */ 50,
+        /* volume */ 10,
+    );
+    debug!(
+        %call_id,
+        %digit,
+        packets = seq.packets.len(),
+        "DTMF: RFC 4733 telephone-event を NGN レッグへ注入"
+    );
+    for pkt in seq.packets {
+        let bytes = pkt.to_bytes();
+        if let Err(e) = mgr.inject_to_ngn(bridge_id, &bytes).await {
+            warn!(error=%e, "DTMF RTP 注入失敗");
+            break;
+        }
+    }
+}
+
 /// Issue #147: PWA WS の close / `ClientMessage::Bye` 受信時に呼ばれる、
 /// PWA→NGN 発信通話の cleanup 経路。
 ///
@@ -5361,6 +5400,50 @@ impl PwaHoldHandler for UasEventHandler {
     }
 }
 
+/// Issue #277: PWA→NGN 発信通話に対する WS DTMF 注入経路。
+///
+/// `UasEventHandler` は PWA→NGN 発信通話を `webrtc_outbound_active` テーブル
+/// (`WebRtcOutboundEntry { bridge_call_id, .. }`) に保持しているので、
+/// `call_id` (NGN レッグの Call-ID) で lookup し、 `CallManager::inject_to_ngn`
+/// 経由で RFC 4733 §2.5 telephone-event RTP packet 列を NGN レッグへ流す。
+///
+/// 対象 `call_id` が `webrtc_outbound_active` に無い場合 (= 当該ハンドラが
+/// 知らない通話 / 既に終了 / NGN→PWA 着信通話) は `Ok(false)` を返し、
+/// 上位 composite handler に inbound 経路の lookup を委ねる。
+#[async_trait::async_trait]
+impl PwaDtmfHandler for UasEventHandler {
+    async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool> {
+        // (1) digit を RFC 4733 §3.2 event 番号にマップ。 範囲外は silent OK
+        //     (false): browser UI が 0-9 / * / # しか押下できない設計のため、
+        //     ここに到達するのは改造クライアントか A-D 以外の文字。 落とすのが
+        //     安全。
+        let Some(event) = super::dtmf::digit_to_event(digit) else {
+            debug!(%digit, "DTMF: RFC 4733 範囲外 digit → drop");
+            return Ok(false);
+        };
+
+        // (2) NGN Call-ID で outbound テーブルを引く。
+        let entry = {
+            let tbl = self.webrtc_outbound_active.lock().await;
+            tbl.get(call_id).cloned()
+        };
+        let Some(entry) = entry else {
+            debug!(%call_id, "DTMF: PWA outbound テーブルに該当無し");
+            return Ok(false);
+        };
+
+        // (3) CallManager 未注入なら bridge も無いので drop。
+        let Some(mgr) = self.call_manager.as_ref() else {
+            debug!(%call_id, "DTMF: CallManager 未注入 → drop");
+            return Ok(false);
+        };
+
+        // (4) RFC 4733 §2.5 telephone-event RTP 列を NGN へ注入。
+        inject_dtmf_event_to_ngn(mgr.as_ref(), entry.bridge_call_id, call_id, event, digit).await;
+        Ok(true)
+    }
+}
+
 /// Bug B / Issue #268: PWA WS の close 受信時に呼ばれる、 NGN→PWA 着信通話
 /// の cleanup 経路 ([`PwaOutboundCloser`] の inbound 対称形)。
 ///
@@ -5452,6 +5535,110 @@ impl PwaInboundCloser for NgnInboundHandler {
         }
 
         count
+    }
+}
+
+/// Issue #277: NGN→PWA 着信通話に対する WS DTMF 注入経路。
+///
+/// `NgnInboundHandler` は NGN→PWA 着信通話を二つのテーブルで管理する:
+/// - `self.webrtc_active`: WS / dialog state (本 trait では存在確認のみ)
+/// - `self.active`: NGN Call-ID → `Option<CallId>` (bridge_call_id) マップ
+///
+/// `call_id` (NGN INVITE の Call-ID) で `self.active` から bridge_call_id を
+/// 引き、 `CallManager::inject_to_ngn` 経由で RFC 4733 §2.5 telephone-event
+/// RTP packet 列を NGN レッグへ流す。
+///
+/// 該当 `call_id` が無い / bridge 未起動 (transparent モード) / digit 範囲外の
+/// いずれでも `Ok(false)` を返す (= 上位 composite handler は別経路に流さない:
+/// inbound 通話は本ハンドラでしか引けない)。
+#[async_trait::async_trait]
+impl PwaDtmfHandler for NgnInboundHandler {
+    async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool> {
+        // (1) RFC 4733 §3.2: digit → event 番号。
+        let Some(event) = super::dtmf::digit_to_event(digit) else {
+            debug!(%digit, "DTMF: RFC 4733 範囲外 digit → drop");
+            return Ok(false);
+        };
+
+        // (2) NGN Call-ID で active テーブルから bridge_call_id を引く。
+        //     active が Some(Some(_)) のときだけ bridge が起動済。
+        //     `webrtc_active` も同 Call-ID で entry が無ければそもそも sabiden が
+        //     知らない通話 (= outbound 経路 / 既に BYE 済) なので false。
+        let bridge_id = {
+            let active = self.active.lock().await;
+            active.get(call_id).copied()
+        };
+        let bridge_id = match bridge_id {
+            Some(Some(id)) => id,
+            Some(None) => {
+                debug!(%call_id, "DTMF: transparent モード (bridge 未起動) → drop");
+                return Ok(false);
+            }
+            None => {
+                debug!(%call_id, "DTMF: NGN→PWA 着信テーブルに該当無し");
+                return Ok(false);
+            }
+        };
+
+        // (3) CallManager 未注入なら drop。
+        let Some(mgr) = self.call_manager.as_ref() else {
+            debug!(%call_id, "DTMF: CallManager 未注入 → drop");
+            return Ok(false);
+        };
+
+        // (4) RFC 4733 §2.5 telephone-event RTP 列を NGN へ注入。
+        inject_dtmf_event_to_ngn(mgr.as_ref(), bridge_id, call_id, event, digit).await;
+        Ok(true)
+    }
+}
+
+/// Issue #277: PWA→NGN / NGN→PWA 両方向の通話に対する WS DTMF を 1 つの
+/// `PwaDtmfHandler` として束ねる composite。
+///
+/// signaling 層 (`SignalingState::pwa_dtmf`) は単一の `Arc<dyn PwaDtmfHandler>`
+/// しか持てないため、 production では 本 composite に `UasEventHandler`
+/// (PWA→NGN 発信用) と `NgnInboundHandler` (NGN→PWA 着信用) を `Arc::clone` で
+/// 渡し、 `call_id` を片方が知らなくても他方が拾えるようにする。
+///
+/// # 呼び出し順
+///
+/// 1. **outbound** (発信用) を先に試す: PWA が起動した通話は call_id が
+///    `webrtc_outbound_active` にある可能性が高い。
+/// 2. outbound が `Ok(false)` (= 該当無し) なら **inbound** にフォールバック。
+/// 3. どちらも false / または 1 つしか配線されていなければ最終 `Ok(false)`。
+///
+/// 注: `Ok(true)` を返した時点で短絡。 production では同じ call_id が両方の
+/// テーブルに存在することは無い (発信と着信は別 Call-ID で生成される) が、
+/// 防御的に短絡する。
+pub struct CompositePwaDtmfHandler {
+    outbound: Option<Arc<dyn PwaDtmfHandler>>,
+    inbound: Option<Arc<dyn PwaDtmfHandler>>,
+}
+
+impl CompositePwaDtmfHandler {
+    /// outbound / inbound いずれか (または両方) を受け取る。
+    pub fn new(
+        outbound: Option<Arc<dyn PwaDtmfHandler>>,
+        inbound: Option<Arc<dyn PwaDtmfHandler>>,
+    ) -> Arc<Self> {
+        Arc::new(Self { outbound, inbound })
+    }
+}
+
+#[async_trait::async_trait]
+impl PwaDtmfHandler for CompositePwaDtmfHandler {
+    async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool> {
+        if let Some(h) = self.outbound.as_ref() {
+            match h.inject_dtmf_to_ngn(call_id, digit).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(h) = self.inbound.as_ref() {
+            return h.inject_dtmf_to_ngn(call_id, digit).await;
+        }
+        Ok(false)
     }
 }
 
@@ -16330,6 +16517,124 @@ mod tests {
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"500\"} 2"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"503\"} 1"));
         assert!(rendered.contains("sabiden_ngn_5xx_total{status=\"other\"} 1"));
+    }
+
+    // ========================================================================
+    // Issue #277: CompositePwaDtmfHandler — outbound/inbound 二段 lookup
+    // ========================================================================
+
+    struct MockOrchestratorDtmf {
+        name: &'static str,
+        outcome: std::sync::Mutex<Result<bool, String>>,
+        calls: std::sync::Mutex<Vec<(String, char)>>,
+    }
+
+    impl MockOrchestratorDtmf {
+        fn new(name: &'static str, outcome: Result<bool, String>) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                outcome: std::sync::Mutex::new(outcome),
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::webrtc::signaling::PwaDtmfHandler for MockOrchestratorDtmf {
+        async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> anyhow::Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((call_id.to_string(), digit));
+            match &*self.outcome.lock().unwrap() {
+                Ok(b) => Ok(*b),
+                Err(s) => Err(anyhow::anyhow!("{}: {}", self.name, s.clone())),
+            }
+        }
+    }
+
+    /// Issue #277: outbound が `Ok(true)` を返したら inbound は呼ばれない (= 短絡)。
+    /// 同 `call_id` で両方の handler に dispatch する race を防ぐ。
+    #[tokio::test]
+    async fn issue277_composite_dtmf_short_circuits_on_outbound_success() {
+        let outbound = MockOrchestratorDtmf::new("outbound", Ok(true));
+        let inbound = MockOrchestratorDtmf::new("inbound", Ok(true));
+        let composite = CompositePwaDtmfHandler::new(
+            Some(outbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+            Some(inbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+        );
+        let r = composite.inject_dtmf_to_ngn("cid-out", '5').await.unwrap();
+        assert!(r, "outbound success → composite も true");
+        assert_eq!(outbound.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            inbound.calls.lock().unwrap().len(),
+            0,
+            "outbound 成功時 inbound は呼ばれない"
+        );
+    }
+
+    /// Issue #277: outbound が `Ok(false)` (= 該当無し) を返したら inbound に
+    /// フォールバック。 inbound が `Ok(true)` を返したら composite も true。
+    #[tokio::test]
+    async fn issue277_composite_dtmf_falls_back_to_inbound_when_outbound_returns_false() {
+        let outbound = MockOrchestratorDtmf::new("outbound", Ok(false));
+        let inbound = MockOrchestratorDtmf::new("inbound", Ok(true));
+        let composite = CompositePwaDtmfHandler::new(
+            Some(outbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+            Some(inbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+        );
+        let r = composite.inject_dtmf_to_ngn("cid-in", '*').await.unwrap();
+        assert!(r, "inbound success → composite も true");
+        assert_eq!(outbound.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            inbound.calls.lock().unwrap().len(),
+            1,
+            "outbound false 時 inbound にフォールバック"
+        );
+        assert_eq!(inbound.calls.lock().unwrap()[0], ("cid-in".into(), '*'));
+    }
+
+    /// Issue #277: outbound が `Err` を返したら composite も即 `Err` (inbound に
+    /// 流さない)。 NGN socket I/O failure 等の致命的エラーは握り潰さず上位
+    /// (signaling) で warn ログさせる。
+    #[tokio::test]
+    async fn issue277_composite_dtmf_propagates_outbound_error() {
+        let outbound = MockOrchestratorDtmf::new("outbound", Err("io failed".into()));
+        let inbound = MockOrchestratorDtmf::new("inbound", Ok(true));
+        let composite = CompositePwaDtmfHandler::new(
+            Some(outbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+            Some(inbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+        );
+        let r = composite.inject_dtmf_to_ngn("cid", '5').await;
+        assert!(r.is_err());
+        assert_eq!(outbound.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            inbound.calls.lock().unwrap().len(),
+            0,
+            "outbound Err 時 inbound には流さない"
+        );
+    }
+
+    /// Issue #277: outbound だけ配線 (inbound = None)、 outbound が `Ok(false)`
+    /// なら composite も `Ok(false)`。
+    #[tokio::test]
+    async fn issue277_composite_dtmf_outbound_only_returns_false_when_outbound_false() {
+        let outbound = MockOrchestratorDtmf::new("outbound", Ok(false));
+        let composite = CompositePwaDtmfHandler::new(
+            Some(outbound.clone() as Arc<dyn crate::webrtc::signaling::PwaDtmfHandler>),
+            None,
+        );
+        let r = composite.inject_dtmf_to_ngn("cid", '5').await.unwrap();
+        assert!(!r);
+    }
+
+    /// Issue #277: 両方 `None` なら `Ok(false)` (= 安全に no-op)。 production 上
+    /// 起きないが defense-in-depth。
+    #[tokio::test]
+    async fn issue277_composite_dtmf_neither_configured_returns_false() {
+        let composite = CompositePwaDtmfHandler::new(None, None);
+        let r = composite.inject_dtmf_to_ngn("cid", '5').await.unwrap();
+        assert!(!r);
     }
 
     /// RFC 3550 §11 / Issue #260 Phase 1-D: `bind_ngn_rtp_socket` は必ず

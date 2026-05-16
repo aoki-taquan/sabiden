@@ -338,6 +338,9 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // Issue #279: PWA UI hold / unhold 経路で NGN レッグへ Re-INVITE を発行する
     // ハンドラ (= 同じ `UasEventHandler`)。 RFC 3264 §8.4 + RFC 3261 §14.1。
     let uas_handler_for_pwa_hold: Arc<dyn webrtc::signaling::PwaHoldHandler> = uas_handler.clone();
+    // Issue #277: 通話中 DTMF (RFC 4733 telephone-event) を WS 経由で NGN レッグへ
+    // 注入するため、 `UasEventHandler` を `PwaDtmfHandler` としても流用する。
+    let uas_handler_for_pwa_dtmf: Arc<dyn webrtc::signaling::PwaDtmfHandler> = uas_handler.clone();
 
     // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup ハンドラを
     // SignalingState (`with_pwa_inbound_closer`) に渡すため、 `ngn_handler` を
@@ -481,6 +484,21 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                     if let Some(h) = ngn_inbound_handler_for_signaling.clone() {
                         let closer: Arc<dyn webrtc::signaling::PwaInboundCloser> = h;
                         state = state.with_pwa_inbound_closer(closer);
+                    }
+                    // Issue #277: 通話中 DTMF (RFC 4733) を WS 経由で受けて NGN
+                    // レッグへ注入する。 outbound (PWA→NGN 発信、 `UasEventHandler`)
+                    // と inbound (NGN→PWA 着信、 `NgnInboundHandler`) の両方の
+                    // 通話を扱えるよう `CompositePwaDtmfHandler` で束ねる。
+                    {
+                        let outbound = Some(uas_handler_for_pwa_dtmf.clone());
+                        let inbound: Option<Arc<dyn webrtc::signaling::PwaDtmfHandler>> =
+                            ngn_inbound_handler_for_signaling
+                                .clone()
+                                .map(|h| h as Arc<dyn webrtc::signaling::PwaDtmfHandler>);
+                        let composite =
+                            call::orchestrator::CompositePwaDtmfHandler::new(outbound, inbound);
+                        state = state
+                            .with_pwa_dtmf(composite as Arc<dyn webrtc::signaling::PwaDtmfHandler>);
                     }
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {

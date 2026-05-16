@@ -235,15 +235,70 @@ NOTIFY 経路を持たないため、 以下の通り default 応答を返す:
 | `PUBLISH` | 200 OK + `Allow` (本文破棄、 受け流し) | RFC 3903 §6 |
 | `UPDATE` | 481 + `Allow` | RFC 3311 §5.2 |
 | `MESSAGE` | 200 OK + `Allow` (本文破棄、 再送ストーム抑止) | RFC 3428 §7 |
-| `REFER` | 405 Method Not Allowed + `Allow` | RFC 3515 §4.5 |
+| `REFER` | 202 Accepted → implicit sub + sipfrag NOTIFY (B2BUA 経路) / 上位未接続時のみ 405 + `Allow` | RFC 3515 §2.4.6 + RFC 3265 §3.1.2 |
 | `Other(_)` | 405 + `Allow` | RFC 3261 §8.2.1 |
 
-`Allow` ヘッダ値は内線側も `INVITE, ACK, BYE, CANCEL, OPTIONS` (定数
-`SUPPORTED_METHODS_ALLOW` in `src/sip/uas.rs`、 NGN 側と同じ集合)。
+`Allow` ヘッダ値は内線側 `INVITE, ACK, BYE, CANCEL, OPTIONS, REFER` (定数
+`SUPPORTED_METHODS_ALLOW` in `src/sip/uas.rs`)。 NGN 側は REFER を実装しない
+(carrier 由来 REFER は Issue #289 scope 外) ため `INVITE, ACK, BYE, CANCEL,
+OPTIONS` のみ。
 PUBLISH の応答が NGN 側 (489 Bad Event) と内線側 (200 OK) で異なるのは、
 NGN 側は carrier IMS が EventStateCompositor を期待するのに対し、 内線側
 UA は presence publish を盲目的に 200 OK で吸って再送を止めるのが
 推奨されるため (Issue #273)。
+
+### REFER 内線間転送 (Issue #289、 RFC 3515 §2.4.6 + RFC 3265 §3.1.2)
+
+内線 A が NGN 通話中に「内線 B へつなぐ」 を押下すると、 A が dialog 内 REFER
+(Refer-To: `<sip:B@...>`) を sabiden に送る。 sabiden は B2BUA として以下の
+signaling を駆動する (`src/call/orchestrator.rs::handle_ext_refer`):
+
+```
+内線 A         sabiden        内線 B (transferee)         NGN P-CSCF
+  │              │                    │                       │
+  ├─ REFER ─────►│                    │                       │
+  │              │ (dialog lookup_by_ext, Refer-To parse)     │
+  │◄─ 202 Accepted (RFC 3515 §2.4.6)  │                       │
+  │              │ (implicit subscription start, §2.4.4)      │
+  │◄─ NOTIFY sipfrag "SIP/2.0 100 Trying" (§2.4.5)            │
+  │              │                    │                       │
+  │              ├─ INVITE ──────────►│                       │
+  │              │◄────────── 200 OK ─┤                       │
+  │              │                    │                       │
+  │◄─ NOTIFY sipfrag "SIP/2.0 200 OK", Subscription-State: terminated
+  │              │                    │                       │
+  │◄─ BYE (元 dialog) (RFC 3261 §15.1.1)                       │
+  │              ├─────────────────── BYE (NGN レッグ) ───────►│
+  │              │                    │                       │
+```
+
+ステップ詳細:
+
+1. **A → sabiden REFER**: dialog 内 (Call-ID = ext_call_id) で受信。 `src/sip/uas.rs`
+   の REFER 分岐は `UasEvent::Refer` を上位へ流す (上位未接続時のみ 405 fallback)。
+2. **dialog 検証 + 202 Accepted**: `OutboundCallRegistry::lookup_by_ext` で
+   transferor の dialog を引く (見つからなければ 481、 RFC 3261 §12.2.2)。
+   `Refer-To` ヘッダの user 部を `extract_refer_to_aor` で抽出 (失敗時 400)。
+3. **NOTIFY 100 Trying**: `Dialog::build_notify_refer_sipfrag` で `Event: refer` +
+   `Subscription-State: active;expires=60` + `Content-Type: message/sipfrag;version=2.0` +
+   body `SIP/2.0 100 Trying\r\n` を組み立て、 ext_layer 経由で transferor へ送出。
+4. **binding lookup**: `ExtensionRegistrar::lookup(target_aor)` で B の binding を引く。
+   - 不在: NOTIFY sipfrag `SIP/2.0 404 Not Found` + `Subscription-State: terminated;reason=noresource`
+     を送って終了 (元 dialog は維持)。
+5. **B2BUA INVITE to transferee**: `UasEventHandler::ext_inviter` (= `NgnInboundHandler`
+   と共有する `Arc<UacForker>`) で B へ INVITE を送出。 SDP は MVP として空 body
+   (blind transfer)。 媒体面 (RTP bridge) re-routing は Issue #289 follow-up。
+6. **final NOTIFY + 元 dialog 終了**:
+   - B が 2xx (Established): NOTIFY sipfrag `SIP/2.0 200 OK` を transferor へ送り、
+     **元 dialog (transferor 内線 + NGN レッグ) を BYE** で閉じる (RFC 3261 §15.1.1)。
+     `teardown_transferred_dialog` で UacDialog::send_bye + Dialog::build_bye の双方を
+     fire し、 RTP bridge も `CallManager::terminate` で停止する。
+   - B が 4xx/5xx/6xx: NOTIFY sipfrag (`SIP/2.0 486 Busy Here` 等) を送って終了。
+     元 dialog は維持 (transferor は元通話を継続できる)。
+   - inviter エラー: NOTIFY `SIP/2.0 503 Service Unavailable`。
+
+NGN 側から sabiden への REFER (carrier 由来) は本実装の scope 外 (Issue #289)。
+`NgnInboundHandler::handle_inbound` の REFER 分岐は default の 405 reject のまま。
 
 ## 通話フロー
 

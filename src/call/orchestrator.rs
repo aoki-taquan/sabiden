@@ -3021,6 +3021,20 @@ pub struct UasEventHandler {
     /// `Arc::clone().spawn()` 後に `set_call_log` を呼べるようにするため
     /// (= `outbound_forwarder` と同じ pattern)。
     call_log: Mutex<Option<Arc<crate::observability::call_log::CallLog>>>,
+    /// Issue #289: REFER (call transfer) で transferee 内線 B へ新 INVITE を
+    /// 発信するための `ExtInviter` (RFC 3515 §2.4.6)。 `None` なら REFER は
+    /// 503 Service Unavailable で拒否する (依存未注入時の縮退)。
+    /// `NgnInboundHandler` が NGN→内線 着信時に使うのと同じ trait obj を共有して
+    /// よい (内線レッグ向け INVITE という意味は両者で同じ)。
+    ///
+    /// `Mutex<Option<_>>` で wrap してあるのは、 `forker` が `uas_handler`
+    /// より後段で構築される main.rs の起動順序 (Arc を clone 共有した後で
+    /// 注入する必要がある) に合わせるため。 `set_call_log` と同じ pattern。
+    ext_inviter: Mutex<Option<ExtInviter>>,
+    /// Issue #289: REFER の Refer-To から内線 B の binding を引くための
+    /// `ExtensionRegistrar`。 `ext_inviter` と組で注入する。 `None` なら
+    /// REFER は 404 (転送先不在) で拒否する。
+    ext_registrar: Mutex<Option<Arc<ExtensionRegistrar>>>,
 }
 
 impl UasEventHandler {
@@ -3042,6 +3056,8 @@ impl UasEventHandler {
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
             call_log: Mutex::new(None),
+            ext_inviter: Mutex::new(None),
+            ext_registrar: Mutex::new(None),
         })
     }
 
@@ -3081,6 +3097,8 @@ impl UasEventHandler {
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
             call_log: Mutex::new(None),
+            ext_inviter: Mutex::new(None),
+            ext_registrar: Mutex::new(None),
         })
     }
 
@@ -3108,6 +3126,8 @@ impl UasEventHandler {
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
             call_log: Mutex::new(None),
+            ext_inviter: Mutex::new(None),
+            ext_registrar: Mutex::new(None),
         })
     }
 
@@ -3168,6 +3188,23 @@ impl UasEventHandler {
         me.ext_local_addr = ext_local_addr;
     }
 
+    /// Issue #289: REFER (call transfer) の transferee 内線へ新 INVITE を
+    /// 発信するための `ExtInviter` + binding lookup 用 `ExtensionRegistrar` を
+    /// 注入する。 `NgnInboundHandler` で使う `forker` をそのまま渡してよい
+    /// (内線向けの INVITE という用途は両者共通)。 未注入なら REFER は 503
+    /// (内線側) で拒否される。
+    ///
+    /// `set_call_log` と同じ pattern で `Mutex<Option<_>>` 経由なので、 Arc を
+    /// 共有した後でも安全に呼べる (= main.rs の forker 構築タイミング合わせ)。
+    pub async fn attach_ext_inviter(
+        self: &Arc<Self>,
+        inviter: ExtInviter,
+        registrar: Arc<ExtensionRegistrar>,
+    ) {
+        *self.ext_inviter.lock().await = Some(inviter);
+        *self.ext_registrar.lock().await = Some(registrar);
+    }
+
     /// `OutboundCallRegistry` の参照を返す。`NgnInboundHandler` と共有するため、
     /// 同じ Arc を渡すことで NGN→内線方向の BYE が同じ通話エントリを引ける。
     pub fn registry(&self) -> Arc<OutboundCallRegistry> {
@@ -3196,6 +3233,8 @@ impl UasEventHandler {
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
             call_log: Mutex::new(None),
+            ext_inviter: Mutex::new(None),
+            ext_registrar: Mutex::new(None),
         })
     }
 
@@ -3248,6 +3287,11 @@ impl UasEventHandler {
                 responder,
             } => self.handle_ext_info(request, remote, responder).await,
             UasEvent::Unregister { aor } => self.handle_ext_unregister(&aor).await,
+            UasEvent::Refer {
+                request,
+                remote,
+                responder,
+            } => self.handle_ext_refer(request, remote, responder).await,
         }
     }
 
@@ -3819,6 +3863,287 @@ impl UasEventHandler {
             }
         }
         Ok(())
+    }
+
+    /// 内線からの **REFER** (call transfer) を受け、 transferee 内線 B へ
+    /// 新 INVITE を発信する B2BUA 経路 (Issue #289)。
+    ///
+    /// シーケンス (RFC 3515 §2.4.6 / RFC 3265 §3.1.2 / RFC 3261 §15.1.1):
+    /// 1. 既存 dialog (Call-ID = ext_call_id) を lookup_by_ext で引く。 無ければ
+    ///    481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)。
+    /// 2. `Refer-To` ヘッダから transferee 内線 B の AOR (user 部) を抽出。
+    ///    不正なら 400 Bad Request (RFC 3515 §2.4.1)。
+    /// 3. **202 Accepted** を transferor (内線 A) へ返す (RFC 3515 §2.4.6:
+    ///    "The 202 Accepted response indicates that the REFER request has
+    ///    been accepted ...")。 202 で implicit subscription が確立 (RFC 3265
+    ///    §3.1.2 + RFC 3515 §2.4.4)。
+    /// 4. NOTIFY (sipfrag `SIP/2.0 100 Trying`、 Subscription-State: active) を
+    ///    transferor の dialog 上で送出 (RFC 3515 §2.4.5)。 ここで dialog の
+    ///    `local_cseq` を 1 つ消費する。
+    /// 5. `ext_registrar` で内線 B の Binding を引く。 不在なら NOTIFY
+    ///    (sipfrag `SIP/2.0 404 Not Found`、 Subscription-State: terminated)
+    ///    で transferor に失敗通知して終了。
+    /// 6. `ext_inviter.invite(target_uri, sdp)` で B へ INVITE を送る。
+    ///    SDP body は元 dialog の NGN 側 offer をそのまま流す (B2BUA blind
+    ///    transfer の MVP)。
+    /// 7. B の最終応答に応じて NOTIFY (sipfrag status line、
+    ///    Subscription-State: terminated;reason=noresource) を transferor へ。
+    /// 8. B が 2xx (Established) で確立した場合のみ、 元 dialog (transferor ↔
+    ///    sabiden + sabiden ↔ NGN) を BYE で閉じる (RFC 3261 §15.1.1)。
+    ///    transferee と NGN の RTP bridge re-routing は本 PR scope 外
+    ///    (signaling のみ; 媒体面は follow-up issue)。
+    ///
+    /// # NGN 側 REFER (scope 外)
+    ///
+    /// NGN carrier IMS からの REFER 受信は本実装の scope 外 (Issue #289)。
+    /// NGN inbound 経路 (`handle_inbound` の `SipMethod::Refer`) は引き続き
+    /// `405` 等の default で reject する。
+    async fn handle_ext_refer(
+        &self,
+        request: SipRequest,
+        remote: SocketAddr,
+        responder: ResponderHandle,
+    ) -> Result<()> {
+        let call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_default();
+        let span = info_span!(
+            "uas_refer",
+            call_id = %call_id,
+            direction = "extension",
+        );
+        async move {
+            // 依存未注入チェック: ext_inviter / ext_registrar / ext_layer の
+            // いずれかが無いと REFER 経路が成立しないため 503 で縮退する。
+            let inviter_opt = self.ext_inviter.lock().await.clone();
+            let registrar_opt = self.ext_registrar.lock().await.clone();
+            let (Some(inviter), Some(registrar), Some(ext_layer)) =
+                (inviter_opt, registrar_opt, self.ext_layer.clone())
+            else {
+                warn!(
+                    "REFER: ext_inviter / ext_registrar / ext_layer 未注入 → 503"
+                );
+                return responder.quick(503, "Service Unavailable").await;
+            };
+
+            // 1) 既存 dialog (Call-ID で lookup) を確認
+            let entry = match self.registry.lookup_by_ext(&call_id).await {
+                Some(e) => e,
+                None => {
+                    warn!(%call_id, "REFER: 対応 dialog なし → 481 (RFC 3261 §12.2.2)");
+                    return responder
+                        .quick(481, "Call/Transaction Does Not Exist")
+                        .await;
+                }
+            };
+
+            // 2) Refer-To から target AOR (user 部) を抽出 (RFC 3515 §2.4.1)
+            let refer_to_raw = match request.headers.get("refer-to") {
+                Some(v) => v.to_string(),
+                None => {
+                    warn!(%call_id, "REFER: Refer-To 欠落 → 400 (RFC 3515 §2.4.1)");
+                    return responder.quick(400, "Bad Request").await;
+                }
+            };
+            let target_aor = match extract_refer_to_aor(&refer_to_raw) {
+                Some(a) => a,
+                None => {
+                    warn!(
+                        %call_id, refer_to = %refer_to_raw,
+                        "REFER: Refer-To の user 部抽出失敗 → 400"
+                    );
+                    return responder.quick(400, "Bad Request").await;
+                }
+            };
+
+            // 3) 202 Accepted を transferor (内線 A) へ返す
+            //    RFC 3515 §2.4.6: "the UAS MUST return a 202 (Accepted) response
+            //    if it is willing to accept the REFER."
+            if let Err(e) = responder.quick(202, "Accepted").await {
+                warn!(error=%e, "REFER 202 Accepted 送出失敗");
+            }
+            info!(%call_id, %target_aor, "REFER 受領: transferor へ 202 Accepted");
+
+            // 4) NOTIFY (sipfrag 100 Trying, Subscription-State: active) を送出
+            //    RFC 3515 §2.4.5 / RFC 3265 §3.2.4
+            self.send_refer_notify(
+                &entry,
+                &ext_layer,
+                "SIP/2.0 100 Trying",
+                "active;expires=60",
+            )
+            .await;
+
+            // 5) 内線 B の binding を lookup
+            let binding = match registrar.lookup(&target_aor).await {
+                Some(b) => b,
+                None => {
+                    warn!(%target_aor, "REFER: 転送先内線 binding なし → NOTIFY 404");
+                    self.send_refer_notify(
+                        &entry,
+                        &ext_layer,
+                        "SIP/2.0 404 Not Found",
+                        "terminated;reason=noresource",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            // 6) 内線 B へ新 INVITE を発信する。
+            //    SDP は元 dialog の NGN 側 offer (transferor が NGN へ送った
+            //    SDP) を流用する blind-transfer MVP。 OutboundCallEntry には
+            //    SDP を保存していないので、 ここでは空 body で送る (B が
+            //    200 OK で SDP answer を返した時点で B2BUA で取り扱える)。
+            //    将来 (Issue #289 follow-up): 元 dialog の NGN 答えを保存して
+            //    blind transfer 用 offer として transferee へ渡す。
+            let target_uri = binding.contact_uri.clone();
+            info!(%target_aor, %target_uri, "REFER: transferee へ B2BUA INVITE 発信");
+            let outcome = inviter.invite(&target_uri, &[]).await;
+
+            // 7) B の応答を sipfrag NOTIFY で transferor へ通知し、
+            //    8) 2xx なら元 dialog を BYE で閉じる
+            match outcome {
+                Ok(super::manager::LegOutcome::Established { response, .. }) => {
+                    let status_line =
+                        format!("SIP/2.0 {} {}", response.status_code, response.reason);
+                    info!(%target_aor, status = response.status_code, "REFER: transferee 確立 → NOTIFY 200 OK 経路");
+                    self.send_refer_notify(
+                        &entry,
+                        &ext_layer,
+                        &status_line,
+                        "terminated;reason=noresource",
+                    )
+                    .await;
+                    // 8) 元 dialog を BYE で閉じる (RFC 3261 §15.1.1):
+                    //    a) transferor 内線レッグ (ext_dialog) へ BYE
+                    //    b) NGN レッグ (ngn_dialog) へ BYE
+                    self.teardown_transferred_dialog(&entry, &ext_layer).await;
+                    // registry から外す
+                    let _ = self.registry.remove_by_ext(&call_id).await;
+                    // 観測: 内線→NGN 発信は転送完了で「Answered」扱い
+                    self.metrics.dec_call_active();
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Answered,
+                        );
+                    }
+                }
+                Ok(super::manager::LegOutcome::Failed { status, .. }) => {
+                    let reason = sip_reason_for(status);
+                    let status_line = format!("SIP/2.0 {} {}", status, reason);
+                    warn!(%target_aor, status, "REFER: transferee 失敗 → NOTIFY 4xx/5xx/6xx");
+                    self.send_refer_notify(
+                        &entry,
+                        &ext_layer,
+                        &status_line,
+                        "terminated;reason=noresource",
+                    )
+                    .await;
+                    // 元 dialog は維持 (transferor は転送失敗を通知され、 元
+                    // 通話を継続できる)。
+                }
+                Ok(super::manager::LegOutcome::Errored { .. }) | Err(_) => {
+                    warn!(%target_aor, "REFER: transferee 送信エラー → NOTIFY 503");
+                    self.send_refer_notify(
+                        &entry,
+                        &ext_layer,
+                        "SIP/2.0 503 Service Unavailable",
+                        "terminated;reason=noresource",
+                    )
+                    .await;
+                }
+            }
+            let _ = remote; // unused unless we extend later
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// 既存 ext_dialog に対して REFER 用 sipfrag NOTIFY を送る (RFC 3515 §2.4.5)。
+    ///
+    /// `Dialog::build_notify_refer_sipfrag` で組み立て、 `TransactionLayer::send_request`
+    /// で transferor へ送信する。 NOTIFY 自体の応答 (200 OK 等) は本実装では
+    /// 待たない (失敗しても通話の本筋に影響しないため warn のみ)。
+    async fn send_refer_notify(
+        &self,
+        entry: &Arc<OutboundCallEntry>,
+        ext_layer: &Arc<TransactionLayer>,
+        sipfrag_status_line: &str,
+        subscription_state: &str,
+    ) {
+        let (notify, dst) = {
+            let dlg = entry.ext_dialog.lock().await;
+            let notify = dlg.build_notify_refer_sipfrag(sipfrag_status_line, subscription_state);
+            let dst = dlg.next_hop_socket(entry.ext_remote);
+            (notify, dst)
+        };
+        // NOTIFY は新規 transaction なので send_request で最終応答まで待てるが、
+        // transferor が NOTIFY 200 OK を返さなくても REFER 全体は進められる
+        // ため fire-and-forget 寄りに扱う (タイムアウト時に warn する)。
+        let layer = ext_layer.clone();
+        let line = sipfrag_status_line.to_string();
+        // 短いタイムアウトで待ち、失敗しても無視 (transferor が居なくても
+        // transferee の通話は確立できるため)。
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(4), layer.send_request(notify, dst))
+                .await
+            {
+                Ok(Ok(resp)) => debug!(
+                    sipfrag = %line,
+                    notify_status = resp.status_code,
+                    "REFER NOTIFY 応答受信"
+                ),
+                Ok(Err(e)) => warn!(error=%e, sipfrag=%line, "REFER NOTIFY 送出失敗"),
+                Err(_) => warn!(sipfrag=%line, "REFER NOTIFY タイムアウト (4s)"),
+            }
+        });
+    }
+
+    /// transferee 確立後に元 dialog (transferor ↔ sabiden + sabiden ↔ NGN) を
+    /// BYE で閉じる (RFC 3261 §15.1.1)。 双方向に BYE を撃ち、 dialog state は
+    /// Terminated に遷移させる。
+    async fn teardown_transferred_dialog(
+        &self,
+        entry: &Arc<OutboundCallEntry>,
+        ext_layer: &Arc<TransactionLayer>,
+    ) {
+        // a) NGN レッグへ BYE (UacDialog::send_bye が CSeq 等を管理)
+        {
+            let mut ngn_dlg = entry.ngn_dialog.lock().await;
+            if let Err(e) = ngn_dlg.send_bye().await {
+                warn!(error=%e, "REFER: NGN レッグ BYE 失敗");
+            }
+        }
+        // b) transferor 内線レッグへ BYE (sabiden が UAC として)
+        let (bye, dst) = {
+            let dlg = entry.ext_dialog.lock().await;
+            let bye = dlg.build_bye();
+            let dst = dlg.next_hop_socket(entry.ext_remote);
+            (bye, dst)
+        };
+        let layer = ext_layer.clone();
+        tokio::spawn(async move {
+            // 内線が BYE 200 OK を返さなくても dialog はもう不要なので
+            // タイムアウトを短くする (transferor 側 UA は 2xx を即返す前提)。
+            match tokio::time::timeout(Duration::from_secs(4), layer.send_request(bye, dst)).await {
+                Ok(Ok(_)) => debug!("REFER: transferor 内線 BYE 完了"),
+                Ok(Err(e)) => warn!(error=%e, "REFER: transferor 内線 BYE 送出失敗"),
+                Err(_) => warn!("REFER: transferor 内線 BYE タイムアウト"),
+            }
+        });
+        // dialog state は Terminated に
+        entry.ext_dialog.lock().await.terminate();
+        // RTP bridge stop
+        if let (Some(bridge_id), Some(mgr)) = (entry.bridge_call_id, self.call_manager.as_ref()) {
+            if let Err(e) = mgr.terminate(bridge_id).await {
+                warn!(error=%e, "REFER: 旧 RTP ブリッジ停止失敗");
+            }
+        }
     }
 
     /// 内線からの **Re-INVITE** (To-tag 付き = mid-dialog) を伝搬する。
@@ -5735,6 +6060,72 @@ fn extract_user_from_sip_uri(uri: &str) -> Option<String> {
         return None;
     }
     Some(user_part.to_string())
+}
+
+/// Issue #289: `Refer-To` ヘッダから transferee の AOR (user 部) を取り出す。
+///
+/// RFC 3515 §2.4.1:
+/// > "The Refer-To header field MUST be present in a REFER request and ...
+/// >  Refer-To field is a SIP URI ..."
+///
+/// 値は `name-addr` 形式 (`"Display" <sip:alice@example.com>`) または
+/// `addr-spec` 形式 (`sip:alice@example.com`) を取りうる。 ヘッダ パラメータ
+/// (`;params`) や URI パラメータは無視する (内線 AOR の lookup には user 部のみ
+/// 必要)。 抽出できなければ None (呼出側で 400 にする)。
+fn extract_refer_to_aor(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let uri_part = if let Some(start) = trimmed.find('<') {
+        let rest = &trimmed[start + 1..];
+        rest.split_once('>').map(|x| x.0).unwrap_or(rest)
+    } else if let Some((uri, _)) = trimmed.split_once(';') {
+        uri
+    } else {
+        trimmed
+    };
+    let after_scheme = uri_part.split_once(':').map(|x| x.1).unwrap_or(uri_part);
+    let (user, _host) = after_scheme.split_once('@')?;
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    }
+}
+
+/// Issue #289: SIP status code → RFC 3261 §21 表の標準 reason phrase に変換する。
+///
+/// REFER の sipfrag NOTIFY (`message/sipfrag` body) では transferee 応答の
+/// status line をそのまま transferor に転送する (RFC 3515 §2.4.5)。 ただし
+/// `LegOutcome::Failed { status, .. }` には status code のみ載っているため、
+/// よく使う code については標準 reason 文字列にマップする (RFC 3261 §21 表)。
+/// 表外の code は generic な `"Failure"` で代替する。
+fn sip_reason_for(status: u16) -> &'static str {
+    match status {
+        100 => "Trying",
+        180 => "Ringing",
+        181 => "Call Is Being Forwarded",
+        182 => "Queued",
+        183 => "Session Progress",
+        200 => "OK",
+        202 => "Accepted",
+        301 => "Moved Permanently",
+        302 => "Moved Temporarily",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        480 => "Temporarily Unavailable",
+        481 => "Call/Transaction Does Not Exist",
+        486 => "Busy Here",
+        487 => "Request Terminated",
+        488 => "Not Acceptable Here",
+        500 => "Server Internal Error",
+        503 => "Service Unavailable",
+        600 => "Busy Everywhere",
+        603 => "Decline",
+        _ => "Failure",
+    }
 }
 
 /// `<sip:user@host>;tag=...` のような name-addr / addr-spec から URI 部分のみ抽出する。
@@ -16635,6 +17026,579 @@ mod tests {
         let composite = CompositePwaDtmfHandler::new(None, None);
         let r = composite.inject_dtmf_to_ngn("cid", '5').await.unwrap();
         assert!(!r);
+    }
+
+    // ===== Issue #289 / RFC 3515 helpers: 純関数のユニット =====
+
+    /// RFC 3515 §2.4.1: Refer-To から transferee の user 部 (AOR) を取り出せる。
+    /// name-addr / addr-spec / display-name 付き / URI parameter 付き / `;params`
+    /// 末尾 を全てカバーする。
+    #[test]
+    fn rfc3515_2_4_1_extract_refer_to_aor_handles_common_forms() {
+        // name-addr
+        assert_eq!(
+            super::extract_refer_to_aor("<sip:alice@example.com>"),
+            Some("alice".to_string())
+        );
+        // name-addr with display-name + URI params
+        assert_eq!(
+            super::extract_refer_to_aor("\"Bob\" <sip:bob@example.com;transport=tcp>"),
+            Some("bob".to_string())
+        );
+        // addr-spec (no <>) with header param
+        assert_eq!(
+            super::extract_refer_to_aor("sip:carol@example.com;tag=ignored"),
+            Some("carol".to_string())
+        );
+        // addr-spec without params
+        assert_eq!(
+            super::extract_refer_to_aor("sip:dave@example.com"),
+            Some("dave".to_string())
+        );
+        // user 部なし (host only) → None
+        assert_eq!(super::extract_refer_to_aor("<sip:example.com>"), None);
+        // 完全 garbage は None
+        assert_eq!(super::extract_refer_to_aor("not-a-uri"), None);
+    }
+
+    /// RFC 3261 §21 / Issue #289: `sip_reason_for` は表に載っている status code
+    /// に対して正しい reason phrase を返し、 表外 code には generic を返す。
+    #[test]
+    fn rfc3261_21_sip_reason_for_returns_canonical_phrases() {
+        assert_eq!(super::sip_reason_for(200), "OK");
+        assert_eq!(super::sip_reason_for(202), "Accepted");
+        assert_eq!(super::sip_reason_for(404), "Not Found");
+        assert_eq!(super::sip_reason_for(486), "Busy Here");
+        assert_eq!(super::sip_reason_for(487), "Request Terminated");
+        assert_eq!(super::sip_reason_for(503), "Service Unavailable");
+        // 表外 code → "Failure"
+        assert_eq!(super::sip_reason_for(799), "Failure");
+    }
+
+    // ===== Issue #289 / RFC 3515: REFER call transfer =====
+
+    /// Issue #289 / RFC 3515 helper: A↔NGN dialog を確立してから REFER 試験を
+    /// 走らせるための共通セットアップ。 fake NGN は INVITE→200 OK→ACK まで処理し、
+    /// その後 transferor 内線 (`phone`) が REFER を送れる状態にする。 戻り値は
+    /// 試験本体で使う各種ハンドルの組。
+    struct ReferHarness {
+        phone: Arc<UdpSocket>,
+        phone_addr: SocketAddr,
+        sabiden_ext_sock: Arc<UdpSocket>,
+        sabiden_ext_addr: SocketAddr,
+        event_tx: mpsc::UnboundedSender<UasEvent>,
+        ngn_task: tokio::task::JoinHandle<bool>,
+        inviter: Arc<ScriptedInviter>,
+        /// dialog の Call-ID (REFER もこの値で送る)
+        call_id: String,
+        ngn_remote_tag: String,
+        /// keep handler alive
+        _handler: Arc<UasEventHandler>,
+    }
+
+    /// `ReferHarness` を構築し、 A↔NGN dialog を 200 OK + ACK まで確立する。
+    /// `transferee_action` は ScriptedInviter に仕込む転送先 B (`sip:B@127.0.0.1:1`)
+    /// の応答スクリプト (None なら binding 自体を登録しない = registrar 不在ケース)。
+    async fn setup_refer_harness(transferee_action: Option<ScriptedAction>) -> ReferHarness {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+            )
+            .with_test_writer()
+            .try_init();
+
+        // fake NGN: INVITE→200 OK→ACK のみ
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let bye_seen = Arc::new(StdMutex::new(false));
+        let bye_seen_c = bye_seen.clone();
+        let fake_ngn_c = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, peer) = fake_ngn_c.recv_from(&mut buf).await.unwrap();
+            let SipMessage::Request(invite) = parse_message(&buf[..n]).unwrap() else {
+                return *bye_seen_c.lock().unwrap();
+            };
+            let mut resp = build_response_skeleton(&invite, 200, "OK");
+            resp.headers.set(
+                "To",
+                format!("{};tag=ngn-tag", invite.headers.get("to").unwrap()),
+            );
+            resp.headers
+                .set("Contact", format!("<sip:ngn@{}>", fake_ngn_addr));
+            fake_ngn_c.send_to(&resp.to_bytes(), peer).await.unwrap();
+            // ACK 受信
+            let _ = fake_ngn_c.recv_from(&mut buf).await;
+            // BYE が来るかどうか観測 (REFER 成功時のみ)
+            if let Ok(Ok((n2, _))) =
+                timeout(Duration::from_secs(4), fake_ngn_c.recv_from(&mut buf)).await
+            {
+                if let Ok(SipMessage::Request(req)) = parse_message(&buf[..n2]) {
+                    if req.method == SipMethod::Bye {
+                        *bye_seen_c.lock().unwrap() = true;
+                        let bye_resp = build_response_skeleton(&req, 200, "OK");
+                        let _ = fake_ngn_c.send_to(&bye_resp.to_bytes(), peer).await;
+                    }
+                }
+            }
+            *bye_seen_c.lock().unwrap()
+        });
+
+        // sabiden NGN UAC
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_inbound_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            crate::sip::uac::UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // sabiden 内線 UAS socket (raw recv for phone's INVITE/REFER)
+        let sabiden_ext_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_ext_addr = sabiden_ext_sock.local_addr().unwrap();
+        // ext_layer は別 socket (sabiden が in-dialog BYE / NOTIFY を送出する側)。
+        // 同じ socket に layer を spawn すると recv loop が phone の REFER を
+        // 横取りしてしまうので分離する。
+        let layer_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ext_layer, _ext_rx) = TransactionLayer::spawn(layer_sock.clone());
+
+        // ScriptedInviter for transferee B
+        let target_uri_b = "sip:bob@127.0.0.1:1".to_string();
+        let builder = ScriptedInviter::builder().default_action(ScriptedAction::busy());
+        let has_action = transferee_action.is_some();
+        let inviter_arc = if let Some(action) = transferee_action {
+            builder.script(target_uri_b.clone(), action).build()
+        } else {
+            // transferee_action なし = registrar に登録しない (404 ケース)
+            builder.build()
+        };
+
+        // ExtensionRegistrar: B を登録 (Some(action) のときのみ)
+        let ext_registrar = ExtensionRegistrar::new();
+        if has_action {
+            ext_registrar
+                .register(
+                    "bob",
+                    target_uri_b.clone(),
+                    "127.0.0.1:1".parse().unwrap(),
+                    Duration::from_secs(60),
+                )
+                .await;
+        }
+
+        let mut handler = UasEventHandler::new(ngn_uac);
+        handler.attach_ext_layer(ext_layer.clone(), Some(sabiden_ext_addr));
+        handler
+            .attach_ext_inviter(inviter_arc.clone(), ext_registrar)
+            .await;
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        handler.clone().spawn(event_rx);
+
+        // フェイク内線 A から INVITE
+        let phone = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_addr = phone.local_addr().unwrap();
+        let call_id = "refer-test-cid".to_string();
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:0312345678@sabiden");
+        invite.headers.set(
+            "Via",
+            format!("SIP/2.0/UDP {};branch=z9hG4bKrefer1", phone_addr),
+        );
+        invite
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=phoneta");
+        invite.headers.set("To", "<sip:0312345678@sabiden>");
+        invite.headers.set("Call-ID", &call_id);
+        invite.headers.set("CSeq", "1 INVITE");
+        invite
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", phone_addr));
+        phone
+            .send_to(&invite.to_bytes(), sabiden_ext_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) = timeout(Duration::from_secs(2), sabiden_ext_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() else {
+            panic!("INVITE 期待");
+        };
+        let stx = ServerTransaction::new(req.clone(), remote, sabiden_ext_sock.clone()).unwrap();
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
+        event_tx
+            .send(UasEvent::Invite {
+                from_aor: "iphone".to_string(),
+                request: req,
+                remote,
+                responder,
+            })
+            .unwrap();
+        // 内線へ 200 OK が届くまで待つ + ACK を返す
+        let mut ngn_remote_tag = String::new();
+        loop {
+            let (n, _) = timeout(Duration::from_secs(3), phone.recv_from(&mut buf))
+                .await
+                .expect("内線へ 200 OK が届かない")
+                .unwrap();
+            if let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() {
+                if r.status_code == 200 {
+                    // To-tag を取り出して REFER の To に乗せる
+                    let to_v = r.headers.get("to").unwrap_or_default().to_string();
+                    if let Some(idx) = to_v.find("tag=") {
+                        ngn_remote_tag = to_v[idx + 4..]
+                            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    // ACK を内線→sabiden に送る (UasEvent::Ack)
+                    let mut ack = SipRequest::new(SipMethod::Ack, "sip:sabiden");
+                    ack.headers.set(
+                        "Via",
+                        format!("SIP/2.0/UDP {};branch=z9hG4bKreferack", phone_addr),
+                    );
+                    ack.headers.set("From", "<sip:iphone@sabiden>;tag=phoneta");
+                    ack.headers.set(
+                        "To",
+                        format!("<sip:0312345678@sabiden>;tag={}", ngn_remote_tag),
+                    );
+                    ack.headers.set("Call-ID", &call_id);
+                    ack.headers.set("CSeq", "1 ACK");
+                    phone
+                        .send_to(&ack.to_bytes(), sabiden_ext_addr)
+                        .await
+                        .unwrap();
+                    // 自前ループで sabiden_ext_sock の ACK を吸い取って UasEvent::Ack に
+                    // 流す (UasEvent::Refer の recv_from が ACK を先取りしないよう順序確定)。
+                    let (n2, remote2) =
+                        timeout(Duration::from_secs(2), sabiden_ext_sock.recv_from(&mut buf))
+                            .await
+                            .expect("ACK を 受信できない")
+                            .unwrap();
+                    let SipMessage::Request(ack_req) = parse_message(&buf[..n2]).unwrap() else {
+                        panic!("ACK 期待");
+                    };
+                    assert_eq!(ack_req.method, SipMethod::Ack);
+                    event_tx
+                        .send(UasEvent::Ack {
+                            request: ack_req,
+                            remote: remote2,
+                        })
+                        .unwrap();
+                    // registry insert (NGN 200 OK 後) と handle_invite 完了の race を
+                    // 確実に解消するため少しだけ wait。
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    break;
+                }
+            }
+        }
+        ReferHarness {
+            phone,
+            phone_addr,
+            sabiden_ext_sock,
+            sabiden_ext_addr,
+            event_tx,
+            ngn_task,
+            inviter: inviter_arc,
+            call_id,
+            ngn_remote_tag,
+            _handler: handler,
+        }
+    }
+
+    /// REFER ヘルパ: A から REFER を送って `UasEvent::Refer` を発火させる。
+    async fn send_refer_to_sabiden(harness: &ReferHarness, refer_to: &str) {
+        let mut refer = SipRequest::new(SipMethod::Refer, "sip:sabiden");
+        refer.headers.set(
+            "Via",
+            format!(
+                "SIP/2.0/UDP {};branch=z9hG4bKrefer-{}",
+                harness.phone_addr,
+                rand::random::<u32>()
+            ),
+        );
+        refer
+            .headers
+            .set("From", "<sip:iphone@sabiden>;tag=phoneta");
+        refer.headers.set(
+            "To",
+            format!("<sip:0312345678@sabiden>;tag={}", harness.ngn_remote_tag),
+        );
+        refer.headers.set("Call-ID", &harness.call_id);
+        refer.headers.set("CSeq", "2 REFER");
+        refer.headers.set("Refer-To", refer_to);
+        refer
+            .headers
+            .set("Contact", format!("<sip:iphone@{}>", harness.phone_addr));
+        harness
+            .phone
+            .send_to(&refer.to_bytes(), harness.sabiden_ext_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            harness.sabiden_ext_sock.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let SipMessage::Request(req) = parse_message(&buf[..n]).unwrap() else {
+            panic!("REFER 期待");
+        };
+        let stx =
+            ServerTransaction::new(req.clone(), remote, harness.sabiden_ext_sock.clone()).unwrap();
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
+        harness
+            .event_tx
+            .send(UasEvent::Refer {
+                request: req,
+                remote,
+                responder,
+            })
+            .unwrap();
+    }
+
+    /// RFC 3515 §2.4.6 / RFC 3265 §3.1.2 / Issue #289 success path:
+    /// transferor が REFER → 202 Accepted + NOTIFY 100 Trying + NOTIFY 200 OK が
+    /// 内線 A に届き、 NGN レッグへ BYE が伝搬される (元 dialog の終結)。
+    #[tokio::test]
+    async fn rfc3515_2_4_6_refer_success_emits_202_notify_chain_and_bye_to_ngn() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let harness = setup_refer_harness(Some(ScriptedAction::ok())).await;
+        send_refer_to_sabiden(&harness, "<sip:bob@127.0.0.1:1>").await;
+
+        // A は 202 Accepted を受け取る
+        let mut buf = vec![0u8; 4096];
+        let mut got_202 = false;
+        let mut got_notify_100 = false;
+        let mut got_notify_200 = false;
+        // NOTIFY も A 宛に来る (sabiden が transferor dialog 経由で送る)
+        for _ in 0..16 {
+            match timeout(Duration::from_secs(3), harness.phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, peer))) => {
+                    match parse_message(&buf[..n]).unwrap() {
+                        SipMessage::Response(r) => {
+                            // 202 Accepted (CSeq REFER)
+                            if r.status_code == 202
+                                && r.headers
+                                    .get("cseq")
+                                    .map(|v| v.contains("REFER"))
+                                    .unwrap_or(false)
+                            {
+                                got_202 = true;
+                            }
+                        }
+                        SipMessage::Request(req) => {
+                            if req.method == SipMethod::Notify {
+                                // 200 OK を返す (transferor 側として)
+                                let resp = build_response_skeleton(&req, 200, "OK");
+                                let _ = harness.phone.send_to(&resp.to_bytes(), peer).await;
+                                let body = String::from_utf8_lossy(&req.body);
+                                // sipfrag body のステータス行を確認
+                                if body.starts_with("SIP/2.0 100") {
+                                    got_notify_100 = true;
+                                } else if body.starts_with("SIP/2.0 200") {
+                                    got_notify_200 = true;
+                                }
+                                // Event: refer ヘッダ必須 (RFC 3515 §2.4.5)
+                                assert_eq!(
+                                    req.headers
+                                        .get("event")
+                                        .map(str::to_string)
+                                        .unwrap_or_default(),
+                                    "refer",
+                                    "RFC 3515 §2.4.5: NOTIFY must carry `Event: refer`"
+                                );
+                                // Content-Type: message/sipfrag (RFC 3420 §2.1)
+                                assert!(
+                                    req.headers
+                                        .get("content-type")
+                                        .map(|v| v.contains("message/sipfrag"))
+                                        .unwrap_or(false),
+                                    "RFC 3420 §2.1: NOTIFY must carry `message/sipfrag` body"
+                                );
+                                // Subscription-State must be present (RFC 3265 §3.2.4)
+                                assert!(
+                                    req.headers.get("subscription-state").is_some(),
+                                    "RFC 3265 §3.2.4: NOTIFY must carry Subscription-State"
+                                );
+                            }
+                        }
+                    }
+                    if got_202 && got_notify_100 && got_notify_200 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_202, "RFC 3515 §2.4.6: REFER に 202 Accepted を返すべき");
+        assert!(
+            got_notify_100,
+            "RFC 3515 §2.4.5: 進捗 NOTIFY (sipfrag 100 Trying) が必要"
+        );
+        assert!(
+            got_notify_200,
+            "RFC 3515 §2.4.5: 成功 NOTIFY (sipfrag 200 OK) が必要"
+        );
+
+        // transferee へ INVITE が送られた
+        assert!(
+            harness.inviter.call_count() >= 1,
+            "RFC 3515 §2.4.6: B2BUA は transferee へ INVITE を発行すべき"
+        );
+        let seen = harness.inviter.seen_targets();
+        assert!(
+            seen.iter().any(|t| t.contains("bob@127.0.0.1:1")),
+            "transferee target が `bob` を含むべき (got {:?})",
+            seen
+        );
+
+        // NGN レッグへ BYE が伝搬される (RFC 3261 §15.1.1)
+        let ngn_bye_seen = harness
+            .ngn_task
+            .await
+            .expect("fake NGN task panicked or aborted");
+        assert!(
+            ngn_bye_seen,
+            "RFC 3261 §15.1.1: transferee 確立後は元 dialog (NGN レッグ) を BYE で閉じるべき"
+        );
+    }
+
+    /// RFC 3515 §2.4.6 / Issue #289: Refer-To 内線が registrar に居ない (binding
+    /// 不在) ケース。 sabiden は 202 を返した後、 NOTIFY sipfrag 404 Not Found で
+    /// 失敗を通知し、 元 dialog は維持する (= NGN レッグへ BYE は撃たない)。
+    #[tokio::test]
+    async fn rfc3515_2_4_6_refer_unknown_extension_emits_notify_404() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // transferee_action なし = registrar に binding 入れない
+        let harness = setup_refer_harness(None).await;
+        send_refer_to_sabiden(&harness, "<sip:bob@127.0.0.1:1>").await;
+
+        let mut buf = vec![0u8; 4096];
+        let mut got_202 = false;
+        let mut got_notify_404 = false;
+        for _ in 0..12 {
+            match timeout(Duration::from_secs(3), harness.phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, peer))) => {
+                    match parse_message(&buf[..n]).unwrap() {
+                        SipMessage::Response(r) => {
+                            if r.status_code == 202 {
+                                got_202 = true;
+                            }
+                        }
+                        SipMessage::Request(req) => {
+                            if req.method == SipMethod::Notify {
+                                let resp = build_response_skeleton(&req, 200, "OK");
+                                let _ = harness.phone.send_to(&resp.to_bytes(), peer).await;
+                                let body = String::from_utf8_lossy(&req.body);
+                                if body.starts_with("SIP/2.0 404") {
+                                    got_notify_404 = true;
+                                    // Subscription-State: terminated を確認
+                                    let ss = req
+                                        .headers
+                                        .get("subscription-state")
+                                        .map(str::to_string)
+                                        .unwrap_or_default();
+                                    assert!(
+                                        ss.contains("terminated"),
+                                        "RFC 3265 §3.2.4: 最終 NOTIFY は Subscription-State terminated"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if got_202 && got_notify_404 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_202, "RFC 3515 §2.4.6: REFER には 202 を返すべき");
+        assert!(
+            got_notify_404,
+            "RFC 3515 §2.4.5: 不在内線への REFER は NOTIFY sipfrag 404 Not Found を返すべき"
+        );
+        // transferee inviter は呼ばれない (registrar lookup 失敗で early return)
+        assert_eq!(
+            harness.inviter.call_count(),
+            0,
+            "binding lookup 失敗時は ext_inviter.invite は呼ばれない"
+        );
+        harness.ngn_task.abort();
+    }
+
+    /// RFC 3515 §2.4.6 / Issue #289: Refer-To 内線が busy (486) を返すケース。
+    /// sabiden は 202 を返した後、 NOTIFY sipfrag 486 Busy Here を transferor へ
+    /// 送り、 元 dialog は維持する (= NGN BYE しない)。
+    #[tokio::test]
+    async fn rfc3515_2_4_6_refer_busy_transferee_emits_notify_486() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let harness = setup_refer_harness(Some(ScriptedAction::busy())).await;
+        send_refer_to_sabiden(&harness, "<sip:bob@127.0.0.1:1>").await;
+
+        let mut buf = vec![0u8; 4096];
+        let mut got_202 = false;
+        let mut got_notify_486 = false;
+        for _ in 0..12 {
+            match timeout(Duration::from_secs(3), harness.phone.recv_from(&mut buf)).await {
+                Ok(Ok((n, peer))) => {
+                    match parse_message(&buf[..n]).unwrap() {
+                        SipMessage::Response(r) => {
+                            if r.status_code == 202 {
+                                got_202 = true;
+                            }
+                        }
+                        SipMessage::Request(req) => {
+                            if req.method == SipMethod::Notify {
+                                let resp = build_response_skeleton(&req, 200, "OK");
+                                let _ = harness.phone.send_to(&resp.to_bytes(), peer).await;
+                                let body = String::from_utf8_lossy(&req.body);
+                                if body.starts_with("SIP/2.0 486") {
+                                    got_notify_486 = true;
+                                }
+                            }
+                        }
+                    }
+                    if got_202 && got_notify_486 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_202, "RFC 3515 §2.4.6: REFER には 202 を返すべき");
+        assert!(
+            got_notify_486,
+            "RFC 3515 §2.4.5: 転送先 busy 時は NOTIFY sipfrag 486 を返すべき"
+        );
+        // transferee inviter は呼ばれている
+        assert_eq!(
+            harness.inviter.call_count(),
+            1,
+            "RFC 3515 §2.4.6: ext_inviter.invite は 1 回呼ばれるべき"
+        );
+        harness.ngn_task.abort();
     }
 
     /// RFC 3550 §11 / Issue #260 Phase 1-D: `bind_ngn_rtp_socket` は必ず

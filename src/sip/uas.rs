@@ -127,6 +127,30 @@ pub enum UasEvent {
         /// 抹消された AOR (内線ユーザ名)。
         aor: String,
     },
+    /// 内線からの **REFER** (call transfer 要求、 RFC 3515)。
+    ///
+    /// RFC 3515 §2.4.6: REFER は転送 (call transfer) を要求するメソッド。
+    /// transferor (= REFER を送ってきた内線 A) が確立済み dialog 内で送信し、
+    /// `Refer-To` ヘッダに転送先 (内線 B) の SIP URI を載せる。 RFC 3515 §2.4.4:
+    /// > "Upon receipt of a REFER request, an implicit subscription is created
+    /// >  to the 'refer' event package."
+    ///
+    /// 上位 (B2BUA) は本イベントを受けたら:
+    /// 1. **202 Accepted** を返す (RFC 3515 §2.4.6)
+    /// 2. implicit subscription を開始し、 `Event: refer` + sipfrag NOTIFY を
+    ///    transferor へ送出 (RFC 3265 §3.1.2 + RFC 3515 §2.4.5)
+    /// 3. Refer-To 内線へ新 INVITE を発信 (B2BUA 経路)
+    /// 4. 新 INVITE の最終応答に応じて sipfrag NOTIFY (`SIP/2.0 200 OK` 等) を
+    ///    transferor へ送出 + Subscription-State: terminated で subscription 終了
+    /// 5. 新 INVITE が 2xx で確立した場合、 元 dialog (transferor ↔ NGN) を
+    ///    BYE で終了 (RFC 3261 §15.1.1)
+    ///
+    /// NGN 側からの REFER (carrier 由来) は本実装の scope 外 (Issue #289)。
+    Refer {
+        request: SipRequest,
+        remote: SocketAddr,
+        responder: ResponderHandle,
+    },
 }
 
 /// 1 リクエストに対応するサーバ トランザクションの操作ハンドル。
@@ -245,12 +269,18 @@ impl ResponderHandle {
 /// 405 / 481 / 489 等の拒否応答 (および MESSAGE の 200 OK 受け流し) に
 /// 必ず添える `Allow` ヘッダ値。 §20.5 「a list of methods that the UA
 /// implementing this header supports」に合わせ、 拒否 default を返すだけの
-/// method (NOTIFY / SUBSCRIBE / PUBLISH / UPDATE / PRACK / REFER / MESSAGE)
+/// method (NOTIFY / SUBSCRIBE / PUBLISH / UPDATE / PRACK / MESSAGE)
 /// は意図的に列挙から除外する。
 ///
-/// NGN inbound 側 (`src/call/orchestrator.rs::SUPPORTED_METHODS_ALLOW`) と
-/// 同じ集合だが、 モジュール独立のため別定義で持つ (Issue #273)。
-const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
+/// Issue #289 で REFER (RFC 3515 §2.4.6) を実装したため、 内線 UAS の
+/// `Allow` に REFER も追加する。 これにより内線 UA は capability ネゴ後に
+/// REFER による call transfer を発行できる。
+///
+/// NGN inbound 側 (`src/call/orchestrator.rs::SUPPORTED_METHODS_ALLOW`) は
+/// carrier から sabiden への REFER を実装しない (Issue #289 scope 外) ため
+/// REFER を含めない。 内線/NGN で対応 method が違うので別定義で持つ
+/// (Issue #273)。
+const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, REFER";
 
 /// 設定済みの内線アカウント表 (username → password)。
 type AuthDb = HashMap<String, String>;
@@ -541,17 +571,34 @@ impl ExtensionUas {
                         .quick_with_allow(200, "OK", SUPPORTED_METHODS_ALLOW)
                         .await;
                 }
-                // RFC 3515 §2.4.6 / RFC 3261 §8.2.1: REFER は転送 (call
-                // transfer) を要求する。 sabiden は B2BUA で REFER 受信処理
-                // (REFER 受領 + implicit subscription + refer event NOTIFY +
-                // 新 INVITE) を実装していないため、 明示的に **405 Method Not
-                // Allowed** + `Allow` ヘッダで拒否する。 RFC 3515 §4.5 は
-                // 「REFER 未対応 UAS は 405 を返す」と規定。
+                // RFC 3515 §2.4.6 / RFC 3265 §3.1.2: REFER は転送 (call
+                // transfer) を要求する。 dialog 内 REFER 受信時、 上位 (B2BUA)
+                // が 202 + implicit subscription + sipfrag NOTIFY + 新 INVITE
+                // (Refer-To 内線へ) + 元 dialog BYE のフローを駆動する
+                // (Issue #289)。 ここでは UAS は dialog state を持たないので、
+                // request をそのまま `UasEvent::Refer` で上位に流す。
+                //
+                // 旧実装は 405 + Allow で拒否していたが (PR #274 / Issue #273)、
+                // SOHO 用途で頻出する「外線通話中に内線 B につなぐ」 を実装する
+                // ため 202 経路に置換した。 上位未接続のときだけ 405 で退行する
+                // (call transfer は B2BUA 必須機能)。
                 SipMethod::Refer => {
-                    warn!("内線側 REFER: 転送未対応 → 405 + Allow (RFC 3515 §4.5)");
-                    let _ = responder
-                        .quick_with_allow(405, "Method Not Allowed", SUPPORTED_METHODS_ALLOW)
-                        .await;
+                    debug!("内線側 REFER → 上位 (B2BUA) へ転送");
+                    if let Some(tx) = &self.event_tx {
+                        let event = UasEvent::Refer {
+                            request,
+                            remote,
+                            responder,
+                        };
+                        if tx.send(event).is_err() {
+                            warn!("Call Manager 受信側が閉じている → REFER は dropped");
+                        }
+                    } else {
+                        warn!("内線側 REFER: Call Manager 未接続 → 405 (RFC 3515 §4.5 fallback)");
+                        let _ = responder
+                            .quick_with_allow(405, "Method Not Allowed", SUPPORTED_METHODS_ALLOW)
+                            .await;
+                    }
                 }
                 // RFC 3261 §8.2.1: 未知メソッド (`SipMethod::Other`) には
                 // **必ず** `Allow` ヘッダ付きの 405 で応答する義務がある。
@@ -1798,11 +1845,13 @@ mod tests {
         assert_ext_method_response(SipMethod::Publish, 200, true).await;
     }
 
-    /// RFC 3515 §4.5 / RFC 3261 §8.2.1: REFER は転送 (call transfer) 要求。
-    /// sabiden は B2BUA で REFER 受信処理を実装していないため、 明示的に
-    /// `405 Method Not Allowed` + `Allow` ヘッダで拒否する。
+    /// RFC 3515 §4.5 / Issue #289 fallback: REFER は B2BUA 経路 (Issue #289)
+    /// で 202 + NOTIFY を駆動するが、 **上位 (Call Manager) が未接続** の場合は
+    /// `405 Method Not Allowed` + `Allow` ヘッダで縮退する (RFC 3515 §4.5)。
+    /// 本テストは `assert_ext_method_response` が `with_handler` を呼ばないため
+    /// 上位未接続経路を踏み、 405 fallback が機能していることを確認する。
     #[tokio::test]
-    async fn rfc3515_4_5_uas_returns_405_for_refer() {
+    async fn rfc3515_4_5_uas_returns_405_for_refer_without_b2bua_handler() {
         assert_ext_method_response(SipMethod::Refer, 405, true).await;
     }
 

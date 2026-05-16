@@ -345,7 +345,7 @@ fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local
 mod tests {
     use super::*;
     use crate::sip::registrar::{Binding, ExtTransport};
-    use chrono::{TimeZone, Timelike};
+    use chrono::Timelike;
     use std::time::{Duration, Instant};
 
     fn mock_bindings(aors: &[&str]) -> Vec<(String, Binding)> {

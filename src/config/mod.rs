@@ -1056,11 +1056,7 @@ fork = []
         assert_eq!(cfg.routing.rule[0].name, "vip_customer");
         assert_eq!(cfg.routing.rule[0].priority, 200);
         assert_eq!(
-            cfg.routing.rule[0]
-                .match_
-                .from_number
-                .as_ref()
-                .map(|v| v.as_slice()),
+            cfg.routing.rule[0].match_.from_number.as_deref(),
             Some(&["0312345678".to_string()][..])
         );
         assert!(cfg.routing.rule[0].match_.weekday.is_none());

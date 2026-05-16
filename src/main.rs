@@ -435,7 +435,7 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // Issue #295: 着信ルーティングルール。 `[[routing.rule]]` (時間帯 /
             // 曜日 / 発信者番号で fork 振分) を NGN inbound handler に渡す。
             // 空 (= 既定) なら従来挙動 (registrar 全 binding に fork) を維持。
-            routing_rules: config.routing.clone().into_rules(),
+            routing_rules: full_config.routing.clone().into_rules(),
         };
         // 着信 NGN→内線 用 CallManager は **outbound 側と同じ Arc**
         // (`shared_call_manager`) を再利用する (Issue #147 review #2 🔴 fix)。

@@ -51,6 +51,8 @@
 //!   ではなく 0 秒幅扱い (= match しない、 退化形)。
 
 use chrono::{DateTime, Datelike, Local, NaiveTime, Weekday};
+#[cfg(test)]
+use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 
 use crate::sip::registrar::Binding;
@@ -119,9 +121,16 @@ pub struct MatchSpec {
     /// 発信者番号 (受信 INVITE From URI の user 部) がここに含まれていれば
     /// match。 省略時は全番号マッチ。
     ///
-    /// NGN inbound は carrier IMS が PAI を剥がし `anonymous` 化するケース
-    /// あり (memory `project_ngn_inbound_caller_id_stripped`)。 rule 側で
-    /// `"anonymous"` を明示列挙すれば非通知 ⇒ 特定 fork を表現可能。
+    /// # 特殊値
+    ///
+    /// - `"anonymous"`: NGN inbound で carrier IMS が PAI を剥がし
+    ///   `anonymous@anonymous.invalid` を載せた **明示的非通知** (memory
+    ///   `project_ngn_inbound_caller_id_stripped`)。 rule 側で `"anonymous"`
+    ///   を明示列挙すれば非通知 ⇒ 特定 fork を表現可能。
+    /// - `"unknown"`: sabiden が From URI から user 部を抽出できなかった
+    ///   **フォールバック** (orchestrator の `extract_user_from_sip_uri` が
+    ///   `None` を返した場合)。 通常 NGN inbound では発生しないが、 防御的に
+    ///   `"unknown"` で評価される。 `"anonymous"` (carrier 由来) と別物。
     #[serde(default)]
     pub from_number: Option<Vec<String>>,
 }
@@ -336,6 +345,7 @@ fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local
 mod tests {
     use super::*;
     use crate::sip::registrar::{Binding, ExtTransport};
+    use chrono::{TimeZone, Timelike};
     use std::time::{Duration, Instant};
 
     fn mock_bindings(aors: &[&str]) -> Vec<(String, Binding)> {

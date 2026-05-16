@@ -1632,6 +1632,11 @@ impl NgnInboundHandler {
                 .map(extract_uri_from_addr)
                 .and_then(|uri| extract_user_from_sip_uri(&uri))
                 .unwrap_or_else(|| "unknown".to_string());
+            // routing_rule_voicemail_direct: rule match で fork=[] = 意図的な
+            // voicemail 直行 (`after_hours rule` 等)。 後段の bindings.is_empty()
+            // ログを「登録内線なし (異常)」 と「rule による voicemail 直行 (正常)」
+            // で区別するためのフラグ。
+            let mut routing_rule_voicemail_direct: Option<String> = None;
             let bindings = match self.cfg.routing_rules.evaluate(
                 chrono::Local::now(),
                 &from_number,
@@ -1647,12 +1652,22 @@ impl NgnInboundHandler {
                         targets = filtered.len(),
                         "Issue #295: routing rule matched"
                     );
+                    if filtered.is_empty() {
+                        routing_rule_voicemail_direct = Some(rule_name);
+                    }
                     filtered
                 }
                 super::routing::RoutingDecision::NoRule => all_bindings,
             };
             if bindings.is_empty() {
-                warn!("登録内線なし → 480 Temporarily Unavailable");
+                if let Some(rule_name) = &routing_rule_voicemail_direct {
+                    info!(
+                        rule = %rule_name,
+                        "Issue #295: routing rule fork=[] → voicemail direct"
+                    );
+                } else {
+                    warn!("登録内線なし → 480 Temporarily Unavailable");
+                }
                 // Issue #288: voicemail 有効なら内線不在 = 録音直行 (内線フォーク
                 // を起動するまでもなく確実に「不在」)。 起動成功時は呼を確立した
                 // とみなして call_active を +1 し、 BYE 受信で finalize する。

@@ -339,6 +339,61 @@ NGN 側から sabiden への REFER (carrier 由来) は本実装の scope 外 (I
 
 ## 通話フロー
 
+### 着信ルーティング rules (Issue #295、 `src/call/routing.rs`)
+
+NGN inbound INVITE のフォーク先を `[[routing.rule]]` で時間帯 / 曜日 / 発信者番号により絞る。
+
+#### 評価モデル
+
+- `RoutingRules.evaluate(now, from_number, all_bindings) -> RoutingDecision`
+- 全 rule を `priority` **降順** (同値は宣言順、 安定ソート) で評価
+- match 条件 (weekday / time_range / from_number) は全部 **AND**、 省略項目は無条件 match
+- `time_range` は半開区間 `[start, end)`、 終端 < 始端なら midnight wrap (`22:00-06:00` = `22:00..24:00 ∪ 00:00..06:00`)
+- 最初に match した rule の `fork = [aor, ...]` で binding を filter
+
+#### 戻り値
+
+| RoutingDecision | 意味 | orchestrator の挙動 |
+|---|---|---|
+| `Matched { rule_name, bindings: Vec<(aor, Binding)> }` (非空) | rule match、 fork 対象あり | bindings に対して fork (= 既存 fork_to_bindings) |
+| `Matched { ... bindings: [] }` | rule match、 fork なし (= `after_hours rule { fork = [] }` の意図的 voicemail 直行) | **voicemail 起動 (= fork-all-fail 経路と合流)、 voicemail 無効なら 480** |
+| `NoRule` | 全 rule no-match (空 rule リスト含む) | 後方互換: `registrar.snapshot()` 全 fork (従来挙動) |
+
+#### TOML スキーマ例 (`config.example.toml` 参照)
+
+```toml
+# priority 高い順に評価。 最初に match した rule の fork を採用
+[[routing.rule]]
+name = "vip_customer"
+priority = 200
+match.from_number = ["0312345678"]
+fork = ["boss-mobile"]
+
+[[routing.rule]]
+name = "office_hours"
+priority = 100
+match.weekday = ["mon", "tue", "wed", "thu", "fri"]
+match.time_range = "09:00-18:00"
+fork = ["iphone", "office-phone"]
+
+[[routing.rule]]
+name = "after_hours"
+priority = 0
+# 条件なし = 常に match (= 上位 rule が no-match なら必ずここに落ちる)
+fork = []  # voicemail 直行 (もしくは voicemail 無効なら 480)
+```
+
+#### NGN 制約との整合
+
+- `from_number` 抽出失敗時は `"unknown"` 固定 (rule 側で `from_number = ["unknown"]` で捕捉可能)
+- 非通知発信 (carrier IMS が PAI/PPI を strip して `anonymous@anonymous.invalid` を載せるケース、 memory `project_ngn_inbound_caller_id_stripped`) は `from_number = "anonymous"` で評価される
+- `"anonymous"` と `"unknown"` は別物 (前者は明示的非通知、 後者は抽出失敗)
+
+#### RFC
+
+- RFC 3261 §16.4 (Determining Targets): 「target を絞る方針」 は administrative policy として §16.4-5 / §16.7 で proxy / B2BUA に許容される
+- RFC 3261 §20.20 (From): user 部のみ比較、 case-sensitive
+
 ### 着信 (NGN → スマホ)
 
 ```

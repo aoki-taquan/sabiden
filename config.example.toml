@@ -85,3 +85,34 @@ max_expires = 3600
 # [bridge]
 # ngn_bind_ip = "118.177.72.242"
 # ext_bind_ip = "192.168.20.239"
+
+# ----------------------------------------------------------------------
+# 着信ルーティング rules (Issue #295)
+# NGN inbound INVITE のフォーク先を時間帯 / 曜日 / 発信者番号で絞る。
+# - priority 降順で評価、 最初に match した rule の `fork` を採用
+# - 全 rule no-match (or rule リスト空) なら全内線 fork (従来挙動)
+# - rule match で fork=[] (空配列) は voicemail 直行
+# - match 条件 (weekday / time_range / from_number) は全部 AND、 省略項目は無条件 match
+# - time_range は HH:MM-HH:MM、 終端 < 始端なら midnight wrap (例: 22:00-06:00)
+# - from_number 値の特殊:
+#   - "anonymous": NGN inbound で carrier IMS が PAI/PPI strip した非通知 (memory `project_ngn_inbound_caller_id_stripped`)
+#   - "unknown":   sabiden が From URI 抽出に失敗した場合の fallback (= 通常起きない、 防御的)
+#
+# [[routing.rule]]
+# name = "vip_customer"
+# priority = 200
+# match.from_number = ["0312345678"]
+# fork = ["boss-mobile"]
+#
+# [[routing.rule]]
+# name = "office_hours"
+# priority = 100
+# match.weekday = ["mon", "tue", "wed", "thu", "fri"]
+# match.time_range = "09:00-18:00"
+# fork = ["iphone", "office-phone"]
+#
+# [[routing.rule]]
+# name = "after_hours"
+# priority = 0
+# # 条件なし = 常に match (= 上位 rule が no-match なら必ずここに落ちる)
+# fork = []  # voicemail 直行 (voicemail 無効なら 480)

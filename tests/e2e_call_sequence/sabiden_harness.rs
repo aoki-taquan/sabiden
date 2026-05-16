@@ -83,6 +83,8 @@ impl SabidenHarness {
             webrtc_active_sweep_interval: Duration::from_secs(30),
             // Issue #288: harness は留守録未使用なので None で旧挙動 (失敗 status)。
             voicemail_recorder: None,
+            // Issue #295: harness は routing rules 未使用、 default (空) で従来挙動。
+            routing_rules: sabiden::call::routing::RoutingRules::default(),
         };
 
         // (5) `wire_ngn_inbound` で NgnInboundHandler を spawn する。

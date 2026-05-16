@@ -2298,7 +2298,11 @@ mod tests {
             extensions.clone(),
             Duration::from_secs(60),
         );
-        let health = HealthState::new(Arc::new(AtomicBool::new(false)), Metrics::new());
+        let health = HealthState::new(
+            Arc::new(AtomicBool::new(false)),
+            Metrics::new(),
+            Arc::new(crate::observability::call_log::CallLog::new(16)),
+        );
 
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let actual = probe.local_addr().unwrap();
@@ -2351,7 +2355,11 @@ mod tests {
         let verifier = Arc::new(Verifier::new(b"k".to_vec()));
         let signaling =
             SignalingState::new(verifier, ExtensionRegistrar::new(), Duration::from_secs(60));
-        let health = HealthState::new(Arc::new(AtomicBool::new(false)), Metrics::new());
+        let health = HealthState::new(
+            Arc::new(AtomicBool::new(false)),
+            Metrics::new(),
+            Arc::new(crate::observability::call_log::CallLog::new(16)),
+        );
 
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let actual = probe.local_addr().unwrap();

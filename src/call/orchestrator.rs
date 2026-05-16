@@ -870,6 +870,13 @@ pub struct NgnInboundHandler {
     outbound_forwarder: Mutex<Option<Arc<dyn OutboundDialogForwarder>>>,
     /// 観測カウンタ。Issue #20。
     metrics: Arc<Metrics>,
+    /// Issue #278: 通話履歴 ring buffer。 NGN 着信 / NGN→PWA / NGN→内線 の
+    /// 確立・終了を 1 件ずつ記録する。 未注入 (= 旧 fixture / テスト経路) では
+    /// `None` で、 hook は no-op となる (record_*)。 `set_call_log` で注入する
+    /// タイミングが `Arc::clone().spawn()` 後 (= shared) の場合があるため、
+    /// `outbound_forwarder` と同じく `Mutex<Option<_>>` で interior mutability
+    /// にする。 hot path には乗らない (1 通話 = 数回の lock 取得)。
+    call_log: Mutex<Option<Arc<crate::observability::call_log::CallLog>>>,
 }
 
 impl NgnInboundHandler {
@@ -905,6 +912,7 @@ impl NgnInboundHandler {
             call_manager: None,
             outbound_forwarder: Mutex::new(None),
             metrics,
+            call_log: Mutex::new(None),
         })
     }
 
@@ -950,6 +958,7 @@ impl NgnInboundHandler {
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
+            call_log: Mutex::new(None),
         })
     }
 
@@ -980,6 +989,7 @@ impl NgnInboundHandler {
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
+            call_log: Mutex::new(None),
         })
     }
 
@@ -1013,6 +1023,7 @@ impl NgnInboundHandler {
             call_manager: Some(call_manager),
             outbound_forwarder: Mutex::new(None),
             metrics,
+            call_log: Mutex::new(None),
         })
     }
 
@@ -1020,6 +1031,26 @@ impl NgnInboundHandler {
     /// テーブルを共有したい外部ハンドラに渡すための accessor (Issue #147)。
     pub fn webrtc_outbound_active(&self) -> WebRtcOutboundActive {
         self.webrtc_outbound_active.clone()
+    }
+
+    /// Issue #278: 通話履歴 ring buffer を注入する (setter)。
+    ///
+    /// `outbound_forwarder` と同じく `Mutex<Option<_>>` ベースなので spawn 後
+    /// (= 既に shared) に呼んでも安全。 未注入時 (`None`) は hook 全て no-op
+    /// となり、 旧挙動と同一。 NGN 着信 (内線フォーク 確立 / PWA 確立) と関連
+    /// BYE がここに集約される。
+    pub async fn set_call_log(
+        self: &Arc<Self>,
+        call_log: Arc<crate::observability::call_log::CallLog>,
+    ) {
+        let mut slot = self.call_log.lock().await;
+        *slot = Some(call_log);
+    }
+
+    /// 通話履歴の Arc clone (注入済みの場合)。 hot path から `record_*` を
+    /// 呼ぶときの helper として使う。 未注入なら `None` で hook 全体を skip する。
+    async fn call_log_clone(&self) -> Option<Arc<crate::observability::call_log::CallLog>> {
+        self.call_log.lock().await.clone()
     }
 
     /// `webrtc_active` (NGN→PWA 着信通話の double BYE 連動テーブル) の Arc を
@@ -1373,6 +1404,26 @@ impl NgnInboundHandler {
                 tx.respond(trying).await?;
             }
 
+            // Issue #278: 通話履歴に「NGN 着信」 を 1 件記録する。 `From` から
+            // 発信者番号 (= user 部) を抽出し、 抽出できない場合は URI 全体を
+            // fallback として残す。 NGN inbound では carrier IMS が PAI/PPI を
+            // 剥がして anonymous@anonymous.invalid を載せてくる現象が観測されて
+            // いる (memory: `project_ngn_inbound_caller_id_stripped`)、 履歴上は
+            // そのまま残し UI 側で「非通知」 表示する。
+            if let Some(call_log) = self.call_log_clone().await {
+                let remote_number = request
+                    .headers
+                    .get("from")
+                    .map(extract_uri_from_addr)
+                    .map(|uri| extract_user_from_sip_uri(&uri).unwrap_or(uri))
+                    .unwrap_or_else(|| "unknown".to_string());
+                call_log.record_start(
+                    crate::observability::call_log::Direction::Inbound,
+                    remote_number,
+                    call_id.clone(),
+                );
+            }
+
             // RFC 3261 §8.2.2.3 (Issue #251 Phase A): 受信 INVITE の `Require`
             // ヘッダに sabiden が understand しない option-tag があれば、
             // **420 Bad Extension + `Unsupported: <unknown-tags>` で reject MUST**。
@@ -1404,6 +1455,17 @@ impl NgnInboundHandler {
                     drop(tx);
                     self.pending.lock().await.remove(&call_id);
                     self.metrics.record_invite_ngn(InviteResult::Error);
+                    // Issue #278 (PR #286 review #2): record_start (line ~1408) は
+                    // 全 reject 経路の前で発火しているため、 reject paths でも
+                    // record_end を呼ばないと orphan entry が ring buffer に残る。
+                    // RFC 3261 §21.4.16: 420 Bad Extension は「未対応 option-tag」
+                    // による拒否で status code を保持して履歴に残す。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed { status: 420 },
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -1456,6 +1518,16 @@ impl NgnInboundHandler {
                         tx.respond(resp).await?;
                         drop(tx);
                         self.pending.lock().await.remove(&call_id);
+                        // Issue #278 (PR #286 review #2): RFC 3261 §21.4.18 / RFC 4028 §10
+                        // 422 Session Interval Too Small は Session-Timer 折衝失敗による
+                        // 拒否 (carrier UAC は Min-SE 整合値で再 INVITE する)、 history
+                        // 上は Failed{422} として保持する。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Failed { status: 422 },
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -1499,6 +1571,18 @@ impl NgnInboundHandler {
                     self.respond(&stx, 481, "Call/Transaction Does Not Exist")
                         .await?;
                     self.pending.lock().await.remove(&call_id);
+                    // Issue #278 (PR #286 review #2): RFC 3261 §21.4.20 481 は dialog
+                    // 不在による拒否。 通常は in-dialog Re-INVITE で fresh Call-ID は
+                    // 来ない (= record_start dedup で no-op) が、 万一新規 Call-ID +
+                    // to-tag の異常パターンで orphan entry が残らないように record_end
+                    // を呼ぶ。 同 Call-ID が既に終端済なら線形検索でヒットしないだけ
+                    // の no-op。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed { status: 481 },
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -1511,6 +1595,14 @@ impl NgnInboundHandler {
                 self.pending.lock().await.remove(&call_id);
                 // 着信は受け付けたが内線不在で確立に至らず → error 計上
                 self.metrics.record_invite_ngn(InviteResult::Error);
+                // Issue #278 (PR #286 review #2): RFC 3261 §21.4.18 480 Temporarily
+                // Unavailable は「callee は一時的に応答できない (= 内線不在)」 で、
+                // ユーザ視点では「鳴らせる端末が無かった」 = Missed と扱うのが
+                // 妥当 (`ForkResult::AllFailed` / `ForkResult::Timeout` と同じ
+                // Missed カテゴリ、 PR #286 既存実装と整合)。
+                if let Some(call_log) = self.call_log_clone().await {
+                    call_log.record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                }
                 return Ok::<(), anyhow::Error>(());
             }
 
@@ -1659,6 +1751,17 @@ impl NgnInboundHandler {
                     self.in_flight.lock().await.remove(&call_id);
                     self.metrics.record_invite_extension(InviteResult::Error);
                     self.metrics.record_invite_ngn(InviteResult::Error);
+                    // Issue #278 (PR #286 review #1): 着信側が応答する前に NGN UAC が
+                    // CANCEL を出した = ユーザ視点での「不在着信」。 record_start
+                    // (line ~1408) に対する record_end を必ず呼んで orphan entry を
+                    // 防ぐ。 RFC 3261 §21.4.27 によれば 487 Request Terminated は
+                    // 「PASSIVE な cancellation でリクエストが終了した」状態を意味し、
+                    // 通話履歴上は Missed として扱う (`Outcome::Missed` の
+                    // 「応答前に終了した着信」 セマンティクスと整合)。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log
+                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                    }
                     return Ok(());
                 }
                 r = fork_fut => r,
@@ -1691,6 +1794,16 @@ impl NgnInboundHandler {
                         self.pending.lock().await.remove(&call_id);
                         self.metrics.record_invite_extension(InviteResult::Timeout);
                         self.metrics.record_invite_ngn(InviteResult::Timeout);
+                        // Issue #278 (PR #286 review #3): RFC 3262 §3 / RFC 3261
+                        // §21.4.8 408 は UAC が reliable 18x に PRACK を返さなかった
+                        // ことによる timeout 終結。 status code を残して PWA UI で
+                        // 「reliable provisional ACK 不在」を区別可能にする。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Failed { status: 408 },
+                            );
+                        }
                         return Ok(());
                     }
                     PrackOutcome::NoState => {
@@ -1969,6 +2082,9 @@ impl NgnInboundHandler {
                             .insert(call_id.clone(), entry);
                     }
                     self.metrics.inc_call_active();
+                    // Issue #278: 通話確立は record_end ではなく `Answered` を
+                    // 仮に記録しない (= まだ BYE していない)。 outcome / duration
+                    // は handle_bye の dec_call_active 時点で確定する。
                 }
                 ForkResult::AllFailed { last_status } => {
                     // Issue #211 / RFC 3261 §16.7 step 6:
@@ -1986,12 +2102,25 @@ impl NgnInboundHandler {
                     };
                     self.metrics.record_invite_extension(result);
                     self.metrics.record_invite_ngn(result);
+                    // Issue #278: 着信が確立せずに終わった (どの内線も応答せず)。
+                    // PWA UI 上は「不在着信」 として表示するため Missed として
+                    // 記録する (486 BUSY も内線都合なので発信側視点 = Missed)。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log
+                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                    }
                 }
                 ForkResult::Timeout => {
                     self.respond(&stx, 408, "Request Timeout").await?;
                     self.pending.lock().await.remove(&call_id);
                     self.metrics.record_invite_extension(InviteResult::Timeout);
                     self.metrics.record_invite_ngn(InviteResult::Timeout);
+                    // Issue #278: 内線が誰も応答しないまま fork タイムアウト
+                    // (RFC 3261 §16.7) → 着信側視点では Missed。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log
+                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                    }
                 }
             }
             // RFC 3262 §3 (Issue #251 Phase B): 全 match arm 共通の cleanup。
@@ -2218,6 +2347,12 @@ impl NgnInboundHandler {
             }
             // メトリクス: PWA outbound 成立時に inc_call_active 済み。
             self.metrics.dec_call_active();
+            // Issue #278: PWA outbound 通話が確立済 → NGN→PWA BYE で正常終了。
+            // record_start は `UasEventHandler::handle_pwa_outbound_offer` が
+            // Outbound 方向で書き込んでいる (同じ Arc<CallLog> を共有)。
+            if let Some(call_log) = self.call_log_clone().await {
+                call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
             // PWA UI に BYE を通知 (RFC 5853 §3.2.2)。 WS が既に切断済みでも
             // テーブルからは削除済みなので idempotent。
             if let Err(e) = entry.ws.send(ServerMessage::Bye) {
@@ -2250,6 +2385,10 @@ impl NgnInboundHandler {
         let removed = { self.active.lock().await.remove(&cid) };
         if removed.is_some() {
             self.metrics.dec_call_active();
+            // Issue #278: 着信通話が確立 → BYE で正常終了。 通話時間が確定する。
+            if let Some(call_log) = self.call_log_clone().await {
+                call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
         }
         if let (Some(Some(call_id)), Some(mgr)) = (removed, self.call_manager.as_ref()) {
             if let Err(e) = mgr.terminate(call_id).await {
@@ -2877,6 +3016,11 @@ pub struct UasEventHandler {
     /// `&self.outbound_rate_limiter` で参照できる (内部は `Mutex<HashMap>` で
     /// スレッド安全)。
     outbound_rate_limiter: Arc<OutboundRateLimiter>,
+    /// Issue #278: 通話履歴 ring buffer (内線発信 / PWA 発信)。 未注入なら
+    /// hook は no-op で旧挙動を保つ。 `Mutex<Option<_>>` にしているのは、
+    /// `Arc::clone().spawn()` 後に `set_call_log` を呼べるようにするため
+    /// (= `outbound_forwarder` と同じ pattern)。
+    call_log: Mutex<Option<Arc<crate::observability::call_log::CallLog>>>,
 }
 
 impl UasEventHandler {
@@ -2897,6 +3041,7 @@ impl UasEventHandler {
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
+            call_log: Mutex::new(None),
         })
     }
 
@@ -2935,6 +3080,7 @@ impl UasEventHandler {
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
+            call_log: Mutex::new(None),
         })
     }
 
@@ -2961,6 +3107,7 @@ impl UasEventHandler {
             webrtc_outbound_active,
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
+            call_log: Mutex::new(None),
         })
     }
 
@@ -2978,6 +3125,24 @@ impl UasEventHandler {
     /// テスト / observability から最新状態を観察する用途。
     pub fn outbound_rate_limiter(&self) -> Arc<OutboundRateLimiter> {
         self.outbound_rate_limiter.clone()
+    }
+
+    /// Issue #278: 通話履歴 ring buffer を注入する (setter)。
+    ///
+    /// 未注入時 (`None`) は内線発信 / PWA 発信の hook が no-op となり、 旧挙動と
+    /// 同一。 `Mutex<Option<_>>` ベースなので spawn 後 (= shared) でも安全に呼べる。
+    pub async fn set_call_log(
+        self: &Arc<Self>,
+        call_log: Arc<crate::observability::call_log::CallLog>,
+    ) {
+        let mut slot = self.call_log.lock().await;
+        *slot = Some(call_log);
+    }
+
+    /// 通話履歴の Arc clone (注入済みの場合)。 hot path から `record_*` を
+    /// 呼ぶときの helper として使う。 未注入なら `None` で hook 全体を skip する。
+    async fn call_log_clone(&self) -> Option<Arc<crate::observability::call_log::CallLog>> {
+        self.call_log.lock().await.clone()
     }
 
     /// `webrtc_outbound_active` の Arc を返す (Issue #147)。
@@ -3030,6 +3195,7 @@ impl UasEventHandler {
             webrtc_outbound_active: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             outbound_rate_limiter: Arc::new(OutboundRateLimiter::new()),
+            call_log: Mutex::new(None),
         })
     }
 
@@ -3242,6 +3408,19 @@ impl UasEventHandler {
                 .ngn_uac
                 .build_invite(&target, sdp_for_ngn.as_deref(), None);
 
+            // Issue #278: 内線→NGN 発信を通話履歴に記録する。 ダイヤル先は
+            // 正規化後の Request-URI から user 部を抽出 (例 `sip:0312345678@P-CSCF:5060`
+            // → `0312345678`)。 抽出失敗時 (= URI 異常) は URI 全体を残す。
+            if let Some(call_log) = self.call_log_clone().await {
+                let remote_number =
+                    extract_user_from_sip_uri(&target).unwrap_or_else(|| target.clone());
+                call_log.record_start(
+                    crate::observability::call_log::Direction::Outbound,
+                    remote_number,
+                    call_id.clone(),
+                );
+            }
+
             // 進行中 INVITE を pending に登録 (CANCEL ルックアップ用)。
             let pending = Arc::new(PendingOutbound {
                 ext_call_id: call_id.clone(),
@@ -3377,6 +3556,17 @@ impl UasEventHandler {
                             warn!(error=%e, "競合 BYE の送出失敗");
                         }
                         self.metrics.record_invite_ngn(InviteResult::Error);
+                        // Issue #278 (PR #286 review #4): RFC 3261 §15.1.1 競合 BYE 経路。
+                        // 内線が CANCEL した直後に NGN 200 OK が到着した場合、 sabiden は
+                        // 即 BYE で閉じるため通話としては「発信側 CANCEL で終了」。
+                        // 既存の `Err(_) + was_cancelled` 経路 (line ~3651) と整合させて
+                        // `Outcome::Cancelled` で record_end する (orphan 防止)。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Cancelled,
+                            );
+                        }
                         return Ok(());
                     }
                     // NGN 側 200 OK の SDP answer を内線に返す。
@@ -3491,6 +3681,17 @@ impl UasEventHandler {
                         InviteResult::Error
                     };
                     self.metrics.record_invite_ngn(result);
+                    // Issue #278: 内線→NGN 発信が NGN により拒否された。
+                    // status code を保持し、 PWA/UI 側で「相手話中」「NGN 障害」
+                    // を区別できるようにする (RFC 3261 §21)。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed {
+                                status: response.status_code,
+                            },
+                        );
+                    }
                     // Issue #157: TTC JJ-90.24 §5.7.3 (INVITE 5xx 自動 retry 禁止 +
                     // Retry-After 尊重) を rate limiter にフィードバック。
                     // NGN が Retry-After ヘッダを付けてくれば parser で抽出する
@@ -3530,10 +3731,27 @@ impl UasEventHandler {
                         // CANCEL 経路で 487 / Timer B で Err になったケース。
                         // 内線へは CANCEL 経路で 487 を返済済みの想定なので何もしない。
                         debug!(error=%e, "CANCEL 後の INVITE 終了");
+                        // Issue #278: 内線が発信側 CANCEL してから NGN が Timer B
+                        // 等で Err になった。 発信者主導の中断として記録する。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Cancelled,
+                            );
+                        }
                         return Ok(());
                     }
                     warn!(error=%e, "NGN 側 INVITE トランスポート失敗 → 503");
                     self.metrics.record_invite_ngn(InviteResult::Timeout);
+                    // Issue #278: NGN トランスポート障害 (Timer B / I/O 失敗) =
+                    // 確立できなかった outbound call。 status 503 (Service Unavailable)
+                    // を載せて履歴に残す。
+                    if let Some(call_log) = self.call_log_clone().await {
+                        call_log.record_end(
+                            &call_id,
+                            crate::observability::call_log::Outcome::Failed { status: 503 },
+                        );
+                    }
                     // Issue #157: トランスポート失敗も 5xx 相当として backoff 対象に含める。
                     // タイムアウトの連続発射は NGN cooldown を起こす典型例。
                     self.outbound_rate_limiter
@@ -3590,6 +3808,11 @@ impl UasEventHandler {
 
         // 3) RTP ブリッジ停止 + 観測
         self.metrics.dec_call_active();
+        // Issue #278: 内線→NGN 発信通話が正常終了 (内線 BYE 起点) → Answered。
+        // record_start は build_invite 直前で書き込まれている。
+        if let Some(call_log) = self.call_log_clone().await {
+            call_log.record_end(&call_id, crate::observability::call_log::Outcome::Answered);
+        }
         if let (Some(bridge_id), Some(mgr)) = (entry.bridge_call_id, self.call_manager.as_ref()) {
             if let Err(e) = mgr.terminate(bridge_id).await {
                 warn!(error=%e, "RTP ブリッジ停止失敗");
@@ -4568,6 +4791,10 @@ impl PwaOutboundHandler for UasEventHandler {
         // ため、 limiter / AOR の clone を持ち込む。
         let rate_limiter = self.outbound_rate_limiter.clone();
         let rate_aor_owned = rate_aor.clone();
+        // Issue #278: 通話履歴を背景タスクから記録するための Arc clone。
+        // `Mutex<Option<...>>` を tokio::sync ロックで一度開いて clone する。
+        // 未注入時 (`None`) は hook 全て no-op。
+        let call_log_for_task = self.call_log_clone().await;
         let span = info_span!("pwa_outbound_invite_bg", target = %target);
 
         let completion = tokio::spawn(
@@ -4590,6 +4817,16 @@ impl PwaOutboundHandler for UasEventHandler {
                     .map(str::to_string)
                     .unwrap_or_default();
                 let plan_target = plan.target_uri.clone();
+                // Issue #278: PWA→NGN 発信を通話履歴に記録する。 ダイヤル先は
+                // signaling 層から渡される target (user 部のみ) なので、 そのまま
+                // remote_number として使う。
+                if let Some(call_log) = call_log_for_task.as_ref() {
+                    call_log.record_start(
+                        crate::observability::call_log::Direction::Outbound,
+                        target_owned.clone(),
+                        plan_call_id.clone(),
+                    );
+                }
                 // Issue #260 Phase 1-A: PWA→NGN 経路でも 5xx 受信時の経過 ms
                 // を構造化ログに載せるため、 invite await 開始直前で計測開始する。
                 let invite_started_at = std::time::Instant::now();
@@ -4883,6 +5120,17 @@ impl PwaOutboundHandler for UasEventHandler {
                                 response.status_code, response.reason
                             ),
                         };
+                        // Issue #278: PWA→NGN 発信が NGN により拒否された。
+                        // status code をそのまま記録して PWA UI が「相手話中」
+                        // 「NGN 一時障害」を区別できるようにする (RFC 3261 §21)。
+                        if let Some(call_log) = call_log_for_task.as_ref() {
+                            call_log.record_end(
+                                &plan_call_id,
+                                crate::observability::call_log::Outcome::Failed {
+                                    status: response.status_code,
+                                },
+                            );
+                        }
                         let _ = ws_sink_clone
                             .send(ServerMessage::error("outbound_failed", detail.clone()));
                         Err(anyhow!(detail))
@@ -4894,6 +5142,13 @@ impl PwaOutboundHandler for UasEventHandler {
                         // Issue #157: トランスポート失敗 (timer B / I/O 等) も 5xx 相当として
                         // backoff 対象にする。 失敗連投で NGN cooldown を起こすのと等価。
                         rate_limiter.record_failure(&rate_aor_owned, 503, None);
+                        // Issue #278: PWA→NGN トランスポート障害 = Failed { status: 503 }。
+                        if let Some(call_log) = call_log_for_task.as_ref() {
+                            call_log.record_end(
+                                &plan_call_id,
+                                crate::observability::call_log::Outcome::Failed { status: 503 },
+                            );
+                        }
                         let _ = ws_sink_clone.send(ServerMessage::error(
                             "outbound_failed",
                             format!("NGN INVITE 失敗: {}", e),
@@ -4973,6 +5228,11 @@ impl PwaOutboundCloser for UasEventHandler {
                 }
             }
             self.metrics.dec_call_active();
+            // Issue #278: PWA→NGN 発信通話が確立済 → PWA WS close で正常終了。
+            // record_start は `handle_pwa_outbound_offer` の spawn 内で書き込まれている。
+            if let Some(call_log) = self.call_log_clone().await {
+                call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
             debug!(ngn_call_id=%cid, "PWA→NGN BYE 完了 (Issue #147)");
         }
 
@@ -5184,6 +5444,11 @@ impl PwaInboundCloser for NgnInboundHandler {
             // (NGN BYE 経路と二重発火しない idempotent ガード: 先に webrtc_active
             // から抜けた側が dec を担当する)。
             self.metrics.dec_call_active();
+            // Issue #278: NGN→PWA 着信通話が確立済 → PWA disconnect で BYE 完了。
+            // record_start は NGN INVITE 受信時に Inbound として書き込まれている。
+            if let Some(call_log) = self.call_log_clone().await {
+                call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
         }
 
         count
@@ -11539,6 +11804,7 @@ mod tests {
             call_manager: None,
             outbound_forwarder: Mutex::new(None),
             metrics: metrics.clone(),
+            call_log: Mutex::new(None),
         });
         // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
         drop(sabiden_inbound_rx);

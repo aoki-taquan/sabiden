@@ -38,6 +38,7 @@ use tracing::info;
 use call::manager::{CallManager, UacForker};
 use call::orchestrator::{NgnInboundConfig, UasEventHandler};
 use config::Config;
+use observability::call_log::CallLog;
 use observability::{Metrics, SipTraceWriter};
 use sip::register::Registrar;
 use sip::transaction::TransactionLayer;
@@ -148,8 +149,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         sip_cfg.phone_number, sip_cfg.domain
     );
 
-    // (1) 観測: SIP トレース writer + メトリクス
+    // (1) 観測: SIP トレース writer + メトリクス + 通話履歴 (Issue #278)
     let metrics = Metrics::new();
+    // Issue #278: 通話履歴 ring buffer。 PWA の「最近の通話」 UI で利用する。
+    // ring buffer 容量は 200 件 (= 1 日数十通話の運用で数日分残る規模)。
+    // 永続化 (sqlite) は別 issue で扱う。
+    let call_log = Arc::new(CallLog::new(200));
     let tracer = match trace_dir.as_deref() {
         Some(dir) => match SipTraceWriter::open(dir) {
             Ok(w) => {
@@ -306,11 +311,17 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // 内線レッグへ in-dialog (BYE 等) を送るため UAS の TransactionLayer を借用。
             h.attach_ext_layer(uas_layer, uas_addr);
         }
+        // Issue #278: 内線→NGN / PWA→NGN 発信の通話履歴を集約する。
+        h.set_call_log(call_log.clone()).await;
         h
     } else {
         // 内線が無いと CallManager の存在意義が無い (RTP ブリッジは内線レッグ前提)。
         // 透過モードのままで内線→NGN プロキシも閉じておく。
-        UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone())
+        let h = UasEventHandler::with_metrics(ngn_uac.clone(), metrics.clone());
+        // Issue #278: 内線無し構成でも PWA 経路は無いが、 PWA outbound handler は
+        // 別 enable 経路を持つ。 ここで CallLog を結線しておく。
+        h.set_call_log(call_log.clone()).await;
+        h
     };
     let uas_handler_for_forwarder: Arc<dyn call::orchestrator::OutboundDialogForwarder> =
         uas_handler.clone();
@@ -399,6 +410,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                 metrics.clone(),
                 webrtc_outbound_active.clone(),
             );
+        // Issue #278: NGN 着信の通話履歴 (NGN→内線 / NGN→PWA) を集約する。
+        // `UasEventHandler` と同じ `Arc<CallLog>` を共有し、 双方向 BYE 経路で
+        // 同じ call_id を `record_end` できるようにする。
+        ngn_handler.set_call_log(call_log.clone()).await;
         // NGN→内線 BYE 伝搬の経路を結線する (B2BUA 双方向 BYE)。
         ngn_handler
             .set_outbound_forwarder(uas_handler_for_forwarder)
@@ -430,7 +445,11 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     }
 
     // (9) health server (メトリクス共有) と WebRTC シグナリング (Issue #23)
-    let health_state = health::HealthState::new(registrar.registered_handle(), metrics.clone());
+    let health_state = health::HealthState::new(
+        registrar.registered_handle(),
+        metrics.clone(),
+        call_log.clone(),
+    );
     let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
         match hex::decode(&secret_hex) {
             Ok(secret_bytes) => {

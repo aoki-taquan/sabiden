@@ -39,6 +39,7 @@ rubato = "0.16"
 # 既定の `aws-lc-rs` バックエンドは crypto 依存が大きいので OpenSSL に切り替える
 # (Linux ではほぼ確実に利用可能で、CI イメージにも入っている)。
 str0m = { version = "0.19", default-features = false, features = ["openssl"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

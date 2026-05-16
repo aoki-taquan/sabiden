@@ -544,6 +544,12 @@ pub struct NgnInboundConfig {
     /// 代理で 200 OK を返し RTP 音声を WAV に保存する。 `None` (= 既定 disable)
     /// は従来挙動を維持。
     pub voicemail_recorder: Option<Arc<super::voicemail::VoicemailRecorder>>,
+    /// Issue #295: 着信ルーティングルール。 空 or 全 rule no-match の場合は
+    /// 従来通り `registrar.snapshot()` (= 全 binding) を fork する。 1 件でも
+    /// match した rule があれば、 そこに列挙された AOR のみを fork 対象にする
+    /// (空 `fork = []` rule は意図的に「誰にも fork しない」 = `bindings.is_empty()`
+    /// 経路へ流入 → voicemail / 480 直行)。 設計詳細は [`crate::call::routing`]。
+    pub routing_rules: super::routing::RoutingRules,
 }
 
 impl Default for NgnInboundConfig {
@@ -556,6 +562,8 @@ impl Default for NgnInboundConfig {
             ngn_local_addr: None,
             webrtc_active_sweep_interval: Duration::from_secs(30),
             voicemail_recorder: None,
+            // Issue #295: 既定は空 (= 全内線 fork)、 旧挙動を維持。
+            routing_rules: super::routing::RoutingRules::default(),
         }
     }
 }
@@ -1605,8 +1613,44 @@ impl NgnInboundHandler {
                 }
             }
 
-            // 登録済み内線の AOR 一覧を取得し target URI に変換する
-            let bindings = self.extensions.snapshot().await;
+            // 登録済み内線の AOR 一覧を取得し target URI に変換する。
+            //
+            // Issue #295: `[[routing.rule]]` (= 時間帯 / 曜日 / 発信者番号
+            // ベースの fork 振分) が config に存在し match した場合、 全 binding
+            // ではなく rule 指定の AOR のみを fork 対象にする。 rule 不在 / 全
+            // rule no-match は従来挙動 (= 全 binding fork) を維持する後方互換
+            // 設計 (`RoutingDecision::NoRule`)。 設計詳細は
+            // [`crate::call::routing`] / `docs/ARCHITECTURE.md` §着信ルーティング。
+            //
+            // 発信者番号は INVITE の From URI user 部 (PAI/PPI が剥がされた
+            // NGN inbound では `anonymous` になる、 memory
+            // `project_ngn_inbound_caller_id_stripped`)。
+            let all_bindings = self.extensions.snapshot().await;
+            let from_number = request
+                .headers
+                .get("from")
+                .map(extract_uri_from_addr)
+                .and_then(|uri| extract_user_from_sip_uri(&uri))
+                .unwrap_or_else(|| "unknown".to_string());
+            let bindings = match self.cfg.routing_rules.evaluate(
+                chrono::Local::now(),
+                &from_number,
+                &all_bindings,
+            ) {
+                super::routing::RoutingDecision::Matched {
+                    rule_name,
+                    bindings: filtered,
+                } => {
+                    info!(
+                        rule = %rule_name,
+                        from = %from_number,
+                        targets = filtered.len(),
+                        "Issue #295: routing rule matched"
+                    );
+                    filtered
+                }
+                super::routing::RoutingDecision::NoRule => all_bindings,
+            };
             if bindings.is_empty() {
                 warn!("登録内線なし → 480 Temporarily Unavailable");
                 // Issue #288: voicemail 有効なら内線不在 = 録音直行 (内線フォーク

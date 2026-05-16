@@ -32,6 +32,45 @@ pub struct Config {
     /// 200 OK を返し RTP 音声を WAV で保存する。 既定 disabled。
     #[serde(default)]
     pub voicemail: crate::call::voicemail::VoicemailConfig,
+    /// 着信ルーティングルール (Issue #295)。 NGN inbound INVITE のフォーク先を
+    /// 時間帯 / 曜日 / 発信者番号で絞り込む。 ルール無し or 全 rule no-match の
+    /// 場合は registrar 全 binding に fork する従来挙動を維持する (後方互換)。
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+/// 着信ルーティング設定 (Issue #295)。
+///
+/// TOML 表記:
+/// ```toml
+/// [[routing.rule]]
+/// name = "office_hours"
+/// priority = 100
+/// match.weekday = ["mon", "tue", "wed", "thu", "fri"]
+/// match.time_range = "09:00-18:00"
+/// fork = ["iphone", "office-phone"]
+/// ```
+///
+/// `rule = []` (省略) で従来挙動 (全内線 fork) を維持。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RoutingConfig {
+    /// 個別ルール。 評価順は `priority` 降順 (同値は宣言順)。
+    #[serde(default)]
+    pub rule: Vec<crate::call::routing::RoutingRule>,
+}
+
+impl RoutingConfig {
+    /// `crate::call::routing::RoutingRules` への変換 (ownership 移転)。
+    pub fn into_rules(self) -> crate::call::routing::RoutingRules {
+        crate::call::routing::RoutingRules { rules: self.rule }
+    }
+
+    /// 借用 ref で `RoutingRules` の clone を取り出す (起動時 validate 用)。
+    pub fn to_rules(&self) -> crate::call::routing::RoutingRules {
+        crate::call::routing::RoutingRules {
+            rules: self.rule.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -373,6 +412,12 @@ impl Config {
         };
         config.apply_env_overrides();
         config.resolve_local_addr()?;
+        // Issue #295: 着信ルーティングルールの構文を起動時に validate。
+        // 不正な time_range / weekday を抱えたまま起動すると評価時に「無条件
+        // unmatch」 で sticky に bypass され、 営業時間外でも全 fork する事故に
+        // つながる。 fail-fast で防ぐ。
+        crate::call::routing::validate_rules(&config.routing.to_rules())
+            .map_err(|e| anyhow::anyhow!("invalid [[routing.rule]]: {}", e))?;
         Ok(config)
     }
 
@@ -429,6 +474,7 @@ impl Config {
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
+            routing: RoutingConfig::default(),
         })
     }
 
@@ -686,6 +732,7 @@ mod tests {
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
+            routing: RoutingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -707,6 +754,7 @@ mod tests {
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
+            routing: RoutingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -728,6 +776,7 @@ mod tests {
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
+            routing: RoutingConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -967,5 +1016,135 @@ idle_timeout_secs = 12
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.webrtc.keepalive_interval_secs, 5);
         assert_eq!(cfg.webrtc.idle_timeout_secs, 12);
+    }
+
+    /// Issue #295: `[[routing.rule]]` セクションを TOML から複数 rule で
+    /// パースし、 `RoutingRules::evaluate` がそのまま使える形にする。
+    /// priority / match.weekday / match.time_range / match.from_number / fork
+    /// の 5 フィールドを 1 件で確認 + 複数 rule の宣言順保持を確認する
+    /// (integration: TOML → struct → RoutingRules round-trip)。
+    #[test]
+    fn toml_parses_routing_rules_with_all_match_fields() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[[routing.rule]]
+name = "vip_customer"
+priority = 200
+match.from_number = ["0312345678"]
+fork = ["boss-mobile"]
+
+[[routing.rule]]
+name = "office_hours"
+priority = 100
+match.weekday = ["mon", "tue", "wed", "thu", "fri"]
+match.time_range = "09:00-18:00"
+fork = ["iphone", "office-phone"]
+
+[[routing.rule]]
+name = "after_hours"
+priority = 0
+fork = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.routing.rule.len(), 3);
+
+        // 宣言順を維持していること
+        assert_eq!(cfg.routing.rule[0].name, "vip_customer");
+        assert_eq!(cfg.routing.rule[0].priority, 200);
+        assert_eq!(
+            cfg.routing.rule[0]
+                .match_
+                .from_number
+                .as_ref()
+                .map(|v| v.as_slice()),
+            Some(&["0312345678".to_string()][..])
+        );
+        assert!(cfg.routing.rule[0].match_.weekday.is_none());
+        assert!(cfg.routing.rule[0].match_.time_range.is_none());
+        assert_eq!(cfg.routing.rule[0].fork, vec!["boss-mobile".to_string()]);
+
+        assert_eq!(cfg.routing.rule[1].name, "office_hours");
+        assert_eq!(cfg.routing.rule[1].priority, 100);
+        assert_eq!(
+            cfg.routing.rule[1].match_.time_range.as_deref(),
+            Some("09:00-18:00")
+        );
+        assert_eq!(
+            cfg.routing.rule[1].match_.weekday.as_ref().map(|v| v.len()),
+            Some(5)
+        );
+        assert_eq!(
+            cfg.routing.rule[1].fork,
+            vec!["iphone".to_string(), "office-phone".to_string()]
+        );
+
+        assert_eq!(cfg.routing.rule[2].name, "after_hours");
+        assert_eq!(cfg.routing.rule[2].priority, 0);
+        assert!(cfg.routing.rule[2].fork.is_empty());
+
+        // 起動時 validate (構文 OK)
+        crate::call::routing::validate_rules(&cfg.routing.to_rules()).expect("validate");
+    }
+
+    /// Issue #295: `[[routing.rule]]` セクション省略時は `rule` 配列が空 (=
+    /// `evaluate` は常に `NoRule` を返す)、 旧挙動 (全 fork) と完全互換。
+    #[test]
+    fn toml_default_routing_section_is_empty_for_backward_compat() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.routing.rule.is_empty());
+        let rules = cfg.routing.to_rules();
+        assert!(rules.is_empty());
+    }
+
+    /// Issue #295: TOML から `priority` 省略時は serde default = 0 が入る。
+    /// `match` も省略可能で、 省略時は MatchSpec::default() (全 None)。
+    #[test]
+    fn toml_routing_rule_omitted_priority_and_match_use_defaults() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[[routing.rule]]
+name = "catchall"
+fork = ["iphone"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.routing.rule.len(), 1);
+        assert_eq!(cfg.routing.rule[0].priority, 0);
+        assert!(cfg.routing.rule[0].match_.weekday.is_none());
+        assert!(cfg.routing.rule[0].match_.time_range.is_none());
+        assert!(cfg.routing.rule[0].match_.from_number.is_none());
+    }
+
+    /// Issue #295: 不正な time_range は `Config::load` 経路の validate で
+    /// エラー化する。 ここでは validate を直接呼んで構文エラー検出を確認。
+    #[test]
+    fn toml_routing_validate_rejects_bad_time_range() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[[routing.rule]]
+name = "bad"
+match.time_range = "25:99-zz:00"
+fork = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let result = crate::call::routing::validate_rules(&cfg.routing.to_rules());
+        assert!(result.is_err());
     }
 }

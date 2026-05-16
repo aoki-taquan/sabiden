@@ -12,6 +12,7 @@
 //! { "type": "answer", "call_id": "...", "sdp": "v=0..." }  // sabiden 発の offer に応答
 //! { "type": "decline", "call_id": "..." }              // Issue #107: 着信拒否
 //! { "type": "ice", "candidate": "candidate:..." }
+//! { "type": "dtmf",  "call_id": "...", "digit": "5" }   // Issue #277: 通話中 DTMF (0-9, *, #, A-D)
 //! { "type": "bye" }
 //! ```
 //!
@@ -440,6 +441,36 @@ pub trait PwaOutboundHandler: Send + Sync {
     ) -> Result<PwaOutboundOutcome>;
 }
 
+/// 通話中 DTMF 注入ハンドラ (Issue #277)。
+///
+/// `ClientMessage::Dtmf { call_id, digit }` 受信時に signaling 層が呼ぶ。
+/// 実装側は `call_id` を NGN レッグの Call-ID として `WebRtcOutboundActive`
+/// (PWA→NGN 発信) または `WebRtcInboundActive` (NGN→PWA 着信) から
+/// `bridge_call_id` を引き、 `CallManager::inject_to_ngn` 経由で
+/// RFC 4733 §2.5 telephone-event RTP packet 列を NGN レッグへ注入する。
+///
+/// # RFC 4733 §3.2 mapping
+///
+/// `digit` フィールドは 1 文字 (例 `"5"` / `"*"` / `"#"`)。 受理可能な文字は
+/// RFC 4733 Table 7 (telephone-event Names) で規定された 0-15 = `0`..`9` /
+/// `*` / `#` / `A`..`D` のいずれか。 範囲外は本トレイト実装側で silent drop
+/// (= `Ok(false)` 相当の戻り値 / または `Ok(())` でログのみ) する想定。
+///
+/// # 戻り値
+///
+/// - `Ok(true)`: 対象通話が見つかり、 RFC 4733 packet 列を送出した。
+/// - `Ok(false)`: 該当 `call_id` の通話が見つからない / digit 範囲外 /
+///   bridge 未確立 等で送出しなかった (= no-op)。 silent OK 扱いで signaling 層は
+///   error を browser に返さない (race / 既知の制限で発火しうるため)。
+/// - `Err(_)`: 送出経路で想定外のエラー (例 NGN socket I/O failure)。
+///   signaling 層は `ServerMessage::Error` を返す。
+#[async_trait::async_trait]
+pub trait PwaDtmfHandler: Send + Sync {
+    /// 指定 `call_id` の NGN レッグへ DTMF `digit` を RFC 4733 telephone-event
+    /// として注入する。 詳細は trait docstring。
+    async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool>;
+}
+
 /// 発信先 `target` の文字種ホワイトリスト (Issue #145, PR #146 review #1 🔴#1)。
 ///
 /// browser からの任意文字列が NGN INVITE の Request-URI user 部に流れる
@@ -503,6 +534,12 @@ pub struct SignalingState {
     /// (PWA 側に `code:"hold_unavailable"` を返す)。 通常 `UasEventHandler` を
     /// `Arc::clone` で渡す (`PwaOutboundHandler` / `PwaOutboundCloser` と同じ Arc)。
     pub pwa_hold_handler: Option<Arc<dyn PwaHoldHandler>>,
+    /// 通話中 DTMF 注入ハンドラ (Issue #277、 RFC 4733)。 `ClientMessage::Dtmf`
+    /// 受信時に呼ぶ。 PWA→NGN 発信 / NGN→PWA 着信のどちらの通話に対しても
+    /// 同じハンドラで対応する (実装側で outbound テーブル → inbound テーブルの
+    /// 順に lookup する想定)。 `None` のときは DTMF を silent drop (= error は
+    /// 返さず browser の dial pad 押下は no-op になる)。
+    pub pwa_dtmf: Option<Arc<dyn PwaDtmfHandler>>,
 }
 
 impl SignalingState {
@@ -523,6 +560,7 @@ impl SignalingState {
             pwa_outbound_closer: None,
             pwa_inbound_closer: None,
             pwa_hold_handler: None,
+            pwa_dtmf: None,
         }
     }
 
@@ -563,6 +601,12 @@ impl SignalingState {
     /// 通常 `with_pwa_outbound` と同じ `UasEventHandler` を渡す。
     pub fn with_pwa_hold_handler(mut self, h: Arc<dyn PwaHoldHandler>) -> Self {
         self.pwa_hold_handler = Some(h);
+        self
+    }
+
+    /// 通話中 DTMF 注入ハンドラを差し込む (Issue #277、 RFC 4733)。
+    pub fn with_pwa_dtmf(mut self, h: Arc<dyn PwaDtmfHandler>) -> Self {
+        self.pwa_dtmf = Some(h);
         self
     }
 }
@@ -631,6 +675,28 @@ pub enum ClientMessage {
     /// Issue #279。
     Unhold {
         call_id: String,
+    },
+    /// Issue #277: 通話中 DTMF 送出 (PWA → sabiden → NGN)。
+    ///
+    /// `digit` は 1 文字の文字列。 RFC 4733 §3.2 Table 7 で規定された
+    /// DTMF event 番号にマップ可能な文字 (`0`-`9` / `*` / `#` / `A`-`D`)
+    /// のみ受理する。 範囲外は orchestrator 側で silent drop する
+    /// (`crate::call::dtmf::digit_to_event` が `None` を返す)。
+    ///
+    /// `call_id` は対象通話を一意に識別する文字列で、 PWA→NGN 発信時の
+    /// NGN レッグ Call-ID (`UacDialog::dialog().id().call_id`)、 または
+    /// NGN→PWA 着信時の NGN INVITE Call-ID を期待する。 sabiden は
+    /// `WebRtcOutboundActive` (発信) と `WebRtcInboundActive` (着信)
+    /// の両テーブルから `bridge_call_id` を引き、 `RtpBridge::send_to_ngn`
+    /// で RFC 4733 telephone-event RTP packet 列を NGN レッグへ注入する。
+    ///
+    /// `application/dtmf-relay` SIP INFO (SIP 内線 UA 経路、 RFC 6086) の
+    /// PWA 版に相当する。 WS 経由のほうが NGN レッグ確立後の追加 SIP
+    /// メッセージング不要で済むため、 sabiden は PWA に対し SIP INFO で
+    /// なくこの WS message を要求する (frontend / PWA 実装側で対応)。
+    Dtmf {
+        call_id: String,
+        digit: String,
     },
     Bye,
 }
@@ -1495,6 +1561,62 @@ pub async fn process_client_message(
                 Err(HoldError::TransportFailed { reason }) => {
                     warn!(%call_id, %reason, "PWA unhold: transport 失敗");
                     SessionAction::Reply(ServerMessage::error("unhold_failed", reason))
+                }
+            }
+        }
+        ClientMessage::Dtmf { call_id, digit } => {
+            // Issue #277: 通話中 DTMF 送出 (PWA→NGN、 RFC 4733 §2.5)。
+            //
+            // 1. digit は 1 文字でなければ拒否 (browser バグ / 改造クライアント
+            //    対策、 OWASP A03:2021 Injection の defense-in-depth)。
+            // 2. RFC 4733 §3.2 Table 7 範囲外 (例 `,` `w` 等の dial pause 系)
+            //    はエラーではなく silent OK で受理する: digit を生成した PWA
+            //    側 UI バグの可能性が高いが、 通話を切らずに無視するほうが
+            //    UX として安全 (内線 SIP INFO 経路、 `handle_ext_info` も同様に
+            //    範囲外は warn + drop)。
+            // 3. ハンドラ未配線 (= NGN UAC 無し構成) なら silent OK。
+            // 4. 該当 call_id が見つからない (race / 既に終了) も silent OK。
+            //
+            // 失敗を browser に通知しない理由: dial pad は通話中 UI なので
+            // ServerMessage::Error を返すとユーザは「通話が切れた」と誤解する。
+            // RFC 6086 §3 と同じく、 INFO 系の hint message は best-effort
+            // 配送で問題ない。
+            let trimmed = digit.trim();
+            let digit_char = match trimmed.chars().next() {
+                Some(c) if trimmed.chars().count() == 1 => c,
+                _ => {
+                    warn!(
+                        digit = %digit.escape_default(),
+                        "DTMF: digit は 1 文字必須 → drop"
+                    );
+                    return SessionAction::Continue;
+                }
+            };
+            let Some(handler) = state.pwa_dtmf.as_ref() else {
+                debug!(%call_id, "DTMF: ハンドラ未配線 → drop (NGN UAC 無し構成)");
+                return SessionAction::Continue;
+            };
+            match handler.inject_dtmf_to_ngn(&call_id, digit_char).await {
+                Ok(true) => {
+                    debug!(%call_id, digit = %digit_char, "DTMF: NGN レッグへ注入完了");
+                    SessionAction::Continue
+                }
+                Ok(false) => {
+                    debug!(
+                        %call_id,
+                        digit = %digit_char,
+                        "DTMF: 対象通話なし / digit 範囲外 / bridge 未確立 → drop"
+                    );
+                    SessionAction::Continue
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        %call_id,
+                        digit = %digit_char,
+                        "DTMF: NGN 注入失敗"
+                    );
+                    SessionAction::Continue
                 }
             }
         }
@@ -3978,5 +4100,251 @@ mod tests {
                 matches!(other, SessionAction::Reply(_))
             ),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #277: DTMF send テスト
+    // -------------------------------------------------------------------------
+
+    /// テスト用 `PwaDtmfHandler`: 受け取った (call_id, digit) と戻り値を制御する。
+    /// Production 型 (`UasEventHandler` / `NgnInboundHandler`) を mock せず、
+    /// trait の境界だけを最小実装する (CLAUDE.md §6.3、 `docs/test-strategy.md` §2.2)。
+    struct MockDtmfHandler {
+        calls: std::sync::Mutex<Vec<(String, char)>>,
+        outcome: std::sync::Mutex<Result<bool, String>>,
+    }
+
+    impl MockDtmfHandler {
+        fn new(outcome: Result<bool, String>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                outcome: std::sync::Mutex::new(outcome),
+            })
+        }
+
+        fn observed(&self) -> Vec<(String, char)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PwaDtmfHandler for MockDtmfHandler {
+        async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((call_id.to_string(), digit));
+            match &*self.outcome.lock().unwrap() {
+                Ok(b) => Ok(*b),
+                Err(s) => Err(anyhow::anyhow!(s.clone())),
+            }
+        }
+    }
+
+    /// RFC 4733 §3.2 Table 7: ClientMessage::Dtmf は JSON で round-trip 可能で、
+    /// `digit` フィールドは 0-9 / * / # / A-D の文字を運ぶ。
+    #[test]
+    fn rfc4733_3_2_client_message_dtmf_round_trip() {
+        for digit in ['0', '5', '9', '*', '#', 'A', 'D'] {
+            let m = ClientMessage::Dtmf {
+                call_id: "cid-abc".into(),
+                digit: digit.to_string(),
+            };
+            let s = serde_json::to_string(&m).unwrap();
+            assert!(s.contains("\"type\":\"dtmf\""));
+            assert!(s.contains("\"call_id\":\"cid-abc\""));
+            let back: ClientMessage = serde_json::from_str(&s).unwrap();
+            match back {
+                ClientMessage::Dtmf { call_id, digit: d } => {
+                    assert_eq!(call_id, "cid-abc");
+                    assert_eq!(d, digit.to_string());
+                }
+                _ => panic!("Dtmf に decode されなかった"),
+            }
+        }
+    }
+
+    /// Issue #277: `Dtmf` を `pwa_dtmf` 配線済みで受信したら handler が呼ばれ、
+    /// `digit` (文字列) が 1 文字の char に変換されて渡る。 RFC 4733 §3.2 で
+    /// 規定された 0-9 / * / # / A-D のすべてが受理される。
+    #[tokio::test]
+    async fn issue277_dtmf_dispatches_to_handler_with_correct_call_id_and_digit() {
+        let mock = MockDtmfHandler::new(Ok(true));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_dtmf = Some(mock.clone() as Arc<dyn PwaDtmfHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        for (call_id, digit) in [
+            ("cid-1", "5"),
+            ("cid-2", "*"),
+            ("cid-3", "#"),
+            ("cid-4", "0"),
+            ("cid-5", "9"),
+            ("cid-6", "A"),
+        ] {
+            let action = process_client_message(
+                ClientMessage::Dtmf {
+                    call_id: call_id.into(),
+                    digit: digit.into(),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            // Success / drop どちらでも reply は無い (= Continue)。
+            assert!(matches!(action, SessionAction::Continue));
+        }
+
+        let observed = mock.observed();
+        assert_eq!(observed.len(), 6);
+        assert_eq!(observed[0], ("cid-1".into(), '5'));
+        assert_eq!(observed[1], ("cid-2".into(), '*'));
+        assert_eq!(observed[2], ("cid-3".into(), '#'));
+        assert_eq!(observed[3], ("cid-4".into(), '0'));
+        assert_eq!(observed[4], ("cid-5".into(), '9'));
+        assert_eq!(observed[5], ("cid-6".into(), 'A'));
+    }
+
+    /// Issue #277: digit が空文字 / 2 文字以上 / 絵文字 など 1 文字でなければ
+    /// handler は呼ばれず silent drop (Continue)。 改造 client / 改造 frontend が
+    /// 投げてきた不正値を NGN レッグまで運ばない defense-in-depth (CLAUDE.md §6
+    /// 推測 PR 禁止)。
+    #[tokio::test]
+    async fn issue277_dtmf_rejects_non_single_char_digit_without_calling_handler() {
+        let mock = MockDtmfHandler::new(Ok(true));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_dtmf = Some(mock.clone() as Arc<dyn PwaDtmfHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        for bad in ["", "12", "abc", "  ", "**"] {
+            let action = process_client_message(
+                ClientMessage::Dtmf {
+                    call_id: "cid".into(),
+                    digit: bad.into(),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            assert!(matches!(action, SessionAction::Continue));
+        }
+        assert!(
+            mock.observed().is_empty(),
+            "1 文字でない digit は handler に到達しない"
+        );
+    }
+
+    /// Issue #277: `pwa_dtmf` 未配線 (= NGN UAC 無し構成) でも DTMF は silent
+    /// drop で受理する。 SessionAction::Continue を返し、 error を browser に
+    /// 返さない (= 通話 UI 上は dial pad 押下が no-op になるだけ、 通話切断は
+    /// 起こさない)。
+    #[tokio::test]
+    async fn issue277_dtmf_without_handler_is_silent_no_op() {
+        let (state, _reg) = make_state(b"k"); // pwa_dtmf = None
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Dtmf {
+                call_id: "cid".into(),
+                digit: "5".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(action, SessionAction::Continue));
+    }
+
+    /// Issue #277: handler が `Err` を返しても session は継続 (Continue)。
+    /// dial pad 押下時の transient な NGN socket error で通話が切れる UX 退行を
+    /// 防ぐ (best-effort 配送、 RFC 6086 §3 hint message)。
+    #[tokio::test]
+    async fn issue277_dtmf_handler_error_is_logged_not_propagated() {
+        let mock = MockDtmfHandler::new(Err("NGN unreachable".into()));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_dtmf = Some(mock.clone() as Arc<dyn PwaDtmfHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Dtmf {
+                call_id: "cid".into(),
+                digit: "5".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(
+            matches!(action, SessionAction::Continue),
+            "handler Err でも session 継続"
+        );
+        // handler は呼ばれた (= digit が一文字の処理は通過した) 証拠。
+        assert_eq!(mock.observed().len(), 1);
+    }
+
+    /// Issue #277: handler が `Ok(false)` (= 該当通話なし / digit 範囲外 /
+    /// bridge 未確立) を返したときも silent drop。
+    #[tokio::test]
+    async fn issue277_dtmf_handler_returns_false_is_silent_drop() {
+        let mock = MockDtmfHandler::new(Ok(false));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_dtmf = Some(mock.clone() as Arc<dyn PwaDtmfHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::Dtmf {
+                call_id: "unknown".into(),
+                digit: "5".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(action, SessionAction::Continue));
+        assert_eq!(mock.observed().len(), 1);
     }
 }

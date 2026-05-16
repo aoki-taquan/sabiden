@@ -155,6 +155,30 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // ring buffer 容量は 200 件 (= 1 日数十通話の運用で数日分残る規模)。
     // 永続化 (sqlite) は別 issue で扱う。
     let call_log = Arc::new(CallLog::new(200));
+
+    // Issue #288: 留守録 recorder を有効ならば up-front で構築する。
+    // `NgnInboundHandler` (orchestrator) と `health::HealthState` (REST API) が
+    // 同じ `Arc<VoicemailRecorder>` を共有することで、 録音した WAV が即座に
+    // `/api/voicemail/list` で見えるようにする。
+    let voicemail_recorder: Option<Arc<call::voicemail::VoicemailRecorder>> =
+        if full_config.voicemail.enabled {
+            match call::voicemail::VoicemailRecorder::from_config(&full_config.voicemail).await {
+                Ok(r) => {
+                    info!(
+                        storage_dir = %full_config.voicemail.storage_dir.display(),
+                        max_duration_secs = full_config.voicemail.max_duration_secs,
+                        "留守録 (Issue #288) 有効: /api/voicemail/{{list,id/audio,id}}"
+                    );
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "留守録 storage 初期化失敗 → 機能無効化");
+                    None
+                }
+            }
+        } else {
+            None
+        };
     let tracer = match trace_dir.as_deref() {
         Some(dir) => match SipTraceWriter::open(dir) {
             Ok(w) => {
@@ -395,6 +419,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // browser WS 切断のみ (NGN BYE 未到来) の経路で entry が leak する
             // のを防ぐ defense-in-depth。
             webrtc_active_sweep_interval: std::time::Duration::from_secs(30),
+            // Issue #288: 留守録 recorder を NgnInboundHandler 経由で渡す
+            // (`health_state` と同じ Arc を共有することで、 録音した WAV が
+            // 即座に `/api/voicemail/list` で見える)。
+            voicemail_recorder: voicemail_recorder.clone(),
         };
         // 着信 NGN→内線 用 CallManager は **outbound 側と同じ Arc**
         // (`shared_call_manager`) を再利用する (Issue #147 review #2 🔴 fix)。
@@ -448,11 +476,15 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     }
 
     // (9) health server (メトリクス共有) と WebRTC シグナリング (Issue #23)
-    let health_state = health::HealthState::new(
+    let mut health_state = health::HealthState::new(
         registrar.registered_handle(),
         metrics.clone(),
         call_log.clone(),
     );
+    // Issue #288: 同じ Arc を up-front で構築済 (前段) → REST API 側に attach。
+    if let Some(rec) = voicemail_recorder.clone() {
+        health_state = health_state.with_voicemail(rec);
+    }
     let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
         match hex::decode(&secret_hex) {
             Ok(secret_bytes) => {

@@ -81,6 +81,8 @@ impl SabidenHarness {
             bridge_ext_bind_ip: None,
             ngn_local_addr: None,
             webrtc_active_sweep_interval: Duration::from_secs(30),
+            // Issue #288: harness は留守録未使用なので None で旧挙動 (失敗 status)。
+            voicemail_recorder: None,
         };
 
         // (5) `wire_ngn_inbound` で NgnInboundHandler を spawn する。

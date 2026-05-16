@@ -59,11 +59,14 @@ src/
 ├── call/             # 通話制御 (Call Manager)
 │   ├── manager.rs    # 着信フォーク・通話状態管理
 │   ├── bridge.rs     # RTPブリッジ
-│   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound) + NGN even-port RTP allocator (Issue #260 Phase 1-D) + PwaDtmfHandler (Issue #277 RFC 4733)
+│   ├── orchestrator.rs # B2BUA orchestration (NGN inbound / 内線・PWA outbound) + NGN even-port RTP allocator (Issue #260 Phase 1-D) + PwaDtmfHandler (Issue #277 RFC 4733) + voicemail hook (Issue #288)
 │   ├── dtmf.rs       # RFC 4733 telephone-event RTP packet 列生成 + RFC 6086 SIP INFO body パース
-│   └── rate_limiter.rs # outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1, Issue #157)
+│   ├── rate_limiter.rs # outbound INVITE per-AOR rate limiter (TTC JJ-90.24 §5.7.1, Issue #157)
+│   └── voicemail/    # 留守録 (Issue #288): NGN inbound fork all-fail → 200 OK + RTP→WAV recording
+│       ├── mod.rs    # VoicemailRecorder / VoicemailFile / VoicemailHandle / VoicemailConfig
+│       └── wav.rs    # WavWriter (RIFF/WAVE linear PCM 16-bit mono 8 kHz)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
-├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278)
+├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278; /api/voicemail/* Issue #288)
 ├── observability/    # メトリクス (Prometheus) + SIP トレース + call_log ring buffer (Issue #278)
 │   ├── mod.rs        # Metrics (atomic counter 群) + SipTraceWriter
 │   └── call_log.rs   # 通話履歴 ring buffer (Direction / Outcome / CallLogEntry / CallLog)
@@ -730,6 +733,110 @@ in-memory ring buffer を導入する (永続化は別 Issue)。
 `NgnInboundHandler::set_call_log` / `UasEventHandler::set_call_log` の全経路に
 同じ Arc を渡す (= record_start / record_end が突合する)。 setter は `Mutex<Option<_>>`
 ベースで spawn 後 (= shared) でも安全に呼べる (`outbound_forwarder` と同じ pattern)。
+
+### Voicemail / 留守録 (Issue #288、 `src/call/voicemail/`)
+
+NGN inbound 着信で **fork all-fail** (内線 / PWA 全 leg 応答失敗 = 486 / 408
+/ 480) かつ `voicemail.enabled = true` のとき、 sabiden が UAS として代理で
+200 OK + sabiden SDP を返し、 NGN から流入する RTP 音声 (PCMU 8 kHz mono) を
+WAV ファイルに保存する。 PWA からは REST API (`/api/voicemail/*`) で一覧 /
+再生 / 削除可能。
+
+**データ構造**:
+
+- `VoicemailFile { call_id, remote_number, recorded_at_unix_ms, duration_ms }`
+  ── sidecar JSON で永続化。 `GET /api/voicemail/list` がそのまま返す。
+- `VoicemailRecorder { storage_dir, max_duration }` ── 録音 task spawn を司る。
+  config の `[voicemail]` セクション (`enabled` / `storage_dir` / `max_duration_secs`)
+  と 1:1 対応。
+- `VoicemailHandle { stop_signal, join }` ── recorder task の制御ハンドル。
+  `stop()` で stop_signal を notify、 `Drop` で再発火 (idempotent)。
+- `WavWriter` (`src/call/voicemail/wav.rs`) ── RIFF/WAVE (linear PCM 16-bit
+  mono 8 kHz) を逐次追記 + finalize で `chunk_size` / `subchunk2_size` を書き戻す。
+  WAVE_FORMAT_MULAW (0x0007) ではなく linear PCM で書く理由はブラウザ `<audio>`
+  互換性 (PR #288 `src/call/voicemail/wav.rs` docstring 参照)。
+
+**動作シーケンス** (NGN inbound fork all-fail → voicemail):
+
+```text
+NGN (P-CSCF)         sabiden                                 内線 / PWA
+    │                  │                                          │
+    │ INVITE + offer SDP                                          │
+    │ ───────────────►│                                          │
+    │                  │ 100 Trying                               │
+    │ ◄───────────────│                                          │
+    │                  │ 180 Ringing                              │
+    │ ◄───────────────│                                          │
+    │                  │ fork_to_bindings ───────────────────────►│
+    │                  │                                          │ (全 leg 486/408 等)
+    │                  │ ◄───────────────────────────────────────│
+    │                  │ ForkResult::AllFailed { last_status }    │
+    │                  │                                          │
+    │                  │ ┌── try_start_voicemail ──┐              │
+    │                  │ │ bind_ngn_rtp_socket     │              │
+    │                  │ │ rewrite_rtp_endpoint    │              │
+    │                  │ │ apply_uas_inbound_2xx_  │              │
+    │                  │ │   headers + Contact     │              │
+    │                  │ └──────────┬──────────────┘              │
+    │ 200 OK + sabiden SDP (PCMU、 c=NGN-side IP、 m=<even port>) │
+    │ ◄───────────────│                                          │
+    │ ACK              │ inc_call_active                          │
+    │ ───────────────►│ voicemail_active.insert(cid, handle)     │
+    │                  │ spawn VoicemailRecorder task             │
+    │                  │   (recv_from RTP → decode_ulaw           │
+    │                  │    → WavWriter::write_samples)           │
+    │ RTP (PCMU)       │                                          │
+    │ ═══════════════►│ (WAV に書き込み続ける)                   │
+    │                  │                                          │
+    │                  │ ─── max_duration (60s 既定) 経過 ───►   │
+    │                  │ recorder finalize (chunk_size 書戻し +   │
+    │                  │   sidecar JSON 書出し)                   │
+    │ BYE              │                                          │
+    │ ───────────────►│ 200 OK BYE                               │
+    │ ◄───────────────│ voicemail_active.remove                   │
+    │                  │ dec_call_active                          │
+    │                  │ record_end(Answered)                     │
+```
+
+NGN が先に BYE を送ってきた場合 (= 留守録メッセージを残し終わって NGN 側が
+切断) も同じ経路で `handle_bye` が `voicemail_active` から handle を引いて
+`stop()` を発火、 録音 task は WAV を finalize する。
+
+**hook ポイント** (`src/call/orchestrator.rs::NgnInboundHandler`):
+
+- `try_start_voicemail` (Issue #288 専用 helper):
+  1. `cfg.voicemail_recorder` 不在 → false (= 旧挙動)。
+  2. NGN INVITE に SDP body 無し → false (offer-only 経路は voicemail 不能)。
+  3. NGN 側 RTP socket を `bind_ngn_rtp_socket` (even-port allocator、
+     Issue #260 Phase 1-D Final と同じ) で確保。
+  4. `rewrite_rtp_endpoint` で sabiden NGN-side endpoint に書き換え、
+     200 OK + `apply_uas_inbound_2xx_headers` (Issue #251 Phase A) で応答。
+  5. `VoicemailRecorder::start` で recorder task を spawn し、
+     `voicemail_active: HashMap<Call-ID, VoicemailHandle>` に登録。
+- 呼び出し元 (`handle_invite`):
+  - **登録内線なし → 480** 経路 → 先に voicemail を試す。
+  - **`ForkResult::AllFailed`** 経路 → 先に voicemail を試す。
+  - **`ForkResult::Timeout`** 経路 → 先に voicemail を試す。
+  - voicemail 起動成功時は `inc_call_active` + 経路 return (200 OK 送出済)。
+  - voicemail 起動失敗 / 未設定時は従来の 480/486/408 等を返す (= 既存挙動)。
+- `handle_bye`:
+  - 既存 inbound BYE クリーンアップの後段で `voicemail_active.remove(cid)`、
+    handle.`stop()` 発火 + `dec_call_active` + `record_end(Answered)`。
+
+**JSON API** (`src/health/mod.rs`):
+
+- `GET /api/voicemail/list` ── 保存済 voicemail を `recorded_at_unix_ms`
+  降順で返す (`Vec<VoicemailFile>`)。 voicemail 無効時は 503。
+- `GET /api/voicemail/{id}/audio` ── WAV ファイル本体を `audio/wav` で返す。
+  未知 ID は 404。 ID は `sanitize_id` で正規化 (path-traversal 防止)。
+- `DELETE /api/voicemail/{id}` ── WAV + JSON sidecar 両方削除。 成功は
+  204 No Content、 未知 ID は 404。
+
+**結線**: `main.rs` で `Arc<VoicemailRecorder>` を 1 個生成し、 `HealthState`
+(`with_voicemail`) と `NgnInboundConfig.voicemail_recorder` の両方に同じ Arc
+を渡す (= 録音した WAV が即座に REST API で見える)。 `voicemail.enabled = false`
+(既定) の場合は recorder を生成せず両側とも `None`、 API は 503、 録音経路は
+従来の失敗 status (480/486/408) で旧挙動と同一。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

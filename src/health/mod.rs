@@ -20,16 +20,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get};
 use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::call::voicemail::{sanitize_id, VoicemailRecorder};
 use crate::observability::call_log::CallLog;
 use crate::observability::Metrics;
 use crate::webrtc::signaling::{signal_ws_handler, SignalingState};
@@ -55,6 +57,10 @@ pub struct HealthState {
     pub metrics: Arc<Metrics>,
     /// Issue #278: 通話履歴 ring buffer。 `/api/call-log/recent` で公開する。
     pub call_log: Arc<CallLog>,
+    /// Issue #288: 留守録 recorder。 `None` の場合 voicemail 機能は無効
+    /// (config で `voicemail.enabled = false` のとき)、 `/api/voicemail/*`
+    /// は 503 Service Unavailable を返す。
+    pub voicemail: Option<Arc<VoicemailRecorder>>,
 }
 
 impl HealthState {
@@ -63,17 +69,28 @@ impl HealthState {
             registered,
             metrics,
             call_log,
+            voicemail: None,
         }
+    }
+
+    /// Issue #288: 留守録 recorder を attach する builder 風メソッド。
+    pub fn with_voicemail(mut self, recorder: Arc<VoicemailRecorder>) -> Self {
+        self.voicemail = Some(recorder);
+        self
     }
 }
 
-/// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` を提供する `Router` を構築する
+/// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` `/api/voicemail/*` を
+/// 提供する `Router` を構築する (Issue #288 voicemail エンドポイント追加)。
 pub fn router(state: HealthState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/call-log/recent", get(call_log_recent))
+        .route("/api/voicemail/list", get(voicemail_list))
+        .route("/api/voicemail/:id/audio", get(voicemail_audio))
+        .route("/api/voicemail/:id", delete(voicemail_delete))
         .with_state(state)
 }
 
@@ -165,6 +182,70 @@ async fn call_log_recent(
     (StatusCode::OK, Json(entries))
 }
 
+/// Issue #288: `GET /api/voicemail/list` — 保存済 voicemail を新しい順で返す。
+/// 留守録機能未有効 (`voicemail.enabled = false`) の場合は 503。
+async fn voicemail_list(State(state): State<HealthState>) -> Response {
+    let Some(recorder) = state.voicemail.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "voicemail disabled\n").into_response();
+    };
+    match recorder.list().await {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(e) => {
+            warn!(error=%e, "voicemail list 取得失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #288: `GET /api/voicemail/{id}/audio` — WAV ファイル本体を返す
+/// (Content-Type: audio/wav)。 ID は path-traversal を防ぐため [`sanitize_id`]
+/// で正規化済の値に対してのみ match する。
+async fn voicemail_audio(State(state): State<HealthState>, Path(id): Path<String>) -> Response {
+    let Some(recorder) = state.voicemail.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "voicemail disabled\n").into_response();
+    };
+    // ID は recorder 内で sanitize されるが、 ファイル check は sanitize 済値で
+    // 行うため事前に正規化する (HTTP path の検証は axum 側で済 = `..` 等は弾く)。
+    let safe_id = sanitize_id(&id);
+    match recorder.get(&safe_id).await {
+        Ok(Some((_meta, wav_path))) => match tokio::fs::read(&wav_path).await {
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "audio/wav")
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "build response failed\n").into_response()
+                }),
+            Err(e) => {
+                warn!(error=%e, "voicemail wav 読込失敗");
+                (StatusCode::INTERNAL_SERVER_ERROR, "read wav failed\n").into_response()
+            }
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "voicemail not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "voicemail metadata 読込失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #288: `DELETE /api/voicemail/{id}` — WAV + JSON サイドカーを削除する。
+async fn voicemail_delete(State(state): State<HealthState>, Path(id): Path<String>) -> Response {
+    let Some(recorder) = state.voicemail.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "voicemail disabled\n").into_response();
+    };
+    let safe_id = sanitize_id(&id);
+    match recorder.delete(&safe_id).await {
+        Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "voicemail not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "voicemail delete 失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +261,27 @@ mod tests {
             Metrics::new(),
             Arc::new(CallLog::new(100)),
         )
+    }
+
+    /// Issue #288: voicemail 試験用に tmp dir + recorder を attach した state を返す。
+    async fn make_state_with_voicemail(registered: bool) -> (HealthState, std::path::PathBuf) {
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("sabiden-vm-api-{pid}-{nanos}-{n}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let recorder = Arc::new(
+            VoicemailRecorder::new(dir.clone(), std::time::Duration::from_secs(60))
+                .await
+                .expect("recorder"),
+        );
+        let state = make_state(registered).with_voicemail(recorder);
+        (state, dir)
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -455,5 +557,164 @@ mod tests {
         );
         // start_unix_ms は有効値 (u64)。
         assert!(entry["start_unix_ms"].is_u64());
+    }
+
+    /// Issue #288: voicemail 未有効状態で `/api/voicemail/list` は 503 を返す。
+    #[tokio::test]
+    async fn voicemail_list_returns_503_when_disabled() {
+        let app = router(make_state(true));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Issue #288: voicemail 有効 + 録音 2 件投入 → list は新しい順で JSON 配列。
+    #[tokio::test]
+    async fn voicemail_list_returns_entries_in_newest_first_order() {
+        use crate::call::voicemail::VoicemailFile;
+
+        let (state, dir) = make_state_with_voicemail(true).await;
+        // sidecar JSON を直接書く (recorder.record_from_packets を使わずに
+        // recorded_at_unix_ms を制御するため)。
+        for (id, ts) in [("old", 1_000_u64), ("new", 2_000)] {
+            let meta = VoicemailFile {
+                call_id: id.to_string(),
+                remote_number: "0312345678".to_string(),
+                recorded_at_unix_ms: ts,
+                duration_ms: 1_000,
+            };
+            let json = serde_json::to_vec(&meta).unwrap();
+            std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
+            // WAV side: 最小ヘッダのみ。
+            std::fs::write(dir.join(format!("{id}.wav")), vec![0u8; 44]).unwrap();
+        }
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["call_id"], "new");
+        assert_eq!(arr[1]["call_id"], "old");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #288: `GET /api/voicemail/{id}/audio` は WAV 本体を返す。 未知 ID は 404。
+    #[tokio::test]
+    async fn voicemail_audio_returns_wav_bytes_for_existing_id_and_404_for_missing() {
+        use crate::call::voicemail::VoicemailFile;
+
+        let (state, dir) = make_state_with_voicemail(true).await;
+        let meta = VoicemailFile {
+            call_id: "abc-123".to_string(),
+            remote_number: "0312345678".to_string(),
+            recorded_at_unix_ms: 100,
+            duration_ms: 0,
+        };
+        std::fs::write(dir.join("abc-123.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        // 「最小有効 WAV (header のみ)」を書く。
+        let mut wav = [0u8; 44];
+        wav[0..4].copy_from_slice(b"RIFF");
+        wav[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(dir.join("abc-123.wav"), wav).unwrap();
+
+        let app = router(state);
+        // 存在する ID。
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/abc-123/audio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert_eq!(ct, "audio/wav");
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body_bytes[0..4], b"RIFF");
+
+        // 存在しない ID。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/nope/audio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #288: `DELETE /api/voicemail/{id}` は 204 No Content + 後続 GET は 404。
+    #[tokio::test]
+    async fn voicemail_delete_removes_files_and_subsequent_get_404() {
+        use crate::call::voicemail::VoicemailFile;
+
+        let (state, dir) = make_state_with_voicemail(true).await;
+        let meta = VoicemailFile {
+            call_id: "victim".to_string(),
+            remote_number: "0312345678".to_string(),
+            recorded_at_unix_ms: 100,
+            duration_ms: 0,
+        };
+        std::fs::write(dir.join("victim.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("victim.wav"), vec![0u8; 44]).unwrap();
+
+        let app = router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/voicemail/victim")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!dir.join("victim.wav").exists());
+        assert!(!dir.join("victim.json").exists());
+
+        // 既に消えているので 404。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/voicemail/victim")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

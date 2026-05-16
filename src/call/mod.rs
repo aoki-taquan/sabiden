@@ -20,6 +20,7 @@ pub mod manager;
 pub mod orchestrator;
 pub mod rate_limiter;
 pub mod transcoder;
+pub mod voicemail;
 
 // Issue #42: ハーネスを使った E2E テスト。`#[cfg(test)]` でゲートしているため
 // production ビルドには含まれない。

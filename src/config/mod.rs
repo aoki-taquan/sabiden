@@ -28,6 +28,10 @@ pub struct Config {
     /// 個別に指定できる。未設定時は SIP local_addr (eth1 NGN 側) にフォールバック。
     #[serde(default)]
     pub bridge: BridgeConfig,
+    /// 留守録 (Issue #288)。 NGN inbound で fork 全失敗時に sabiden が代理で
+    /// 200 OK を返し RTP 音声を WAV で保存する。 既定 disabled。
+    #[serde(default)]
+    pub voicemail: crate::call::voicemail::VoicemailConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -424,6 +428,7 @@ impl Config {
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
+            voicemail: crate::call::voicemail::VoicemailConfig::default(),
         })
     }
 
@@ -535,6 +540,21 @@ impl Config {
         if let Ok(v) = std::env::var("SABIDEN_BRIDGE_EXT_BIND_IP") {
             self.bridge.ext_bind_ip = if v.is_empty() { None } else { v.parse().ok() };
         }
+        // [voicemail] セクション (Issue #288): 留守録 ON/OFF + storage 上書き。
+        if let Ok(v) = std::env::var("SABIDEN_VOICEMAIL_ENABLED") {
+            let lower = v.to_ascii_lowercase();
+            self.voicemail.enabled = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_VOICEMAIL_STORAGE_DIR") {
+            if !v.is_empty() {
+                self.voicemail.storage_dir = std::path::PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_VOICEMAIL_MAX_DURATION_SECS") {
+            if let Ok(n) = v.parse() {
+                self.voicemail.max_duration_secs = n;
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -620,6 +640,14 @@ max_expires = 3600
 # [bridge]
 # ngn_bind_ip = "118.177.72.242"
 # ext_bind_ip = "192.168.20.239"
+
+# 留守録 (Issue #288)。 fork all-fail (内線も PWA も応答せず) の inbound 通話で
+# sabiden が代理で 200 OK を返し、 NGN からの RTP 音声を WAV に保存する。
+# PWA からは `/api/voicemail/list` / `/api/voicemail/{id}/audio` / DELETE で操作。
+# [voicemail]
+# enabled = false
+# storage_dir = "/var/lib/sabiden/voicemail"
+# max_duration_secs = 60
 "#
         .to_string()
     }
@@ -657,6 +685,7 @@ mod tests {
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
+            voicemail: crate::call::voicemail::VoicemailConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -677,6 +706,7 @@ mod tests {
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
+            voicemail: crate::call::voicemail::VoicemailConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -697,6 +727,7 @@ mod tests {
             webrtc: WebRtcConfig::default(),
             ngn: NgnConfig::default(),
             bridge: BridgeConfig::default(),
+            voicemail: crate::call::voicemail::VoicemailConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -875,6 +906,48 @@ secret_hex = "00"
     #[should_panic]
     async fn tokio_interval_panics_on_zero_duration() {
         let _ = tokio::time::interval(std::time::Duration::from_secs(0));
+    }
+
+    /// Issue #288: `[voicemail]` セクション省略時の既定値は `enabled=false` /
+    /// `storage_dir=/tmp/sabiden-voicemail` / `max_duration_secs=60`。
+    #[test]
+    fn toml_default_voicemail_section_is_disabled_with_safe_defaults() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.voicemail.enabled);
+        assert_eq!(
+            cfg.voicemail.storage_dir,
+            std::path::PathBuf::from("/tmp/sabiden-voicemail")
+        );
+        assert_eq!(cfg.voicemail.max_duration_secs, 60);
+    }
+
+    /// Issue #288: TOML から `enabled` / `storage_dir` / `max_duration_secs` を上書き。
+    #[test]
+    fn toml_voicemail_section_can_be_overridden() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[voicemail]
+enabled = true
+storage_dir = "/var/lib/sabiden/voicemail"
+max_duration_secs = 120
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.voicemail.enabled);
+        assert_eq!(
+            cfg.voicemail.storage_dir,
+            std::path::PathBuf::from("/var/lib/sabiden/voicemail")
+        );
+        assert_eq!(cfg.voicemail.max_duration_secs, 120);
     }
 
     /// Issue #131: TOML で keepalive を上書きできる (経路追加 idle timer 対策)。

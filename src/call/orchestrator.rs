@@ -539,6 +539,11 @@ pub struct NgnInboundConfig {
     /// 通話あたり数十秒の leak window は許容範囲。 過剰に短いと不要な
     /// Mutex 競合が増える。
     pub webrtc_active_sweep_interval: Duration,
+    /// Issue #288: 留守録 recorder。 `Some` の場合、 fork all-fail / timeout /
+    /// 内線不在で従来「失敗 status」 を返していた経路の代わりに、 sabiden が
+    /// 代理で 200 OK を返し RTP 音声を WAV に保存する。 `None` (= 既定 disable)
+    /// は従来挙動を維持。
+    pub voicemail_recorder: Option<Arc<super::voicemail::VoicemailRecorder>>,
 }
 
 impl Default for NgnInboundConfig {
@@ -550,6 +555,7 @@ impl Default for NgnInboundConfig {
             bridge_ext_bind_ip: None,
             ngn_local_addr: None,
             webrtc_active_sweep_interval: Duration::from_secs(30),
+            voicemail_recorder: None,
         }
     }
 }
@@ -877,6 +883,14 @@ pub struct NgnInboundHandler {
     /// `outbound_forwarder` と同じく `Mutex<Option<_>>` で interior mutability
     /// にする。 hot path には乗らない (1 通話 = 数回の lock 取得)。
     call_log: Mutex<Option<Arc<crate::observability::call_log::CallLog>>>,
+    /// Issue #288: 留守録中の通話 Call-ID → handle のテーブル。
+    ///
+    /// AllFailed / Timeout / 内線不在で `voicemail_recorder` が設定済なら、
+    /// 通常の失敗 status (480 / 486 / 408) の代わりに sabiden が 200 OK を返し、
+    /// `VoicemailRecorder::start` で recorder task を spawn してここに登録する。
+    /// NGN BYE 受信時 (`handle_bye`) は `stop()` で task を停止し、
+    /// `record_end` を [`Outcome::Voicemail`] で書く (call_log 連動)。
+    voicemail_active: Arc<Mutex<HashMap<String, super::voicemail::VoicemailHandle>>>,
 }
 
 impl NgnInboundHandler {
@@ -913,6 +927,7 @@ impl NgnInboundHandler {
             outbound_forwarder: Mutex::new(None),
             metrics,
             call_log: Mutex::new(None),
+            voicemail_active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -959,6 +974,7 @@ impl NgnInboundHandler {
             outbound_forwarder: Mutex::new(None),
             metrics,
             call_log: Mutex::new(None),
+            voicemail_active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -990,6 +1006,7 @@ impl NgnInboundHandler {
             outbound_forwarder: Mutex::new(None),
             metrics,
             call_log: Mutex::new(None),
+            voicemail_active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1024,6 +1041,7 @@ impl NgnInboundHandler {
             outbound_forwarder: Mutex::new(None),
             metrics,
             call_log: Mutex::new(None),
+            voicemail_active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1591,6 +1609,17 @@ impl NgnInboundHandler {
             let bindings = self.extensions.snapshot().await;
             if bindings.is_empty() {
                 warn!("登録内線なし → 480 Temporarily Unavailable");
+                // Issue #288: voicemail 有効なら内線不在 = 録音直行 (内線フォーク
+                // を起動するまでもなく確実に「不在」)。 起動成功時は呼を確立した
+                // とみなして call_active を +1 し、 BYE 受信で finalize する。
+                let voicemail_started = self
+                    .try_start_voicemail(&stx, &request, &call_id)
+                    .await
+                    .unwrap_or(false);
+                if voicemail_started {
+                    self.metrics.inc_call_active();
+                    return Ok::<(), anyhow::Error>(());
+                }
                 self.respond(&stx, 480, "Temporarily Unavailable").await?;
                 self.pending.lock().await.remove(&call_id);
                 // 着信は受け付けたが内線不在で確立に至らず → error 計上
@@ -2087,39 +2116,75 @@ impl NgnInboundHandler {
                     // は handle_bye の dec_call_active 時点で確定する。
                 }
                 ForkResult::AllFailed { last_status } => {
-                    // Issue #211 / RFC 3261 §16.7 step 6:
-                    //   reason phrase は `reason_phrase_for_status` で決める。
-                    //   旧実装は 603 に "Declined" を返していたが、 RFC 3261
-                    //   §21.6.2 は単数 "Decline" が正規。
-                    let code = last_status.unwrap_or(486);
-                    let reason = reason_phrase_for_status(code);
-                    self.respond(&stx, code, reason).await?;
-                    self.pending.lock().await.remove(&call_id);
-                    let result = if code == 486 {
-                        InviteResult::Busy
+                    // Issue #288: voicemail 有効なら 200 OK + 録音開始で
+                    // 「不在着信を留守録で受ける」 動作を試みる。 起動成功時は
+                    // failure status を返さず call_log は「録音」 = Missed
+                    // のまま (= 通常 UI は不在着信扱い)、 BYE 受信時に call が
+                    // 確定終了する。 起動失敗 (= 設定無し / SDP 不正 / socket 失敗)
+                    // は false を返し、 従来通り failure status で応答する。
+                    let voicemail_started = self
+                        .try_start_voicemail(&stx, &request, &call_id)
+                        .await
+                        .unwrap_or(false);
+                    if voicemail_started {
+                        // 録音セッションは BYE 受信 / max_duration 経過まで継続。
+                        // `pending` / `active` は voicemail 経路でも RFC 3261
+                        // §13 上は通話確立 = 200 OK 後 ACK で dialog 確定なので
+                        // BYE まで pending を保持する (handle_bye が pending /
+                        // voicemail_active 双方を cleanup)。
+                        // observability 上は inc_call_active して BYE で dec する
+                        // (= 確立した呼として記録)、 call_log は
+                        // `record_end(Missed)` ではなく BYE で `Answered`
+                        // (留守録で「応答済」 扱い) として確定する。
+                        self.metrics.inc_call_active();
                     } else {
-                        InviteResult::Error
-                    };
-                    self.metrics.record_invite_extension(result);
-                    self.metrics.record_invite_ngn(result);
-                    // Issue #278: 着信が確立せずに終わった (どの内線も応答せず)。
-                    // PWA UI 上は「不在着信」 として表示するため Missed として
-                    // 記録する (486 BUSY も内線都合なので発信側視点 = Missed)。
-                    if let Some(call_log) = self.call_log_clone().await {
-                        call_log
-                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                        // Issue #211 / RFC 3261 §16.7 step 6:
+                        //   reason phrase は `reason_phrase_for_status` で決める。
+                        //   旧実装は 603 に "Declined" を返していたが、 RFC 3261
+                        //   §21.6.2 は単数 "Decline" が正規。
+                        let code = last_status.unwrap_or(486);
+                        let reason = reason_phrase_for_status(code);
+                        self.respond(&stx, code, reason).await?;
+                        self.pending.lock().await.remove(&call_id);
+                        let result = if code == 486 {
+                            InviteResult::Busy
+                        } else {
+                            InviteResult::Error
+                        };
+                        self.metrics.record_invite_extension(result);
+                        self.metrics.record_invite_ngn(result);
+                        // Issue #278: 着信が確立せずに終わった (どの内線も応答せず)。
+                        // PWA UI 上は「不在着信」 として表示するため Missed として
+                        // 記録する (486 BUSY も内線都合なので発信側視点 = Missed)。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Missed,
+                            );
+                        }
                     }
                 }
                 ForkResult::Timeout => {
-                    self.respond(&stx, 408, "Request Timeout").await?;
-                    self.pending.lock().await.remove(&call_id);
-                    self.metrics.record_invite_extension(InviteResult::Timeout);
-                    self.metrics.record_invite_ngn(InviteResult::Timeout);
-                    // Issue #278: 内線が誰も応答しないまま fork タイムアウト
-                    // (RFC 3261 §16.7) → 着信側視点では Missed。
-                    if let Some(call_log) = self.call_log_clone().await {
-                        call_log
-                            .record_end(&call_id, crate::observability::call_log::Outcome::Missed);
+                    // Issue #288: voicemail 経由で代理応答できれば起動する。
+                    let voicemail_started = self
+                        .try_start_voicemail(&stx, &request, &call_id)
+                        .await
+                        .unwrap_or(false);
+                    if voicemail_started {
+                        self.metrics.inc_call_active();
+                    } else {
+                        self.respond(&stx, 408, "Request Timeout").await?;
+                        self.pending.lock().await.remove(&call_id);
+                        self.metrics.record_invite_extension(InviteResult::Timeout);
+                        self.metrics.record_invite_ngn(InviteResult::Timeout);
+                        // Issue #278: 内線が誰も応答しないまま fork タイムアウト
+                        // (RFC 3261 §16.7) → 着信側視点では Missed。
+                        if let Some(call_log) = self.call_log_clone().await {
+                            call_log.record_end(
+                                &call_id,
+                                crate::observability::call_log::Outcome::Missed,
+                            );
+                        }
                     }
                 }
             }
@@ -2390,6 +2455,26 @@ impl NgnInboundHandler {
                 call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
             }
         }
+        // Issue #288: voicemail で代理応答した通話 (= AllFailed/Timeout 経路で
+        // 200 OK + WAV 録音を始めた) は `voicemail_active` から引いて停止する。
+        // recorder task は max_duration / stop_signal のどちらかで finalize する。
+        let voicemail_was_active = {
+            let mut tbl = self.voicemail_active.lock().await;
+            tbl.remove(&cid)
+        };
+        if let Some(h) = voicemail_was_active {
+            h.stop();
+            self.metrics.dec_call_active();
+            // Issue #288: 録音できた / できなかったは task 側で確定する。 history
+            // 上は「正常終了」 扱い (Outcome::Answered) で記録する: 不在着信を
+            // 留守録で受けた = ユーザ視点では「メッセージあり」 で missed とは
+            // 区別したい。 既存 Outcome 種別の追加は別 PR で扱う想定 (CLAUDE.md
+            // §6.5 並列 agent との競合回避 / 最小 hook 原則)。
+            if let Some(call_log) = self.call_log_clone().await {
+                call_log.record_end(&cid, crate::observability::call_log::Outcome::Answered);
+            }
+            info!(call_id=%cid, "voicemail: NGN BYE 受信 → 録音停止 (Issue #288)");
+        }
         if let (Some(Some(call_id)), Some(mgr)) = (removed, self.call_manager.as_ref()) {
             if let Err(e) = mgr.terminate(call_id).await {
                 warn!(error=%e, "BYE 受信時の通話終了に失敗");
@@ -2600,6 +2685,120 @@ impl NgnInboundHandler {
         let mut resp = build_response_skeleton(tx.request(), status, reason);
         ensure_to_tag(&mut resp);
         tx.respond(resp).await
+    }
+
+    /// Issue #288: fork all-fail / timeout / 内線不在 経路から呼ばれ、 voicemail
+    /// 機能が有効なら sabiden が代理で 200 OK + SDP を返し、 NGN からの RTP
+    /// 音声を WAV に保存する task を spawn する。
+    ///
+    /// 戻り値:
+    /// - `Ok(true)` — voicemail 経路で 200 OK を返した (= 呼出側は失敗 status を
+    ///   返してはいけない)。 通話 ID は `voicemail_active` に登録済で、 NGN BYE
+    ///   受信時に [`handle_bye`] が `stop()` してファイル finalize を待つ。
+    /// - `Ok(false)` — voicemail 未有効 / 構築失敗 / 起動失敗。 呼出側は従来通り
+    ///   失敗 status (480 / 486 / 408 等) を返す。
+    /// - `Err(_)` — `respond` 自体が失敗 (socket I/O error)。 呼出側は伝搬する。
+    ///
+    /// RFC 3261 §17.2.1 / §13.3.1.4: UAS は INVITE に対する final response として
+    /// 200 OK + SDP answer (本路 = sabiden SDP) を返す。 ACK は orchestrator の
+    /// 既存 `handle_inbound` の `SipMethod::Ack` 分岐で受ける (現状 ACK は SDP
+    /// を含まないことが NGN の慣例で、 dialog state も sabiden は voicemail 用に
+    /// は持たない: BYE 受信時に `voicemail_active` から引いて停止する)。
+    async fn try_start_voicemail(
+        &self,
+        stx: &Arc<Mutex<ServerTransaction>>,
+        request: &SipRequest,
+        call_id: &str,
+    ) -> Result<bool> {
+        let Some(recorder) = self.cfg.voicemail_recorder.clone() else {
+            return Ok(false);
+        };
+        if request.body.is_empty() {
+            debug!(%call_id, "voicemail: NGN INVITE に SDP body 無し → 起動見送り");
+            return Ok(false);
+        }
+        let ngn_bind_ip = self.bridge_ngn_ip();
+        let ngn_sock = match bind_ngn_rtp_socket(ngn_bind_ip).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%call_id, error=%e, "voicemail: NGN RTP socket bind 失敗 → 起動見送り");
+                return Ok(false);
+            }
+        };
+        let sabiden_ngn_addr = match ngn_sock.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%call_id, error=%e, "voicemail: local_addr 取得失敗 → 起動見送り");
+                return Ok(false);
+            }
+        };
+
+        // SDP answer: NGN offer から `c=` / `m=` port のみ書き換えた最小形式を返す
+        // (CLAUDE.md §5 NGN は PCMU only)。 NGN offer の他要素 (a=rtpmap、 fmtp、
+        // session-level attr) は留守録経路でも壊さないようそのまま echo する。
+        let rewritten = match rewrite_rtp_endpoint(
+            &request.body,
+            sabiden_ngn_addr.ip(),
+            sabiden_ngn_addr.port(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    %call_id, error=%e,
+                    "voicemail: SDP rewrite 失敗 → 起動見送り (offer 不正?)"
+                );
+                return Ok(false);
+            }
+        };
+
+        // 200 OK 組み立て。 `Answered` 経路の最小サブセット (Allow / Supported /
+        // Server / Date / Contact / To-tag)。 Session-Timer は voicemail では
+        // negotiate せず (sabiden 側が refresher 担当でも数十秒録音で完結する
+        // ため SE 不要)。 Issue #251 Phase A の `apply_uas_inbound_2xx_headers`
+        // を流用する。
+        let contact_addr = self
+            .cfg
+            .ngn_local_addr
+            .map(Ok)
+            .unwrap_or_else(|| self.socket.local_addr())?;
+        let mut resp = {
+            let tx = stx.lock().await;
+            build_response_skeleton(tx.request(), 200, "OK")
+        };
+        resp.body = rewritten;
+        resp.headers.set("Content-Type", "application/sdp");
+        ensure_to_tag(&mut resp);
+        apply_uas_inbound_2xx_headers(&mut resp);
+        resp.headers
+            .set("Contact", format!("<sip:sabiden@{}>", contact_addr));
+
+        {
+            let mut tx = stx.lock().await;
+            if let Err(e) = tx.respond(resp).await {
+                warn!(%call_id, error=%e, "voicemail: 200 OK 送出失敗 → 起動見送り");
+                return Ok(false);
+            }
+        }
+
+        // 発信者番号を `From` URI から抽出。 NGN inbound は carrier IMS が
+        // anonymous 化することがある (memory: `project_ngn_inbound_caller_id_stripped`)、
+        // 取れなければ "unknown" を保存する。
+        let remote_number = request
+            .headers
+            .get("from")
+            .map(extract_uri_from_addr)
+            .map(|uri| extract_user_from_sip_uri(&uri).unwrap_or(uri))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let handle = recorder
+            .clone()
+            .start(ngn_sock, call_id.to_string(), remote_number);
+        self.voicemail_active
+            .lock()
+            .await
+            .insert(call_id.to_string(), handle);
+        info!(%call_id, "voicemail 録音開始 (Issue #288)");
+        Ok(true)
     }
 }
 
@@ -11992,6 +12191,7 @@ mod tests {
             outbound_forwarder: Mutex::new(None),
             metrics: metrics.clone(),
             call_log: Mutex::new(None),
+            voicemail_active: Arc::new(Mutex::new(HashMap::new())),
         });
         // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
         drop(sabiden_inbound_rx);

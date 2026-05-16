@@ -433,9 +433,9 @@ pub enum Scenario {
 
 ### 4.4 `SipMethod::Other(String)` で 405 化 [**解消済**]
 
-**NGN inbound 側**: Issue #110 / PR #154 で `src/call/orchestrator.rs::handle_inbound` を method 別 status に整理済。
+**NGN inbound 側**: Issue #110 / PR #189 で `src/call/orchestrator.rs::handle_inbound` を method 別 status に整理済。
 
-**内線 UAS 側**: Issue #273 / PR #XXX で `src/sip/uas.rs::handle_request` を以下の通り個別 status に整理済 (RFC 引用付き):
+**内線 UAS 側**: Issue #273 / PR #274 で `src/sip/uas.rs::handle_request` を以下の通り個別 status に整理済 (RFC 引用付き):
 
 | Method | 応答 | 根拠 |
 |---|---|---|

@@ -177,7 +177,7 @@ src/
 ### NGN UAS メソッド ディスパッチ (Issue #110)
 
 `NgnInboundHandler::handle_inbound` は NGN 側 `TransactionLayer` から
-受信した SIP リクエストを method 別に振り分ける。 以前 (PR #154 以前) は
+受信した SIP リクエストを method 別に振り分ける。 以前 (PR #189 以前) は
 `SipMethod::Other(String)` を含む未対応メソッドを **一律 405** で
 拒否していたが、 RFC 3261 §8.2.1 が要求する `Allow` ヘッダが欠落しており、
 かつ NOTIFY (reg-event) / MESSAGE (SMS) 等で UA の再送ストームを誘発する

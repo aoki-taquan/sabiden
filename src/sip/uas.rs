@@ -1702,11 +1702,17 @@ mod tests {
             match time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
                     if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
-                        // 100 Trying は INVITE 系のみ。 非 INVITE 経路には来ない想定。
-                        if r.status_code != 100 {
-                            got_response = Some(r);
-                            break;
-                        }
+                        // RFC 3261 §17.1.1.1: 100 Trying は INVITE 系のみで
+                        // 送出される。 非 INVITE method 経路 (NOTIFY 等の本
+                        // helper 対象) に届くこと自体が異常 → 即 panic で
+                        // silent fail を防ぐ (CLAUDE.md §7 flaky 禁止)。
+                        assert_ne!(
+                            r.status_code, 100,
+                            "100 Trying は INVITE 系のみ。 非 INVITE method ({}) に届くのは異常",
+                            method_str
+                        );
+                        got_response = Some(r);
+                        break;
                     }
                 }
                 _ => break,

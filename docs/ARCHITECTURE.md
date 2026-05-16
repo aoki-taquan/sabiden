@@ -258,36 +258,70 @@ signaling を駆動する (`src/call/orchestrator.rs::handle_ext_refer`):
   │              │                    │                       │
   ├─ REFER ─────►│                    │                       │
   │              │ (dialog lookup_by_ext, Refer-To parse)     │
+  │              │ (scheme allowlist: sip:/sips: のみ, §2.4.1) │
   │◄─ 202 Accepted (RFC 3515 §2.4.6)  │                       │
   │              │ (implicit subscription start, §2.4.4)      │
   │◄─ NOTIFY sipfrag "SIP/2.0 100 Trying" (§2.4.5)            │
-  │              │                    │                       │
-  │              ├─ INVITE ──────────►│                       │
-  │              │◄────────── 200 OK ─┤                       │
+  ├─ 200 OK (NOTIFY) ──►│              │                       │ (RFC 6665 §4.2.2)
+  │              │ (NOTIFY 100 await 完了、 順序保証 §3.2.2) │
+  │              │ (registrar.lookup で B の binding 引き)    │
+  │              │ (=toll fraud 防御: 未登録 AOR は INVITE 不発、 §26.1) │
+  │              ├─ INVITE (offer-less, §13.2.1) ──►│         │
+  │              │◄────────── 200 OK (SDP offer) ───┤         │
+  │              ├─ ACK (TODO: SDP answer, §13.2.1 + RFC 3264 §5) ──►│
   │              │                    │                       │
   │◄─ NOTIFY sipfrag "SIP/2.0 200 OK", Subscription-State: terminated
+  ├─ 200 OK (NOTIFY) ──►│              │                       │ (RFC 6665 §4.2.2)
   │              │                    │                       │
   │◄─ BYE (元 dialog) (RFC 3261 §15.1.1)                       │
   │              ├─────────────────── BYE (NGN レッグ) ───────►│
   │              │                    │                       │
 ```
 
+**ノート (sequence の読み方):**
+
+- 各 NOTIFY の `200 OK (NOTIFY)` は transferor UA が返す ACK 相当の応答
+  (RFC 6665 §4.2.2 + RFC 3265 §3.2.2)。 sabiden 側は **進捗 NOTIFY を
+  await し終わってから次の step に進む** (`send_refer_notify` で同期化)。
+  これにより `100 Trying → terminated` の状態遷移が UDP 上で逐次保証され、
+  transferor 側で「terminated を先に受けてから active を受ける」 race を
+  防止する。 NOTIFY 200 OK が返らなくても 4 秒で timeout して進行する
+  (transferor 不在時のフェイルセーフ)。
+- transferee B への INVITE は **offer-less** で送出する (RFC 3261
+  §13.2.1)。 本来 RFC 3264 §5 に従い ACK で SDP answer を返す必要が
+  あるが、 本 PR は signaling 完成までの MVP として未実装。 媒体面
+  (RTP bridge re-routing + NGN への Re-INVITE) は Issue #289 follow-up。
+
 ステップ詳細:
 
 1. **A → sabiden REFER**: dialog 内 (Call-ID = ext_call_id) で受信。 `src/sip/uas.rs`
    の REFER 分岐は `UasEvent::Refer` を上位へ流す (上位未接続時のみ 405 fallback)。
-2. **dialog 検証 + 202 Accepted**: `OutboundCallRegistry::lookup_by_ext` で
-   transferor の dialog を引く (見つからなければ 481、 RFC 3261 §12.2.2)。
-   `Refer-To` ヘッダの user 部を `extract_refer_to_aor` で抽出 (失敗時 400)。
-3. **NOTIFY 100 Trying**: `Dialog::build_notify_refer_sipfrag` で `Event: refer` +
-   `Subscription-State: active;expires=60` + `Content-Type: message/sipfrag;version=2.0` +
-   body `SIP/2.0 100 Trying\r\n` を組み立て、 ext_layer 経由で transferor へ送出。
-4. **binding lookup**: `ExtensionRegistrar::lookup(target_aor)` で B の binding を引く。
-   - 不在: NOTIFY sipfrag `SIP/2.0 404 Not Found` + `Subscription-State: terminated;reason=noresource`
-     を送って終了 (元 dialog は維持)。
-5. **B2BUA INVITE to transferee**: `UasEventHandler::ext_inviter` (= `NgnInboundHandler`
-   と共有する `Arc<UacForker>`) で B へ INVITE を送出。 SDP は MVP として空 body
-   (blind transfer)。 媒体面 (RTP bridge) re-routing は Issue #289 follow-up。
+2. **dialog 検証 + Refer-To 解析 + 202 Accepted**: `OutboundCallRegistry::lookup_by_ext`
+   で transferor の dialog を引く (見つからなければ 481、 RFC 3261 §12.2.2)。
+   `Refer-To` ヘッダの user 部を `extract_refer_to_aor` で抽出する。 ここで
+   **`sip:` / `sips:` 以外の scheme (`tel:` / `http:` / `https:` 等) は 400 で
+   reject** する (RFC 3515 §2.4.1 + RFC 3261 §26.1 toll fraud 防御の素材レベル
+   ガード)。 user 部抽出失敗時も 400。
+3. **NOTIFY 100 Trying (await 完走)**: `Dialog::build_notify_refer_sipfrag` で
+   `Event: refer` + `Subscription-State: active;expires=60` + `Content-Type:
+   message/sipfrag;version=2.0` + body `SIP/2.0 100 Trying\r\n` を組み立て、
+   ext_layer 経由で transferor へ送出。 **`tokio::spawn` は使わず `await` まで
+   完走** することで、 RFC 3265 §3.2.2 が要求する subscription state 遷移の
+   順序保証 (active → terminated) を UDP 送信側で逐次化する。 transferor
+   からの NOTIFY 200 OK (RFC 6665 §4.2.2) は 4 秒で timeout (応答不要)。
+4. **binding lookup + toll fraud gating**: `ExtensionRegistrar::lookup(target_aor)`
+   で B の binding を引く。 **lookup 成功時のみ B への INVITE を発行** すること
+   で、 外線番号風の AOR (例: `<sip:0312345678@ntt-east.ne.jp>`) が指定されても
+   gateway を介した「踏み台外線発信」 が成立しない (RFC 3261 §26.1 + RFC 3515
+   §2.4.1)。 二重防御として step 2 の scheme allowlist と組み合わせる。
+   - 不在: NOTIFY sipfrag `SIP/2.0 404 Not Found` + `Subscription-State:
+     terminated;reason=noresource` を送って終了 (元 dialog は維持)。
+5. **B2BUA INVITE to transferee (offer-less, MVP)**: `UasEventHandler::ext_inviter`
+   (= `NgnInboundHandler` と共有する `Arc<UacForker>`) で B へ INVITE を送出。
+   **SDP body は空 (offer-less INVITE, RFC 3261 §13.2.1)**。 RFC 3264 §5 では
+   ACK に SDP answer を載せる必要があるが、 本 PR では未実装 (B 側 UA が自前
+   で SDP を組んで 200 OK で返す前提の blind transfer MVP)。 媒体面 (RTP bridge
+   re-routing + NGN への Re-INVITE で SDP 再ネゴ) は Issue #289 follow-up。
 6. **final NOTIFY + 元 dialog 終了**:
    - B が 2xx (Established): NOTIFY sipfrag `SIP/2.0 200 OK` を transferor へ送り、
      **元 dialog (transferor 内線 + NGN レッグ) を BYE** で閉じる (RFC 3261 §15.1.1)。

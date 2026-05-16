@@ -3873,6 +3873,10 @@ impl UasEventHandler {
     ///    481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)。
     /// 2. `Refer-To` ヘッダから transferee 内線 B の AOR (user 部) を抽出。
     ///    不正なら 400 Bad Request (RFC 3515 §2.4.1)。
+    ///    [`extract_refer_to_aor`] は **`sip:` / `sips:` scheme のみを accept**
+    ///    し、 `tel:` / `http:` 等の他スキームは reject する (RFC 3515 §2.4.1:
+    ///    "the value of the Refer-To header field MUST be a SIP URI"). これにより
+    ///    任意 URI を介した外線抜けの toll fraud 入口を素材レベルで塞ぐ。
     /// 3. **202 Accepted** を transferor (内線 A) へ返す (RFC 3515 §2.4.6:
     ///    "The 202 Accepted response indicates that the REFER request has
     ///    been accepted ...")。 202 で implicit subscription が確立 (RFC 3265
@@ -3880,12 +3884,24 @@ impl UasEventHandler {
     /// 4. NOTIFY (sipfrag `SIP/2.0 100 Trying`、 Subscription-State: active) を
     ///    transferor の dialog 上で送出 (RFC 3515 §2.4.5)。 ここで dialog の
     ///    `local_cseq` を 1 つ消費する。
-    /// 5. `ext_registrar` で内線 B の Binding を引く。 不在なら NOTIFY
-    ///    (sipfrag `SIP/2.0 404 Not Found`、 Subscription-State: terminated)
-    ///    で transferor に失敗通知して終了。
-    /// 6. `ext_inviter.invite(target_uri, sdp)` で B へ INVITE を送る。
-    ///    SDP body は元 dialog の NGN 側 offer をそのまま流す (B2BUA blind
-    ///    transfer の MVP)。
+    /// 5. `ext_registrar` で内線 B の Binding を引く。 **lookup 成功時のみ B へ
+    ///    INVITE を発行する** ことで、 user 部 の AOR が registrar に登録された
+    ///    内線でない限り発信させない (RFC 3261 §26.1 "the gateway MUST take care
+    ///    to authenticate and authorize requests... so that gateway resources
+    ///    cannot be used to launch unauthorized requests")。 これにより Refer-To
+    ///    に外線番号 (例: `<sip:0312345678@ntt-east.ne.jp>`) が指定されても
+    ///    `registrar.lookup` が None を返し、 NOTIFY sipfrag 404 で transferor に
+    ///    失敗通知するのみで NGN 側へ INVITE は出ない。 RFC 3515 §2.4.1 + RFC
+    ///    3261 §26.1 を満たす toll fraud 防御として機能する。
+    ///    不在なら NOTIFY (sipfrag `SIP/2.0 404 Not Found`、 Subscription-State:
+    ///    terminated) で transferor に失敗通知して終了。
+    /// 6. `ext_inviter.invite(target_uri, sdp)` で B へ **offer-less INVITE**
+    ///    (空 SDP) を送る。 RFC 3261 §13.2.1 / RFC 3264 §5 に基づき、 B 側 UA
+    ///    が 200 OK で SDP offer を載せ、 sabiden が ACK で SDP answer を返す
+    ///    "INVITE without offer + ACK-with-answer" シーケンスが本来必要だが、
+    ///    本 PR では未実装 (B 側 UA が自前で SDP を組んで 200 OK で返す前提の
+    ///    blind transfer MVP)。 媒体面 (RTP bridge re-routing + NGN への
+    ///    Re-INVITE / SDP 再ネゴ) は follow-up Issue #289 で対応する。
     /// 7. B の最終応答に応じて NOTIFY (sipfrag status line、
     ///    Subscription-State: terminated;reason=noresource) を transferor へ。
     /// 8. B が 2xx (Established) で確立した場合のみ、 元 dialog (transferor ↔
@@ -3898,6 +3914,20 @@ impl UasEventHandler {
     /// NGN carrier IMS からの REFER 受信は本実装の scope 外 (Issue #289)。
     /// NGN inbound 経路 (`handle_inbound` の `SipMethod::Refer`) は引き続き
     /// `405` 等の default で reject する。
+    ///
+    /// # Toll fraud 防御 (RFC 3261 §26.1)
+    ///
+    /// 内線 → 外線への REFER 経由「踏み台」 を防ぐため、 本実装は **二重防御**
+    /// を持つ:
+    /// 1. **scheme allowlist** ([`extract_refer_to_aor`]): `sip:` / `sips:` 以外
+    ///    の URI を 400 で reject。
+    /// 2. **registrar lookup gating** (step 5): `ExtensionRegistrar::lookup`
+    ///    成功時のみ INVITE 発行。 外線番号風の AOR (`sip:0312345678@...`) は
+    ///    binding 不在で必ず NOTIFY 404 に落ちる。
+    ///
+    /// 将来 (Issue #289 follow-up) で「内線 → 外線 transfer」 (= NGN 側へ
+    /// 出る REFER) を実装する場合、 別途認可ポリシ (caller AOR allowlist 等) を
+    /// 必須化する。
     async fn handle_ext_refer(
         &self,
         request: SipRequest,
@@ -4067,8 +4097,27 @@ impl UasEventHandler {
     /// 既存 ext_dialog に対して REFER 用 sipfrag NOTIFY を送る (RFC 3515 §2.4.5)。
     ///
     /// `Dialog::build_notify_refer_sipfrag` で組み立て、 `TransactionLayer::send_request`
-    /// で transferor へ送信する。 NOTIFY 自体の応答 (200 OK 等) は本実装では
-    /// 待たない (失敗しても通話の本筋に影響しないため warn のみ)。
+    /// で transferor へ送信する。
+    ///
+    /// # 送信完了まで await する理由 (RFC 3265 §3.2.2 / RFC 3515 §2.4.5)
+    ///
+    /// RFC 3265 §3.2.2 (Notifier NOTIFY Behavior): "The notifier MUST also
+    /// generate a NOTIFY request, the body of which carries the new
+    /// resource state...". つまり subscription state の遷移
+    /// (`active;expires=60` → `terminated;reason=noresource`) は **順序保証
+    /// 付きで** subscriber に届ける必要がある。 進捗 NOTIFY (sipfrag 100
+    /// Trying) と最終 NOTIFY (sipfrag 200/4xx/5xx terminated) を UDP 上で
+    /// 並列発射してしまうと、 OS の write race / 経路差で再順位入れ替え
+    /// が発生し、 transferor 側 UA が "terminated → active" と誤解する
+    /// production flake を生む。
+    ///
+    /// そのため本実装は `tokio::spawn` を **使わず** に `await` まで完走
+    /// する。 これにより `handle_ext_refer` の呼出シーケンス (NOTIFY 100 →
+    /// transferee INVITE → 最終 NOTIFY) は UDP 送信側で逐次化される。
+    ///
+    /// NOTIFY 自体の応答 (200 OK 等) は本実装では待たない (失敗しても
+    /// 通話の本筋に影響しないため warn のみ)。 タイムアウト上限は短く保ち、
+    /// transferor が応答しない場合の遅延を最小化する。
     async fn send_refer_notify(
         &self,
         entry: &Arc<OutboundCallEntry>,
@@ -4082,26 +4131,20 @@ impl UasEventHandler {
             let dst = dlg.next_hop_socket(entry.ext_remote);
             (notify, dst)
         };
-        // NOTIFY は新規 transaction なので send_request で最終応答まで待てるが、
-        // transferor が NOTIFY 200 OK を返さなくても REFER 全体は進められる
-        // ため fire-and-forget 寄りに扱う (タイムアウト時に warn する)。
-        let layer = ext_layer.clone();
-        let line = sipfrag_status_line.to_string();
+        // RFC 3265 §3.2.2 の順序保証のため await まで完走する。
         // 短いタイムアウトで待ち、失敗しても無視 (transferor が居なくても
         // transferee の通話は確立できるため)。
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(4), layer.send_request(notify, dst))
-                .await
-            {
-                Ok(Ok(resp)) => debug!(
-                    sipfrag = %line,
-                    notify_status = resp.status_code,
-                    "REFER NOTIFY 応答受信"
-                ),
-                Ok(Err(e)) => warn!(error=%e, sipfrag=%line, "REFER NOTIFY 送出失敗"),
-                Err(_) => warn!(sipfrag=%line, "REFER NOTIFY タイムアウト (4s)"),
-            }
-        });
+        match tokio::time::timeout(Duration::from_secs(4), ext_layer.send_request(notify, dst))
+            .await
+        {
+            Ok(Ok(resp)) => debug!(
+                sipfrag = %sipfrag_status_line,
+                notify_status = resp.status_code,
+                "REFER NOTIFY 応答受信"
+            ),
+            Ok(Err(e)) => warn!(error=%e, sipfrag=%sipfrag_status_line, "REFER NOTIFY 送出失敗"),
+            Err(_) => warn!(sipfrag=%sipfrag_status_line, "REFER NOTIFY タイムアウト (4s)"),
+        }
     }
 
     /// transferee 確立後に元 dialog (transferor ↔ sabiden + sabiden ↔ NGN) を
@@ -6072,6 +6115,17 @@ fn extract_user_from_sip_uri(uri: &str) -> Option<String> {
 /// `addr-spec` 形式 (`sip:alice@example.com`) を取りうる。 ヘッダ パラメータ
 /// (`;params`) や URI パラメータは無視する (内線 AOR の lookup には user 部のみ
 /// 必要)。 抽出できなければ None (呼出側で 400 にする)。
+///
+/// # Scheme allowlist (RFC 3515 §2.4.1 + RFC 3261 §26.1)
+///
+/// 本実装は **`sip:` / `sips:` scheme のみを accept** する。 `tel:` /
+/// `http:` / `https:` 等の他スキームは None を返して呼出側で 400 Bad Request
+/// にする。 これは:
+/// 1. **RFC 3515 §2.4.1**: "the value of the Refer-To header field MUST be
+///    a SIP URI" を遵守。
+/// 2. **RFC 3261 §26.1 toll fraud 防御**: REFER 経由で gateway を踏み台に
+///    任意 URI へ INVITE を発射されないよう、 素材レベルで scheme を縛る。
+///    user 部の registrar lookup と二重防御になる (`handle_ext_refer` step 5)。
 fn extract_refer_to_aor(value: &str) -> Option<String> {
     let trimmed = value.trim();
     let uri_part = if let Some(start) = trimmed.find('<') {
@@ -6082,7 +6136,13 @@ fn extract_refer_to_aor(value: &str) -> Option<String> {
     } else {
         trimmed
     };
-    let after_scheme = uri_part.split_once(':').map(|x| x.1).unwrap_or(uri_part);
+    // RFC 3515 §2.4.1 + RFC 3261 §26.1: scheme allowlist (sip / sips のみ).
+    // 大文字小文字無視 (RFC 3261 §19.1.1 "the URI scheme is case-insensitive").
+    let (scheme, after_scheme) = uri_part.split_once(':')?;
+    let scheme_lc = scheme.trim().to_ascii_lowercase();
+    if scheme_lc != "sip" && scheme_lc != "sips" {
+        return None;
+    }
     let (user, _host) = after_scheme.split_once('@')?;
     if user.is_empty() {
         None
@@ -17061,6 +17121,50 @@ mod tests {
         assert_eq!(super::extract_refer_to_aor("not-a-uri"), None);
     }
 
+    /// RFC 3515 §2.4.1 + RFC 3261 §26.1 (toll fraud 防御): `sip:` / `sips:` 以外
+    /// の scheme を持つ Refer-To は extract_refer_to_aor が None を返し、 呼出側
+    /// で 400 Bad Request にする。 これは Refer-To を踏み台にした外線抜けを
+    /// 素材レベルで塞ぐ二重防御の片方 (もう片方は handle_ext_refer step 5 の
+    /// registrar.lookup gating)。
+    #[test]
+    fn rfc3515_2_4_1_extract_refer_to_aor_rejects_non_sip_schemes() {
+        // tel: は SIP URI ではないので reject (RFC 3515 §2.4.1: "MUST be a SIP URI")
+        assert_eq!(
+            super::extract_refer_to_aor("<tel:+12025550100>"),
+            None,
+            "RFC 3515 §2.4.1: tel: URI は SIP URI ではないので reject"
+        );
+        // http: scheme は明らかに想定外 (toll fraud / SSRF 入口)
+        assert_eq!(
+            super::extract_refer_to_aor("<http://evil.example.com/inject>"),
+            None,
+            "RFC 3261 §26.1: 任意 http URI は reject"
+        );
+        // https: も同様
+        assert_eq!(
+            super::extract_refer_to_aor("<https://evil.example.com/inject>"),
+            None,
+            "RFC 3261 §26.1: 任意 https URI は reject"
+        );
+        // 大文字 SIP: は accept (RFC 3261 §19.1.1: scheme は case-insensitive)
+        assert_eq!(
+            super::extract_refer_to_aor("<SIP:alice@example.com>"),
+            Some("alice".to_string()),
+            "RFC 3261 §19.1.1: scheme は case-insensitive"
+        );
+        // sips: は SIP URI 扱いで accept (RFC 3515 §2.4.1: "SIP URI" は sips: を含む)
+        assert_eq!(
+            super::extract_refer_to_aor("<sips:bob@example.com>"),
+            Some("bob".to_string()),
+            "RFC 3515 §2.4.1: sips: も SIP URI として accept"
+        );
+        // 異 scheme + display-name (toll fraud 攻撃ベクタ)
+        assert_eq!(
+            super::extract_refer_to_aor("\"victim\" <tel:+819012345678>"),
+            None
+        );
+    }
+
     /// RFC 3261 §21 / Issue #289: `sip_reason_for` は表に載っている status code
     /// に対して正しい reason phrase を返し、 表外 code には generic を返す。
     #[test]
@@ -17387,6 +17491,10 @@ mod tests {
         let mut got_202 = false;
         let mut got_notify_100 = false;
         let mut got_notify_200 = false;
+        // NOTIFY 受信順を記録 (RFC 3265 §3.2.2: subscription state は順序保証
+        // 付きで届く必要がある。 send_refer_notify を await 化したので 100 →
+        // 200 の順で sabiden が UDP send することを確認)。
+        let mut notify_order: Vec<u16> = Vec::new();
         // NOTIFY も A 宛に来る (sabiden が transferor dialog 経由で送る)
         for _ in 0..16 {
             match timeout(Duration::from_secs(3), harness.phone.recv_from(&mut buf)).await {
@@ -17412,8 +17520,10 @@ mod tests {
                                 // sipfrag body のステータス行を確認
                                 if body.starts_with("SIP/2.0 100") {
                                     got_notify_100 = true;
+                                    notify_order.push(100);
                                 } else if body.starts_with("SIP/2.0 200") {
                                     got_notify_200 = true;
+                                    notify_order.push(200);
                                 }
                                 // Event: refer ヘッダ必須 (RFC 3515 §2.4.5)
                                 assert_eq!(
@@ -17455,6 +17565,16 @@ mod tests {
         assert!(
             got_notify_200,
             "RFC 3515 §2.4.5: 成功 NOTIFY (sipfrag 200 OK) が必要"
+        );
+        // RFC 3265 §3.2.2: NOTIFY の subscription state 遷移は順序保証付き。
+        // 100 Trying (active) → 200 OK (terminated) で必ず届く (= sabiden 側で
+        // tokio::spawn ではなく await まで完走させた効果)。
+        let idx_100 = notify_order.iter().position(|&s| s == 100);
+        let idx_200 = notify_order.iter().position(|&s| s == 200);
+        assert!(
+            matches!((idx_100, idx_200), (Some(i100), Some(i200)) if i100 < i200),
+            "RFC 3265 §3.2.2: NOTIFY 100 (active) は NOTIFY 200 (terminated) より先に届くべき (got order: {:?})",
+            notify_order
         );
 
         // transferee へ INVITE が送られた

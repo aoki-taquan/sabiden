@@ -216,7 +216,41 @@ impl ResponderHandle {
         ensure_to_tag(&mut resp);
         self.respond(resp).await
     }
+
+    /// `Allow` ヘッダ付きの簡易応答を送る (RFC 3261 §8.2.1 / §20.5)。
+    ///
+    /// `405 Method Not Allowed` / `481 Call/Transaction Does Not Exist` /
+    /// `489 Bad Event` 等の **拒否応答** では `Allow` ヘッダで UAS が処理可能な
+    /// method を列挙するのが MUST (RFC 3261 §8.2.1: "MUST also generate an
+    /// Allow header field listing the set of methods supported by the UAS")。
+    /// `MESSAGE` の `200 OK` 受け流し (RFC 3428 §7) など、 拒否ではない応答でも
+    /// capability 広告のため Allow を付けて返すのが推奨される (§20.5)。
+    ///
+    /// 内線側 UAS の method 別 default 応答 (Issue #273) で使う。
+    /// 100 Trying 以外は `ensure_to_tag` で To-tag を保証する (§8.2.6.2)。
+    pub async fn quick_with_allow(&self, status: u16, reason: &str, allow: &str) -> Result<()> {
+        let mut resp = {
+            let tx = self.inner.lock().await;
+            build_response_skeleton(tx.request(), status, reason)
+        };
+        resp.headers.set("Allow", allow);
+        if status != 100 {
+            ensure_to_tag(&mut resp);
+        }
+        self.respond(resp).await
+    }
 }
+
+/// RFC 3261 §8.2.1 / §20.5: 内線 UAS が **実装経路を持つ** method 列。
+/// 405 / 481 / 489 等の拒否応答 (および MESSAGE の 200 OK 受け流し) に
+/// 必ず添える `Allow` ヘッダ値。 §20.5 「a list of methods that the UA
+/// implementing this header supports」に合わせ、 拒否 default を返すだけの
+/// method (NOTIFY / SUBSCRIBE / PUBLISH / UPDATE / PRACK / REFER / MESSAGE)
+/// は意図的に列挙から除外する。
+///
+/// NGN inbound 側 (`src/call/orchestrator.rs::SUPPORTED_METHODS_ALLOW`) と
+/// 同じ集合だが、 モジュール独立のため別定義で持つ (Issue #273)。
+const SUPPORTED_METHODS_ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS";
 
 /// 設定済みの内線アカウント表 (username → password)。
 type AuthDb = HashMap<String, String>;
@@ -420,9 +454,118 @@ impl ExtensionUas {
                             .await;
                     }
                 }
-                other => {
-                    warn!(?other, "未対応メソッド → 405");
-                    let _ = responder.quick(405, "Method Not Allowed").await;
+                // RFC 3265 §3.2 / RFC 6665 §3.2: NOTIFY は事前に確立した
+                // subscription dialog 内で送られるべき。 sabiden 内線 UAS は
+                // SUBSCRIBE state machine を持たないため、 該当 subscription が
+                // 存在しないとして **481 Subscription Does Not Exist** を返す。
+                // 旧 catch-all 405 では IMS の reg-event NOTIFY をブロックし
+                // UA 側の再送ストームを誘発していた band-aid (Issue #273、
+                // CLAUDE.md §9)。 405 だと UA は「実装が無い」と判断して
+                // dialog を畳むが、 481 を返すと UA は subscription state を
+                // 整理して以降の NOTIFY 送信を止めるのが期待挙動。
+                SipMethod::Notify => {
+                    warn!("内線側 NOTIFY: 該当 subscription なし → 481 (RFC 3265 §3.2)");
+                    let _ = responder
+                        .quick_with_allow(
+                            481,
+                            "Subscription Does Not Exist",
+                            SUPPORTED_METHODS_ALLOW,
+                        )
+                        .await;
+                }
+                // RFC 6665 §4.1.4 / RFC 3265 §7.2.4: SUBSCRIBE 受信時に
+                // event package を実装していない UAS は **489 Bad Event** で
+                // 拒否し、 `Allow-Events` ヘッダで対応 package を広告する
+                // (sabiden は提供 0 個なので Allow-Events ヘッダは省略可)。
+                // 内線 UA からの presence / dialog-info 等の subscribe を
+                // 個別 status で reject する。
+                SipMethod::Subscribe => {
+                    warn!("内線側 SUBSCRIBE: 未対応 event package → 489 (RFC 6665 §4.1.4)");
+                    let _ = responder
+                        .quick_with_allow(489, "Bad Event", SUPPORTED_METHODS_ALLOW)
+                        .await;
+                }
+                // RFC 3262 §4: PRACK は UAS が `Require: 100rel` 付きの 1xx を
+                // 出した直後に届く ACK 相当。 内線側 UAS は 1xx を reliable で
+                // 発行しないため (内線レッグは 180/183 unreliable + 200 OK のみ)、
+                // PRACK が来るのは UA 側の誤実装か stale な dialog 残骸であり、
+                // §4 / §7.1 に従い対応 transaction なし扱いで **481** を返す。
+                SipMethod::Prack => {
+                    warn!("内線側 PRACK: reliable 1xx 未発行 → 481 (RFC 3262 §4 / §7.1)");
+                    let _ = responder
+                        .quick_with_allow(
+                            481,
+                            "Call/Transaction Does Not Exist",
+                            SUPPORTED_METHODS_ALLOW,
+                        )
+                        .await;
+                }
+                // RFC 3903 §6: PUBLISH は presence / event state を発行する
+                // method。 sabiden 内線 UAS は EventStateCompositor を持たないが、
+                // Issue #273 の方針 (受け流し) では UA の再送を止めるため
+                // **200 OK** で素直に応答する (本文 = event state は破棄)。
+                // RFC 3903 §6 は「UAS が PUBLISH を受け入れた場合 200 OK を
+                // 返す」と規定しており、 SIP-Etag 等の補助ヘッダは optional な
+                // ため省略可。
+                SipMethod::Publish => {
+                    debug!("内線側 PUBLISH: 200 OK で受け流し (RFC 3903 §6、 本文は破棄)");
+                    let _ = responder
+                        .quick_with_allow(200, "OK", SUPPORTED_METHODS_ALLOW)
+                        .await;
+                }
+                // RFC 3311 §5.2: UPDATE は既存ダイアログの early / 確立後の
+                // セッション情報更新に使う。 内線 UAS はダイアログ毎の
+                // UPDATE 経路を持たない (Re-INVITE のみ対応、 §14.2 経路) ため、
+                // 対応ダイアログ不在として **481** を返す。 §5.2 は
+                // 「If a UAS receives an UPDATE for an existing dialog, it
+                // must check ...」と規定するが、 そもそも UPDATE を解さない
+                // 場合は RFC 3261 §12.2.2 に従い 481 で応答する。
+                SipMethod::Update => {
+                    warn!("内線側 UPDATE: 対応ダイアログ無し → 481 (RFC 3311 §5.2)");
+                    let _ = responder
+                        .quick_with_allow(
+                            481,
+                            "Call/Transaction Does Not Exist",
+                            SUPPORTED_METHODS_ALLOW,
+                        )
+                        .await;
+                }
+                // RFC 3428 §7: UAS が MESSAGE をサポートしない場合でも、
+                // **200 OK で受け流す** のが推奨される (UA の再送ストーム抑止)。
+                // 内線 UA (Linphone / iPhone 系) は IM メッセージを発行する
+                // ケースがあり、 405 で拒否すると UA 側の retry queue が
+                // 詰まる band-aid (Issue #273 / CLAUDE.md §9)。 本文は破棄。
+                SipMethod::Message => {
+                    debug!("内線側 MESSAGE: 200 OK で受け流し (RFC 3428 §7、 本文は破棄)");
+                    let _ = responder
+                        .quick_with_allow(200, "OK", SUPPORTED_METHODS_ALLOW)
+                        .await;
+                }
+                // RFC 3515 §2.4.6 / RFC 3261 §8.2.1: REFER は転送 (call
+                // transfer) を要求する。 sabiden は B2BUA で REFER 受信処理
+                // (REFER 受領 + implicit subscription + refer event NOTIFY +
+                // 新 INVITE) を実装していないため、 明示的に **405 Method Not
+                // Allowed** + `Allow` ヘッダで拒否する。 RFC 3515 §4.5 は
+                // 「REFER 未対応 UAS は 405 を返す」と規定。
+                SipMethod::Refer => {
+                    warn!("内線側 REFER: 転送未対応 → 405 + Allow (RFC 3515 §4.5)");
+                    let _ = responder
+                        .quick_with_allow(405, "Method Not Allowed", SUPPORTED_METHODS_ALLOW)
+                        .await;
+                }
+                // RFC 3261 §8.2.1: 未知メソッド (`SipMethod::Other`) には
+                // **必ず** `Allow` ヘッダ付きの 405 で応答する義務がある。
+                // Allow 欠落は §8.2.1 違反であり UA 側の実装によっては
+                // 再送し続ける。 旧実装は Allow 無しで 405 を返していた
+                // (Issue #273 で解消)。
+                ref other => {
+                    warn!(
+                        ?other,
+                        "内線側で未対応メソッド → 405 + Allow (RFC 3261 §8.2.1)"
+                    );
+                    let _ = responder
+                        .quick_with_allow(405, "Method Not Allowed", SUPPORTED_METHODS_ALLOW)
+                        .await;
                 }
             }
         }
@@ -1508,5 +1651,166 @@ mod tests {
             "RFC 3261 §12.2.2: 二重 tag になってはならない: To={}",
             to
         );
+    }
+
+    // =========================================================================
+    // Issue #273: 内線 UAS の method 別 default 応答 (CLAUDE.md §9 解消済)
+    //
+    // 旧 catch-all 405 が NOTIFY / MESSAGE 等で UA 側の再送ストームを誘発する
+    // band-aid だったため、 RFC 引用付きで method 別 status に分解した。
+    // NGN inbound 側 (Issue #110、 PR #154) と同じ方針を内線レッグにも適用。
+    //
+    // 各テストは ExtensionUas を bind → run し、 client UDP socket から
+    // 該当 method の SIP リクエストを送り、 返ってくる status code と
+    // Allow ヘッダ (RFC 3261 §8.2.1 MUST) を検証する。
+    // =========================================================================
+
+    /// `ExtensionUas` を bind して run し、 client socket から `method` の
+    /// リクエストを送って **非 100 final 応答** を 1 つ受領するヘルパ。
+    /// `expected_status` と一致しない / Allow ヘッダが欠落していると panic。
+    async fn assert_ext_method_response(
+        method: SipMethod,
+        expected_status: u16,
+        expect_allow_header: bool,
+    ) {
+        let extensions = vec![fixtures::extension_iphone()];
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap();
+        let server_addr = uas.socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        let method_str = method.as_str().to_string();
+        let req = builders::request_from_phone(
+            &local,
+            "iphone",
+            method,
+            "sip:sabiden",
+            &format!("z9hG4bKext-{}", method_str.to_lowercase()),
+        );
+        let method_str = method_str.as_str();
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let mut got_response = None;
+        for _ in 0..3 {
+            match time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                        // RFC 3261 §17.1.1.1: 100 Trying は INVITE 系のみで
+                        // 送出される。 非 INVITE method 経路 (NOTIFY 等の本
+                        // helper 対象) に届くこと自体が異常 → 即 panic で
+                        // silent fail を防ぐ (CLAUDE.md §7 flaky 禁止)。
+                        assert_ne!(
+                            r.status_code, 100,
+                            "100 Trying は INVITE 系のみ。 非 INVITE method ({}) に届くのは異常",
+                            method_str
+                        );
+                        got_response = Some(r);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let resp = got_response.unwrap_or_else(|| {
+            panic!(
+                "{} に対する応答が内線側に届くべき (期待 status={})",
+                method_str, expected_status
+            )
+        });
+        assert_eq!(
+            resp.status_code, expected_status,
+            "{} には status={} を返すべき (実際: {} {})",
+            method_str, expected_status, resp.status_code, resp.reason,
+        );
+        if expect_allow_header {
+            let allow = resp.headers.get("allow").unwrap_or_else(|| {
+                panic!(
+                    "{} 応答には `Allow` ヘッダが必須 (RFC 3261 §8.2.1 / §20.5)",
+                    method_str
+                )
+            });
+            // 旧 catch-all 405 は Allow を付けていなかった (Issue #273)。
+            // 内線 UAS が処理経路を持つ method (INVITE / BYE 等) が
+            // 含まれることを確認する。
+            assert!(
+                allow.contains("INVITE") && allow.contains("BYE"),
+                "{} 応答の Allow に INVITE / BYE が含まれること: {}",
+                method_str,
+                allow
+            );
+        }
+    }
+
+    /// RFC 3265 §3.2 / RFC 6665 §3.2: 内線側から届いた NOTIFY は該当
+    /// subscription が無いため `481 Subscription Does Not Exist` で応答する。
+    /// 旧 catch-all 405 は IMS / reg-event 等の UA 再送を引き起こす
+    /// band-aid だった (Issue #273)。
+    #[tokio::test]
+    async fn rfc3265_3_2_uas_returns_481_for_orphan_notify() {
+        assert_ext_method_response(SipMethod::Notify, 481, true).await;
+    }
+
+    /// RFC 6665 §4.1.4 / RFC 3265 §7.2.4: 未対応 event package に対する
+    /// SUBSCRIBE には `489 Bad Event` で返す。 sabiden 内線 UAS は
+    /// presence / dialog-info 等の event package を提供しない。
+    #[tokio::test]
+    async fn rfc6665_4_1_4_uas_returns_489_for_subscribe() {
+        assert_ext_method_response(SipMethod::Subscribe, 489, true).await;
+    }
+
+    /// RFC 3262 §4 / §7.1: PRACK は UAS が `Require: 100rel` 付きの
+    /// 1xx を出した直後に届く ACK 相当。 内線 UAS は reliable 1xx を
+    /// 発行しないため、 対応 transaction なし扱いで `481` を返す。
+    #[tokio::test]
+    async fn rfc3262_4_uas_returns_481_for_prack() {
+        assert_ext_method_response(SipMethod::Prack, 481, true).await;
+    }
+
+    /// RFC 3311 §5.2: UPDATE 経路を持たない内線 UAS は、 対応ダイアログ
+    /// 不在として `481 Call/Transaction Does Not Exist` で応答する
+    /// (RFC 3261 §12.2.2)。
+    #[tokio::test]
+    async fn rfc3311_5_2_uas_returns_481_for_update() {
+        assert_ext_method_response(SipMethod::Update, 481, true).await;
+    }
+
+    /// RFC 3428 §7: UAS が MESSAGE をサポートしない場合でも `200 OK` で
+    /// 受け流す (UA 側の再送ストーム抑止)。 内線 UA (Linphone 等) が
+    /// IM メッセージを発行するケースで 405 だと retry queue が詰まる
+    /// 旧 band-aid を解消 (Issue #273、 CLAUDE.md §9)。
+    #[tokio::test]
+    async fn rfc3428_7_uas_returns_200_for_message() {
+        assert_ext_method_response(SipMethod::Message, 200, true).await;
+    }
+
+    /// RFC 3903 §6: PUBLISH は presence / event state 発行 method。
+    /// sabiden 内線 UAS は EventStateCompositor を持たないが、 Issue #273
+    /// の方針 (受け流し) で `200 OK` を返し UA の再送を止める (本文破棄)。
+    #[tokio::test]
+    async fn rfc3903_6_uas_returns_200_for_publish() {
+        assert_ext_method_response(SipMethod::Publish, 200, true).await;
+    }
+
+    /// RFC 3515 §4.5 / RFC 3261 §8.2.1: REFER は転送 (call transfer) 要求。
+    /// sabiden は B2BUA で REFER 受信処理を実装していないため、 明示的に
+    /// `405 Method Not Allowed` + `Allow` ヘッダで拒否する。
+    #[tokio::test]
+    async fn rfc3515_4_5_uas_returns_405_for_refer() {
+        assert_ext_method_response(SipMethod::Refer, 405, true).await;
+    }
+
+    /// RFC 3261 §8.2.1: 未知メソッド (`SipMethod::Other`) には **必ず**
+    /// `Allow` ヘッダ付きの 405 で応答する。 旧実装は Allow 無しで 405 を
+    /// 返していた (Issue #273 で解消)。
+    #[tokio::test]
+    async fn rfc3261_8_2_1_uas_returns_405_with_allow_for_unknown_method() {
+        assert_ext_method_response(SipMethod::Other("FOO".to_string()), 405, true).await;
     }
 }

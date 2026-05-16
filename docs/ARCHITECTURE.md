@@ -180,7 +180,7 @@ src/
 ### NGN UAS メソッド ディスパッチ (Issue #110)
 
 `NgnInboundHandler::handle_inbound` は NGN 側 `TransactionLayer` から
-受信した SIP リクエストを method 別に振り分ける。 以前 (PR #154 以前) は
+受信した SIP リクエストを method 別に振り分ける。 以前 (PR #189 以前) は
 `SipMethod::Other(String)` を含む未対応メソッドを **一律 405** で
 拒否していたが、 RFC 3261 §8.2.1 が要求する `Allow` ヘッダが欠落しており、
 かつ NOTIFY (reg-event) / MESSAGE (SMS) 等で UA の再送ストームを誘発する
@@ -212,8 +212,34 @@ UPDATE 等は 481 で拒否するため Allow には含めない (§20.5 「supp
 `Refer` を専用バリアント化済 (旧来は `Other(String)` 経由)。 これにより
 上位ハンドラは `match` 式の網羅性チェックを得る。
 
-内線側 (`src/sip/uas.rs`) の同種ディスパッチは Phase R2 で同様の方針で
-整理する予定 (`docs/refactor-plan.md` §4.4)。
+内線側 (`src/sip/uas.rs::handle_request`) も同じ方針で整理済 (Issue #273)。
+`ExtensionUas` は SUBSCRIBE state machine / EventStateCompositor / refer-event
+NOTIFY 経路を持たないため、 以下の通り default 応答を返す:
+
+| Method | 応答 | 根拠 |
+|---|---|---|
+| `REGISTER` | 401 / 200 (Digest) | RFC 3261 §10.2 |
+| `INVITE` | 100 → フォーク → 200/4xx | RFC 3261 §13 |
+| `ACK` | 応答なし | RFC 3261 §17.2.7 |
+| `BYE` | 200 OK (上位経由) | RFC 3261 §15.1.1 |
+| `CANCEL` | 200 OK + 内線フォーク中止通知 | RFC 3261 §9.2 |
+| `OPTIONS` | 200 OK | RFC 3261 §11 |
+| `INFO` | 上位委譲 → 481 (未接続時) | RFC 6086 §3 / §4 |
+| `NOTIFY` | 481 Subscription Does Not Exist + `Allow` | RFC 3265 §3.2 / RFC 6665 §3.2 |
+| `SUBSCRIBE` | 489 Bad Event + `Allow` | RFC 6665 §4.1.4 |
+| `PRACK` | 481 Call/Transaction Does Not Exist + `Allow` | RFC 3262 §4 |
+| `PUBLISH` | 200 OK + `Allow` (本文破棄、 受け流し) | RFC 3903 §6 |
+| `UPDATE` | 481 + `Allow` | RFC 3311 §5.2 |
+| `MESSAGE` | 200 OK + `Allow` (本文破棄、 再送ストーム抑止) | RFC 3428 §7 |
+| `REFER` | 405 Method Not Allowed + `Allow` | RFC 3515 §4.5 |
+| `Other(_)` | 405 + `Allow` | RFC 3261 §8.2.1 |
+
+`Allow` ヘッダ値は内線側も `INVITE, ACK, BYE, CANCEL, OPTIONS` (定数
+`SUPPORTED_METHODS_ALLOW` in `src/sip/uas.rs`、 NGN 側と同じ集合)。
+PUBLISH の応答が NGN 側 (489 Bad Event) と内線側 (200 OK) で異なるのは、
+NGN 側は carrier IMS が EventStateCompositor を期待するのに対し、 内線側
+UA は presence publish を盲目的に 200 OK で吸って再送を止めるのが
+推奨されるため (Issue #273)。
 
 ## 通話フロー
 

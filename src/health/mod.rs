@@ -107,6 +107,10 @@ pub fn router(state: HealthState) -> Router {
         .route("/api/recording/list", get(recording_list))
         .route("/api/recording/:id/audio", get(recording_audio))
         .route("/api/recording/:id", delete(recording_delete))
+        // Issue #300: AI 文字起こし sidecar text を `text/plain` で返す。
+        // transcript 不在 (= まだ生成されていない / backend disable) は 404。
+        .route("/api/voicemail/:id/transcript", get(voicemail_transcript))
+        .route("/api/recording/:id/transcript", get(recording_transcript))
         .with_state(state)
 }
 
@@ -300,6 +304,89 @@ async fn recording_audio(State(state): State<HealthState>, Path(id): Path<String
                 (StatusCode::INTERNAL_SERVER_ERROR, "read wav failed\n").into_response()
             }
         },
+        Ok(None) => (StatusCode::NOT_FOUND, "recording not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "recording metadata 読込失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #300: `GET /api/voicemail/{id}/transcript` — sidecar `.txt` を
+/// `text/plain; charset=utf-8` で返す。 録音は存在するが transcript 未生成
+/// (= `[transcription] enabled = false` で運用、 もしくは生成失敗) のときは
+/// 404 を返す (= UI は「文字起こし無し」 と表示する想定)。 録音自体が無いと
+/// きも 404 (区別したい場合は `/api/voicemail/{id}/audio` を先に GET する)。
+async fn voicemail_transcript(
+    State(state): State<HealthState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(recorder) = state.voicemail.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "voicemail disabled\n").into_response();
+    };
+    let safe_id = sanitize_id(&id);
+    match recorder.get(&safe_id).await {
+        Ok(Some((_meta, wav_path))) => {
+            match crate::observability::transcription::read_transcript(&wav_path).await {
+                Ok(Some(text)) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Body::from(text))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "build response failed\n")
+                            .into_response()
+                    }),
+                Ok(None) => (StatusCode::NOT_FOUND, "transcript not found\n").into_response(),
+                Err(e) => {
+                    warn!(error=%e, "voicemail transcript 読込失敗");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "read transcript failed\n",
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "voicemail not found\n").into_response(),
+        Err(e) => {
+            warn!(error=%e, "voicemail metadata 読込失敗");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
+        }
+    }
+}
+
+/// Issue #300: `GET /api/recording/{id}/transcript` — recording の sidecar
+/// `.txt` を返す。 voicemail と同じ責務 / 失敗扱い。
+async fn recording_transcript(
+    State(state): State<HealthState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(recorder) = state.recording.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "recording disabled\n").into_response();
+    };
+    let safe_id = sanitize_id(&id);
+    match recorder.get(&safe_id).await {
+        Ok(Some((_meta, wav_path))) => {
+            match crate::observability::transcription::read_transcript(&wav_path).await {
+                Ok(Some(text)) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Body::from(text))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "build response failed\n")
+                            .into_response()
+                    }),
+                Ok(None) => (StatusCode::NOT_FOUND, "transcript not found\n").into_response(),
+                Err(e) => {
+                    warn!(error=%e, "recording transcript 読込失敗");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "read transcript failed\n",
+                    )
+                        .into_response()
+                }
+            }
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "recording not found\n").into_response(),
         Err(e) => {
             warn!(error=%e, "recording metadata 読込失敗");
@@ -748,6 +835,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #300: voicemail 未有効状態で transcript endpoint も 503 を返す。
+    #[tokio::test]
+    async fn voicemail_transcript_returns_503_when_voicemail_disabled() {
+        let app = router(make_state(true));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/anything/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Issue #300: 録音は存在するが sidecar `.txt` が無い場合は 404
+    /// (= `[transcription] enabled = false` 運用 / 生成前 状態を意味する)。
+    #[tokio::test]
+    async fn voicemail_transcript_returns_404_when_sidecar_txt_missing() {
+        use crate::call::voicemail::VoicemailFile;
+
+        let (state, dir) = make_state_with_voicemail(true).await;
+        let meta = VoicemailFile {
+            call_id: "no-tr".to_string(),
+            remote_number: "0312345678".to_string(),
+            recorded_at_unix_ms: 100,
+            duration_ms: 0,
+        };
+        std::fs::write(dir.join("no-tr.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("no-tr.wav"), vec![0u8; 44]).unwrap();
+        // `.txt` は意図的に書かない (= transcription disabled 相当)
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/no-tr/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #300: sidecar `.txt` が存在すれば 200 + `text/plain` で本文を返す。
+    #[tokio::test]
+    async fn voicemail_transcript_returns_text_for_existing_sidecar() {
+        use crate::call::voicemail::VoicemailFile;
+
+        let (state, dir) = make_state_with_voicemail(true).await;
+        let meta = VoicemailFile {
+            call_id: "with-tr".to_string(),
+            remote_number: "0312345678".to_string(),
+            recorded_at_unix_ms: 100,
+            duration_ms: 0,
+        };
+        std::fs::write(dir.join("with-tr.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("with-tr.wav"), vec![0u8; 44]).unwrap();
+        std::fs::write(dir.join("with-tr.txt"), "ハロー世界").unwrap();
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/with-tr/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert_eq!(ct, "text/plain; charset=utf-8");
+        let body = body_string(resp).await;
+        assert_eq!(body, "ハロー世界");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #300: voicemail 自体が存在しないと 404 (transcript endpoint も同様)。
+    #[tokio::test]
+    async fn voicemail_transcript_returns_404_when_voicemail_missing() {
+        let (state, dir) = make_state_with_voicemail(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/voicemail/nope/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #300: recording transcript endpoint も同様に動作する。
+    /// recording 未設定なら 503、 sidecar `.txt` ありなら 200 + UTF-8 本文。
+    #[tokio::test]
+    async fn recording_transcript_returns_text_or_404_503_consistently() {
+        // 1) recording 未設定 → 503
+        let app = router(make_state(true));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recording/anything/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 2) recording 設定済 + sidecar `.txt` あり → 200 + 本文
+        use crate::call::recording::{CallRecorder, RecordingFile};
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("sabiden-rec-api-{pid}-{nanos}-{n}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let recorder = Arc::new(
+            CallRecorder::new(dir.clone(), std::time::Duration::from_secs(60))
+                .await
+                .expect("recorder"),
+        );
+        let rec_meta = RecordingFile {
+            recording_id: "rid-1".to_string(),
+            call_id: "cid-1".to_string(),
+            remote_number: "0312345678".to_string(),
+            started_at_unix_ms: 100,
+            duration_ms: 0,
+        };
+        std::fs::write(
+            dir.join("rid-1.json"),
+            serde_json::to_vec(&rec_meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("rid-1.wav"), vec![0u8; 44]).unwrap();
+        std::fs::write(dir.join("rid-1.txt"), "テスト録音").unwrap();
+        let state = make_state(true).with_recording(recorder);
+
+        let app = router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recording/rid-1/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert_eq!(body, "テスト録音");
+
+        // 3) sidecar `.txt` 無し → 404 (録音は存在)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recording/rid-1/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 削除して 404 にする
+        std::fs::remove_file(dir.join("rid-1.txt")).unwrap();
+        let _ = resp; // 上の resp は使い済 (=OK)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recording/rid-1/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 4) recording 自体が無い ID → 404
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recording/nope/transcript")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
         std::fs::remove_dir_all(dir).ok();
     }
 

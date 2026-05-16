@@ -150,10 +150,23 @@ fn default_max_duration_secs() -> u64 {
 /// 3. `max_duration` で打ち切り、 もしくは [`VoicemailRecorder::stop`]
 ///    (= orchestrator 側で NGN BYE 受信時) で task は WAV finalize 後に終了。
 /// 4. 結果 [`VoicemailFile`] は JSON sidecar と共に永続化される。
-#[derive(Debug)]
 pub struct VoicemailRecorder {
     storage_dir: PathBuf,
     max_duration: Duration,
+    /// Issue #300: WAV finalize 直後に呼ぶ AI 文字起こし backend (option)。
+    /// `None` (= 既定) の場合は transcript 生成しない (`.txt` も書かれない)、
+    /// 完全な既存挙動 (Issue #288 当時の動作と同一)。
+    transcriber: Option<Arc<dyn crate::observability::transcription::Transcriber>>,
+}
+
+impl std::fmt::Debug for VoicemailRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoicemailRecorder")
+            .field("storage_dir", &self.storage_dir)
+            .field("max_duration", &self.max_duration)
+            .field("transcriber", &self.transcriber.is_some())
+            .finish()
+    }
 }
 
 impl VoicemailRecorder {
@@ -165,6 +178,7 @@ impl VoicemailRecorder {
         Ok(Self {
             storage_dir,
             max_duration,
+            transcriber: None,
         })
     }
 
@@ -172,6 +186,18 @@ impl VoicemailRecorder {
     /// する責務。 ここでは「設定値を recorder に embed」 のみ行う。
     pub async fn from_config(cfg: &VoicemailConfig) -> Result<Self> {
         Self::new(cfg.storage_dir.clone(), cfg.max_duration()).await
+    }
+
+    /// Issue #300: WAV finalize 直後に呼ぶ AI 文字起こし backend を attach する
+    /// (builder 風)。 `None` のままなら transcript 生成しない (= 既存挙動)。
+    /// orchestrator / main が `[transcription] enabled = true` のときに
+    /// `Arc<dyn Transcriber>` を組み立てて差し込む。
+    pub fn with_transcriber(
+        mut self,
+        transcriber: Arc<dyn crate::observability::transcription::Transcriber>,
+    ) -> Self {
+        self.transcriber = Some(transcriber);
+        self
     }
 
     /// 保存先ディレクトリ。
@@ -275,6 +301,12 @@ impl VoicemailRecorder {
             .await
             .with_context(|| format!("WAV finalize 失敗: {:?}", wav_path))?;
 
+        // Issue #300: WAV finalize 直後に AI 文字起こし stub を呼んで sidecar
+        // `.txt` を書く。 transcriber 未設定 (= 既定 disabled) なら no-op。
+        // 失敗は warn ログのみで音声本体は保護する (RFC 4566 / RIFF WAVE 仕様
+        // を持つ `wav.rs` 出力には触らない)。
+        run_transcription_hook(self.transcriber.as_ref(), &wav_path, &call_id).await;
+
         // 録音長 = サンプル数 / 8000 Hz (PCMU 8kHz 想定)。
         let duration_ms = total_samples * 1000 / (crate::rtp::packet::SAMPLE_RATE as u64).max(1);
 
@@ -327,8 +359,9 @@ impl VoicemailRecorder {
         Ok(Some((meta, wav_path)))
     }
 
-    /// 指定 ID の voicemail を削除する (WAV + JSON 両方)。
-    /// 存在しなければ `Ok(false)` を返す (404 用)。
+    /// 指定 ID の voicemail を削除する (WAV + JSON + Issue #300 transcript `.txt`)。
+    /// 存在しなければ `Ok(false)` を返す (404 用)。 transcript の有無は
+    /// `found` の判定には影響させない (主資源 = WAV/JSON が無ければ 404)。
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let safe_id = sanitize_id(id);
         let meta_path = self
@@ -345,6 +378,12 @@ impl VoicemailRecorder {
         if wav_path.exists() {
             fs::remove_file(&wav_path).await.ok();
             found = true;
+        }
+        // Issue #300: sidecar transcript `.txt` も削除。 単独欠如は found
+        // フラグには影響させない (= 主資源不在で 404、 transcript-only でも残骸を残さない)。
+        let txt_path = crate::observability::transcription::transcript_path_for(&wav_path);
+        if txt_path.exists() {
+            fs::remove_file(&txt_path).await.ok();
         }
         Ok(found)
     }
@@ -379,6 +418,11 @@ impl VoicemailRecorder {
             total_samples += pcm.len() as u64;
         }
         writer.finalize().await?;
+
+        // Issue #300: 同期版 finalize でも transcript hook を呼ぶ (unit test
+        // 経路でも transcript 生成を検証可能にするため)。 transcriber 未設定なら
+        // no-op、 失敗は warn ログのみで recorded WAV は保護する。
+        run_transcription_hook(self.transcriber.as_ref(), &wav_path, call_id).await;
 
         let duration_ms = total_samples * 1000 / (crate::rtp::packet::SAMPLE_RATE as u64).max(1);
         let meta = VoicemailFile {
@@ -471,6 +515,44 @@ async fn load_list(storage_dir: &Path) -> Result<Vec<VoicemailFile>> {
     Ok(out)
 }
 
+/// Issue #300: WAV finalize 直後に呼ぶ transcript hook。 transcriber が
+/// `None` (= 既定 disabled) なら何もしない (I/O ゼロ、 完全な既存挙動)。
+/// 失敗は warn ログのみで音声本体 (WAV) は保護する: transcript stub の失敗
+/// で留守録 (= UX 上の主機能) が消える事故を防ぐ防御層。
+///
+/// `transcriber.transcribe` は同期 API (Issue #300 stub) のため `spawn_blocking`
+/// で blocking pool に逃がす必要は無い (stub は I/O ゼロ即時 return)。
+/// 将来 HTTP backend を生やしたら trait 自体を async 化する想定。
+async fn run_transcription_hook(
+    transcriber: Option<&Arc<dyn crate::observability::transcription::Transcriber>>,
+    wav_path: &Path,
+    call_id: &str,
+) {
+    let Some(transcriber) = transcriber else {
+        return;
+    };
+    match transcriber.transcribe(wav_path) {
+        Ok(result) => {
+            match crate::observability::transcription::write_transcript(wav_path, &result).await {
+                Ok(txt_path) => {
+                    debug!(
+                        %call_id,
+                        path = %txt_path.display(),
+                        model = %result.model,
+                        "voicemail transcript 書込 (Issue #300)"
+                    );
+                }
+                Err(e) => {
+                    warn!(%call_id, error=%e, "voicemail transcript 書込失敗 (Issue #300、 WAV は保護)");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(%call_id, error=%e, "voicemail transcribe 失敗 (Issue #300、 WAV は保護)");
+        }
+    }
+}
+
 /// 安全な path component に正規化する。 `..` / `/` / null / 制御文字を弾く。
 /// 留守録 ID は SIP Call-ID 由来で任意文字を含み得るため、 directory traversal
 /// 攻撃 (`GET /api/voicemail/..%2Fetc%2Fpasswd/audio`) を防ぐ目的で sanitize する。
@@ -494,6 +576,9 @@ pub fn sanitize_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::transcription::{
+        transcript_path_for, StubTranscriber, Transcriber, TranscriptionResult,
+    };
     use crate::rtp::{encode_ulaw, RtpPacket, PAYLOAD_TYPE_ULAW};
 
     /// Issue #288 DoD: 5 秒分の RTP packet 群 → WAV ファイル生成 + メタ JSON。
@@ -761,6 +846,144 @@ mod tests {
         let wav_bytes = std::fs::read(meta.audio_path(tmp.path())).expect("read wav");
         assert_eq!(&wav_bytes[0..4], b"RIFF");
         assert_eq!(&wav_bytes[8..12], b"WAVE");
+    }
+
+    /// Issue #300: voicemail finalize 経路で transcriber が attach されている
+    /// ときに sidecar `.txt` が生成され、 placeholder text が書かれていること。
+    /// 主資源 (WAV / JSON) も従来通り生成されていることを併せて確認する
+    /// (= transcription 失敗で音声本体が消えない、 finalize hook が後方互換)。
+    #[tokio::test]
+    async fn issue_300_voicemail_finalize_writes_stub_transcript_sidecar_txt() {
+        let tmp = tempdir();
+        let recorder = VoicemailRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(StubTranscriber));
+        let packets = vec![RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: true,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            payload: vec![encode_ulaw(0); 160],
+        }];
+        let meta = recorder
+            .record_from_packets("call-tr-vm", "0312345678", &packets)
+            .await
+            .expect("record");
+
+        // 主資源 WAV + JSON は従来通り存在する。
+        let wav_path = meta.audio_path(tmp.path());
+        let meta_path = meta.meta_path(tmp.path());
+        assert!(wav_path.exists(), "WAV must exist after finalize");
+        assert!(meta_path.exists(), "JSON sidecar must exist after finalize");
+
+        // Issue #300 transcript `.txt` が WAV と同じ basename で生成される。
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(
+            txt_path.exists(),
+            "transcript `.txt` must be written by finalize hook: {:?}",
+            txt_path
+        );
+        let txt = std::fs::read_to_string(&txt_path).expect("read txt");
+        assert_eq!(txt, StubTranscriber::PLACEHOLDER_TEXT);
+    }
+
+    /// Issue #300: transcriber 未 attach (= 既定 disabled) なら `.txt` は
+    /// **書かれない** (完全な後方互換、 Issue #288 当時の挙動と同一)。
+    #[tokio::test]
+    async fn issue_300_voicemail_without_transcriber_does_not_write_txt() {
+        let tmp = tempdir();
+        let recorder = VoicemailRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new");
+        let packets = vec![RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: true,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            payload: vec![encode_ulaw(0); 160],
+        }];
+        let meta = recorder
+            .record_from_packets("call-no-tr", "0312345678", &packets)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        assert!(wav_path.exists());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(
+            !txt_path.exists(),
+            "transcript `.txt` must NOT be written when transcriber is None"
+        );
+    }
+
+    /// Issue #300: transcribe が `Err` を返しても WAV / JSON 本体は保護される
+    /// (= warn のみで finalize 完了)。 production code の panic 禁止を満たす。
+    #[tokio::test]
+    async fn issue_300_voicemail_transcriber_failure_preserves_wav_and_json() {
+        struct FailingTranscriber;
+        impl Transcriber for FailingTranscriber {
+            fn transcribe(&self, _: &Path) -> Result<TranscriptionResult> {
+                Err(anyhow::anyhow!("synthetic failure"))
+            }
+        }
+        let tmp = tempdir();
+        let recorder = VoicemailRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(FailingTranscriber));
+        let packets = vec![RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: true,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            payload: vec![encode_ulaw(0); 160],
+        }];
+        let meta = recorder
+            .record_from_packets("call-tr-fail", "0312345678", &packets)
+            .await
+            .expect("record (should succeed despite transcriber failure)");
+        let wav_path = meta.audio_path(tmp.path());
+        let meta_path = meta.meta_path(tmp.path());
+        assert!(wav_path.exists(), "WAV must survive transcriber failure");
+        assert!(meta_path.exists(), "JSON must survive transcriber failure");
+        // transcript は書かれていない (失敗時は no `.txt`)
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(
+            !txt_path.exists(),
+            "transcript `.txt` must NOT exist when transcribe fails"
+        );
+    }
+
+    /// Issue #300: `delete` は sidecar transcript `.txt` も削除する。
+    #[tokio::test]
+    async fn issue_300_voicemail_delete_removes_sidecar_transcript_txt() {
+        let tmp = tempdir();
+        let recorder = VoicemailRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(StubTranscriber));
+        let packets = vec![RtpPacket {
+            payload_type: PAYLOAD_TYPE_ULAW,
+            marker: true,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+            payload: vec![encode_ulaw(0); 160],
+        }];
+        let meta = recorder
+            .record_from_packets("call-del", "0312345678", &packets)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(txt_path.exists());
+        let removed = recorder.delete("call-del").await.expect("delete");
+        assert!(removed);
+        assert!(!wav_path.exists());
+        assert!(!txt_path.exists(), "transcript must be deleted with WAV");
     }
 
     /// テスト用 tempdir ヘルパ (`tempfile` crate を引かないため自前)。

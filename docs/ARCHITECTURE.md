@@ -67,10 +67,11 @@ src/
 │       ├── mod.rs    # VoicemailRecorder / VoicemailFile / VoicemailHandle / VoicemailConfig
 │       └── wav.rs    # WavWriter (RIFF/WAVE linear PCM 16-bit mono 8 kHz、 recording からも再利用)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
-├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278; /api/voicemail/* Issue #288; /api/recording/* Issue #296)
-├── observability/    # メトリクス (Prometheus) + SIP トレース + call_log ring buffer (Issue #278)
+├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278; /api/voicemail/* Issue #288; /api/recording/* Issue #296; /api/{voicemail,recording}/:id/transcript Issue #300)
+├── observability/    # メトリクス (Prometheus) + SIP トレース + call_log ring buffer (Issue #278) + transcription stub (Issue #300)
 │   ├── mod.rs        # Metrics (atomic counter 群) + SipTraceWriter
-│   └── call_log.rs   # 通話履歴 ring buffer (Direction / Outcome / CallLogEntry / CallLog)
+│   ├── call_log.rs   # 通話履歴 ring buffer (Direction / Outcome / CallLogEntry / CallLog)
+│   └── transcription.rs # AI 文字起こし stub (Issue #300): Transcriber trait + StubTranscriber + sidecar `.txt` I/O
 └── main.rs
 ```
 
@@ -1084,6 +1085,75 @@ PWA (browser)        sabiden (signaling)              CallRecorder       WavWrit
 `UasEventHandler` の `set_recording_recorder` (BYE 経路の cleanup) の 3 経路に
 同じ Arc を渡す。 `recording.enabled = false` (既定) なら recorder を生成せず、
 全 hook が `None` で旧挙動と同一。
+
+### AI 文字起こし stub (Issue #300、 `src/observability/transcription.rs`)
+
+Voicemail (Issue #288) / Recording (Issue #296) が保存した WAV (RFC 3551 §4.5.14
+PCMU → RIFF/WAVE linear PCM 16-bit / mono / 8 kHz) を AI ASR (Whisper API /
+faster-whisper 等) に投げて文字起こしを生成し、 WAV と同じディレクトリに
+sidecar `.txt` を保存する仕組み。 **本 PR (Issue #300) は stub レベル**で、
+実 ASR backend は別 Issue で wire-up する。 既定 `[transcription] enabled = false`
+で `.txt` は生成されず、 既存挙動と完全互換。
+
+**データ構造** (`src/observability/transcription.rs`):
+
+- `Transcriber` trait (`Send + Sync`) ── WAV path を受けて `Result<TranscriptionResult>`
+  を返す sync API。 `Arc<dyn Transcriber>` で voicemail / recording に渡す。
+- `TranscriptionResult { text, language, duration_ms, model }` ── 文字起こし
+  本文 (UTF-8) + 検出言語 (ISO 639-1) + 処理時間 + backend 識別子。
+- `StubTranscriber` ── 常に「(transcription unavailable - configure backend)」
+  + `model = "stub"` を返す no-op 実装。 PWA UI は `model == "stub"` で
+  「未対応」 と判別する想定。
+- `TranscriptionConfig { enabled, backend, api_key_env, model_path }` ── TOML
+  `[transcription]` セクション。 `backend = "stub"` のみ wire 済、
+  `"whisper-api"` / `"faster-whisper"` は将来。
+- `build_transcriber(cfg)` ── 設定値から `Arc<dyn Transcriber>` を組み立てる
+  factory。 未対応 backend は起動時に fail-fast。
+- `transcript_path_for(wav)` / `write_transcript(wav, res)` / `read_transcript(wav)`
+  ── sidecar `.txt` のパス計算 + 入出力ヘルパ。 拡張子を `.txt` に置換、
+  UTF-8 LF で書く。
+
+**動作シーケンス** (voicemail finalize ‐ recording finalize も同形):
+
+```
+voicemail recorder task          transcription::Transcriber  filesystem
+        │                                  │                       │
+        │ WAV write_samples / finalize     │                       │
+        │ ────────────────────────────────►│                       │
+        │                                  │                       │
+        │ run_transcription_hook(wav_path) │                       │
+        │ ────────────────────────────────►│ transcribe(wav_path)  │
+        │                                  │ (stub: instant return)│
+        │ ◄────────────────────────────────│ TranscriptionResult   │
+        │ write_transcript(wav, result)    │                       │
+        │ ─────────────────────────────────┼──────────────────────►│ <id>.txt
+        │                                  │                       │
+        │ JSON sidecar 書込み (既存)         │                       │
+        │ ─────────────────────────────────┼──────────────────────►│ <id>.json
+```
+
+`transcriber` が `None` (= 既定 disabled) の場合は `run_transcription_hook`
+が早期 return し、 transcript dispatch も `.txt` 書込も発生しない (I/O ゼロ、
+完全な後方互換)。 transcribe / write が `Err` を返しても warn ログのみで
+WAV / JSON 本体は保護する (production code で panic 禁止、 CLAUDE.md §6.5)。
+
+**JSON API** (`src/health/mod.rs`):
+
+- `GET /api/voicemail/{id}/transcript` ── sidecar `.txt` の中身を
+  `text/plain; charset=utf-8` で返す。 voicemail 無効 → 503、 voicemail 不在
+  → 404、 transcript 不在 (= `[transcription] enabled = false` で運用中 /
+  生成失敗) → 404。
+- `GET /api/recording/{id}/transcript` ── 同様。
+
+`DELETE /api/voicemail/{id}` / `DELETE /api/recording/{id}` は **sidecar `.txt`
+も合わせて削除** する (= 残骸を残さない)。 transcript 単独欠如は 404 判定
+には影響しない (主資源 = WAV/JSON が無いと 404)。
+
+**結線**: `main.rs` で `[transcription] enabled = true` のときに
+`transcription::build_transcriber(&cfg.transcription)` で `Arc<dyn Transcriber>`
+を組み立て、 `VoicemailRecorder::with_transcriber` / `CallRecorder::with_transcriber`
+で **どちらかの recorder を経由する WAV finalize 経路に**注入する。
+disabled (既定) なら hook 自体が呼ばれず旧挙動と同一。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

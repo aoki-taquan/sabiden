@@ -42,6 +42,12 @@ pub struct Config {
     /// 既定 disabled (= 完全に既存挙動)。
     #[serde(default)]
     pub recording: crate::call::recording::RecordingConfig,
+    /// AI 文字起こし (Issue #300)。 Voicemail / Recording WAV から sidecar
+    /// `.txt` を生成する。 既定 disabled (= transcript 生成しない、 既存
+    /// 挙動と完全互換)。 backend は `"stub"` (本 PR で wire 済) のみで、
+    /// `"whisper-api"` / `"faster-whisper"` は別 Issue で wire-up 予定。
+    #[serde(default)]
+    pub transcription: crate::observability::transcription::TranscriptionConfig,
 }
 
 /// 着信ルーティング設定 (Issue #295)。
@@ -481,6 +487,7 @@ impl Config {
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
+            transcription: crate::observability::transcription::TranscriptionConfig::default(),
         })
     }
 
@@ -607,6 +614,29 @@ impl Config {
                 self.voicemail.max_duration_secs = n;
             }
         }
+        // [transcription] セクション (Issue #300): AI 文字起こし。 既定 disabled
+        // で完全な後方互換。 backend は "stub" のみ wire 済、 将来 Whisper API /
+        // faster-whisper を追加した時に api_key_env / model_path も env で
+        // 上書きできるよう経路だけ用意しておく。
+        if let Ok(v) = std::env::var("SABIDEN_TRANSCRIPTION_ENABLED") {
+            let lower = v.to_ascii_lowercase();
+            self.transcription.enabled = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_TRANSCRIPTION_BACKEND") {
+            if !v.is_empty() {
+                self.transcription.backend = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_TRANSCRIPTION_API_KEY_ENV") {
+            self.transcription.api_key_env = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("SABIDEN_TRANSCRIPTION_MODEL_PATH") {
+            self.transcription.model_path = if v.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(v))
+            };
+        }
     }
 
     pub fn example() -> String {
@@ -700,6 +730,14 @@ max_expires = 3600
 # enabled = false
 # storage_dir = "/var/lib/sabiden/voicemail"
 # max_duration_secs = 60
+
+# AI 文字起こし stub (Issue #300)。 Voicemail / Recording の WAV から sidecar
+# `.txt` を生成する。 既定 disabled (= `.txt` 不生成、 完全な後方互換)。
+# 現状は backend = "stub" のみ wire 済 (placeholder text)。 実 Whisper API /
+# faster-whisper backend は別 Issue で実装予定。
+# [transcription]
+# enabled = false
+# backend = "stub"
 "#
         .to_string()
     }
@@ -740,6 +778,7 @@ mod tests {
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
+            transcription: crate::observability::transcription::TranscriptionConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -763,6 +802,7 @@ mod tests {
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
+            transcription: crate::observability::transcription::TranscriptionConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -786,6 +826,7 @@ mod tests {
             voicemail: crate::call::voicemail::VoicemailConfig::default(),
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
+            transcription: crate::observability::transcription::TranscriptionConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -1131,6 +1172,42 @@ fork = ["iphone"]
         assert!(cfg.routing.rule[0].match_.weekday.is_none());
         assert!(cfg.routing.rule[0].match_.time_range.is_none());
         assert!(cfg.routing.rule[0].match_.from_number.is_none());
+    }
+
+    /// Issue #300: `[transcription]` セクション省略時は disabled + backend="stub"。
+    /// `[transcription]` セクション全省略でも TOML パースが通り、
+    /// `Config.transcription.enabled = false` で完全な後方互換。
+    #[test]
+    fn toml_default_transcription_section_is_disabled_with_stub_backend() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.transcription.enabled);
+        assert_eq!(cfg.transcription.backend, "stub");
+        assert!(cfg.transcription.api_key_env.is_none());
+        assert!(cfg.transcription.model_path.is_none());
+    }
+
+    /// Issue #300: `[transcription]` セクション override → TOML パース確認。
+    #[test]
+    fn toml_transcription_section_can_be_overridden() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[transcription]
+enabled = true
+backend = "stub"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.transcription.enabled);
+        assert_eq!(cfg.transcription.backend, "stub");
     }
 
     /// Issue #295: 不正な time_range は `Config::load` 経路の validate で

@@ -17,6 +17,9 @@ pub mod carrier_retry;
 pub mod codec_pipeline;
 pub mod dtmf;
 pub mod manager;
+/// Issue #299: SMS (RFC 3428 MESSAGE) ring buffer。 受信 / 送信履歴を保持し、
+/// `GET /api/sms/recent` (PWA UI) で公開する。
+pub mod message_log;
 pub mod orchestrator;
 pub mod rate_limiter;
 pub mod recording;

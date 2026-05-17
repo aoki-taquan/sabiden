@@ -24,19 +24,20 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::call::message_log::MessageLog;
 use crate::call::recording::CallRecorder;
 use crate::call::voicemail::{sanitize_id, VoicemailRecorder};
 use crate::observability::call_log::CallLog;
 use crate::observability::Metrics;
 use crate::webrtc::push::VapidKeys;
-use crate::webrtc::signaling::{signal_ws_handler, SignalingState};
+use crate::webrtc::signaling::{signal_ws_handler, PwaSmsHandler, SignalingState, SmsSendOutcome};
 
 /// `GET /api/call-log/recent?n=20` のクエリパラメータ (Issue #278)。
 ///
@@ -49,6 +50,33 @@ pub struct CallLogQuery {
 
 /// `n` 省略時のデフォルト件数 (PWA UI で同時表示する想定の数)。
 pub const DEFAULT_CALL_LOG_LIMIT: usize = 20;
+
+/// `GET /api/sms/recent?n=20` のクエリパラメータ (Issue #299)。 `CallLogQuery`
+/// と同形 (省略時は [`DEFAULT_SMS_LIMIT`])。
+#[derive(Debug, Deserialize)]
+pub struct SmsRecentQuery {
+    pub n: Option<usize>,
+}
+
+/// `n` 省略時のデフォルト件数 (`/api/sms/recent`)。
+pub const DEFAULT_SMS_LIMIT: usize = 20;
+
+/// `POST /api/sms` の request body (Issue #299)。
+///
+/// RFC 3428 §4 / §10: `to` は宛先 (例 `"117"`)、 `body` は text/plain UTF-8。
+/// 大き過ぎる body は 413 Payload Too Large、 不正 target は 400 Bad Request。
+#[derive(Debug, Deserialize)]
+pub struct SmsSendRequest {
+    pub to: String,
+    pub body: String,
+}
+
+/// `POST /api/sms` の response body (Issue #299)。 成功時 `{"status": 200}` 等
+/// (受領した final response status を反映)。 失敗時は 4xx/5xx HTTP status + text。
+#[derive(Debug, serde::Serialize)]
+pub struct SmsSendResponse {
+    pub status: u16,
+}
 
 /// ヘルスサーバが参照する共有状態
 #[derive(Clone)]
@@ -72,6 +100,12 @@ pub struct HealthState {
     /// `None` の場合 `/api/push/vapid-public-key` は 503 Service Unavailable
     /// を返す (= push 機能無効 / VAPID 鍵未設定)。
     pub vapid_keys: Option<Arc<VapidKeys>>,
+    /// Issue #299: SMS / MESSAGE ring buffer (`None` のときは `/api/sms/*` を
+    /// 503 で拒否、 = `[sms] enabled = false` と同義)。
+    pub sms_log: Option<Arc<MessageLog>>,
+    /// Issue #299: PWA→NGN / 内線 SMS 送出ハンドラ。 `None` のときは
+    /// `POST /api/sms` を 503 で拒否。
+    pub sms_handler: Option<Arc<dyn PwaSmsHandler>>,
 }
 
 impl HealthState {
@@ -83,6 +117,8 @@ impl HealthState {
             voicemail: None,
             recording: None,
             vapid_keys: None,
+            sms_log: None,
+            sms_handler: None,
         }
     }
 
@@ -104,11 +140,23 @@ impl HealthState {
         self.vapid_keys = Some(keys);
         self
     }
+
+    /// Issue #299: SMS ring buffer + 送信ハンドラを attach する。
+    /// 通常 `sms_handler` には `UasEventHandler` を `Arc::clone` で渡す
+    /// (`PwaSmsHandler` の trait 実装)。
+    pub fn with_sms(mut self, log: Arc<MessageLog>, handler: Arc<dyn PwaSmsHandler>) -> Self {
+        self.sms_log = Some(log);
+        self.sms_handler = Some(handler);
+        self
+    }
 }
 
 /// `/healthz` `/readyz` `/metrics` `/api/call-log/recent` `/api/voicemail/*`
-/// `/api/recording/*` を提供する `Router` を構築する (Issue #288 voicemail +
-/// Issue #296 active call recording エンドポイント追加)。
+/// `/api/recording/*` `/api/sms/*` を提供する `Router` を構築する。
+///
+/// 各機能 endpoint は `HealthState` に対応リソースが embedded されていない
+/// (= `None`) のとき 503 で拒否する: voicemail / recording / sms (Issue #288 /
+/// #296 / #299)。
 pub fn router(state: HealthState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -126,6 +174,8 @@ pub fn router(state: HealthState) -> Router {
         .route("/api/voicemail/:id/transcript", get(voicemail_transcript))
         .route("/api/recording/:id/transcript", get(recording_transcript))
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
+        .route("/api/sms/recent", get(sms_recent))
+        .route("/api/sms", post(sms_send))
         .with_state(state)
 }
 
@@ -370,6 +420,85 @@ async fn voicemail_transcript(
     }
 }
 
+/// Issue #299: `GET /api/sms/recent?n=20` — SMS 履歴 ring buffer (受信 / 送信
+/// 混在) を新しい順 (= `timestamp_unix_ms` 降順) で返す。 `sms.enabled = false`
+/// なら 503 Service Unavailable。
+async fn sms_recent(State(state): State<HealthState>, Query(q): Query<SmsRecentQuery>) -> Response {
+    let Some(log) = state.sms_log.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "sms disabled\n").into_response();
+    };
+    let n = q.n.unwrap_or(DEFAULT_SMS_LIMIT);
+    let entries = log.recent(n);
+    (StatusCode::OK, Json(entries)).into_response()
+}
+
+/// Issue #299: `POST /api/sms` — SMS / RFC 3428 MESSAGE を送信する。
+///
+/// # Request body (JSON)
+/// ```json
+/// {"to": "117", "body": "hello"}
+/// ```
+///
+/// # Response
+/// - **200 OK** + `{"status":200}`: 2xx 受領 ack (RFC 3428 §7)。
+/// - **502 Bad Gateway** + text: 非 2xx (相手側拒否、 NGN unreachable 等)。
+///   status code は本文に含める。
+/// - **400 Bad Request**: `to` がホワイトリスト違反 (= `[0-9*#+]{1,32}`)。
+/// - **413 Payload Too Large**: body が 1024 byte を超過 (RFC 3428 §8: aggregate
+///   request size SHOULD NOT exceed 1300 bytes; body 1024 で安全圏に押さえる)。
+/// - **503 Service Unavailable**: `sms.enabled = false` / ハンドラ未配線。
+///
+/// RFC 3428 §7: 200 OK は受領 ack に過ぎず、 配送 / 表示の保証ではない。
+/// 本実装も transport 層の ack 取得までを成功扱いとする。
+async fn sms_send(State(state): State<HealthState>, Json(req): Json<SmsSendRequest>) -> Response {
+    let Some(handler) = state.sms_handler.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "sms disabled\n").into_response();
+    };
+    // RFC 3261 §25.1 user 文法サブセット (`is_valid_pwa_dial_target` と同一基準)。
+    // signaling 層の `is_valid_dial_target` と同じだが、 health モジュールから
+    // 直接参照しないため REST 経路でも独立に再検証する (defense in depth)。
+    if !sms_is_valid_target(&req.to) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid target: {:?}\n",
+                req.to.escape_default().to_string()
+            ),
+        )
+            .into_response();
+    }
+    // RFC 3428 §8 推奨上限内に収める (orchestrator 側 truncate と同じ閾値)。
+    const SMS_BODY_MAX_BYTES: usize = 1024;
+    if req.body.len() > SMS_BODY_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "body too large: max {} bytes (RFC 3428 §8 aggregate size guidance)\n",
+                SMS_BODY_MAX_BYTES
+            ),
+        )
+            .into_response();
+    }
+    match handler.send_sms(&req.to, &req.body).await {
+        Ok(SmsSendOutcome::Sent { status }) => {
+            (StatusCode::OK, Json(SmsSendResponse { status })).into_response()
+        }
+        Ok(SmsSendOutcome::Rejected { status }) => (
+            StatusCode::BAD_GATEWAY,
+            format!("sms rejected (status={})\n", status),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(error=%e, "sms send failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sms send failed: {}\n", e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Issue #300: `GET /api/recording/{id}/transcript` — recording の sidecar
 /// `.txt` を返す。 voicemail と同じ責務 / 失敗扱い。
 async fn recording_transcript(
@@ -408,6 +537,19 @@ async fn recording_transcript(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
         }
     }
+}
+
+/// `is_valid_dial_target` / `is_valid_pwa_dial_target` と同等のホワイトリスト
+/// (RFC 3261 §25.1 user 文法サブセット)。 signaling 層 / orchestrator 側からは
+/// 参照せず、 REST 経路 (`POST /api/sms`) 用に health モジュール独立に再定義する
+/// (Issue #299)。
+fn sms_is_valid_target(target: &str) -> bool {
+    if target.is_empty() || target.len() > 32 {
+        return false;
+    }
+    target
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '*' || c == '#' || c == '+')
 }
 
 /// Issue #296: `DELETE /api/recording/{id}` — WAV + JSON sidecar を削除。
@@ -1129,5 +1271,222 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ==================== Issue #299: SMS REST endpoints ====================
+
+    /// `PwaSmsHandler` mock (`MockSmsHandler` in signaling tests と同等)。
+    struct MockSmsRest {
+        outcome: std::sync::Mutex<Result<SmsSendOutcome, String>>,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl MockSmsRest {
+        fn new(outcome: Result<SmsSendOutcome, String>) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: std::sync::Mutex::new(outcome),
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PwaSmsHandler for MockSmsRest {
+        async fn send_sms(&self, to: &str, body: &str) -> anyhow::Result<SmsSendOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((to.to_string(), body.to_string()));
+            match &*self.outcome.lock().unwrap() {
+                Ok(o) => Ok(o.clone()),
+                Err(s) => Err(anyhow::anyhow!(s.clone())),
+            }
+        }
+    }
+
+    fn make_state_with_sms(log: Arc<MessageLog>, handler: Arc<dyn PwaSmsHandler>) -> HealthState {
+        HealthState::new(
+            Arc::new(AtomicBool::new(true)),
+            Metrics::new(),
+            Arc::new(CallLog::new(100)),
+        )
+        .with_sms(log, handler)
+    }
+
+    /// Issue #299: SMS 機能未配線 (= `sms.enabled = false`) は GET / POST とも
+    /// 503 Service Unavailable。
+    #[tokio::test]
+    async fn sms_endpoints_return_503_when_disabled() {
+        let app = router(make_state(true));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sms/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"117","body":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Issue #299: `GET /api/sms/recent` は ring buffer を新しい順 JSON 配列で返す。
+    #[tokio::test]
+    async fn sms_recent_returns_entries_in_newest_first_order() {
+        use crate::call::message_log::{Direction, SmsMessage};
+        let log = Arc::new(MessageLog::new(10));
+        log.push(SmsMessage::new_now(
+            Direction::Inbound,
+            "sip:a@x".into(),
+            "sip:b@x".into(),
+            "first".into(),
+        ));
+        log.push(SmsMessage::new_now(
+            Direction::Outbound,
+            "sip:b@x".into(),
+            "sip:a@x".into(),
+            "second".into(),
+        ));
+        let handler = MockSmsRest::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let app = router(make_state_with_sms(
+            log,
+            handler.clone() as Arc<dyn PwaSmsHandler>,
+        ));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sms/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&body).expect("JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["body"], "second");
+        assert_eq!(arr[0]["direction"], "outbound");
+        assert_eq!(arr[1]["body"], "first");
+        assert_eq!(arr[1]["direction"], "inbound");
+    }
+
+    /// Issue #299: `POST /api/sms` で 200 OK の SMS が送信成功し、
+    /// `{"status":200}` を返す (RFC 3428 §7 受領 ack)。
+    #[tokio::test]
+    async fn rfc3428_7_sms_send_returns_status_200_on_success() {
+        let log = Arc::new(MessageLog::new(10));
+        let handler = MockSmsRest::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let app = router(make_state_with_sms(
+            log,
+            handler.clone() as Arc<dyn PwaSmsHandler>,
+        ));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"117","body":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], 200);
+        assert_eq!(
+            handler.calls.lock().unwrap().clone(),
+            vec![("117".to_string(), "hello".to_string())]
+        );
+    }
+
+    /// Issue #299: handler が `Rejected` を返すと 502 Bad Gateway + status を本文に含める。
+    #[tokio::test]
+    async fn rfc3428_7_sms_send_returns_502_for_non_2xx() {
+        let log = Arc::new(MessageLog::new(10));
+        let handler = MockSmsRest::new(Ok(SmsSendOutcome::Rejected { status: 486 }));
+        let app = router(make_state_with_sms(
+            log,
+            handler.clone() as Arc<dyn PwaSmsHandler>,
+        ));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"117","body":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Issue #299: 不正 target は 400 Bad Request で拒否 (handler 呼び出し無し)。
+    #[tokio::test]
+    async fn sms_send_returns_400_for_invalid_target() {
+        let log = Arc::new(MessageLog::new(10));
+        let handler = MockSmsRest::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let app = router(make_state_with_sms(
+            log,
+            handler.clone() as Arc<dyn PwaSmsHandler>,
+        ));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"abc","body":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // handler は呼ばれていない (defense-in-depth)。
+        assert!(handler.calls.lock().unwrap().is_empty());
+    }
+
+    /// Issue #299 / RFC 3428 §8: body が 1024 byte 超は 413 Payload Too Large。
+    #[tokio::test]
+    async fn rfc3428_8_sms_send_returns_413_for_oversize_body() {
+        let log = Arc::new(MessageLog::new(10));
+        let handler = MockSmsRest::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let app = router(make_state_with_sms(
+            log,
+            handler.clone() as Arc<dyn PwaSmsHandler>,
+        ));
+        let oversize = "x".repeat(1025);
+        let payload = format!(r#"{{"to":"117","body":"{}"}}"#, oversize);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(handler.calls.lock().unwrap().is_empty());
     }
 }

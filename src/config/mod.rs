@@ -54,6 +54,10 @@ pub struct Config {
     /// 通知できるようにする。 既定 disabled (= 既存挙動完全互換)。
     #[serde(default)]
     pub push: PushConfig,
+    /// SMS (RFC 3428 MESSAGE) ring buffer / 送信 API (Issue #299)。 既定 disabled
+    /// (= 旧挙動: NGN 着 MESSAGE は 200 OK 受け流し、 PWA SMS 送信 API は 503)。
+    #[serde(default)]
+    pub sms: SmsConfig,
 }
 
 /// PWA Web Push 通知設定 (Issue #294)。
@@ -102,6 +106,44 @@ pub struct PushConfig {
     /// (FCM 等) で必須。 `mailto:operator@example.com` または `https://example.com`。
     #[serde(default)]
     pub subject: Option<String>,
+}
+
+/// SMS (RFC 3428) 設定 (Issue #299)。
+///
+/// TOML 表記:
+/// ```toml
+/// [sms]
+/// enabled = true
+/// max_history = 200
+/// ```
+///
+/// `enabled = false` (既定) のときは:
+/// - NGN / 内線 から受信した MESSAGE は body 破棄して 200 OK で受け流す (従来挙動)
+/// - `POST /api/sms` / `GET /api/sms/recent` / `ClientMessage::SendSms` は
+///   `sms_unavailable` / 503 で拒否される
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SmsConfig {
+    /// 有効化フラグ。 既定 `false`。
+    #[serde(default)]
+    pub enabled: bool,
+    /// ring buffer 保持上限 (件)。 既定 200 件 (RFC 3428 は配送保証無し pager-mode
+    /// なので、 中規模 SOHO 想定で 200 = およそ 1 日分)。 過大値は RAM を圧迫する
+    /// ので運用上は 1000 程度を上限の目安にする (各 message 数 KB)。
+    #[serde(default = "default_sms_max_history")]
+    pub max_history: usize,
+}
+
+impl Default for SmsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_history: default_sms_max_history(),
+        }
+    }
+}
+
+fn default_sms_max_history() -> usize {
+    200
 }
 
 /// 着信ルーティング設定 (Issue #295)。
@@ -543,6 +585,7 @@ impl Config {
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
+            sms: SmsConfig::default(),
         })
     }
 
@@ -708,6 +751,16 @@ impl Config {
                 self.push.subject = Some(v);
             }
         }
+        // [sms] セクション (Issue #299): SMS ring buffer / 送信 API ON/OFF。
+        if let Ok(v) = std::env::var("SABIDEN_SMS_ENABLED") {
+            let lower = v.to_ascii_lowercase();
+            self.sms.enabled = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_SMS_MAX_HISTORY") {
+            if let Ok(n) = v.parse() {
+                self.sms.max_history = n;
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -826,6 +879,13 @@ max_expires = 3600
 # MIGH...
 # -----END PRIVATE KEY-----
 # """
+
+# SMS (RFC 3428 MESSAGE、 Issue #299)。 NGN / 内線 から受信した MESSAGE 本文を
+# ring buffer に store し、 PWA から送信もできる (`GET /api/sms/recent`
+# / `POST /api/sms`)。 既定 disabled (= 旧挙動: 200 OK 受け流しのみ)。
+# [sms]
+# enabled = false
+# max_history = 200
 "#
         .to_string()
     }
@@ -868,6 +928,7 @@ mod tests {
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
+            sms: SmsConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -893,6 +954,7 @@ mod tests {
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
+            sms: SmsConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -918,6 +980,7 @@ mod tests {
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
+            sms: SmsConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);

@@ -300,6 +300,10 @@ pub struct ExtensionUas {
     event_tx: Option<mpsc::UnboundedSender<UasEvent>>,
     /// 観測カウンタ。internal `extension_registered` gauge を更新する。
     metrics: Arc<Metrics>,
+    /// Issue #299: 受信した MESSAGE 本文を保存する ring buffer。 `None` のとき
+    /// MESSAGE は従来通り 200 OK で受け流すのみ (本文は破棄)、 `Some` のとき
+    /// `text/plain` body を抽出して push する (RFC 3428 §10)。
+    message_log: Option<Arc<crate::call::message_log::MessageLog>>,
 }
 
 impl ExtensionUas {
@@ -330,6 +334,7 @@ impl ExtensionUas {
             inbound_rx,
             event_tx: None,
             metrics,
+            message_log: None,
         })
     }
 
@@ -337,6 +342,13 @@ impl ExtensionUas {
     /// 呼ばなければ INVITE は 503、BYE は 481 で応答する。
     pub fn with_handler(mut self, event_tx: mpsc::UnboundedSender<UasEvent>) -> Self {
         self.event_tx = Some(event_tx);
+        self
+    }
+
+    /// Issue #299: 受信 MESSAGE 本文を保存する ring buffer を注入する (RFC 3428 §7)。
+    /// 呼ばなければ MESSAGE は body 破棄して 200 OK で受け流すのみ (従来挙動)。
+    pub fn with_message_log(mut self, log: Arc<crate::call::message_log::MessageLog>) -> Self {
+        self.message_log = Some(log);
         self
     }
 
@@ -564,9 +576,25 @@ impl ExtensionUas {
                 // **200 OK で受け流す** のが推奨される (UA の再送ストーム抑止)。
                 // 内線 UA (Linphone / iPhone 系) は IM メッセージを発行する
                 // ケースがあり、 405 で拒否すると UA 側の retry queue が
-                // 詰まる band-aid (Issue #273 / CLAUDE.md §9)。 本文は破棄。
+                // 詰まる band-aid 経路 (Issue #273 / CLAUDE.md §9) は維持する。
+                //
+                // Issue #299: `message_log` 注入時は body を抽出して ring buffer に
+                // store する (RFC 3428 §10: text/plain;charset=utf-8 が IETF default)。
+                // 200 OK 自体は本文の利用可否に関わらず常に返す (= 既存 UA への
+                // backward compat: log 注入の有無で UA 観察動作が変わらない)。
                 SipMethod::Message => {
-                    debug!("内線側 MESSAGE: 200 OK で受け流し (RFC 3428 §7、 本文は破棄)");
+                    if let Some(log) = self.message_log.as_ref() {
+                        if let Some(sms) =
+                            crate::call::message_log::sms_from_inbound_message(&request)
+                        {
+                            log.push(sms);
+                        } else {
+                            debug!(
+                                "内線側 MESSAGE: text/plain でないため body 破棄 (RFC 3428 §10)"
+                            );
+                        }
+                    }
+                    debug!("内線側 MESSAGE: 200 OK (RFC 3428 §7)");
                     let _ = responder
                         .quick_with_allow(200, "OK", SUPPORTED_METHODS_ALLOW)
                         .await;
@@ -1835,6 +1863,115 @@ mod tests {
     #[tokio::test]
     async fn rfc3428_7_uas_returns_200_for_message() {
         assert_ext_method_response(SipMethod::Message, 200, true).await;
+    }
+
+    /// Issue #299 / RFC 3428 §7 / §10: `with_message_log` で注入した ring buffer
+    /// に、 text/plain body の MESSAGE が **direction=Inbound** で push されること。
+    /// 200 OK は本文有無に関わらず常に返る (= 旧 UA 動作互換)。
+    #[tokio::test]
+    async fn rfc3428_10_uas_pushes_text_plain_message_body_to_log() {
+        use crate::call::message_log::{Direction, MessageLog};
+        use crate::testing::{builders, fixtures};
+
+        let extensions = vec![fixtures::extension_iphone()];
+        let log = Arc::new(MessageLog::new(10));
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap()
+            .with_message_log(log.clone());
+        let server_addr = uas.socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        // text/plain MESSAGE を組み立てる
+        let mut req = builders::request_from_phone(
+            &local,
+            "iphone",
+            SipMethod::Message,
+            "sip:sabiden",
+            "z9hG4bKsms-1",
+        );
+        req.headers.set("Content-Type", "text/plain;charset=utf-8");
+        req.body = b"hello from iphone".to_vec();
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        // 200 OK が返ること
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(r.status_code, 200);
+
+        // 短いポーリングで push が完了するのを待つ (RFC 3428 §7 の処理は
+        // 200 OK 後に行われる可能性があるため)。
+        for _ in 0..20 {
+            if !log.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entries = log.recent(10);
+        assert_eq!(entries.len(), 1, "MESSAGE 受信で 1 件 push されるべき");
+        assert_eq!(entries[0].direction, Direction::Inbound);
+        assert_eq!(entries[0].body, "hello from iphone");
+        assert!(entries[0].from.contains("iphone"));
+    }
+
+    /// Issue #299 / RFC 3428 §10: `application/im-iscomposing+xml` 等 non-text body は
+    /// ring buffer に push されない (200 OK のみ返す)。 PWA UI で render できない
+    /// MIME を観測ログに混ぜないため。
+    #[tokio::test]
+    async fn rfc3428_10_uas_drops_non_text_plain_body_from_log() {
+        use crate::call::message_log::MessageLog;
+        use crate::testing::{builders, fixtures};
+
+        let extensions = vec![fixtures::extension_iphone()];
+        let log = Arc::new(MessageLog::new(10));
+        let uas = ExtensionUas::bind(fixtures::uas_config(), &extensions)
+            .await
+            .unwrap()
+            .with_message_log(log.clone());
+        let server_addr = uas.socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            uas.run().await.unwrap();
+        });
+
+        let client = UdpSocket::bind(fixtures::loopback_any()).await.unwrap();
+        let local = client.local_addr().unwrap();
+
+        let mut req = builders::request_from_phone(
+            &local,
+            "iphone",
+            SipMethod::Message,
+            "sip:sabiden",
+            "z9hG4bKsms-2",
+        );
+        req.headers
+            .set("Content-Type", "application/im-iscomposing+xml");
+        req.body = b"<isComposing/>".to_vec();
+        client.send_to(&req.to_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let SipMessage::Response(r) = parse_message(&buf[..n]).unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(r.status_code, 200, "non-text body でも 200 で受け流す");
+
+        // ring buffer には push されていない (= 観測ログを汚染しない)。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(log.len(), 0, "non-text body は ring buffer に push しない");
     }
 
     /// RFC 3903 §6: PUBLISH は presence / event state 発行 method。

@@ -313,6 +313,24 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         } else {
             None
         };
+    // Issue #299: SMS / RFC 3428 MESSAGE ring buffer。 `[sms] enabled = true`
+    // のときのみ ring buffer を確保し、 NgnInboundHandler / UasEventHandler /
+    // HealthState (REST API) で共有する。 `None` のときは旧挙動 (MESSAGE は
+    // 200 OK 受け流しのみ、 `/api/sms/*` は 503、 PWA WS SendSms は
+    // `sms_unavailable`)。
+    let message_log: Option<Arc<call::message_log::MessageLog>> = if full_config.sms.enabled {
+        let log = Arc::new(call::message_log::MessageLog::new(
+            full_config.sms.max_history,
+        ));
+        info!(
+            max_history = full_config.sms.max_history,
+            "SMS (RFC 3428 MESSAGE、 Issue #299) 有効: /api/sms/{{recent,POST}}"
+        );
+        Some(log)
+    } else {
+        None
+    };
+
     let tracer = match trace_dir.as_deref() {
         Some(dir) => match SipTraceWriter::open(dir) {
             Ok(w) => {
@@ -394,6 +412,14 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
             // B2BUA 用に UAS の Layer / addr を控えておく (内線へ BYE を送る経路)。
             let uas_layer = uas.layer();
             let uas_addr = uas.socket().local_addr()?;
+            // Issue #299: 内線 UA 経由の受信 MESSAGE 本文を ring buffer に
+            // push する。 `message_log` 未構築時 (= `[sms] enabled = false`) は
+            // 旧挙動 (body 破棄 + 200 OK 受け流し) を維持。
+            let uas = if let Some(log) = message_log.clone() {
+                uas.with_message_log(log)
+            } else {
+                uas
+            };
             let uas = uas.with_handler(uas_event_tx.clone());
             (
                 Some(uas),
@@ -499,6 +525,10 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // Issue #277: 通話中 DTMF (RFC 4733 telephone-event) を WS 経由で NGN レッグへ
     // 注入するため、 `UasEventHandler` を `PwaDtmfHandler` としても流用する。
     let uas_handler_for_pwa_dtmf: Arc<dyn webrtc::signaling::PwaDtmfHandler> = uas_handler.clone();
+    // Issue #299: PWA → NGN / 内線 SMS 送出を `UasEventHandler` (= ngn_uac を
+    // 保持) で駆動する。 同じ Arc を SignalingState (WS dispatch) と HealthState
+    // (REST `POST /api/sms`) で共有する (RFC 3428 §4)。
+    let uas_handler_for_pwa_sms: Arc<dyn webrtc::signaling::PwaSmsHandler> = uas_handler.clone();
 
     // Bug B / Issue #268: NGN→PWA 着信通話の WS close cleanup ハンドラを
     // SignalingState (`with_pwa_inbound_closer`) に渡すため、 `ngn_handler` を
@@ -630,6 +660,16 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         }
         uas_handler.set_recording_recorder(rec).await;
     }
+    // Issue #299: SMS / RFC 3428 MESSAGE ring buffer を NGN inbound / outbound
+    // 両 handler に注入する。 NGN 着 MESSAGE 受信 (`NgnInboundHandler::handle_inbound`
+    // の MESSAGE arm)、 PWA → NGN 送出 (`UasEventHandler::send_sms`) で共通の
+    // ring buffer に push される。 `None` のときは hook 全 no-op (旧挙動)。
+    if let Some(log) = message_log.clone() {
+        if let Some(h) = ngn_inbound_handler_for_signaling.clone() {
+            h.set_message_log(log.clone()).await;
+        }
+        uas_handler.set_message_log(log).await;
+    }
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ
@@ -662,6 +702,15 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // (`/api/push/vapid-public-key` は 503 を返す)。
     if let Some((ref keys, _, _)) = push_runtime {
         health_state = health_state.with_vapid(keys.clone());
+    }
+    // Issue #299: SMS ring buffer + 送信ハンドラを REST API (HealthState) に
+    // attach する。 `message_log` が None (= `[sms] enabled = false`) のときは
+    // attach せず、 `/api/sms/*` は 503 を返す。 ハンドラ側 (= UasEventHandler)
+    // は ngn_uac を持っていれば SMS 送信は技術的に可能だが、 ring buffer 無しで
+    // 送信履歴を残さないのは UX として悪いので、 buffer + handler を「組」 で
+    // attach する規約。
+    if let Some(log) = message_log.clone() {
+        health_state = health_state.with_sms(log, uas_handler_for_pwa_sms.clone());
     }
     let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
         match hex::decode(&secret_hex) {
@@ -729,6 +778,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                     if let Some((_, ref store, _)) = push_runtime {
                         let handler: Arc<dyn webrtc::signaling::PwaPushHandler> = store.clone();
                         state = state.with_pwa_push(handler);
+                    }
+                    // Issue #299: PWA WS の SendSms を `UasEventHandler` (= ngn_uac
+                    // 保持) に取り次ぐ。 `message_log` 未構築時 (= `[sms].enabled
+                    // = false`) は attach せず `sms_unavailable` で拒否する。
+                    if message_log.is_some() {
+                        state = state.with_pwa_sms(uas_handler_for_pwa_sms.clone());
                     }
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {

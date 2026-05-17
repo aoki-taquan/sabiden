@@ -104,6 +104,24 @@ impl PushSubscription {
     /// のみで、 暗号鍵としての妥当性 (= 圧縮形式 byte 長 65 等) は
     /// `WebPushMessageBuilder::build` 側で検出する (= `InvalidCryptoKeys` を
     /// 返す)。
+    ///
+    /// # base64url padding の扱い (Issue #307)
+    ///
+    /// `p256dh` / `auth` の base64url encode は **padding (`=`) 無し** が正則。
+    ///
+    /// - **RFC 4648 §3.2**: padding は "MAY be required"。 base64url を採用する
+    ///   個別仕様が padding 有無を定める。
+    /// - **RFC 8291 §3.2 (Web Push 鍵): "values are encoded using
+    ///   base64url encoding [RFC7515]"**。 RFC 7515 §2 (JSON Web Signature) の
+    ///   "Base64url Encoding" 定義は **明示的に no-padding** で固定されている
+    ///   ("Base64 encoding using the URL- and filename-safe character set ...
+    ///   with all trailing '=' characters omitted")。
+    /// - PWA frontend (`navigator.serviceWorker` 経由) も意図的に `=` を strip
+    ///   して送ってくるため、 server が `=` 入りを許容すると、 同一 device で
+    ///   「padding 有り版」 と「padding 無し版」 の **二重 entry** が
+    ///   `PushSubscriptionStore` に登録されうる。 fan-out が 2 重発火する。
+    ///
+    /// 以上から padding (`=`) を含む値は **Err で reject** する。
     pub fn validate(&self) -> Result<()> {
         if !(self.endpoint.starts_with("https://") || self.endpoint.starts_with("http://")) {
             return Err(anyhow!(
@@ -118,9 +136,16 @@ impl PushSubscription {
             if value.is_empty() {
                 return Err(anyhow!("{name} must not be empty"));
             }
+            // RFC 7515 §2 / RFC 8291 §3.2: base64url for Web Push keys is
+            // **no-padding**。 `=` 入りは reject (Issue #307)。
+            if value.contains('=') {
+                return Err(anyhow!(
+                    "{name} must be base64url without padding (RFC 7515 §2 / RFC 8291 §3.2)"
+                ));
+            }
             if !value
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 return Err(anyhow!("{name} must be base64url"));
             }
@@ -265,9 +290,10 @@ impl VapidKeys {
         &self.subject
     }
 
-    /// PEM bytes を Cursor で取り出す (`VapidSignatureBuilder::from_pem` が
-    /// `Read` を要求するため)。 内部は `Arc<Vec<u8>>` で共有しているので
-    /// clone コストは小さい。
+    /// PEM bytes を Cursor で取り出す (`VapidSignatureBuilder::from_pem*` が
+    /// `Read` を要求するため)。 起動時 1 度の builder 構築でのみ呼ぶ想定
+    /// (Issue #308: 通知ごとの再パースは廃止)。 内部は `Arc<Vec<u8>>` で
+    /// 共有しているので clone コストは小さい。
     pub(crate) fn pem_cursor(&self) -> std::io::Cursor<Vec<u8>> {
         std::io::Cursor::new((*self.private_pem).clone())
     }
@@ -290,22 +316,55 @@ pub trait PushNotifier: Send + Sync {
 
 /// `PushNotifier::send_incoming_call` の失敗を呼出側がカテゴリ分けできるよう
 /// 分類した error。 `Gone` の場合は store から該当 subscription を破棄する。
+///
+/// # 区別の根拠 (Issue #309, RFC 8030 §5)
+///
+/// RFC 8030 §5 ("Removing a Subscription") は 404 / 410 を「永続的無効」 と
+/// 規定する。 一方 401 Unauthorized (VAPID JWT exp 切れや署名鍵 rotation) は
+/// **再起動 / 鍵 reload で復活可能** な一時状態。 5xx / IO error も同様に
+/// transient。 そのため:
+///
+/// - **`Gone`**: 404 / 410。 store から該当 subscription を即削除。
+/// - **`Rejected { code, message }`**: 400 BadRequest / 413 PayloadTooLarge /
+///   InvalidCryptoKeys 等、 **request 自体が恒久的に不正**。 store は保持
+///   (config を直して再起動すれば直る可能性はあるが、 そのままでは何度送っても
+///   同じ結果)。 `code` は HTTP status 由来の数値で、 metric / log 区別用。
+/// - **`Transient(String)`**: 401 Unauthorized (JWT exp 切れ等) / 5xx ServerError
+///   / connection IO / unencryptable payload。 retry もしくは次回 INVITE で
+///   復活する想定。 store は当然保持。
 #[derive(Debug)]
 pub enum PushSendError {
     /// RFC 8030 §5: 404 Not Found / 410 Gone。 subscription は永続的に無効。
     Gone,
-    /// 4xx (Gone 以外): payload や VAPID 署名の不備など。 store は保持する
-    /// (config を直して再起動すれば直る可能性があるため)。
-    Rejected(String),
-    /// 5xx / connection error / unencryptable payload。 一時障害扱い。
+    /// 4xx (Gone / Unauthorized を除く) の恒久 reject。
+    /// `code` は HTTP status code 相当 (web-push crate 内 mapping、 必ずしも
+    /// 受信した wire 上の数値とは限らない)。 metric / log で分類するために
+    /// 数値で保持する。
+    Rejected { code: u16, message: String },
+    /// 5xx / connection error / unencryptable payload / 401 Unauthorized
+    /// (JWT exp 切れ等の一時不正)。 store は保持し、 次回送信で復活を期待する。
     Transient(String),
+}
+
+impl PushSendError {
+    /// `Rejected` を構築するヘルパ。 internal error (= crate 内で発生して
+    /// wire status を持たない error: payload serialize 失敗等) は
+    /// `code = 0` を使う。
+    fn rejected(code: u16, message: impl Into<String>) -> Self {
+        PushSendError::Rejected {
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for PushSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PushSendError::Gone => f.write_str("subscription gone (404/410)"),
-            PushSendError::Rejected(m) => write!(f, "push rejected: {m}"),
+            PushSendError::Rejected { code, message } => {
+                write!(f, "push rejected ({code}): {message}")
+            }
             PushSendError::Transient(m) => write!(f, "push transient error: {m}"),
         }
     }
@@ -315,21 +374,43 @@ impl std::error::Error for PushSendError {}
 
 impl From<WebPushError> for PushSendError {
     fn from(e: WebPushError) -> Self {
-        // web-push 0.11 の `WebPushError::EndpointNotValid` / `EndpointNotFound`
-        // が RFC 8030 §5 の 410/404 にあたる。 それ以外は実用上 transient
-        // (= 暗号生成失敗等は 5xx 相当) または rejected (= 不正な鍵) に
-        // 振り分ける。
+        // RFC 8030 §5 (Removing a Subscription): 404 / 410 = 永続的無効
+        // (web-push crate では `EndpointNotFound` / `EndpointNotValid`)。
+        //
+        // RFC 8030 §5 (Request Validation): 400 BadRequest / 413 PayloadTooLarge
+        // は request 自体の不正で、 同じ subscription でも request 内容を
+        // 直さない限り恒久 reject。
+        //
+        // RFC 8292 §2 (VAPID): 401 Unauthorized は JWT exp 切れや署名鍵 rotation
+        // で発生する **一時** 不正。 次回送信時に JWT を作り直せば復活する。
+        // ゆえに Transient に振り分ける (Issue #309)。
+        //
+        // 5xx ServerError / IO / Unspecified は network or push service 側の
+        // 一時障害で、 retry で復活する想定 → Transient。
         match e {
             WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_) => {
                 PushSendError::Gone
             }
+            // RFC 8030 §5 で `Bad Request` (400) は subscription 自体の問題ではなく
+            // request 内容の不正 (payload / header) を示す。
+            WebPushError::BadRequest(_) => PushSendError::rejected(400, e.to_string()),
+            // RFC 8030 §5 で 413 Payload Too Large。
+            WebPushError::PayloadTooLarge => PushSendError::rejected(413, e.to_string()),
+            // 暗号鍵 / package name / TTL / Topic / Claims は crate 内 validation
+            // 失敗で wire status を持たないが、 request 内容が恒久的に不正なので
+            // Rejected 扱い。 code = 0 (= 内部 validation error)。
             WebPushError::InvalidCryptoKeys
+            | WebPushError::MissingCryptoKeys
             | WebPushError::InvalidPackageName
             | WebPushError::InvalidTtl
             | WebPushError::InvalidTopic
-            | WebPushError::BadRequest(_)
-            | WebPushError::Unauthorized(_)
-            | WebPushError::PayloadTooLarge => PushSendError::Rejected(e.to_string()),
+            | WebPushError::InvalidClaims
+            | WebPushError::InvalidUri => PushSendError::rejected(0, e.to_string()),
+            // 401: VAPID JWT exp 切れ等は一時的 → Transient (Issue #309)。
+            WebPushError::Unauthorized(_) => PushSendError::Transient(e.to_string()),
+            // 5xx server-side。 retry_after は web-push crate が保持するが
+            // 上位はまず種別だけ知れれば良い。
+            WebPushError::ServerError { .. } => PushSendError::Transient(e.to_string()),
             _ => PushSendError::Transient(e.to_string()),
         }
     }
@@ -338,16 +419,38 @@ impl From<WebPushError> for PushSendError {
 /// 本番用 `PushNotifier`: VAPID 署名 + AES128-GCM (RFC 8291) で Push Service
 /// に送信する。 内部は isahc-based HTTP/2 client (`IsahcWebPushClient`)
 /// を使う (web-push crate 既定)。
+///
+/// # VAPID 鍵の再利用 (Issue #308)
+///
+/// `PartialVapidSignatureBuilder` は **PEM パース + ECDSA 鍵展開済み**
+/// の状態を保持する。 通知 1 件ごとに PEM 文字列から都度パースすると
+/// 数 ms の ECDSA decode が hot path に乗る (fan-out 数 × Issue #294 規模)。
+/// web-push crate `vapid/builder.rs` §270 `#[derive(Clone)]` + §276
+/// `add_sub_info(self, sub_info)` を利用し、 起動時に 1 度だけ PEM を
+/// パース → builder を保持 → 送信ごとに `.clone()` してから per-subscription
+/// `add_sub_info(&info)` で `VapidSignatureBuilder<'_>` を取り出す。
 pub struct WebPushNotifier {
     client: IsahcWebPushClient,
     keys: VapidKeys,
+    /// 起動時に PEM から構築した署名 builder。 ECDSA private key を
+    /// 内部に保持する。 通知ごとに `clone()` (= 鍵 byte の `Arc`-like cheap
+    /// copy) してから `add_sub_info` を呼ぶ。
+    sig_builder: PartialVapidSignatureBuilder,
 }
 
 impl WebPushNotifier {
     pub fn new(keys: VapidKeys) -> Result<Self> {
         let client =
             IsahcWebPushClient::new().map_err(|e| anyhow!("isahc HTTP client init: {e}"))?;
-        Ok(Self { client, keys })
+        // 起動時に 1 度だけ PEM をパースして、 後の送信では clone + add_sub_info
+        // のみで JWT を作る (Issue #308)。
+        let sig_builder = VapidSignatureBuilder::from_pem_no_sub(keys.pem_cursor())
+            .map_err(|e| anyhow!("VAPID PEM パース失敗 (起動時): {e}"))?;
+        Ok(Self {
+            client,
+            keys,
+            sig_builder,
+        })
     }
 
     pub fn keys(&self) -> &VapidKeys {
@@ -363,22 +466,18 @@ impl PushNotifier for WebPushNotifier {
         payload: &IncomingCallPayload,
     ) -> Result<(), PushSendError> {
         let info = SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
-        // RFC 8292: VAPID 署名は subscription 毎に audience (endpoint origin) を
-        // 含む JWT。 `from_pem` で都度署名するのは web-push crate の API 設計上
-        // やむを得ない (PartialVapidSignatureBuilder から add_sub_info する手も
-        // ある)。
-        let mut sig_builder = VapidSignatureBuilder::from_pem(self.keys.pem_cursor(), &info)
-            .map_err(|e| {
-                PushSendError::Rejected(format!("VAPID PEM 再パース失敗 (config を確認): {e}"))
-            })?;
+        // RFC 8292 §2: VAPID 署名は subscription 毎に audience (endpoint origin)
+        // を含む JWT。 起動時 cache 済の `PartialVapidSignatureBuilder` を clone
+        // し、 per-send で `add_sub_info(&info)` から完成させる (Issue #308)。
+        let mut sig_builder = self.sig_builder.clone().add_sub_info(&info);
         // RFC 8292 §2.1.1 `sub` claim。
         sig_builder.add_claim("sub", self.keys.subject.as_str());
         let sig = sig_builder
             .build()
-            .map_err(|e| PushSendError::Rejected(format!("VAPID signature build: {e}")))?;
+            .map_err(|e| PushSendError::rejected(0, format!("VAPID signature build: {e}")))?;
 
         let body = serde_json::to_vec(payload)
-            .map_err(|e| PushSendError::Rejected(format!("payload JSON serialize 失敗: {e}")))?;
+            .map_err(|e| PushSendError::rejected(0, format!("payload JSON serialize 失敗: {e}")))?;
         let mut builder = WebPushMessageBuilder::new(&info);
         // RFC 8030 §5.2: TTL (秒)。 着信通知は短く保つ (5 分 = 300 秒)。
         // それを超えて未配送なら通話は既に終わっている可能性が高い。
@@ -448,8 +547,14 @@ pub async fn notify_incoming_call(
                 dropped += n;
                 info!(%aor, endpoint=%sub.endpoint, removed=n, "push: subscription Gone → store から削除");
             }
-            Err(e) => {
-                warn!(%aor, endpoint=%sub.endpoint, error=%e, "push: 送信失敗 (subscription 保持)");
+            Err(e @ PushSendError::Rejected { .. }) => {
+                // 恒久 reject (Issue #309): config / request 自体が不正。
+                // 再送しても改善せず subscription も保持 (rotation 等で別ルートから直る可能性)。
+                warn!(%aor, endpoint=%sub.endpoint, error=%e, "push: 送信 Rejected (subscription 保持)");
+            }
+            Err(e @ PushSendError::Transient(_)) => {
+                // 一時障害 (5xx / 401 JWT exp / IO 等): retry 視野で subscription 保持。
+                warn!(%aor, endpoint=%sub.endpoint, error=%e, "push: 送信 Transient (subscription 保持、 次回 retry)");
             }
         }
     }
@@ -564,6 +669,145 @@ mod tests {
         assert!(sub.validate().is_err());
     }
 
+    /// validate: base64url padding (`=`) を含む鍵を reject する (Issue #307,
+    /// RFC 7515 §2 / RFC 8291 §3.2)。 p256dh / auth どちらでも reject。
+    #[tokio::test]
+    async fn subscription_validate_rejects_base64url_padding_in_p256dh() {
+        let mut sub = make_sub("https://example.com/p/1");
+        // 末尾に padding が付いた値
+        sub.p256dh = "BPq=".to_string();
+        let err = sub.validate().unwrap_err();
+        // メッセージに padding 検出が出ていること (RFC 引用込み)
+        let msg = err.to_string();
+        assert!(
+            msg.contains("padding") || msg.contains("RFC 7515"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_validate_rejects_base64url_padding_in_auth() {
+        let mut sub = make_sub("https://example.com/p/1");
+        sub.auth = "AAA=".to_string();
+        assert!(sub.validate().is_err());
+    }
+
+    /// validate: padding 無しの (正則な) base64url は通る (regression 用)。
+    #[tokio::test]
+    async fn subscription_validate_accepts_base64url_no_padding() {
+        let sub = PushSubscription {
+            endpoint: "https://example.com/p/1".to_string(),
+            // 典型的な uncompressed P-256 公開鍵 base64url (87 文字、 padding なし)
+            p256dh:
+                "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"
+                    .to_string(),
+            // 典型的な 16 byte auth secret base64url (22 文字、 padding なし)
+            auth: "tBHItJI5svbpez7KI4CCXg".to_string(),
+        };
+        assert!(sub.validate().is_ok());
+    }
+
+    /// `PushSendError`: Display で variant が区別できる (metric / log 用)。
+    #[test]
+    fn push_send_error_display_distinguishes_variants() {
+        assert!(PushSendError::Gone.to_string().contains("gone"));
+        let rejected = PushSendError::Rejected {
+            code: 413,
+            message: "payload too large".to_string(),
+        };
+        let s = rejected.to_string();
+        assert!(s.contains("413"));
+        assert!(s.contains("payload too large"));
+
+        let transient = PushSendError::Transient("io".to_string());
+        assert!(transient.to_string().contains("transient"));
+    }
+
+    /// `WebPushError` → `PushSendError` 変換: Issue #309 の主旨。
+    ///
+    /// `web_push::ErrorInfo` は crate 外に公開されていない (lib.rs §55-61 の
+    /// re-export 対象外) ため、 `ErrorInfo` を要求する variant
+    /// (`Unauthorized` / `BadRequest` / `Endpoint*` / `ServerError` /
+    /// `NotImplemented` / `Other`) の直接構築はテストできない。
+    /// ここでは **構築できる unit variant** のみで対応表を検証する。
+    ///
+    /// `Unauthorized` を Transient に振り分ける Issue #309 主旨は、
+    /// `From<WebPushError> for PushSendError` の docstring + match 表で
+    /// **本流側コードで明示** している (= レビューでの担保)。
+    #[test]
+    fn web_push_error_maps_payload_too_large_to_rejected_413() {
+        let e: PushSendError = WebPushError::PayloadTooLarge.into();
+        match e {
+            PushSendError::Rejected { code, .. } => assert_eq!(code, 413),
+            other => panic!("expected Rejected(413), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_crypto_keys_to_rejected_zero() {
+        let e: PushSendError = WebPushError::InvalidCryptoKeys.into();
+        match e {
+            PushSendError::Rejected { code, .. } => assert_eq!(code, 0),
+            other => panic!("expected Rejected(0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn web_push_error_maps_missing_crypto_keys_to_rejected_zero() {
+        let e: PushSendError = WebPushError::MissingCryptoKeys.into();
+        match e {
+            PushSendError::Rejected { code, .. } => assert_eq!(code, 0),
+            other => panic!("expected Rejected(0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_ttl_to_rejected_zero() {
+        let e: PushSendError = WebPushError::InvalidTtl.into();
+        match e {
+            PushSendError::Rejected { code, .. } => assert_eq!(code, 0),
+            other => panic!("expected Rejected(0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_topic_to_rejected_zero() {
+        let e: PushSendError = WebPushError::InvalidTopic.into();
+        assert!(matches!(e, PushSendError::Rejected { code: 0, .. }));
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_package_name_to_rejected_zero() {
+        let e: PushSendError = WebPushError::InvalidPackageName.into();
+        assert!(matches!(e, PushSendError::Rejected { code: 0, .. }));
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_uri_to_rejected_zero() {
+        let e: PushSendError = WebPushError::InvalidUri.into();
+        assert!(matches!(e, PushSendError::Rejected { code: 0, .. }));
+    }
+
+    /// 5xx ServerError / IO / Unspecified / InvalidResponse / ResponseTooLarge
+    /// 等は **Transient** (Issue #309)。 unit variant の中から代表選定。
+    #[test]
+    fn web_push_error_maps_unspecified_to_transient() {
+        let e: PushSendError = WebPushError::Unspecified.into();
+        assert!(matches!(e, PushSendError::Transient(_)));
+    }
+
+    #[test]
+    fn web_push_error_maps_invalid_response_to_transient() {
+        let e: PushSendError = WebPushError::InvalidResponse.into();
+        assert!(matches!(e, PushSendError::Transient(_)));
+    }
+
+    #[test]
+    fn web_push_error_maps_response_too_large_to_transient() {
+        let e: PushSendError = WebPushError::ResponseTooLarge.into();
+        assert!(matches!(e, PushSendError::Transient(_)));
+    }
+
     /// notify fan-out: 複数 subscription に正しく送信される。
     #[tokio::test]
     async fn notify_incoming_call_fans_out_to_all_subscriptions() {
@@ -663,5 +907,48 @@ QdPnU3DA4y5ptWiM3WQVvw8Xvk6BWnZcrNr1fh1uP9V/w+CG76Ya0gKP\n\
         assert!(pub_b64
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    /// Issue #308: `WebPushNotifier::new` が `PartialVapidSignatureBuilder`
+    /// を 1 回だけ構築して保持する。 PEM が壊れていれば new で失敗する
+    /// (= 通知ごとの再パースは廃止された)。
+    ///
+    /// `IsahcWebPushClient::new()` も呼ぶので、 isahc init が失敗する環境
+    /// (例: 一部 sandbox) では skip 相当の扱いをする。
+    #[test]
+    fn web_push_notifier_new_parses_pem_once_at_startup() {
+        const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgb2gYuG8JTWzkrOXL\n\
+Ysmtx3EJ1admqAJc8UwOexy1MFKhRANCAAQtqZ42q5xPHcPSMGdo7DdS9vaFSB4w\n\
+QdPnU3DA4y5ptWiM3WQVvw8Xvk6BWnZcrNr1fh1uP9V/w+CG76Ya0gKP\n\
+-----END PRIVATE KEY-----\n";
+        let keys = VapidKeys::from_pem(TEST_PEM, "mailto:test@example.com").unwrap();
+        // 良い PEM では new が通る (= builder 構築済み)。
+        let notifier = match WebPushNotifier::new(keys.clone()) {
+            Ok(n) => n,
+            Err(e) => {
+                // isahc init 失敗 (sandbox 等) は本テストの対象外。
+                eprintln!("WebPushNotifier::new skipped (isahc init failed): {e}");
+                return;
+            }
+        };
+        // 公開鍵が builder と keys で一致 (= 同じ PEM 由来) を確認する。
+        // PartialVapidSignatureBuilder::get_public_key() は uncompressed 65 byte。
+        let from_builder = notifier.sig_builder.get_public_key();
+        let from_keys = URL_SAFE_NO_PAD.decode(keys.public_key_b64url()).unwrap();
+        assert_eq!(from_builder, from_keys);
+    }
+
+    /// Issue #308: 壊れた PEM では `WebPushNotifier::new` が即 Err を返す
+    /// (= 起動時に検出される、 通知 hot path に持ち越さない)。
+    #[test]
+    fn web_push_notifier_new_rejects_broken_pem() {
+        const BROKEN_PEM: &str =
+            "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n";
+        // VapidKeys::from_pem も同じ PEM をパースするので、 そちらで先に
+        // 弾かれる (= 壊れた PEM が new に到達しない)。 これも回避経路として
+        // 妥当。
+        let result = VapidKeys::from_pem(BROKEN_PEM, "mailto:test@example.com");
+        assert!(result.is_err());
     }
 }

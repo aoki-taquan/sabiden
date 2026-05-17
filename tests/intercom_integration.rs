@@ -8,6 +8,28 @@
 //! (caller の SAVPF answer 受領 → callee WS Offer push → answer 配送 →
 //! WebRtcRelayBridge attach → `InternalCallRegistry` 登録) で検証する。
 //!
+//! # テスト層 (PR #314 review #2 fix で明示化)
+//!
+//! 本 file の test は 2 層に分かれている:
+//!
+//! - **trait-API direct** (大半): `PwaOutboundHandler::handle_pwa_outbound_offer`
+//!   を直接呼ぶ。 WS 入口 ([`process_client_message`]) の
+//!   [`is_valid_dial_target`] (charset `[0-9*#+]{1,32}`、 CRLF injection 防御)
+//!   を **bypass** するため、 AOR 文字種に制約が無く `"alice"` / `"bob"` 等の
+//!   alphabetic AOR を直接 dispatcher に流せる。 dispatcher 単体の挙動
+//!   (admit / SDP / bridge attach / registry insert) を独立に検証するのが目的。
+//!
+//! - **WS-entry e2e**:
+//!   [`ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn`] のみ。 production
+//!   入口 ([`process_client_message`]) を実 `pwa_outbound` ハンドラに結線して
+//!   ClientMessage::Offer { target: "101" } を流す。 数字 AOR
+//!   (`[0-9*#+]{1,32}`、 RFC 3261 §25.1 user 文法のサブセット) のみが WS validator を
+//!   通過し dispatcher まで到達することを示す。
+//!
+//! 本 PR scope (PWA→PWA production 到達経路) は **numeric AOR** のみ対応する
+//! (HLD `docs/ARCHITECTURE.md` 「内線間 direct dial」 節)。 alphabetic AOR
+//! 対応は follow-up Issue (WS validator 拡張 or `[extensions]` alias map)。
+//!
 //! # 防御効果
 //!
 //! - **NGN regression 防止**: テスト中の sabiden NGN UAC は「絶対に応答しない」
@@ -26,10 +48,13 @@
 //!
 //! - RFC 3261 §13.2.1 / RFC 5853 §3.2.2 (SBC framework): B2BUA は dial target
 //!   が同一管理ドメイン内なら外部 (NGN) へプロキシしない選択を取れる。
+//! - RFC 3261 §25.1 (user 文法): WS validator は `unreserved / escaped /
+//!   user-unreserved` のサブセット (`[0-9*#+]`) を許容。
 //! - RFC 3264 §6 / RFC 8829: SAVPF offer/answer (browser ↔ sabiden)。
 //! - RFC 3551 §4.5.14 PCMU PT 0 / 8kHz: 媒体面 relay の素材。
 //! - RFC 8827 §5: caller と callee の DTLS-SRTP context は独立 (sabiden は
 //!   decoded MediaFrame だけを relay する)。
+//! - RFC 8829 §5.1 (Connection Cleanup): SHOULD send shutdown when tearing down.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -47,8 +72,12 @@ use sabiden::call::orchestrator::UasEventHandler;
 use sabiden::sip::registrar::{ExtTransport, ExtensionRegistrar};
 use sabiden::sip::transaction::TransactionLayer;
 use sabiden::sip::uac::{Uac, UacConfig};
+use sabiden::webrtc::auth::{AuthClaims, Verifier};
 use sabiden::webrtc::peer::{MediaFrame, PeerSession};
-use sabiden::webrtc::signaling::{PendingAnswers, PwaOutboundHandler, ServerMessage, WsSink};
+use sabiden::webrtc::signaling::{
+    process_client_message, ClientMessage, PendingAnswers, PwaOutboundHandler, ServerMessage,
+    SessionAction, SignalingState, WsSink,
+};
 
 /// Test-only `PeerSession` that records `send_media` frames and returns
 /// trivial SDP from `handle_offer` / `create_offer`. `take_media_rx` is
@@ -236,6 +265,14 @@ async fn register_pwa_callee(
 ///    `InternalCallRegistry` にエントリが入る
 /// 4. NGN socket には何も飛ばない (band-aid 防止の決定的証拠)
 /// 5. caller→callee の `MediaFrame` が `WebRtcRelayBridge` 経由で届く
+///
+/// テスト層: **trait-API direct** (`handle_pwa_outbound_offer` を直接呼ぶ)。 WS
+/// 入口の `is_valid_dial_target` (charset `[0-9*#+]`) を bypass するため、
+/// alphabetic AOR (`"bob"`) を dispatcher に直接流す。 dispatcher の挙動を
+/// AOR 文字種制約と独立に検証することが目的。
+/// WS 入口を含む production 到達経路は
+/// [`ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn`] (numeric AOR
+/// `"101"`) で検証する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc5853_pwa_to_pwa_dispatcher_e2e_no_ngn_traffic_and_bridge_forwards_media() {
     // (a) fake NGN socket (応答しない、 hit count を監視)
@@ -393,6 +430,8 @@ async fn rfc5853_pwa_to_pwa_dispatcher_e2e_no_ngn_traffic_and_bridge_forwards_me
 ///
 /// これは「band-aid 防止 (CLAUDE.md §6.1)」 を担保する重要なテスト: dispatcher
 /// が落ちると NGN に内線 AOR が漏れて 404 が帰る band-aid 経路に逆戻りする。
+///
+/// テスト層: **trait-API direct** (WS validator bypass、 alphabetic AOR を使う)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pwa_to_sip_callee_intercom_returns_unsupported_error_and_no_ngn_traffic() {
     // (a) fake NGN
@@ -464,6 +503,8 @@ async fn pwa_to_sip_callee_intercom_returns_unsupported_error_and_no_ngn_traffic
 
 /// DoD: 同時通話上限超過 (`max_concurrent_internal_calls = 1`) のとき、 2 件目
 /// の PWA→内線 dial は `intercom_busy` で reject される (RFC 3261 §21.4.20)。
+///
+/// テスト層: **trait-API direct** (WS validator bypass、 alphabetic AOR を使う)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc3261_21_4_20_intercom_capacity_overflow_rejects_with_intercom_busy_error() {
     let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
@@ -540,3 +581,276 @@ async fn rfc3261_21_4_20_intercom_capacity_overflow_rejects_with_intercom_busy_e
 // した経緯あり) のため、 外部 `tests/` クレートからは構築できない。
 // 該当 test 名は `src/call/orchestrator.rs` 内
 // `rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_temporarily_unavailable`。
+
+/// PR #314 review #2 🟡#1 fix: **WS 入口 (`process_client_message`) を経由した
+/// e2e 検証**。 trait-API direct な他の test とは違い、 WS 入口の
+/// [`is_valid_dial_target`] (charset `[0-9*#+]{1,32}`) を通過する **numeric AOR**
+/// (`"101"`) で dispatcher までの full path を検証する。
+///
+/// 本 PR scope: PWA→PWA full multi-leg orchestration が numeric AOR 経由でのみ
+/// production 到達可能であることを担保 (HLD `docs/ARCHITECTURE.md` 「内線間
+/// direct dial」 節)。 alphabetic AOR (`"alice"` 等) は WS validator で reject
+/// され、 follow-up Issue で WS validator 拡張 or `[extensions]` alias map に
+/// よって対応する。
+///
+/// # DoD
+///
+/// 1. `process_client_message(Offer { target: "101" })` が WS validator を通過
+/// 2. dispatcher が Internal 経路に分岐 (NGN socket には何も飛ばない)
+/// 3. callee (= ext_id `"101"` で registrar に登録された PWA) の WS に
+///    `ServerMessage::Offer` が push される
+/// 4. caller には `ServerMessage::Answer { sdp }` が SessionAction::Reply で返る
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §25.1 (user 文法): WS validator が許容するサブセット
+///   `[0-9*#+]{1,32}`。
+/// - RFC 5853 §3.2.2 (SBC): 同一管理ドメイン内の dial は外部にプロキシしない選択肢。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn() {
+    // (a) fake NGN socket (応答しない、 hit count を監視)
+    let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) registrar に callee PWA `"101"` (numeric AOR) を登録
+    let registrar = ExtensionRegistrar::new();
+    let (callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let callee_peer_inner = Arc::new(RecordingPeer::new("callee101", callee_up_rx, "callee101"));
+    let callee_peer: Arc<dyn PeerSession> = callee_peer_inner.clone();
+    let (mut callee_ws_rx, callee_pending, _callee_ws_sink) =
+        register_pwa_callee(&registrar, "101", callee_peer.clone()).await;
+
+    // (c) UasEventHandler を組み立て、 pwa_outbound に Arc<UasEventHandler> を結線
+    let (uas_handler, _call_manager) =
+        build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
+    let pwa_outbound: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
+
+    // (d) SignalingState を組み立てて pwa_outbound を結線 (= main.rs と同じ pattern)
+    let verifier = Arc::new(Verifier::new(b"test-secret".to_vec()));
+    let state = SignalingState::new(verifier, registrar.clone(), Duration::from_secs(60))
+        .with_pwa_outbound(pwa_outbound);
+
+    // (e) caller PWA peer (`peer.handle_offer` / `take_media_rx` を呼ばれる)
+    let (_caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer: Arc<dyn PeerSession> =
+        Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
+
+    // (f) caller 側 WS sink + PendingAnswers (= process_client_message の引数)
+    let (caller_ws_tx, _caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let caller_ws_sink = WsSink::new(caller_ws_tx);
+    let pending_answers = PendingAnswers::new();
+
+    let claims = AuthClaims {
+        ext_id: "caller-pwa".to_string(),
+        expiry: 9_999_999_999,
+    };
+    let mut aor_guard: Option<String> = None;
+    let remote: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+
+    // (g) WS 入口を駆動: target = "101" → validator 通過 → dispatcher → Internal
+    let action = process_client_message(
+        ClientMessage::Offer {
+            sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=caller-offer\r\n".into(),
+            target: Some("101".into()),
+        },
+        &state,
+        &claims,
+        &caller_peer,
+        remote,
+        &mut aor_guard,
+        &caller_ws_sink,
+        &pending_answers,
+    )
+    .await;
+
+    // (h) caller には ServerMessage::Answer が返る (SessionAction::Reply 経由)
+    //     RFC 3264 §6 / RFC 8829: caller は SAVPF answer を即時受領。
+    match action {
+        SessionAction::Reply(ServerMessage::Answer { sdp }) => {
+            assert!(
+                sdp.contains("caller-answer"),
+                "WS 入口経由で caller に Answer が返るべき (SAVPF answer): {}",
+                sdp
+            );
+        }
+        SessionAction::Reply(other) => panic!(
+            "numeric AOR `\"101\"` (validator pass) で ServerMessage::Answer が \
+             期待値 — Internal dispatcher 未到達: reply={:?}",
+            other
+        ),
+        SessionAction::Continue => {
+            panic!("expected Reply(Answer), got Continue")
+        }
+        SessionAction::Close => {
+            panic!("expected Reply(Answer), got Close")
+        }
+    }
+
+    // (i) callee WS に sabiden 発 Offer が push される (= dispatcher が
+    //     numeric AOR の binding を引き当て internal 経路に分岐した証拠)
+    let pushed = timeout(Duration::from_secs(3), callee_ws_rx.recv())
+        .await
+        .expect("callee `\"101\"` WS に Offer が push されない (WS validator が numeric AOR を弾いた可能性、 dispatcher 未到達)")
+        .expect("callee WS rx closed prematurely");
+    let callee_call_id = match pushed {
+        ServerMessage::Offer { call_id, sdp } => {
+            assert!(
+                sdp.contains("callee101-offer"),
+                "callee に push された SDP が callee_peer.create_offer 戻り値でない: {}",
+                sdp
+            );
+            call_id
+        }
+        other => panic!(
+            "callee WS で受け取った最初の ServerMessage が Offer ではない: {:?}",
+            other
+        ),
+    };
+
+    // (j) callee answer (= 通常 PWA `ClientMessage::Answer` を再現)
+    callee_pending
+        .deliver(
+            &callee_call_id,
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=callee101-answered\r\n".to_string(),
+        )
+        .await;
+
+    // (k) NGN socket には到達 0 件 (band-aid 防止の決定的証拠)
+    //     dispatcher が numeric AOR の binding を引けずに NGN 経路に落ちると
+    //     fake_ngn_addr に INVITE が飛び hit_count が増える。
+    assert_eq!(
+        ngn_hit_count.load(Ordering::SeqCst),
+        0,
+        "WS 入口経由 numeric AOR でも NGN socket に内線 AOR が漏れている: \
+         {} 通到達 (intercom dispatcher gate 破綻)",
+        ngn_hit_count.load(Ordering::SeqCst)
+    );
+
+    // 後始末
+    let _ = callee_up_tx;
+}
+
+/// PR #314 review #2 🟡#2 fix: dispatch_pwa_internal_call の callee 側失敗
+/// (= 30s answer timeout) で **caller_peer.close() が呼ばれる** ことを確認。
+///
+/// caller cleanup が抜けると caller 側 str0m peer (DTLS-SRTP / ICE) が live
+/// 残り、 PWA は「呼んだ後即切れたのに caller 側だけ alive」 状態になる。
+/// 再発呼すると `take_media_rx` が既に取られている等の race を引く。
+///
+/// # シーケンス
+///
+/// 1. registrar に callee PWA を登録するが、 callee answer は **送らない**
+///    (= 30s timeout 経路にする)
+/// 2. timeout 短縮のため `tokio::time::pause` + `advance` を使う
+/// 3. background completion が Err で完了し、 caller の
+///    `close_called` カウンタが 1 になることを確認
+///
+/// # RFC 引用
+///
+/// - RFC 8829 §5.1 (Connection Cleanup): "When a connection is being torn
+///   down, the local peer SHOULD send a shutdown message"。 sabiden は
+///   `caller_peer.close().await` を best-effort で呼ぶ。
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dispatch_pwa_internal_call_closes_caller_peer_on_callee_timeout() {
+    use std::sync::atomic::AtomicBool;
+
+    /// `close()` カウントを取る peer (他 method は RecordingPeer と同等の
+    /// 最小実装。 caller cleanup 専用なので別 struct で簡潔化)。
+    struct CallerWithCloseCounter {
+        media_rx: Mutex<Option<mpsc::Receiver<MediaFrame>>>,
+        close_called: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl PeerSession for CallerWithCloseCounter {
+        async fn handle_offer(&self, _sdp: &str) -> Result<String> {
+            Ok("v=0\r\ns=caller-answer\r\n".to_string())
+        }
+        async fn create_offer(&self) -> Result<String> {
+            Ok("v=0\r\ns=caller-offer\r\n".to_string())
+        }
+        async fn accept_answer(&self, _sdp: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn add_ice_candidate(&self, _c: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn take_media_rx(&self) -> Option<mpsc::Receiver<MediaFrame>> {
+            self.media_rx.lock().await.take()
+        }
+        async fn send_media(&self, _frame: MediaFrame) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            self.close_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // (a) fake NGN
+    let (_ngn_sock, fake_ngn_addr, _ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) callee PWA は registrar に登録するが answer は返さない
+    let registrar = ExtensionRegistrar::new();
+    let (_callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let callee_peer_inner = Arc::new(RecordingPeer::new("callee", callee_up_rx, "callee"));
+    let callee_peer: Arc<dyn PeerSession> = callee_peer_inner.clone();
+    let (mut _callee_ws_rx, _callee_pending, _callee_ws_sink) =
+        register_pwa_callee(&registrar, "bob-timeout", callee_peer.clone()).await;
+
+    // (c) UasEventHandler
+    let (uas_handler, _call_manager) =
+        build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
+
+    // (d) caller peer (close 検出用)
+    let (_caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer_inner = Arc::new(CallerWithCloseCounter {
+        media_rx: Mutex::new(Some(caller_up_rx)),
+        close_called: AtomicBool::new(false),
+    });
+    let caller_peer: Arc<dyn PeerSession> = caller_peer_inner.clone();
+
+    let (caller_ws_tx, mut caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let caller_ws_sink = WsSink::new(caller_ws_tx);
+
+    // (e) dispatcher 駆動 — callee answer は送らないので 30s で timeout
+    let handler_trait: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
+    let outcome = handler_trait
+        .handle_pwa_outbound_offer(
+            "bob-timeout",
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=caller-offer\r\n",
+            &caller_peer,
+            &caller_ws_sink,
+        )
+        .await
+        .expect("dispatcher 同期 path で Err");
+
+    // caller の SAVPF answer は同期で返る (= caller peer は活きた状態で background へ)
+    assert!(outcome.savpf_answer.contains("caller-answer"));
+    // この時点では caller_peer.close() は呼ばれていない (livelock 防止確認)
+    assert!(!caller_peer_inner.close_called.load(Ordering::SeqCst));
+
+    // (f) 仮想時計を 30s 進める → callee answer timeout → caller cleanup 発火
+    //     注: `start_paused = true` + `tokio::time::sleep` を内部で使う dispatcher の
+    //     `tokio::time::timeout(30s, ...)` が経過する。
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    // (g) background completion が Err で完了する
+    let join = outcome.completion.await.expect("completion paniced");
+    assert!(join.is_err(), "callee timeout → Err 期待");
+
+    // (h) caller WS に intercom_callee_timeout Error が push されている
+    //     (background での send は仮想時計でも実 IO されるため、 短い実時間で受け取れる)
+    let pushed = timeout(Duration::from_secs(1), caller_ws_rx.recv()).await;
+    match pushed {
+        Ok(Some(ServerMessage::Error { code, .. })) => {
+            assert_eq!(code, "intercom_callee_timeout");
+        }
+        other => panic!("intercom_callee_timeout Error 期待だが {:?}", other),
+    }
+
+    // (i) ★ caller_peer.close() が呼ばれた (= 本 fix のコア)
+    assert!(
+        caller_peer_inner.close_called.load(Ordering::SeqCst),
+        "caller cleanup 漏れ: callee 30s timeout 後に caller_peer.close() が \
+         呼ばれていない (RFC 8829 §5.1 違反)"
+    );
+}

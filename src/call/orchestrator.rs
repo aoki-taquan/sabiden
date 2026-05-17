@@ -5677,6 +5677,19 @@ impl UasEventHandler {
                 let callee_call_id = format!("{}-callee", intercom_call_id);
 
                 // background completion: callee leg 確立 + bridge attach + registry insert
+                //
+                // PR #314 review #2 🟡#2 fix (caller cleanup): callee 側 leg 確立
+                // (create_offer / WS push / answer / accept_answer / take_media_rx /
+                // bridge attach) のいずれかが失敗した時、 既に caller `peer.handle_offer`
+                // で立ち上げてある caller str0m peer (DTLS-SRTP / ICE) を解放しないと
+                // PWA が「呼んだ後すぐ切れたのに caller 側だけ alive」 状態になり、
+                // 再発呼すると `take_media_rx` が既に取られている等の race を引く。
+                // RFC 8829 §5.1 (Connection Cleanup): "When a connection is being
+                // torn down, the local peer SHOULD send a shutdown message"。
+                //
+                // Err(...) で抜ける手前で `caller_peer.close()` を best-effort で
+                // 呼ぶ。 既に close されている / stub backend で no-op の場合も
+                // 無害なため `let _ =` で握る。
                 let completion = tokio::spawn(async move {
                     // (3a) callee_peer.create_offer (RFC 8829)。
                     let callee_offer = match callee_peer.create_offer().await {
@@ -5687,6 +5700,7 @@ impl UasEventHandler {
                                 "intercom_callee_offer_failed",
                                 format!("callee create_offer failed: {}", e),
                             ));
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("callee create_offer: {}", e));
                         }
                     };
@@ -5705,6 +5719,7 @@ impl UasEventHandler {
                             "intercom_callee_unreachable",
                             format!("callee WS push failed: {}", e),
                         ));
+                        let _ = caller_peer.close().await;
                         return Err(anyhow!("callee WS push: {}", e));
                     }
 
@@ -5722,6 +5737,7 @@ impl UasEventHandler {
                                 "intercom_callee_declined",
                                 format!("callee declined ({})", status),
                             ));
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("intercom callee declined: {}", status));
                         }
                         Ok(Err(_)) => {
@@ -5730,6 +5746,7 @@ impl UasEventHandler {
                                 "intercom_callee_disconnected",
                                 "callee WS disconnected before answering",
                             ));
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("intercom callee oneshot cancelled"));
                         }
                         Err(_) => {
@@ -5739,6 +5756,7 @@ impl UasEventHandler {
                                 "intercom_callee_timeout",
                                 "callee did not answer within 30s",
                             ));
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("intercom callee answer timeout"));
                         }
                     };
@@ -5751,6 +5769,7 @@ impl UasEventHandler {
                             "intercom_callee_answer_invalid",
                             format!("callee accept_answer failed: {}", e),
                         ));
+                        let _ = caller_peer.close().await;
                         return Err(anyhow!("callee accept_answer: {}", e));
                     }
 
@@ -5765,6 +5784,8 @@ impl UasEventHandler {
                                 "intercom_caller_media_unavailable",
                                 "caller peer media not available",
                             ));
+                            let _ = callee_peer.close().await;
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("caller take_media_rx None"));
                         }
                     };
@@ -5776,6 +5797,8 @@ impl UasEventHandler {
                                 "intercom_callee_media_unavailable",
                                 "callee peer media not available",
                             ));
+                            let _ = callee_peer.close().await;
+                            let _ = caller_peer.close().await;
                             return Err(anyhow!("callee take_media_rx None"));
                         }
                     };
@@ -5801,6 +5824,8 @@ impl UasEventHandler {
                             "intercom_bridge_attach_failed",
                             format!("attach_media_bridge failed: {}", e),
                         ));
+                        let _ = callee_peer.close().await;
+                        let _ = caller_peer.close().await;
                         return Err(anyhow!("attach_media_bridge: {}", e));
                     }
 

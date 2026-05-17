@@ -67,7 +67,7 @@ src/
 │       ├── mod.rs    # VoicemailRecorder / VoicemailFile / VoicemailHandle / VoicemailConfig
 │       └── wav.rs    # WavWriter (RIFF/WAVE linear PCM 16-bit mono 8 kHz、 recording からも再利用)
 ├── config/           # 設定 (TOML + 環境変数 for K8s)
-├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278; /api/voicemail/* Issue #288; /api/recording/* Issue #296; /api/{voicemail,recording}/:id/transcript Issue #300)
+├── health/           # ヘルスチェック HTTP サーバ + JSON API (/api/call-log/recent、 Issue #278; /api/voicemail/* Issue #288; /api/recording/* Issue #296; /api/{voicemail,recording}/:id/transcript Issue #300; /api/push/vapid-public-key Issue #294)
 ├── observability/    # メトリクス (Prometheus) + SIP トレース + call_log ring buffer (Issue #278) + transcription stub (Issue #300)
 │   ├── mod.rs        # Metrics (atomic counter 群) + SipTraceWriter
 │   ├── call_log.rs   # 通話履歴 ring buffer (Direction / Outcome / CallLogEntry / CallLog)
@@ -1154,6 +1154,103 @@ WAV / JSON 本体は保護する (production code で panic 禁止、 CLAUDE.md 
 を組み立て、 `VoicemailRecorder::with_transcriber` / `CallRecorder::with_transcriber`
 で **どちらかの recorder を経由する WAV finalize 経路に**注入する。
 disabled (既定) なら hook 自体が呼ばれず旧挙動と同一。
+
+### PWA Web Push 通知 (Issue #294、 `src/webrtc/push.rs`)
+
+PWA tab が閉じている / 画面 lock 中でも NGN inbound INVITE を通知するため、
+Web Push (RFC 8030 / RFC 8291 / RFC 8292 VAPID) で browser に push する機構。
+
+**RFC 引用**:
+
+- **RFC 8030**: HTTP Web Push の wire protocol (POST `<endpoint>` +
+  `TTL` / `Urgency` ヘッダ等)。 §5 で 404/410 受信時は subscription を
+  「永続的に無効」 と扱い、 store から削除する。
+- **RFC 8291**: payload は ECDH 派生鍵 + HKDF + AES128-GCM (= aes128gcm,
+  RFC 8188) で encrypt。 `p256dh` (subscriber 公開鍵) / `auth` (16 byte
+  secret) は base64url (no padding)。
+- **RFC 8292** (VAPID): "Voluntary Application Server Identification"。 push
+  service (FCM 等) に「誰が送ったか」 を JWT で示す。 P-256 ECDSA 鍵対 +
+  `sub` claim (`mailto:` or `https:`)。 公開鍵は uncompressed base64url で
+  PWA の `applicationServerKey` に渡す。
+- **W3C Push API**: browser 側 API (`navigator.serviceWorker` →
+  `PushManager.subscribe`)。
+
+**データ構造** (`src/webrtc/push.rs`):
+
+- `PushSubscription { endpoint, p256dh, auth }` ── 1 device の購読単位。
+  `validate()` で HTTPS scheme / base64url / 空鍵を検査。
+- `PushSubscriptionStore { AOR → Vec<PushSubscription> }` ── 1 AOR に複数
+  device (= PC + スマホ) を許容。 同一 `endpoint` の再 subscribe は dedup
+  (= 鍵 rotation 上書き)。
+- `VapidKeys { private_pem, public_b64url, subject }` ── 起動時に PEM から
+  派生して keep。 `public_key_b64url()` を `/api/push/vapid-public-key` で
+  PWA に配信。
+- `PushNotifier` trait + `WebPushNotifier` 実装 ── 本番は `IsahcWebPushClient`
+  (HTTP/2)。 test は `MockPushNotifier` で fan-out / Gone 経路を検証。
+- `IncomingCallPayload { type: "incoming_call", call_id, caller_number,
+  issued_at }` ── Service Worker 側で受け取って Notification API で表示する
+  JSON。
+
+**動作シーケンス** (PWA 購読登録 → NGN inbound INVITE → push fan-out):
+
+```text
+PWA (browser)         sabiden                Push Service     PWA SW
+   │ ① /api/push/vapid-public-key (GET)            │             │
+   │ ─────────────────────────►│                   │             │
+   │ ◄─────────────────────────│ { publicKey, subject }          │
+   │ ② PushManager.subscribe({ applicationServerKey })           │
+   │ ─── (browser → push svc) ────────────────────►│             │
+   │ ◄───────────────────────────────────────── PushSubscription │
+   │ ③ WS: { type: "pushsubscribe", endpoint, keys }             │
+   │ ─────────────────────────►│                   │             │
+   │                           │ store.upsert(aor=ext_id, sub)   │
+   │ ◄─────────────────────────│ { type: "pushsubscribed", ep }  │
+   │                           │                   │             │
+   │       (later)             │                   │             │
+   │ NGN INVITE  ─────────────►│                   │             │
+   │                           │ store.list(aor) → notify_incoming_call
+   │                           │ ──── POST endpoint (AES128-GCM、 VAPID JWT) ──►
+   │                           │                   │ push event  │
+   │                           │                   │ ──────────► │
+   │                           │                   │             │ showNotification
+   │                           │                   │             │ (caller_number 表示)
+   │   tap → notificationclick │                   │             │
+   │ ◄────── clients.openWindow / focus ───────────│             │
+```
+
+**fan-out 経路** (`src/call/orchestrator.rs::NgnInboundHandler::handle_invite`、
+180 Ringing 直前):
+
+1. `bindings = registrar.snapshot() + routing.evaluate(...)` で alert 対象 AOR
+   が確定。
+2. `push_clones()` で store + notifier の Arc を取得 (= push 機能 ON のとき)。
+3. `tokio::spawn` で background task に切り出し、 各 AOR に対して
+   `notify_incoming_call(store, notifier, aor, payload)` を呼ぶ。
+4. push 送信は INVITE 処理の hot path をブロックしない (= 180/200 OK 経路に
+   影響を与えない、 RFC 5853 §3.2.2 B2BUA 副次的 notification の規範)。
+5. `Gone` (404/410) は store から自動削除 (RFC 8030 §5)。
+
+**結線** (`src/main.rs`):
+
+1. `[push] enabled = true` + `vapid_private_pem` + `subject` が揃えば、
+   `VapidKeys::from_pem` で `Arc<VapidKeys>`、 `PushSubscriptionStore::new()`
+   で `Arc<PushSubscriptionStore>`、 `WebPushNotifier::new(keys)` で
+   `Arc<dyn PushNotifier>` を生成。
+2. (a) `HealthState::with_vapid` (`GET /api/push/vapid-public-key`)、
+   (b) `SignalingState::with_pwa_push` (`PushSubscriptionStore` 自身が
+   `PwaPushHandler` を実装、 `ClientMessage::PushSubscribe` を dispatch)、
+   (c) `NgnInboundHandler::set_push` (NGN INVITE で fan-out) の 3 経路に
+   同じ Arc を渡す。
+3. `push.enabled = false` (既定) なら全 hook が `None` で旧挙動完全互換。
+
+**Service Worker** (`frontend/public/sw.js`、 vite-plugin-pwa `injectManifest`):
+
+- `push` event: payload を JSON parse して `showNotification(title, options)`
+  で表示。 iOS Safari 16.4+ は `userVisibleOnly: true` 強制 (silent push 禁止)。
+- `notificationclick` event: 既存 tab があれば `focus` + postMessage
+  (`incoming_call_action`)、 無ければ `clients.openWindow("/?#incoming=<id>")`。
+  action ボタン (`accept` / `decline`) は Chrome/Android で表示される。
+- `notificationclose`: 現状 no-op。
 
 ### 発信 (PWA → NGN、 Issue #145 / #147)
 

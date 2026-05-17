@@ -48,6 +48,60 @@ pub struct Config {
     /// `"whisper-api"` / `"faster-whisper"` は別 Issue で wire-up 予定。
     #[serde(default)]
     pub transcription: crate::observability::transcription::TranscriptionConfig,
+    /// PWA Web Push 通知 (Issue #294)。 NGN inbound INVITE 受領時に
+    /// 該当 PWA 内線 ID への購読があれば Web Push (RFC 8030 / RFC 8291
+    /// / RFC 8292 VAPID) を送り、 tab 閉じ / 画面 lock 中でも着信を
+    /// 通知できるようにする。 既定 disabled (= 既存挙動完全互換)。
+    #[serde(default)]
+    pub push: PushConfig,
+}
+
+/// PWA Web Push 通知設定 (Issue #294)。
+///
+/// # RFC 引用
+/// - **RFC 8030**: Generic Event Delivery Using HTTP Push (Web Push wire protocol)
+/// - **RFC 8291**: Message Encryption for Web Push (AES128-GCM)
+/// - **RFC 8292**: VAPID (Voluntary Application Server Identification)
+///
+/// # VAPID 鍵生成手順 (運用者向け)
+///
+/// VAPID 鍵は P-256 (prime256v1) ECDSA 鍵対。 PEM 秘密鍵を sabiden に渡し、
+/// 派生した公開鍵 (uncompressed, base64url) は `GET /api/push/vapid-public-key`
+/// から PWA が取得する。
+///
+/// ```bash
+/// # 1. P-256 秘密鍵 (PKCS#8) を生成
+/// openssl ecparam -name prime256v1 -genkey -noout |
+///   openssl pkcs8 -topk8 -nocrypt -out vapid_private.pem
+///
+/// # 2. config.toml に PEM 全文を埋め込む (改行を \n で escape)、
+/// #    または環境変数 SABIDEN_PUSH_VAPID_PRIVATE_PEM で渡す。
+/// ```
+///
+/// # TOML 例
+///
+/// ```toml
+/// [push]
+/// enabled = true
+/// subject = "mailto:operator@example.com"
+/// vapid_private_pem = """-----BEGIN PRIVATE KEY-----
+/// MIGH...
+/// -----END PRIVATE KEY-----
+/// """
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PushConfig {
+    /// 機能 ON/OFF。 false (既定) のとき push サブシステムは完全未起動。
+    #[serde(default)]
+    pub enabled: bool,
+    /// VAPID 秘密鍵の PEM 文字列 (PKCS#8 / SEC1 どちらも可)。
+    /// 機密情報なので環境変数 `SABIDEN_PUSH_VAPID_PRIVATE_PEM` で渡すのが推奨。
+    #[serde(default)]
+    pub vapid_private_pem: Option<String>,
+    /// VAPID JWT の `sub` claim (RFC 8292 §2.1.1)。 多くの push service
+    /// (FCM 等) で必須。 `mailto:operator@example.com` または `https://example.com`。
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 /// 着信ルーティング設定 (Issue #295)。
@@ -488,6 +542,7 @@ impl Config {
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
+            push: PushConfig::default(),
         })
     }
 
@@ -637,6 +692,22 @@ impl Config {
                 Some(std::path::PathBuf::from(v))
             };
         }
+        // [push] セクション (Issue #294): PWA Web Push 通知。
+        // RFC 8030 / RFC 8291 / RFC 8292 VAPID。 機密情報なので環境変数経由を推奨。
+        if let Ok(v) = std::env::var("SABIDEN_PUSH_ENABLED") {
+            let lower = v.to_ascii_lowercase();
+            self.push.enabled = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_PUSH_VAPID_PRIVATE_PEM") {
+            if !v.is_empty() {
+                self.push.vapid_private_pem = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("SABIDEN_PUSH_SUBJECT") {
+            if !v.is_empty() {
+                self.push.subject = Some(v);
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -738,6 +809,23 @@ max_expires = 3600
 # [transcription]
 # enabled = false
 # backend = "stub"
+
+# PWA Web Push 通知 (Issue #294、 RFC 8030 / RFC 8291 / RFC 8292 VAPID)。
+# PWA tab が閉じている / 画面 lock 中でも NGN 着信を通知するため、 Service
+# Worker + Notification API + Web Push (Mozilla / FCM 等) 経由で push する。
+#
+# VAPID 鍵生成 (運用者):
+#   openssl ecparam -name prime256v1 -genkey -noout |
+#     openssl pkcs8 -topk8 -nocrypt -out vapid_private.pem
+# 機密情報なので環境変数 `SABIDEN_PUSH_VAPID_PRIVATE_PEM` で渡すのが推奨。
+#
+# [push]
+# enabled = false
+# subject = "mailto:operator@example.com"
+# vapid_private_pem = """-----BEGIN PRIVATE KEY-----
+# MIGH...
+# -----END PRIVATE KEY-----
+# """
 "#
         .to_string()
     }
@@ -779,6 +867,7 @@ mod tests {
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
+            push: PushConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -803,6 +892,7 @@ mod tests {
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
+            push: PushConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -827,6 +917,7 @@ mod tests {
             routing: RoutingConfig::default(),
             recording: crate::call::recording::RecordingConfig::default(),
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
+            push: PushConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);

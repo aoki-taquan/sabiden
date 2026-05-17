@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod peer;
+pub mod push;
 pub mod signaling;
 pub mod str0m_session;
 

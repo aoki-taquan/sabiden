@@ -45,6 +45,14 @@ use sip::transaction::TransactionLayer;
 use sip::uac::{Uac, UacConfig};
 use sip::uas::ExtensionUas;
 
+/// Issue #294: PWA Web Push 通知の起動時 runtime セット。
+/// VAPID 鍵 / 購読 store / 送信 notifier の 3 つ組。 None = 機能無効。
+type PushRuntime = (
+    Arc<webrtc::push::VapidKeys>,
+    Arc<webrtc::push::PushSubscriptionStore>,
+    Arc<dyn webrtc::push::PushNotifier>,
+);
+
 #[derive(Parser)]
 #[command(name = "sabiden")]
 #[command(about = "NTT ひかり電話 SIP クライアント (DIY 実装)")]
@@ -223,6 +231,51 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                 tracing::error!(
                     error=%e,
                     "active call recording storage 初期化失敗 → 機能無効化"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Issue #294: PWA Web Push 通知 (RFC 8030 / RFC 8291 / RFC 8292 VAPID)。
+    // `[push] enabled = true` かつ VAPID PEM + subject が設定されていれば、
+    //   - `Arc<VapidKeys>`: 公開鍵を `GET /api/push/vapid-public-key` で配信
+    //   - `Arc<PushSubscriptionStore>`: PWA からの subscribe を保存
+    //   - `Arc<WebPushNotifier>`: NGN INVITE で AOR の購読に push 送信
+    // の 3 つを構築し、 signaling / orchestrator / health に注入する。
+    // 設定不足 (PEM 欠落 / parse 失敗) は warn ログを残して機能無効化 (= 既存挙動)。
+    let push_runtime: Option<PushRuntime> = if full_config.push.enabled {
+        match (
+            full_config.push.vapid_private_pem.as_deref(),
+            full_config.push.subject.as_deref(),
+        ) {
+            (Some(pem), Some(subject)) => match webrtc::push::VapidKeys::from_pem(pem, subject) {
+                Ok(keys) => match webrtc::push::WebPushNotifier::new(keys.clone()) {
+                    Ok(notifier) => {
+                        let keys_arc = Arc::new(keys);
+                        let store = webrtc::push::PushSubscriptionStore::new();
+                        let notifier_arc: Arc<dyn webrtc::push::PushNotifier> = Arc::new(notifier);
+                        info!(
+                            subject = %keys_arc.subject(),
+                            "PWA Web Push (Issue #294) 有効: /api/push/vapid-public-key + ClientMessage::PushSubscribe + NGN INVITE → push fan-out"
+                        );
+                        Some((keys_arc, store, notifier_arc))
+                    }
+                    Err(e) => {
+                        tracing::error!(error=%e, "WebPushNotifier 構築失敗 → push 機能無効化");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error=%e, "VAPID PEM parse 失敗 → push 機能無効化");
+                    None
+                }
+            },
+            _ => {
+                tracing::warn!(
+                    "[push] enabled=true だが vapid_private_pem / subject が未設定 → 機能無効化"
                 );
                 None
             }
@@ -543,6 +596,14 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         ngn_handler
             .set_outbound_forwarder(uas_handler_for_forwarder)
             .await;
+        // Issue #294: PWA Web Push の購読 store + notifier を注入する。
+        // NGN inbound INVITE 受領 → bindings 確定後に store を引いて
+        // `notify_incoming_call` を background task で fan-out する経路
+        // (orchestrator §1730 付近)。 push 機能無効 (= push_runtime = None) なら
+        // 注入スキップで hook は no-op (旧挙動完全互換)。
+        if let Some((_, ref store, ref notifier)) = push_runtime {
+            ngn_handler.set_push(store.clone(), notifier.clone()).await;
+        }
         // Bug B (Issue #268): SignalingState から PwaInboundCloser として参照できるよう
         // ハンドラを保持する。
         ngn_inbound_handler_for_signaling = Some(ngn_handler.clone());
@@ -595,6 +656,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // NgnInboundHandler) への注入は spawn 前に済んでいる。
     if let Some(rec) = recording_recorder.clone() {
         health_state = health_state.with_recording(rec);
+    }
+    // Issue #294: VAPID 公開鍵を `/api/push/vapid-public-key` で PWA に配信する
+    // ため、 HealthState に keys を attach する。 push 機能無効ならスキップ
+    // (`/api/push/vapid-public-key` は 503 を返す)。
+    if let Some((ref keys, _, _)) = push_runtime {
+        health_state = health_state.with_vapid(keys.clone());
     }
     let webrtc_signaling = if let Some(secret_hex) = full_config.webrtc.secret_hex.clone() {
         match hex::decode(&secret_hex) {
@@ -652,6 +719,16 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         state = state.with_pwa_record(
                             handler as Arc<dyn webrtc::signaling::PwaRecordHandler>,
                         );
+                    }
+                    // Issue #294: PWA からの `ClientMessage::PushSubscribe`
+                    // を `PushSubscriptionStore` に dispatch するハンドラ。
+                    // `PushSubscriptionStore` 自体が `PwaPushHandler` を実装
+                    // (push.rs §PushStoreHandler) しているため、 Arc clone で
+                    // 直接 trait obj に変換可能。 push 機能無効ならスキップ
+                    // (PWA は `push_unavailable` error を受け取る)。
+                    if let Some((_, ref store, _)) = push_runtime {
+                        let handler: Arc<dyn webrtc::signaling::PwaPushHandler> = store.clone();
+                        state = state.with_pwa_push(handler);
                     }
                     if backend == "str0m" {
                         match webrtc::Str0mConfig::from_webrtc(&full_config.webrtc) {

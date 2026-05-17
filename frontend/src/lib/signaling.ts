@@ -86,6 +86,17 @@ export type ClientMessage =
    */
   | { type: "decline"; call_id: string }
   | { type: "ice"; candidate: string }
+  /**
+   * Issue #294: PWA Web Push 購読を sabiden に登録する (RFC 8030 / RFC 8291
+   * / RFC 8292 VAPID)。 Service Worker が `PushManager.subscribe` で得た
+   * subscription を JSON 化して送る。 sabiden は AOR (= 認証済 ext_id) に
+   * 紐づけて store に保存し、 NGN INVITE で push を fan-out する。
+   */
+  | {
+      type: "pushsubscribe";
+      endpoint: string;
+      keys: { p256dh: string; auth: string };
+    }
   | { type: "bye" };
 
 export type ServerMessage =
@@ -101,6 +112,8 @@ export type ServerMessage =
   | { type: "cancel"; call_id: string }
   | { type: "ice"; candidate: string }
   | { type: "error"; code: string; message: string }
+  /** Issue #294: PWA Web Push 購読登録成功通知。 endpoint は echo (idempotency 判定用)。 */
+  | { type: "pushsubscribed"; endpoint: string }
   | { type: "bye" };
 
 /**

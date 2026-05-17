@@ -20,6 +20,15 @@ export const Dialer: Component<{
   status: string;
   statusOk: boolean;
   rateLimitedSeconds?: number | null;
+  /**
+   * Issue #294: PWA Web Push を有効化するコールバック。
+   * 押下時に Service Worker 登録 + `Notification.requestPermission()` +
+   * `PushManager.subscribe` + sabiden への `pushsubscribe` 送信を行う。
+   * `null` / undefined のときボタンは表示されない (= サーバが push 機能 OFF)。
+   */
+  onEnablePush?: () => void;
+  /** push 購読登録済かどうか (true なら button を「通知 ON」 状態にする)。 */
+  pushSubscribed?: boolean;
 }> = (props) => {
   const [num, setNum] = createSignal("");
 
@@ -57,9 +66,23 @@ export const Dialer: Component<{
           <h2 style={{ margin: 0 }}>{props.extId}</h2>
           <span class={`status ${props.statusOk ? "ok" : "err"}`}>{props.status}</span>
         </div>
-        <button onClick={props.onLogout} style={{ padding: "8px 12px" }}>
-          ログアウト
-        </button>
+        <div class="row" style={{ gap: "8px" }}>
+          {/* Issue #294: 通知有効化ボタン (push が backend で有効な場合のみ表示)。 */}
+          <Show when={props.onEnablePush}>
+            <button
+              onClick={() => props.onEnablePush?.()}
+              disabled={props.pushSubscribed}
+              aria-disabled={props.pushSubscribed}
+              data-testid="enable-push-button"
+              style={{ padding: "8px 12px" }}
+            >
+              {props.pushSubscribed ? "通知 ON" : "通知を有効化"}
+            </button>
+          </Show>
+          <button onClick={props.onLogout} style={{ padding: "8px 12px" }}>
+            ログアウト
+          </button>
+        </div>
       </div>
 
       <input

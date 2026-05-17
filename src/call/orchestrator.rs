@@ -909,6 +909,15 @@ pub struct NgnInboundHandler {
     /// `set_call_log` / `outbound_forwarder` と同じ pattern (Arc::clone 後に
     /// 注入できるようにする)。
     recording_recorder: Mutex<Option<Arc<super::recording::CallRecorder>>>,
+    /// Issue #294: PWA Web Push 通知の購読 store。 NGN inbound INVITE で 180
+    /// Ringing と同時に各 AOR の push 購読 (browser PushManager.subscribe 経由)
+    /// へ着信通知を fan-out する。 None (= 機能無効) なら hook は no-op で
+    /// 既存挙動完全互換。 RFC 8030 / RFC 8291 / RFC 8292 VAPID。
+    push_store: Mutex<Option<Arc<super::super::webrtc::push::PushSubscriptionStore>>>,
+    /// Issue #294: PWA Web Push 通知の本番 notifier。 `push_store` と pair で
+    /// `set_push` から注入する。 `Arc<dyn PushNotifier>` で抽象化し、 test
+    /// では `MockPushNotifier` を差し込める設計 (push.rs § tests)。
+    push_notifier: Mutex<Option<Arc<dyn super::super::webrtc::push::PushNotifier>>>,
 }
 
 impl NgnInboundHandler {
@@ -947,6 +956,8 @@ impl NgnInboundHandler {
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
             recording_recorder: Mutex::new(None),
+            push_store: Mutex::new(None),
+            push_notifier: Mutex::new(None),
         })
     }
 
@@ -995,6 +1006,8 @@ impl NgnInboundHandler {
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
             recording_recorder: Mutex::new(None),
+            push_store: Mutex::new(None),
+            push_notifier: Mutex::new(None),
         })
     }
 
@@ -1028,6 +1041,8 @@ impl NgnInboundHandler {
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
             recording_recorder: Mutex::new(None),
+            push_store: Mutex::new(None),
+            push_notifier: Mutex::new(None),
         })
     }
 
@@ -1064,6 +1079,8 @@ impl NgnInboundHandler {
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
             recording_recorder: Mutex::new(None),
+            push_store: Mutex::new(None),
+            push_notifier: Mutex::new(None),
         })
     }
 
@@ -1125,6 +1142,35 @@ impl NgnInboundHandler {
     /// helper)。 未注入なら `None` で、 呼出側は silent no-op する。
     async fn recording_recorder_clone(&self) -> Option<Arc<super::recording::CallRecorder>> {
         self.recording_recorder.lock().await.clone()
+    }
+
+    /// Issue #294: PWA Web Push の購読 store + notifier を注入する。
+    ///
+    /// `set_call_log` / `set_recording_recorder` と同じ pattern (= 起動後の
+    /// Arc::clone 経由でも注入できる Mutex<Option<_>>)。 production では
+    /// `main.rs` で `[push] enabled = true` のとき構築した Arc を渡す。
+    /// store のみ / notifier のみは取らない (= NGN INVITE で push 送信するには
+    /// 両方必要なため、 atomic に注入)。
+    pub async fn set_push(
+        self: &Arc<Self>,
+        store: Arc<super::super::webrtc::push::PushSubscriptionStore>,
+        notifier: Arc<dyn super::super::webrtc::push::PushNotifier>,
+    ) {
+        *self.push_store.lock().await = Some(store);
+        *self.push_notifier.lock().await = Some(notifier);
+    }
+
+    /// Issue #294: 注入済の push store + notifier の Arc clone をペアで返す。
+    /// 片方欠落 (= 注入未済) の場合は `None` を返す。
+    async fn push_clones(
+        &self,
+    ) -> Option<(
+        Arc<super::super::webrtc::push::PushSubscriptionStore>,
+        Arc<dyn super::super::webrtc::push::PushNotifier>,
+    )> {
+        let store = self.push_store.lock().await.clone()?;
+        let notifier = self.push_notifier.lock().await.clone()?;
+        Some((store, notifier))
     }
 
     /// `inbound_rx` を駆動するループを spawn する。
@@ -1727,6 +1773,37 @@ impl NgnInboundHandler {
                     call_log.record_end(&call_id, crate::observability::call_log::Outcome::Missed);
                 }
                 return Ok::<(), anyhow::Error>(());
+            }
+
+            // Issue #294: PWA Web Push 通知の fan-out。 当該 AOR が fork 対象
+            // で、 かつ purchase 購読が登録されていれば、 RFC 8030 / RFC 8291 /
+            // RFC 8292 VAPID 経由で着信を browser に push する。 これにより PWA
+            // タブが閉じている / 画面 lock 中でも `Notification API` で着信を
+            // 表示できる。 push 送信は background task で行い (= INVITE 処理を
+            // ブロックしない)、 失敗は warn ログのみで握る (= 通話本流である
+            // 180/200 OK 経路には影響させない)。
+            //
+            // RFC 5853 §3.2.2 B2BUA: NGN INVITE → 内線 alerting に付随する
+            // 追加 notification は副次的、 通話確立処理を遅延させない (背景化)。
+            if let Some((store, notifier)) = self.push_clones().await {
+                let aor_list: Vec<String> = bindings.iter().map(|(aor, _)| aor.clone()).collect();
+                let from_for_push = from_number.clone();
+                let call_id_for_push = call_id.clone();
+                tokio::spawn(async move {
+                    let payload = crate::webrtc::push::IncomingCallPayload::new(
+                        call_id_for_push,
+                        from_for_push,
+                    );
+                    for aor in aor_list {
+                        let (sent, dropped) = crate::webrtc::push::notify_incoming_call(
+                            &store, &*notifier, &aor, &payload,
+                        )
+                        .await;
+                        if sent > 0 || dropped > 0 {
+                            debug!(%aor, sent, dropped, "Issue #294: push fan-out");
+                        }
+                    }
+                });
             }
 
             // RFC 3261 §13.3.1.4 (Issue #249): UAS が "remote callee is being
@@ -12812,6 +12889,8 @@ mod tests {
             call_log: Mutex::new(None),
             voicemail_active: Arc::new(Mutex::new(HashMap::new())),
             recording_recorder: Mutex::new(None),
+            push_store: Mutex::new(None),
+            push_notifier: Mutex::new(None),
         });
         // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
         drop(sabiden_inbound_rx);

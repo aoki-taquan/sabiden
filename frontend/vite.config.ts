@@ -9,6 +9,13 @@ export default defineConfig({
   plugins: [
     solid(),
     VitePWA({
+      // Issue #294: 自前 `public/sw.js` で Web Push event handler を載せるため
+      // `injectManifest` strategy に切替える (autogenerate ではなく user sw.js を
+      // 取り込む)。 push event は VitePWA 既定の workbox autogen に含まれないため、
+      // 自前 SW を base にして workbox precache を `injectManifest` で挿入する。
+      strategies: "injectManifest",
+      srcDir: "public",
+      filename: "sw.js",
       registerType: "autoUpdate",
       includeAssets: ["icons/icon-192.png", "icons/icon-512.png"],
       manifest: {
@@ -35,9 +42,8 @@ export default defineConfig({
           },
         ],
       },
-      workbox: {
-        // /signal はリアルタイム WS なのでキャッシュしない
-        navigateFallbackDenylist: [/^\/signal/],
+      injectManifest: {
+        // /signal はリアルタイム WS なのでキャッシュしない (precache 対象外)。
         globPatterns: ["**/*.{js,css,html,svg,png,ico,webmanifest}"],
       },
     }),

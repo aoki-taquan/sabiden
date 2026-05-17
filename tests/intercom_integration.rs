@@ -773,12 +773,19 @@ async fn rfc3261_21_4_20_intercom_capacity_overflow_rejects_with_intercom_busy_e
     assert_eq!(ngn_hit_count.load(Ordering::SeqCst), 0);
 }
 
-// NOTE: SIP UA → 内線 AOR dispatcher gate (= `handle_invite` 冒頭で 480 を
-// 返す) のテストは lib 内 (`#[cfg(test)] mod`) で実装する。 `ResponderHandle::new`
-// は `pub(crate)` (CLAUDE.md §9 / PR #176 で production-side test hook を撤去
-// した経緯あり) のため、 外部 `tests/` クレートからは構築できない。
-// 該当 test 名は `src/call/orchestrator.rs` 内
-// `rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_temporarily_unavailable`。
+// NOTE: SIP UA → 内線 AOR dispatcher gate (`enabled = false` のとき 480 を
+// 返すキルスイッチ経路) の決定的テストは lib 内 (`#[cfg(test)] mod`) で実装する。
+// `ResponderHandle::new` は `pub(crate)` (CLAUDE.md §9 / PR #176 で
+// production-side test hook を撤去した経緯あり) のため、 外部 `tests/`
+// クレートからは構築できない。 該当 test 名は `src/call/orchestrator.rs` 内
+// `rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_when_intercom_disabled`。
+//
+// `enabled = true` (= 通常構成) での SIP UA → SIP UA / SIP UA → PWA
+// full multi-leg orchestration の e2e は、 本 file 下方の
+// `issue317_sip_ua_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic` /
+// `issue317_sip_ua_to_pwa_full_multi_leg_e2e_pcmu_no_ngn_traffic` で検証する
+// (`ExtensionUas` 経由で fake SIP UA caller socket から実 INVITE を発射、
+// orchestrator が UasEventHandler 経由で 200 OK 中継するフルパス)。
 
 /// PR #314 review #2 🟡#1 fix: **WS 入口 (`process_client_message`) を経由した
 /// e2e 検証**。 trait-API direct な他の test とは違い、 WS 入口の
@@ -1050,5 +1057,644 @@ async fn dispatch_pwa_internal_call_closes_caller_peer_on_callee_timeout() {
         caller_peer_inner.close_called.load(Ordering::SeqCst),
         "caller cleanup 漏れ: callee 30s timeout 後に caller_peer.close() が \
          呼ばれていない (RFC 8829 §5.1 違反)"
+    );
+}
+
+// =========================================================================
+// Issue #317: SIP UA → 内線 (SIP UA / PWA) full multi-leg orchestration の
+// e2e integration tests。
+//
+// PWA→ 系 (PR #320) と違って caller が **SIP UA** = UDP socket レベルで
+// INVITE を発射するため、 入口は `PwaOutboundHandler` trait ではなく
+// `ExtensionUas` (UDP UAS) 経由になる。 sabiden の UAS が caller AOR を
+// registrar で照会して `UasEvent::Invite` を `UasEventHandler::handle_invite` に
+// 流し、 そこで Issue #317 の dispatcher が起動する。
+// =========================================================================
+
+/// SIP UA caller を REGISTER 済 binding として registrar に登録するヘルパ。
+/// 実 REGISTER の往復は省略 (本テスト主眼は INVITE dispatcher の挙動)。
+async fn register_sip_ua_caller(
+    registrar: &ExtensionRegistrar,
+    aor: &str,
+    caller_addr: SocketAddr,
+) {
+    registrar
+        .register(
+            aor,
+            format!("sip:{}@{}", aor, caller_addr),
+            caller_addr,
+            Duration::from_secs(300),
+        )
+        .await;
+}
+
+/// `ExtensionUas` を bind して `UasEventHandler` に結線するヘルパ。
+/// 既存の `build_uas_handler` に加えて UAS bind を含めた完全版。
+///
+/// 戻り値: (UasEventHandler, CallManager, UAS bind addr, 共有 registrar)。
+/// 共有 registrar は ExtensionUas が `bind` 時に内部で生成する Arc を返し、
+/// dispatcher が呼ぶ `ext_registrar` と同じ Arc を `attach_ext_inviter` に
+/// 渡すため必須。
+async fn build_uas_handler_with_uas(
+    fake_ngn_addr: SocketAddr,
+    intercom_enabled: bool,
+    intercom_max: usize,
+) -> (
+    Arc<sabiden::call::orchestrator::UasEventHandler>,
+    Arc<sabiden::call::manager::CallManager>,
+    SocketAddr,
+    Arc<ExtensionRegistrar>,
+) {
+    use sabiden::call::manager::UacForker;
+    use sabiden::config::UasConfig;
+    use sabiden::sip::uas::ExtensionUas;
+
+    // (1) ExtensionUas を bind (caller SIP UA からの INVITE 受信)
+    let uas_cfg = UasConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        realm: "sabiden-test".to_string(),
+        max_expires: 3600,
+    };
+    let uas = ExtensionUas::bind(uas_cfg, &[]).await.unwrap();
+    let uas_addr = uas.socket().local_addr().unwrap();
+    let registrar = uas.registrar();
+
+    // (2) NGN UAC (fake_ngn 宛、 dispatcher が誤って NGN に流したら検出)
+    let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+    let ngn_uac = Arc::new(Uac::new(
+        UacConfig {
+            local_uri: "sip:test-aor@ntt-east.ne.jp".to_string(),
+            domain: "ntt-east.ne.jp".to_string(),
+            local_addr: ngn_client_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+            auth_username: None,
+            auth_password: None,
+        },
+        ngn_layer,
+        fake_ngn_addr,
+    ));
+
+    // (3) CallManager (内線 RTP bridge を attach する先)
+    let call_manager = sabiden::call::manager::CallManager::new(registrar.clone());
+
+    // (4) UasEventHandler (with_call_manager_and_metrics、 PR #320 と同じ pattern)
+    let handler = sabiden::call::orchestrator::UasEventHandler::with_call_manager_and_metrics(
+        ngn_uac,
+        call_manager.clone(),
+        None,
+        None,
+        sabiden::observability::Metrics::new(),
+    );
+
+    // (5) ext_inviter (内線 SIP UA 向け INVITE 発射用 UAC) を結線
+    let ext_send_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (ext_layer, _ext_rx) = TransactionLayer::spawn(ext_send_sock.clone());
+    let ext_uac = Arc::new(Uac::new(
+        UacConfig {
+            local_uri: "sip:sabiden@internal".to_string(),
+            domain: "internal".to_string(),
+            local_addr: ext_send_sock.local_addr().unwrap(),
+            user_agent: "sabiden-test/0.1".to_string(),
+            auth_username: None,
+            auth_password: None,
+        },
+        ext_layer,
+        "127.0.0.1:1".parse().unwrap(),
+    ));
+    let forker = Arc::new(UacForker {
+        uac: ext_uac,
+        targets: std::collections::HashMap::new(),
+    });
+    handler.attach_ext_inviter(forker, registrar.clone()).await;
+
+    // (6) IntercomService 注入
+    let svc = IntercomService::new(IntercomConfig {
+        enabled: intercom_enabled,
+        max_concurrent_internal_calls: intercom_max,
+    });
+    handler.set_intercom_service(svc).await;
+
+    // (7) UAS event channel + spawn
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let uas_with_handler = uas.with_handler(event_tx);
+    tokio::spawn(async move {
+        let _ = uas_with_handler.run().await;
+    });
+    handler.clone().spawn(event_rx);
+
+    (handler, call_manager, uas_addr, registrar)
+}
+
+/// caller SIP UA から INVITE を組み立てるヘルパ。 PCMU AVP SDP body 付き。
+fn build_invite_from_sip_ua(
+    caller_aor: &str,
+    callee_aor: &str,
+    caller_local: SocketAddr,
+    target_host: &str,
+    rtp_port: u16,
+) -> sabiden::sip::message::SipRequest {
+    use sabiden::sip::message::{SipMethod, SipRequest};
+    use sabiden::sip::utils::{new_call_id, new_tag};
+
+    let mut req = SipRequest::new(
+        SipMethod::Invite,
+        format!("sip:{}@{}", callee_aor, target_host),
+    );
+    req.headers.set(
+        "Via",
+        format!(
+            "SIP/2.0/UDP {};branch=z9hG4bKsipua-{}-1",
+            caller_local,
+            new_tag()
+        ),
+    );
+    req.headers.set("Max-Forwards", "70");
+    req.headers.set(
+        "From",
+        format!("<sip:{}@sabiden>;tag={}", caller_aor, new_tag()),
+    );
+    req.headers
+        .set("To", format!("<sip:{}@{}>", callee_aor, target_host));
+    req.headers.set("Call-ID", new_call_id());
+    req.headers.set("CSeq", "1 INVITE");
+    req.headers
+        .set("Contact", format!("<sip:{}@{}>", caller_aor, caller_local));
+    req.headers.set("Content-Type", "application/sdp");
+    req.body = format!(
+        "v=0\r\n\
+o=- 1 1 IN IP4 {ip}\r\n\
+s=caller-offer\r\n\
+c=IN IP4 {ip}\r\n\
+t=0 0\r\n\
+m=audio {port} RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n",
+        ip = caller_local.ip(),
+        port = rtp_port,
+    )
+    .into_bytes();
+    req
+}
+
+/// Issue #317 case A DoD: **SIP UA → SIP UA 内線通話の full multi-leg e2e**。
+///
+/// fake SIP UA caller (UDP socket 直叩き) が sabiden ExtensionUas の bind addr へ
+/// INVITE を投げる。 sabiden の dispatcher は target を classify して Internal hit
+/// と判定し、 ext_inviter 経由で fake SIP UA callee (別 UDP socket) に INVITE を
+/// 中継する。 callee 200 OK を受領後 caller にも 200 OK (PCMU SDP、 sabiden が
+/// anchoring した RTP endpoint) を返す。 双方向 PCMU RTP が sabiden 経由で
+/// caller ⇄ callee に流れることを確認する。 NGN socket 到達 0 件で band-aid 防止。
+///
+/// # 検証項目
+///
+/// 1. caller socket に 200 OK が届く (PCMU SDP 付き)
+/// 2. callee socket に INVITE が届く (sabiden から fake_callee 宛)
+/// 3. NGN socket には INVITE が 0 件
+/// 4. caller → callee 方向の RTP (PCMU) が sabiden 経由で callee に届く
+/// 5. callee → caller 方向の RTP が sabiden 経由で caller に届く
+/// 6. `IntercomService` registry に entry が 1 件 (= CallManager に bridge 1 件)
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §17.1 / §13.2.2.4 (INVITE → 200 OK → ACK 自動送出 by Uac::invite_to)
+/// - RFC 3261 §13.2 (caller への 200 OK は sabiden が組み立てる B2BUA anchoring)
+/// - RFC 3551 §4.5.14 PCMU PT 0 / 8 kHz / 160 sample = 20 ms
+/// - RFC 5853 §3.2.2 SBC framework (B2BUA で両 leg を anchoring)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue317_sip_ua_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic() {
+    use sabiden::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW};
+    use sabiden::sip::message::{parse_message, SipHeaders, SipMessage};
+
+    // (a) fake NGN (応答しない、 hit count 監視)
+    let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) fake SIP UA callee の SIP signaling + RTP socket
+    let fake_callee_sip_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let fake_callee_sip_addr = fake_callee_sip_sock.local_addr().unwrap();
+    let fake_callee_rtp_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let fake_callee_rtp_addr = fake_callee_rtp_sock.local_addr().unwrap();
+
+    let callee_invite_received = Arc::new(AtomicU32::new(0));
+    let callee_invite_received_c = callee_invite_received.clone();
+    let fake_callee_sip_clone = fake_callee_sip_sock.clone();
+    let fake_callee_rtp_addr_for_resp = fake_callee_rtp_addr;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match fake_callee_sip_clone.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let msg = match parse_message(&buf[..n]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let req = match msg {
+                SipMessage::Request(r) => r,
+                SipMessage::Response(_) => continue,
+            };
+            let method_str = req.method.as_str();
+            if method_str != "INVITE" {
+                continue;
+            }
+            callee_invite_received_c.fetch_add(1, Ordering::SeqCst);
+
+            // 200 OK + PCMU SDP を返す (callee RTP は fake_callee_rtp_sock の port)
+            let mut headers = SipHeaders::new();
+            if let Some(v) = req.headers.get("via") {
+                headers.set("Via", v);
+            }
+            if let Some(f) = req.headers.get("from") {
+                headers.set("From", f);
+            }
+            let to_with_tag = match req.headers.get("to") {
+                Some(t) if !t.contains(";tag=") => format!("{};tag=callee-tag-1", t),
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            headers.set("To", &to_with_tag);
+            if let Some(c) = req.headers.get("call-id") {
+                headers.set("Call-ID", c);
+            }
+            if let Some(cs) = req.headers.get("cseq") {
+                headers.set("CSeq", cs);
+            }
+            headers.set(
+                "Contact",
+                format!("<sip:callee-bob@{}>", fake_callee_sip_addr),
+            );
+            let sdp = format!(
+                "v=0\r\n\
+o=- 1 1 IN IP4 {ip}\r\n\
+s=fake-callee\r\n\
+c=IN IP4 {ip}\r\n\
+t=0 0\r\n\
+m=audio {port} RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n",
+                ip = fake_callee_rtp_addr_for_resp.ip(),
+                port = fake_callee_rtp_addr_for_resp.port(),
+            );
+            headers.set("Content-Type", "application/sdp");
+            let resp = sabiden::sip::message::SipResponse {
+                status_code: 200,
+                reason: "OK".to_string(),
+                headers,
+                body: sdp.into_bytes(),
+            };
+            let _ = fake_callee_sip_clone.send_to(&resp.to_bytes(), peer).await;
+        }
+    });
+
+    // (c) UasEventHandler を bind 込みで組み立て、 registrar を取得
+    let (_uas_handler, call_manager, sabiden_uas_addr, registrar) =
+        build_uas_handler_with_uas(fake_ngn_addr, true, 4).await;
+
+    // (d) caller SIP UA / callee SIP UA を registrar に登録
+    //
+    // caller (alice) の RTP socket も作っておく (= sabiden が caller-leg socket に
+    // 流す PCMU を受信する側)。
+    let caller_sip_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let caller_sip_addr = caller_sip_sock.local_addr().unwrap();
+    let caller_rtp_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let caller_rtp_addr = caller_rtp_sock.local_addr().unwrap();
+
+    register_sip_ua_caller(&registrar, "alice", caller_sip_addr).await;
+    registrar
+        .register(
+            "bob",
+            format!("sip:bob@{}", fake_callee_sip_addr),
+            fake_callee_sip_addr,
+            Duration::from_secs(300),
+        )
+        .await;
+
+    // (e) caller から INVITE 送出 (target = "bob"、 internal AOR)
+    let invite = build_invite_from_sip_ua(
+        "alice",
+        "bob",
+        caller_sip_addr,
+        "sabiden.local",
+        caller_rtp_addr.port(),
+    );
+    caller_sip_sock
+        .send_to(&invite.to_bytes(), sabiden_uas_addr)
+        .await
+        .unwrap();
+
+    // (f) caller socket で 100 Trying / 200 OK を受信する
+    let mut buf = vec![0u8; 8192];
+    let mut got_200: Option<sabiden::sip::message::SipResponse> = None;
+    for _ in 0..6 {
+        match timeout(Duration::from_secs(5), caller_sip_sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    if r.status_code == 200 {
+                        got_200 = Some(r);
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let response_200 = got_200.expect(
+        "caller socket に 200 OK が届かない (full multi-leg orchestration が失敗 or 中継が壊れている)",
+    );
+    assert!(
+        !response_200.body.is_empty(),
+        "200 OK には PCMU SDP body が含まれるべき (B2BUA anchoring)"
+    );
+
+    // (g) callee socket に INVITE が届いている (= dispatcher が SIP UA leg に分岐)
+    assert!(
+        callee_invite_received.load(Ordering::SeqCst) >= 1,
+        "callee SIP UA に INVITE が届かない (dispatcher が ext_inviter.invite_intercom を呼んでいない疑い)"
+    );
+
+    // (h) NGN socket には何も到達していない (= dispatcher が NGN proxy 経路に
+    //     落ちていない、 band-aid 防止の決定的証拠)
+    assert_eq!(
+        ngn_hit_count.load(Ordering::SeqCst),
+        0,
+        "SIP UA → SIP UA intercom だったのに NGN socket に {} 通の SIP message が漏れた \
+         (CLAUDE.md §6.1 / Issue #317 band-aid 防止 / NGN regression 防御)",
+        ngn_hit_count.load(Ordering::SeqCst)
+    );
+
+    // (i) caller の SDP から sabiden の caller-leg RTP endpoint を解析
+    //     (= caller の 200 OK SDP の m=audio port、 c= IP)
+    let sabi_caller_leg = sabiden::call::manager::extract_rtp_endpoint(&response_200.body)
+        .expect("sabiden の 200 OK SDP から RTP endpoint を抽出できる必要がある");
+
+    // (j) caller → callee 方向の RTP forward 確認
+    //     RFC 3551 §4.5.14: PCMU PT 0 / 160 byte / 20 ms。 caller socket から
+    //     sabiden caller-leg socket に PCMU を送る → callee_rtp_sock で受信。
+    let caller_payload = vec![0xAB; 160];
+    let pkt = RtpPacket {
+        payload_type: PAYLOAD_TYPE_ULAW,
+        marker: false,
+        sequence: 1,
+        timestamp: 0,
+        ssrc: 0xCAFE,
+        payload: caller_payload.clone(),
+    }
+    .to_bytes();
+    caller_rtp_sock
+        .send_to(&pkt, sabi_caller_leg)
+        .await
+        .unwrap();
+
+    let mut rtp_buf = vec![0u8; 1500];
+    let (n, _src_at_callee) = timeout(
+        Duration::from_secs(3),
+        fake_callee_rtp_sock.recv_from(&mut rtp_buf),
+    )
+    .await
+    .expect("caller→callee RTP が sabiden RtpBridge 経由で callee に届かない")
+    .unwrap();
+    let recv_rtp = RtpPacket::from_bytes(&rtp_buf[..n]).expect("RTP parse");
+    assert_eq!(
+        recv_rtp.payload_type, PAYLOAD_TYPE_ULAW,
+        "caller→callee は PCMU PT 0 で届く (RFC 3551)"
+    );
+    assert_eq!(
+        recv_rtp.payload, caller_payload,
+        "PCMU payload が変質している (transcode bug、 SIP UA 経路は relay only であるべき)"
+    );
+
+    // (k) callee → caller 方向の RTP forward 確認
+    //     callee socket → sabiden callee-leg socket (= _src_at_callee の送信元)
+    //     → caller_rtp_sock で受信。
+    let sabi_callee_leg = _src_at_callee;
+    let pkt_back = RtpPacket {
+        payload_type: PAYLOAD_TYPE_ULAW,
+        marker: false,
+        sequence: 100,
+        timestamp: 0,
+        ssrc: 0xBEEF,
+        payload: vec![0xCD; 160],
+    }
+    .to_bytes();
+    fake_callee_rtp_sock
+        .send_to(&pkt_back, sabi_callee_leg)
+        .await
+        .unwrap();
+    let (n, _) = timeout(
+        Duration::from_secs(3),
+        caller_rtp_sock.recv_from(&mut rtp_buf),
+    )
+    .await
+    .expect("callee→caller RTP が sabiden 経由で caller に届かない")
+    .unwrap();
+    let recv_rtp_back = RtpPacket::from_bytes(&rtp_buf[..n]).expect("RTP parse");
+    assert_eq!(recv_rtp_back.payload_type, PAYLOAD_TYPE_ULAW);
+    assert_eq!(recv_rtp_back.payload, vec![0xCD; 160]);
+
+    // (l) CallManager に bridge が 1 件 attach されている (= InternalCallRegistry insert OK)
+    assert_eq!(
+        call_manager.len().await,
+        1,
+        "SIP UA → SIP UA intercom 確立で CallManager に bridge が 1 件あるべき"
+    );
+}
+
+/// Issue #317 case B DoD: **SIP UA → PWA 内線通話 full multi-leg e2e**。
+///
+/// fake SIP UA caller (UDP 直叩き) が sabiden に INVITE を投げ、 dispatcher が
+/// classify Internal hit (PWA WebRtc binding) と判定する。 sabiden は callee PWA
+/// の `peer.create_offer` で SAVPF offer を作り、 `ws` に push、 `PendingAnswers`
+/// で answer 待ちした後 `WebRtcAudioBridge` (direct_pcmu_passthrough = true) を
+/// 起動して caller-leg UDP socket ⇄ callee PWA peer の双方向 PCMU 透過を成立させる。
+/// caller には PCMU SDP の 200 OK が返る。
+///
+/// # 検証項目
+///
+/// 1. caller socket に 200 OK が届く (PCMU SDP 付き)
+/// 2. callee PWA WS に `ServerMessage::Offer` が push される (SDP marker で確認)
+/// 3. NGN socket には何も到達しない
+/// 4. caller → callee 方向の PCMU RTP が `MediaFrame` として callee peer に届く
+/// 5. callee → caller 方向の `MediaFrame` が caller-leg socket の PCMU RTP として返る
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §17.1 / §13.2 (INVITE → 200 OK 中継、 B2BUA anchoring)
+/// - RFC 8829 §4 / §5.2 (sabiden が callee に対する offerer、 take_media_rx 1 回のみ)
+/// - RFC 3551 §4.5.14 PCMU PT 0 (direct_pcmu_passthrough)
+/// - RFC 5853 §3.2.2 (SBC: 両 leg dialog 終端 + Media path anchoring)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue317_sip_ua_to_pwa_full_multi_leg_e2e_pcmu_no_ngn_traffic() {
+    use sabiden::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW};
+    use sabiden::sip::message::{parse_message, SipMessage};
+
+    // (a) fake NGN (応答しない、 hit count 監視)
+    let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) UasEventHandler を bind 込みで組み立て、 registrar を取得
+    let (_uas_handler, call_manager, sabiden_uas_addr, registrar) =
+        build_uas_handler_with_uas(fake_ngn_addr, true, 4).await;
+
+    // (c) callee = PWA を WebRtc transport で registrar に登録
+    let (callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let callee_peer_inner = Arc::new(RecordingPeer::new("callee-pwa", callee_up_rx, "callee-pwa"));
+    let callee_peer: Arc<dyn PeerSession> = callee_peer_inner.clone();
+    let (mut callee_ws_rx, callee_pending, _callee_ws_sink) =
+        register_pwa_callee(&registrar, "carol", callee_peer.clone()).await;
+
+    // (d) caller SIP UA を registrar に登録 + UDP socket 準備
+    let caller_sip_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let caller_sip_addr = caller_sip_sock.local_addr().unwrap();
+    let caller_rtp_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let caller_rtp_addr = caller_rtp_sock.local_addr().unwrap();
+    register_sip_ua_caller(&registrar, "alice", caller_sip_addr).await;
+
+    // (e) caller INVITE 送出 (target = "carol"、 PWA AOR)
+    let invite = build_invite_from_sip_ua(
+        "alice",
+        "carol",
+        caller_sip_addr,
+        "sabiden.local",
+        caller_rtp_addr.port(),
+    );
+    caller_sip_sock
+        .send_to(&invite.to_bytes(), sabiden_uas_addr)
+        .await
+        .unwrap();
+
+    // (f) callee WS に sabiden 発 Offer が push される (= dispatcher が
+    //     WebRTC leg に分岐した証拠)。 SDP marker で確認。
+    let pushed = timeout(Duration::from_secs(5), callee_ws_rx.recv())
+        .await
+        .expect("callee PWA WS に Offer が push されない (dispatcher 未到達?)")
+        .expect("callee WS rx closed prematurely");
+    let callee_call_id = match pushed {
+        ServerMessage::Offer { call_id, sdp } => {
+            assert!(
+                sdp.contains("callee-pwa-offer"),
+                "callee に push された SDP が callee_peer.create_offer 戻り値でない: {}",
+                sdp
+            );
+            call_id
+        }
+        other => panic!(
+            "callee WS で受け取った最初の ServerMessage が Offer ではない: {:?}",
+            other
+        ),
+    };
+
+    // (g) callee から answer を返す (= 通常の PWA `ClientMessage::Answer` を再現)
+    let delivered = callee_pending
+        .deliver(
+            &callee_call_id,
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\n\
+s=callee-pwa-answer\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 40000 RTP/SAVPF 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n"
+                .to_string(),
+        )
+        .await;
+    assert!(
+        delivered,
+        "callee PWA pending.deliver が waiter を見つけられなかった (race)"
+    );
+
+    // (h) caller socket で 200 OK を受信
+    let mut buf = vec![0u8; 8192];
+    let mut got_200: Option<sabiden::sip::message::SipResponse> = None;
+    for _ in 0..6 {
+        match timeout(Duration::from_secs(5), caller_sip_sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                if let Ok(SipMessage::Response(r)) = parse_message(&buf[..n]) {
+                    if r.status_code == 200 {
+                        got_200 = Some(r);
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let response_200 = got_200.expect(
+        "caller socket に 200 OK が届かない (SIP UA → PWA full multi-leg orchestration 失敗)",
+    );
+    assert!(
+        !response_200.body.is_empty(),
+        "200 OK には PCMU SDP body が含まれるべき (B2BUA anchoring)"
+    );
+
+    // (i) NGN socket には何も到達していない (band-aid 防止)
+    assert_eq!(
+        ngn_hit_count.load(Ordering::SeqCst),
+        0,
+        "SIP UA → PWA intercom だったのに NGN socket に {} 通の SIP message が漏れた \
+         (CLAUDE.md §6.1 / Issue #317 band-aid 防止)",
+        ngn_hit_count.load(Ordering::SeqCst)
+    );
+
+    // (j) caller → callee 方向の PCMU RTP が MediaFrame として callee peer に届く
+    let sabi_caller_leg = sabiden::call::manager::extract_rtp_endpoint(&response_200.body)
+        .expect("200 OK SDP から sabiden caller-leg RTP endpoint を抽出");
+
+    use std::time::Instant;
+    let pkt = RtpPacket {
+        payload_type: PAYLOAD_TYPE_ULAW,
+        marker: false,
+        sequence: 1,
+        timestamp: 0,
+        ssrc: 0xCAFE,
+        payload: vec![0xAB; 160],
+    }
+    .to_bytes();
+    caller_rtp_sock
+        .send_to(&pkt, sabi_caller_leg)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while callee_peer_inner.received_count.load(Ordering::SeqCst) == 0 {
+        if Instant::now() > deadline {
+            panic!(
+                "caller→callee PCMU RTP が WebRtcAudioBridge 経由で callee peer に届かない \
+                 (bridge attach 失敗 or direct_pcmu_passthrough 経路 bug)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = callee_peer_inner.received.lock().await;
+    assert_eq!(got[0].pt, 0, "callee peer に届く MediaFrame は PCMU PT 0");
+    assert_eq!(got[0].payload, vec![0xAB; 160], "PCMU payload 透過");
+    drop(got);
+
+    // (k) callee → caller 方向 (PWA→sabiden 上りの MediaFrame が caller-leg socket
+    //     から PCMU RTP として送出される)
+    callee_up_tx
+        .send(MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: vec![0xCD; 160],
+            network_time: Instant::now(),
+        })
+        .await
+        .unwrap();
+    let mut rtp_buf = vec![0u8; 1500];
+    let (n, _src) = timeout(
+        Duration::from_secs(3),
+        caller_rtp_sock.recv_from(&mut rtp_buf),
+    )
+    .await
+    .expect("callee→caller MediaFrame が caller socket に PCMU RTP として届かない")
+    .unwrap();
+    let recv_rtp = RtpPacket::from_bytes(&rtp_buf[..n]).expect("RTP parse");
+    assert_eq!(recv_rtp.payload_type, PAYLOAD_TYPE_ULAW);
+    assert_eq!(recv_rtp.payload, vec![0xCD; 160]);
+
+    // (l) CallManager に bridge が 1 件 attach されている (= InternalCallRegistry insert OK)
+    assert_eq!(
+        call_manager.len().await,
+        1,
+        "SIP UA → PWA intercom 確立で CallManager に bridge が 1 件あるべき"
     );
 }

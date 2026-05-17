@@ -116,3 +116,15 @@ max_expires = 3600
 # priority = 0
 # # 条件なし = 常に match (= 上位 rule が no-match なら必ずここに落ちる)
 # fork = []  # voicemail 直行 (voicemail 無効なら 480)
+
+# AI 文字起こし stub (Issue #300、 任意)
+# Voicemail / Recording で保存した WAV (RFC 3551 §4.5.14 PCMU 由来) を
+# AI ASR backend に投げて sidecar `.txt` を生成する。 既定 disabled (= `.txt`
+# 不生成、 完全な後方互換)。 現状は `backend = "stub"` のみ wire 済で、
+# placeholder text 「(transcription unavailable - configure backend)」 を返す。
+# 実 Whisper API / faster-whisper backend は別 Issue で wire-up 予定。
+# [transcription]
+# enabled = false
+# backend = "stub"  # "stub" のみ、 "whisper-api" / "faster-whisper" は将来
+# # api_key_env = "OPENAI_API_KEY"  # Whisper API 用 (将来)
+# # model_path = "/var/lib/sabiden/models/whisper-base.bin"  # faster-whisper 用 (将来)

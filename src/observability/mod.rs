@@ -38,6 +38,12 @@ use tracing::{debug, warn};
 /// `Arc<CallLog>` として各 handler に渡す。
 pub mod call_log;
 
+/// Issue #300: Voicemail / Recording WAV に対する AI 文字起こし (transcription)
+/// stub。 trait + `StubTranscriber` + sidecar `.txt` 入出力ヘルパを提供し、
+/// voicemail / recording の finalize 経路から呼ばれる。 実 ASR backend
+/// (Whisper API / faster-whisper) は別 Issue で wire-up する。
+pub mod transcription;
+
 /// SIP メッセージの送信方向。トレースのファイル名に埋め込む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceDir {

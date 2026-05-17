@@ -265,6 +265,10 @@ pub struct CallRecorder {
     /// `call_id` → 録音 sender + handle のテーブル。 同一 call で重複 start
     /// すると [`RecordingError::AlreadyRecording`] を返す。
     active: Arc<Mutex<std::collections::HashMap<String, ActiveEntry>>>,
+    /// Issue #300: WAV finalize 直後に呼ぶ AI 文字起こし backend (option)。
+    /// `None` (= 既定) の場合は transcript 生成しない (`.txt` も書かれない)、
+    /// 完全な既存挙動 (Issue #296 当時の動作と同一)。
+    transcriber: Option<Arc<dyn crate::observability::transcription::Transcriber>>,
 }
 
 struct ActiveEntry {
@@ -282,6 +286,7 @@ impl CallRecorder {
             storage_dir,
             max_duration,
             active: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            transcriber: None,
         })
     }
 
@@ -289,6 +294,16 @@ impl CallRecorder {
     /// が判定する責務。 ここでは「設定値を recorder に embed」 のみ行う。
     pub async fn from_config(cfg: &RecordingConfig) -> Result<Self> {
         Self::new(cfg.storage_dir.clone(), cfg.max_duration()).await
+    }
+
+    /// Issue #300: WAV finalize 直後に呼ぶ AI 文字起こし backend を attach する
+    /// (builder 風)。 `None` のままなら transcript 生成しない (= 既存挙動)。
+    pub fn with_transcriber(
+        mut self,
+        transcriber: Arc<dyn crate::observability::transcription::Transcriber>,
+    ) -> Self {
+        self.transcriber = Some(transcriber);
+        self
     }
 
     /// 保存先ディレクトリ。
@@ -349,6 +364,9 @@ impl CallRecorder {
         let call_id_clone = call_id.to_string();
         let remote_clone = remote_number.to_string();
         let max_duration = self.max_duration;
+        // Issue #300: transcriber を task に move (= clone した Arc を渡す)。
+        let transcriber_clone = self.transcriber.clone();
+        let wav_path_clone = wav_path.clone();
 
         let join = tokio::spawn(async move {
             run_recording_loop(
@@ -360,7 +378,9 @@ impl CallRecorder {
                 call_id_clone,
                 remote_clone,
                 started_at_unix_ms,
+                wav_path_clone,
                 meta_path,
+                transcriber_clone,
             )
             .await
         });
@@ -446,8 +466,9 @@ impl CallRecorder {
         Ok(Some((meta, wav_path)))
     }
 
-    /// 指定 ID の recording を削除 (WAV + JSON 両方)。 存在しなければ
-    /// `Ok(false)` を返す (404 用)。
+    /// 指定 ID の recording を削除 (WAV + JSON + Issue #300 transcript `.txt`)。
+    /// 存在しなければ `Ok(false)` を返す (404 用)。 transcript の有無は
+    /// `found` の判定には影響させない (= 主資源 = WAV/JSON が無ければ 404)。
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let safe_id = sanitize_id(id);
         let meta_path = self
@@ -464,6 +485,12 @@ impl CallRecorder {
         if wav_path.exists() {
             fs::remove_file(&wav_path).await.ok();
             found = true;
+        }
+        // Issue #300: sidecar transcript `.txt` も一緒に消す (= delete で残骸
+        // を残さない)。 transcript 単独欠如は found フラグに影響させない。
+        let txt_path = crate::observability::transcription::transcript_path_for(&wav_path);
+        if txt_path.exists() {
+            fs::remove_file(&txt_path).await.ok();
         }
         Ok(found)
     }
@@ -501,6 +528,10 @@ impl CallRecorder {
         }
         writer.finalize().await?;
 
+        // Issue #300: 同期版 finalize (test 経路) でも transcript hook を
+        // 呼ぶ。 transcriber 未設定なら no-op。
+        run_transcription_hook(self.transcriber.as_ref(), &wav_path, &recording_id).await;
+
         let duration_ms = total_samples * 1000 / (crate::rtp::packet::SAMPLE_RATE as u64).max(1);
         let meta = RecordingFile {
             recording_id,
@@ -533,7 +564,9 @@ async fn run_recording_loop(
     call_id: String,
     remote_number: String,
     started_at_unix_ms: u64,
+    wav_path: PathBuf,
     meta_path: PathBuf,
+    transcriber: Option<Arc<dyn crate::observability::transcription::Transcriber>>,
 ) -> Result<RecordingFile> {
     let mut total_samples: u64 = 0;
     let deadline = tokio::time::sleep(max_duration);
@@ -584,6 +617,11 @@ async fn run_recording_loop(
         .await
         .with_context(|| format!("WAV finalize 失敗 (recording_id={})", recording_id))?;
 
+    // Issue #300: WAV finalize 直後に AI 文字起こし stub を呼んで sidecar
+    // `.txt` を書く。 transcriber 未設定 (= 既定 disabled) なら no-op。
+    // 失敗は warn ログのみで音声本体は保護する。
+    run_transcription_hook(transcriber.as_ref(), &wav_path, &recording_id).await;
+
     let duration_ms = total_samples * 1000 / (crate::rtp::packet::SAMPLE_RATE as u64).max(1);
     let meta = RecordingFile {
         recording_id: recording_id.clone(),
@@ -611,6 +649,40 @@ async fn run_recording_loop(
         "recording finalize 完了 (Issue #296)"
     );
     Ok(meta)
+}
+
+/// Issue #300: WAV finalize 直後に呼ぶ transcript hook。 transcriber が
+/// `None` (= 既定 disabled) なら何もしない。 失敗は warn ログのみで recording
+/// 本体 (WAV) は保護する。 voicemail/mod.rs の同名 helper と同じ責務だが、
+/// recording 側は `recording_id` を識別子に使う点だけ異なる。
+async fn run_transcription_hook(
+    transcriber: Option<&Arc<dyn crate::observability::transcription::Transcriber>>,
+    wav_path: &Path,
+    recording_id: &str,
+) {
+    let Some(transcriber) = transcriber else {
+        return;
+    };
+    match transcriber.transcribe(wav_path) {
+        Ok(result) => {
+            match crate::observability::transcription::write_transcript(wav_path, &result).await {
+                Ok(txt_path) => {
+                    debug!(
+                        %recording_id,
+                        path = %txt_path.display(),
+                        model = %result.model,
+                        "recording transcript 書込 (Issue #300)"
+                    );
+                }
+                Err(e) => {
+                    warn!(%recording_id, error=%e, "recording transcript 書込失敗 (Issue #300、 WAV は保護)");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(%recording_id, error=%e, "recording transcribe 失敗 (Issue #300、 WAV は保護)");
+        }
+    }
 }
 
 /// `<call_id_sanitized>-<unix_ms>-<seq>` の形式で新規 recording_id を生成する。
@@ -739,6 +811,9 @@ impl PwaRecordHandler for PwaRecordHandlerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::transcription::{
+        transcript_path_for, StubTranscriber, Transcriber, TranscriptionResult,
+    };
     use crate::rtp::{encode_ulaw, RtpPacket, PAYLOAD_TYPE_ULAW};
 
     /// テスト用 tempdir ヘルパ (voicemail と同じ pattern)。
@@ -1070,6 +1145,98 @@ mod tests {
         };
         // u64::MAX / 2 秒 ≒ 数十億年。
         assert!(cfg.max_duration() > Duration::from_secs(60 * 60 * 24 * 365));
+    }
+
+    /// Issue #300: recording finalize 経路で transcriber が attach されている
+    /// ときに sidecar `.txt` が WAV と同じ basename で生成される。
+    #[tokio::test]
+    async fn issue_300_recording_finalize_writes_stub_transcript_sidecar_txt() {
+        let tmp = tempdir();
+        let recorder = CallRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(StubTranscriber));
+        let p = vec![pcmu_packet(0, 160)];
+        let meta = recorder
+            .record_from_packets("call-tr-rec", "0312345678", &p)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        assert!(wav_path.exists());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(
+            txt_path.exists(),
+            "recording transcript `.txt` must be written by finalize hook"
+        );
+        let txt = std::fs::read_to_string(&txt_path).expect("read txt");
+        assert_eq!(txt, StubTranscriber::PLACEHOLDER_TEXT);
+    }
+
+    /// Issue #300: recording transcriber 未 attach なら `.txt` は書かれない
+    /// (完全な後方互換)。
+    #[tokio::test]
+    async fn issue_300_recording_without_transcriber_does_not_write_txt() {
+        let tmp = tempdir();
+        let recorder = CallRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new");
+        let p = vec![pcmu_packet(0, 160)];
+        let meta = recorder
+            .record_from_packets("call-no-tr-rec", "0312345678", &p)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(!txt_path.exists());
+    }
+
+    /// Issue #300: transcribe Err でも WAV / JSON 本体は finalize 完了する。
+    #[tokio::test]
+    async fn issue_300_recording_transcriber_failure_preserves_wav_and_json() {
+        struct FailingTranscriber;
+        impl Transcriber for FailingTranscriber {
+            fn transcribe(&self, _: &Path) -> Result<TranscriptionResult> {
+                Err(anyhow::anyhow!("synthetic failure"))
+            }
+        }
+        let tmp = tempdir();
+        let recorder = CallRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(FailingTranscriber));
+        let p = vec![pcmu_packet(0, 160)];
+        let meta = recorder
+            .record_from_packets("call-tr-rec-fail", "0312345678", &p)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        let meta_path = meta.meta_path(tmp.path());
+        assert!(wav_path.exists());
+        assert!(meta_path.exists());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(!txt_path.exists());
+    }
+
+    /// Issue #300: recording `delete` も sidecar transcript を消す。
+    #[tokio::test]
+    async fn issue_300_recording_delete_removes_sidecar_transcript_txt() {
+        let tmp = tempdir();
+        let recorder = CallRecorder::new(tmp.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .expect("new")
+            .with_transcriber(Arc::new(StubTranscriber));
+        let p = vec![pcmu_packet(0, 160)];
+        let meta = recorder
+            .record_from_packets("call-rec-del", "0312345678", &p)
+            .await
+            .expect("record");
+        let wav_path = meta.audio_path(tmp.path());
+        let txt_path = transcript_path_for(&wav_path);
+        assert!(txt_path.exists());
+        let removed = recorder.delete(&meta.recording_id).await.expect("delete");
+        assert!(removed);
+        assert!(!wav_path.exists());
+        assert!(!txt_path.exists());
     }
 
     /// next_recording_id は同 call_id でも seq でユニークになる

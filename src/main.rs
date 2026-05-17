@@ -156,6 +156,37 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
     // 永続化 (sqlite) は別 issue で扱う。
     let call_log = Arc::new(CallLog::new(200));
 
+    // Issue #300: AI 文字起こし backend を有効ならば up-front で構築する。
+    // `[transcription] enabled = true` のときに `build_transcriber` で
+    // `Arc<dyn Transcriber>` を組み立て、 voicemail / recording の finalize
+    // hook (WavWriter::finalize 直後) に渡す。 backend が "stub" のみ wire 済、
+    // "whisper-api" / "faster-whisper" は別 Issue。 enabled=false (既定) なら
+    // None で finalize hook は no-op、 完全な後方互換。
+    let transcriber: Option<Arc<dyn observability::transcription::Transcriber>> = if full_config
+        .transcription
+        .enabled
+    {
+        match observability::transcription::build_transcriber(&full_config.transcription) {
+            Ok(t) => {
+                info!(
+                    backend = %full_config.transcription.backend,
+                    "AI 文字起こし (Issue #300) 有効: voicemail / recording finalize で sidecar `.txt` 生成"
+                );
+                Some(t)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error=%e,
+                    backend = %full_config.transcription.backend,
+                    "transcription backend 構築失敗 → 機能無効化"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Issue #296: active call recording recorder を有効ならば up-front で構築。
     // 同じ `Arc<CallRecorder>` を `HealthState::with_recording` (REST API) と
     // `SignalingState::with_pwa_record` (PWA WS RecordStart/RecordStop の
@@ -179,6 +210,13 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                     max_duration_secs = full_config.recording.max_duration_secs,
                     "active call recording (Issue #296) 有効: /api/recording/{{list,id/audio,id}}"
                 );
+                // Issue #300: WAV finalize で sidecar `.txt` を作る hook を attach。
+                // transcriber None (= disabled) のときは builder を経由しない。
+                let r = if let Some(t) = transcriber.clone() {
+                    r.with_transcriber(t)
+                } else {
+                    r
+                };
                 Some(Arc::new(r))
             }
             Err(e) => {
@@ -206,6 +244,12 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
                         max_duration_secs = full_config.voicemail.max_duration_secs,
                         "留守録 (Issue #288) 有効: /api/voicemail/{{list,id/audio,id}}"
                     );
+                    // Issue #300: voicemail 側にも transcriber を attach する。
+                    let r = if let Some(t) = transcriber.clone() {
+                        r.with_transcriber(t)
+                    } else {
+                        r
+                    };
                     Some(Arc::new(r))
                 }
                 Err(e) => {

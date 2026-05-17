@@ -37,6 +37,7 @@ HGW (ホームゲートウェイ) を介さず、ONU 直収のルーター配下
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - アーキテクチャ概要
 - [docs/INSTALL.md](docs/INSTALL.md) - 実機インストールガイド (NGN 直収)
 - [docs/CLOUDFLARE.md](docs/CLOUDFLARE.md) - Cloudflare Tunnel + Workers デプロイ
+- [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) - Prometheus メトリクス / Grafana dashboard / alert rule
 - [frontend/README.md](frontend/README.md) - PWA フロントエンド (SolidJS) 開発手順
 - [deploy/dhcp/](deploy/dhcp/) - DHCP Option 120 取得スクリプトと設定例
 - [deploy/systemd/](deploy/systemd/) - systemd ユニット (ハードニング済)

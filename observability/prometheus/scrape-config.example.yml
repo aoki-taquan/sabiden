@@ -1,0 +1,94 @@
+# sabiden Prometheus scrape 設定例 (Issue #318)
+#
+# sabiden は src/health/mod.rs で /metrics を Prometheus text exposition 形式
+# で公開する。 endpoint は [health] bind_addr (config.example.toml 既定値:
+# 0.0.0.0:8080) の HTTP server に乗る。 認証なし / TLS なしの平文。 production
+# 環境では NetworkPolicy / 同一 namespace 内のみ許可、 LB から expose しない、
+# あるいは前段に oauth2-proxy / mTLS terminator を置くこと。
+#
+# 公開メトリクス一覧は ../../docs/OBSERVABILITY.md §2 を参照。
+#
+# ---- bare metal / docker compose で使う場合 ----
+#
+# このファイル全体を /etc/prometheus/prometheus.yml の最下層
+# (`scrape_configs:` 配下) にコピーする。 既存設定がある場合は
+# scrape_configs リストに job を追記する。
+#
+# bare metal 起動例 (sabiden が 192.168.1.10:8080 で /metrics を expose
+# している場合):
+#   prometheus --config.file=/etc/prometheus/prometheus.yml
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: sabiden-home
+
+scrape_configs:
+  # ---- (A) static target (単一ホスト / bare metal / systemd) ----
+  - job_name: sabiden
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    honor_labels: false
+    static_configs:
+      - targets:
+          # health.bind_addr (config.example.toml [health].bind_addr) に合わせる
+          - "sabiden.local:8080"
+        labels:
+          # 物理機 / VM の識別。 deploy/k8s/ では K8s SD で自動付与されるので
+          # 不要。
+          service: sabiden
+          role: sip-b2bua
+
+  # ---- (B) Kubernetes pod SD (sabiden を K8s に乗せている場合) ----
+  #
+  # sabiden Pod に下記 annotation を付ければこのジョブで自動 discover する:
+  #
+  #   metadata:
+  #     annotations:
+  #       prometheus.io/scrape: "true"
+  #       prometheus.io/port: "8080"
+  #       prometheus.io/path: "/metrics"
+  #
+  # (deploy/k8s/ で hostNetwork: true の場合は __meta_kubernetes_pod_host_ip
+  #  が NodeIP になるため static_configs と挙動が変わる。 NetworkPolicy で
+  #  scrape ingress を許可することを忘れない。)
+  - job_name: sabiden-k8s
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # prometheus.io/scrape=true の Pod のみ対象に絞り込む
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      # prometheus.io/path で /metrics 以外を許容
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # prometheus.io/port を __address__ に注入 (host:port を上書き)
+      - source_labels:
+          [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      # 役立つラベルを expose
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: app
+        regex: (.+)
+    # sabiden 以外の Pod も拾わないよう、 app=sabiden に絞る (任意)
+    # 削るとクラスタ内の他 Pod も対象になり、 無関係 endpoint への scrape が増える。
+    metric_relabel_configs:
+      - source_labels: [app]
+        regex: sabiden
+        action: keep

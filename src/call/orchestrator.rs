@@ -3864,53 +3864,57 @@ impl UasEventHandler {
         async move {
             info!(%from_aor, %remote, "内線発信 → NGN へプロキシ");
 
-            // Issue #313: SIP UA → 内線 AOR の intercom dispatcher gate。
+            // Issue #313 / #317: SIP UA → 内線 AOR の intercom dispatcher。
             //
             // 内線 AOR (ExtensionRegistrar に登録済) を Request-URI user 部に
             // 取った INVITE は、 NGN に流すと 404 が返って band-aid 経路になる
-            // (CLAUDE.md §6.1)。 dispatcher で classify_dial_target を呼び、
-            // Internal hit なら NGN proxy を skip して固有経路に振り分ける。
+            // (CLAUDE.md §6.1)。 dispatcher で `classify_dial_target` を呼び、
+            // Internal hit なら NGN proxy を skip して `dispatch_sip_ua_internal_invite`
+            // ヘルパに振り分ける。 ヘルパは callee binding の transport で
+            // case A (SIP UA → SIP UA: ext_inviter + RtpBridge) / case B
+            // (SIP UA → PWA: peer.create_offer + WebRtcAudioBridge) を分岐する
+            // (RFC 3261 §17.1 / §13 / §13.2.2.4 / RFC 5853 §3.2.2 B2BUA)。
             //
-            // 本 PR では SIP UA → 内線 (SIP UA / PWA) の full multi-leg
-            // orchestration (= ext_inviter + RtpBridge / WebRtcAudioBridge 結線)
-            // を実装していないため、 NGN 経路に流れて 404 になる band-aid を
-            // 防ぐ目的で **480 Temporarily Unavailable** で fail-fast する
-            // (RFC 3261 §21.4.18: "callee is currently unavailable to take
-            // the call")。 caller_aor へ self-call の場合も同様に 480 (内線が
-            // 自分自身を呼ぶ意味は無い、 RFC 3261 §16 loop detection 相当)。
+            // `intercom_service.is_enabled() = false` (= キルスイッチ) の場合は
+            // dispatcher 自体を skip せず、 Internal 判定だけは行い **480
+            // Temporarily Unavailable** で fail-fast する。 これは Issue #317
+            // 以前の挙動 (= NGN proxy band-aid を防ぐ最低限の gate) を維持し、
+            // 「intercom を意図的に切った構成でも内線 AOR が NGN に漏れない」
+            // ことを保証する (RFC 3261 §21.4.18: "callee is currently
+            // unavailable to take the call")。 caller_aor へ self-call の場合も
+            // 480 (内線が自分自身を呼ぶ意味は無い、 RFC 3261 §16 loop detection
+            // 相当)。
             //
             // RFC 3261 §13.2.1 / RFC 5853 §3.2.2: B2BUA は dial target が同一
             // 管理ドメイン内なら外部 (NGN) へプロキシしない選択を取れる。
-            // TODO(本流対応): SIP UA → 内線 (SIP / PWA) の full multi-leg を
-            //   PR #314 review follow-up Issue で実装 (ext_inviter + RtpBridge /
-            //   run_webrtc_leg pattern + responder で 200 OK 中継)。
             {
                 let intercom_svc_opt = self.intercom_service_clone().await;
                 let ext_registrar_opt = self.ext_registrar.lock().await.clone();
                 if let (Some(svc), Some(registrar)) =
                     (intercom_svc_opt.as_ref(), ext_registrar_opt.as_ref())
                 {
-                    if svc.is_enabled() {
-                        // Request-URI から user 部を抽出 (RFC 3261 §19.1.1)。
-                        if let Some(target_user) = extract_user_from_sip_uri(&request.uri) {
-                            // self-call は弾く (発信元 = 着信先 AOR)。
-                            if target_user != from_aor {
-                                let dest = super::intercom::classify_dial_target(
-                                    &target_user,
-                                    registrar,
-                                )
-                                .await;
-                                if let super::intercom::DialDestination::Internal {
-                                    aor: callee_aor,
-                                    ..
-                                } = dest
-                                {
+                    // Request-URI から user 部を抽出 (RFC 3261 §19.1.1)。
+                    if let Some(target_user) = extract_user_from_sip_uri(&request.uri) {
+                        // self-call は弾く (発信元 = 着信先 AOR)。
+                        if target_user != from_aor {
+                            let dest = super::intercom::classify_dial_target(
+                                &target_user,
+                                registrar,
+                            )
+                            .await;
+                            if let super::intercom::DialDestination::Internal {
+                                binding,
+                                aor: callee_aor,
+                            } = dest
+                            {
+                                if !svc.is_enabled() {
+                                    // intercom を意図的に切った構成: 480 で
+                                    // fail-fast (= NGN 漏洩防止だけ維持)。
                                     info!(
                                         %from_aor,
                                         %callee_aor,
-                                        "SIP UA → 内線 AOR を classify_dial_target が Internal と判定。 \
-                                         本 PR では full multi-leg 未実装のため 480 で fail-fast \
-                                         (NGN に流す band-aid を防止、 Issue #313 follow-up)"
+                                        "intercom disabled → SIP UA → 内線 AOR を 480 で fail-fast \
+                                         (RFC 3261 §21.4.18、 NGN 漏洩防止 / Issue #317)"
                                     );
                                     let _ = responder
                                         .quick(480, "Temporarily Unavailable")
@@ -3919,6 +3923,24 @@ impl UasEventHandler {
                                         .record_invite_extension(InviteResult::Error);
                                     return Ok(());
                                 }
+                                info!(
+                                    %from_aor,
+                                    %callee_aor,
+                                    "SIP UA → 内線 AOR を classify_dial_target が Internal と判定。 \
+                                     full multi-leg orchestration へ分岐 (Issue #317)"
+                                );
+                                let result = self
+                                    .dispatch_sip_ua_internal_invite(
+                                        from_aor.clone(),
+                                        request.clone(),
+                                        remote,
+                                        responder.clone(),
+                                        binding,
+                                        callee_aor,
+                                        svc.clone(),
+                                    )
+                                    .await;
+                                return result;
                             }
                         }
                     }
@@ -6149,6 +6171,696 @@ impl UasEventHandler {
         }
     }
 
+    /// Issue #317: SIP UA → 内線 (PWA / SIP UA) full multi-leg orchestration ヘルパ。
+    ///
+    /// `handle_invite` の冒頭 dispatcher が `classify_dial_target` で
+    /// `Internal { binding, aor }` を引いた SIP UA 発内線 INVITE を受け取り、
+    /// callee binding の `transport` で case A (SIP UA → SIP UA) と case B
+    /// (SIP UA → PWA) を分岐する。 PR #320 (PWA → SIP UA) の pattern を踏襲し、
+    /// `ext_inviter.invite_intercom` + `LegInviter::invite_intercom` /
+    /// `WebRtcAudioBridge` / `InternalCallRegistry` を再利用する。
+    ///
+    /// # 設計方針
+    ///
+    /// - **RFC 5853 §3.2.2** (B2BUA / SBC framework): sabiden は両 leg の
+    ///   dialog 終端 + Media path anchoring を担い、 NGN を介さない。
+    /// - **RFC 3261 §17.1 / §13 / §13.2.2.4**: client transaction, dialog,
+    ///   2xx ACK は `Uac::invite_to` (case A) / `responder.respond_with_body`
+    ///   (caller leg 200 OK) で送出する。
+    /// - **RFC 3551 §4.5.14 PCMU PT 0 / 8 kHz**: 内線間は PCMU 固定
+    ///   (`Negotiator::for_ngn` で正規化、 carrier-specific 制約は乗らない)。
+    /// - **RFC 8829 §5.1** (Connection Cleanup): caller leg は `responder.quick`
+    ///   で 5xx を返すだけで cleanup が済む (DTLS-SRTP 等の state は無い)。
+    ///   callee PWA leg は `peer.close()` を best-effort で呼ぶ。 callee SIP UA leg
+    ///   は 2xx 後の cleanup 時に `dialog.send_bye()` を呼んで leak を防ぐ
+    ///   (RFC 3261 §15.1.1)。
+    /// - **RFC 4566 §5.2 / §5.7**: 200 OK の `c=` / `o=` / `m=` の IP / port は
+    ///   sabiden が bind した内線 NIC 側 socket のものに書換える
+    ///   (`rewrite_rtp_endpoint`)。 caller SIP UA が広告した c=/m= をそのまま
+    ///   200 OK に echo すると caller が自分自身に音声を送る形になる (relay 不能)。
+    ///
+    /// # 失敗時の caller への応答コード
+    ///
+    /// | 失敗点 | caller への応答 | RFC |
+    /// |---|---|---|
+    /// | admit 拒否 (capacity / disabled) | 486 Busy Here | RFC 3261 §21.4.20 |
+    /// | call_manager / ext_inviter 未注入 | 503 Service Unavailable | RFC 3261 §21.5.4 |
+    /// | socket bind / SDP rewrite 失敗 | 500 Server Internal Error | RFC 3261 §21.5.1 |
+    /// | callee 拒否 (3xx-6xx) | 同 status コード echo | RFC 3261 §13.2.2.3 |
+    /// | callee transport error | 408 Request Timeout | RFC 3261 §21.4.8 |
+    /// | callee answer timeout (case B、 30 秒) | 408 Request Timeout | RFC 3261 §21.4.8 |
+    /// | 200 OK SDP 解析 / bridge attach 失敗 | 500 Server Internal Error | RFC 3261 §21.5.1 |
+    ///
+    /// 200 OK 返却済で bridge attach 失敗の場合は、 RFC 3261 §15.1.1 に従い
+    /// `dialog.send_bye()` を case A の callee 側 dialog にも撃って leak を防ぐ。
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_sip_ua_internal_invite(
+        &self,
+        from_aor: String,
+        request: SipRequest,
+        _remote: SocketAddr,
+        responder: ResponderHandle,
+        binding: Binding,
+        callee_aor: String,
+        intercom_svc: Arc<super::intercom::IntercomService>,
+    ) -> Result<()> {
+        // (1) Admit check (RFC 3261 §21.4.20)。
+        if let Err(reason) = intercom_svc.try_admit().await {
+            warn!(
+                %from_aor, %callee_aor, %reason,
+                "SIP UA → 内線 intercom admit 拒否 → 486 Busy Here (Issue #317)"
+            );
+            let _ = responder.quick(486, "Busy Here").await;
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (2) call_manager / ext_inviter / bridge_ext_bind_ip を確認。
+        //     未注入時は 503 Service Unavailable で fail-fast。
+        let call_manager = match self.call_manager.clone() {
+            Some(m) => m,
+            None => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → 内線 intercom: CallManager 未注入 → 503 (Issue #317)"
+                );
+                let _ = responder.quick(503, "Service Unavailable").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (3) caller の SDP offer (PCMU AVP) から RTP endpoint を抽出。
+        //     SIP UA caller は通常 PCMU AVP offer を出してくる
+        //     (`docs/asterisk-real-invite.md` §2)。 SDP body 不在 / parse 失敗は
+        //     488 Not Acceptable Here (RFC 3261 §21.4.26 / RFC 3264 §6) で拒否。
+        let caller_rtp_peer = match extract_rtp_endpoint(&request.body) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → 内線 intercom: caller SDP 不正 → 488 (Issue #317)"
+                );
+                let _ = responder.quick(488, "Not Acceptable Here").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (4) sabiden 内線 NIC 側 caller-leg RTP socket を bind。
+        //     NGN even-port allocator は carrier IMS の odd-port aversion 対応
+        //     (`project_ngn_500_FINAL.md`) なので内線 SIP UA leg には不要。
+        let ext_bind_ip = self
+            .bridge_ext_bind_ip
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let caller_leg_sock = match UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor,
+                    "SIP UA → 内線 intercom: caller-leg socket bind 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+        let caller_leg_addr = match caller_leg_sock.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor,
+                    "SIP UA → 内線 intercom: caller-leg local_addr 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (5) callee binding の transport で case A / case B に分岐。
+        match binding.transport.clone() {
+            ExtTransport::Sip => {
+                self.dispatch_sip_ua_to_sip_ua_intercom(
+                    from_aor,
+                    request,
+                    responder,
+                    binding,
+                    callee_aor,
+                    intercom_svc,
+                    call_manager,
+                    caller_rtp_peer,
+                    caller_leg_sock,
+                    caller_leg_addr,
+                )
+                .await
+            }
+            ExtTransport::WebRtc {
+                peer: callee_peer,
+                ws: callee_ws,
+                pending: callee_pending,
+            } => {
+                self.dispatch_sip_ua_to_pwa_intercom(
+                    from_aor,
+                    request,
+                    responder,
+                    callee_peer,
+                    callee_ws,
+                    callee_pending,
+                    callee_aor,
+                    intercom_svc,
+                    call_manager,
+                    caller_rtp_peer,
+                    caller_leg_sock,
+                    caller_leg_addr,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Issue #317 case A: SIP UA → SIP UA 内線通話 full multi-leg orchestration。
+    ///
+    /// # シーケンス (RFC 3261 §17.1 / §13.2.2.4)
+    ///
+    /// 1. (caller-leg socket は呼出側で bind 済) sabiden 内線 NIC に callee-leg
+    ///    RTP socket を bind。
+    /// 2. caller の SDP offer (PCMU AVP) を `Negotiator::for_ngn` で正規化し、
+    ///    `c=/o=/m=` を sabiden callee-leg socket の addr に書換える
+    ///    (RFC 4566 §5.2 §5.7)。 これを SIP UA callee 宛 SDP offer として渡す。
+    /// 3. `ext_inviter.invite_intercom(binding.contact_uri, binding.remote, sdp)` で
+    ///    callee SIP UA に INVITE 送出 (PCMU SDP offer 付き、 RFC 5626)。
+    /// 4. 3xx-6xx 受信は caller へ same-status で echo (RFC 3261 §13.2.2.3)、
+    ///    transport error は 408 Request Timeout (§21.4.8)。
+    /// 5. 200 OK 受信: callee SDP から callee RTP endpoint を抽出
+    ///    (`extract_rtp_endpoint`、 RFC 3264 §6)。
+    /// 6. sabiden caller-leg socket の addr に c=/m= を書換えた 200 OK SDP を
+    ///    `responder.respond_with_body` で caller に返す (B2BUA SDP anchoring)。
+    /// 7. `RtpBridge` (既存 PCMU↔PCMU relay) を caller-leg / callee-leg socket 間で起動。
+    /// 8. `IntercomService::register_call` で `InternalCallRegistry` に登録。
+    ///
+    /// # Err cleanup (RFC 8829 §5.1 / RFC 3261 §15.1.1)
+    ///
+    /// 6 〜 8 のいずれかで失敗した場合、 callee SIP UA leg は **2xx 確立後** の
+    /// 状態なので `dialog.send_bye()` を撃って leak を防ぐ。 caller 側は
+    /// `responder.quick(5xx)` を返すだけで cleanup される (DTLS-SRTP / ICE は
+    /// SIP UA レッグでは持たない)。
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_sip_ua_to_sip_ua_intercom(
+        &self,
+        from_aor: String,
+        request: SipRequest,
+        responder: ResponderHandle,
+        binding: Binding,
+        callee_aor: String,
+        intercom_svc: Arc<super::intercom::IntercomService>,
+        call_manager: Arc<CallManager>,
+        caller_rtp_peer: SocketAddr,
+        caller_leg_sock: Arc<UdpSocket>,
+        caller_leg_addr: SocketAddr,
+    ) -> Result<()> {
+        let ext_inviter = match self.ext_inviter.lock().await.clone() {
+            Some(i) => i,
+            None => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: ext_inviter 未注入 → 503 (Issue #317)"
+                );
+                let _ = responder.quick(503, "Service Unavailable").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (1) callee-leg socket bind (caller-leg は呼出側で bind 済)。
+        let ext_bind_ip = self
+            .bridge_ext_bind_ip
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let callee_leg_sock = match UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor,
+                    "SIP UA → SIP UA intercom: callee-leg socket bind 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+        let callee_leg_addr = match callee_leg_sock.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor,
+                    "SIP UA → SIP UA intercom: callee-leg local_addr 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (2) callee SIP UA 宛 SDP offer を組み立てる。
+        //     caller の offer を PCMU only に正規化し、 c=/m= を sabiden の
+        //     callee-leg socket addr に書換える (RFC 4566 §5.2 §5.7 / RFC 3551 PT 0)。
+        let pcmu_only = Negotiator::for_ngn().rewrite_offer(&request.body);
+        let sdp_for_callee =
+            match rewrite_rtp_endpoint(&pcmu_only, callee_leg_addr.ip(), callee_leg_addr.port()) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        error=%e, %from_aor, %callee_aor,
+                        "SIP UA → SIP UA intercom: callee 宛 SDP rewrite 失敗 → 500 (Issue #317)"
+                    );
+                    let _ = responder.quick(500, "Server Internal Error").await;
+                    self.metrics.record_invite_extension(InviteResult::Error);
+                    return Ok(());
+                }
+            };
+
+        // (3) callee SIP UA に INVITE 送出。
+        info!(
+            %from_aor, %callee_aor,
+            target_uri = %binding.contact_uri,
+            dest = %binding.remote,
+            sabi_caller_leg = %caller_leg_addr,
+            sabi_callee_leg = %callee_leg_addr,
+            "SIP UA → SIP UA intercom: INVITE 送出 (Issue #317 / RFC 3261 §17.1)"
+        );
+        let outcome = ext_inviter
+            .invite_intercom(&binding.contact_uri, binding.remote, &sdp_for_callee)
+            .await;
+        let (mut dialog, callee_response) = match outcome {
+            Ok(super::manager::IntercomLegOutcome::Established { dialog, response }) => {
+                (dialog, response)
+            }
+            Ok(super::manager::IntercomLegOutcome::Failed { status, .. }) => {
+                warn!(
+                    %from_aor, %callee_aor, status,
+                    "SIP UA → SIP UA intercom: callee が拒否 → caller に same-status echo (RFC 3261 §13.2.2.3)"
+                );
+                let reason = reason_phrase_for_status(status);
+                let _ = responder.quick(status, reason).await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+            Ok(super::manager::IntercomLegOutcome::Errored) => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: callee transport error → 408 (RFC 3261 §21.4.8)"
+                );
+                let _ = responder.quick(408, "Request Timeout").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: ext_inviter API 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (4) callee 200 OK SDP から RTP endpoint 抽出。
+        let callee_rtp_peer = match extract_rtp_endpoint(&callee_response.body) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: callee 200 OK SDP 解析失敗 → caller 500、 callee BYE 送出 (Issue #317)"
+                );
+                if let Err(be) = dialog.send_bye().await {
+                    warn!(error=%be, "SIP UA → SIP UA intercom: callee leg BYE (cleanup) 失敗");
+                }
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (5) caller に返す 200 OK SDP を組み立てる。
+        //     callee 200 OK answer をベースに PCMU subset 正規化 + c=/m= を sabiden
+        //     caller-leg socket addr に書換える (B2BUA SDP anchoring、 RFC 4566)。
+        let answer_pcmu = Negotiator::for_ngn().rewrite_offer(&callee_response.body);
+        let sdp_for_caller = match rewrite_rtp_endpoint(
+            &answer_pcmu,
+            caller_leg_addr.ip(),
+            caller_leg_addr.port(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: caller 向け 200 OK SDP rewrite 失敗 → caller 500、 callee BYE (Issue #317)"
+                );
+                if let Err(be) = dialog.send_bye().await {
+                    warn!(error=%be, "SIP UA → SIP UA intercom: callee leg BYE (cleanup) 失敗");
+                }
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (6) caller に 200 OK + PCMU SDP 返却 (RFC 3261 §8.2.6.2 / §13.2)。
+        if let Err(e) = responder
+            .respond_with_body(200, "OK", "application/sdp", sdp_for_caller)
+            .await
+        {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → SIP UA intercom: caller への 200 OK 送出失敗 → callee BYE (cleanup) (Issue #317)"
+            );
+            if let Err(be) = dialog.send_bye().await {
+                warn!(error=%be, "SIP UA → SIP UA intercom: callee leg BYE (cleanup) 失敗");
+            }
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (7) RtpBridge を caller-leg / callee-leg socket 間で起動
+        //     (RFC 3551 §4.5.14 PCMU 直送、 既存 `MediaBridge::Relay`)。
+        let bridge = match RtpBridge::start(BridgeConfig {
+            ngn_socket: caller_leg_sock,
+            ext_socket: callee_leg_sock,
+            ngn_peer: Some(caller_rtp_peer),
+            ext_peer: Some(callee_rtp_peer),
+            metrics: Some(self.metrics.clone()),
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → SIP UA intercom: RtpBridge::start 失敗 → callee BYE cleanup、 caller 側は 200 OK 送出済 (Issue #317 / RFC 3261 §15.1.1)"
+                );
+                if let Err(be) = dialog.send_bye().await {
+                    warn!(error=%be, "SIP UA → SIP UA intercom: callee leg BYE (cleanup) 失敗");
+                }
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+        let bridge: MediaBridge = bridge.into();
+
+        let bridge_call_id = call_manager.create_call().await;
+        if let Err(e) = call_manager
+            .attach_media_bridge(bridge_call_id, bridge)
+            .await
+        {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → SIP UA intercom: attach_media_bridge 失敗 → callee BYE cleanup (Issue #317)"
+            );
+            let _ = call_manager.terminate(bridge_call_id).await;
+            if let Err(be) = dialog.send_bye().await {
+                warn!(error=%be, "SIP UA → SIP UA intercom: callee leg BYE (cleanup) 失敗");
+            }
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (8) `InternalCallRegistry` に確立 entry を登録。
+        let caller_call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_else(|| "<no-call-id>".to_string());
+        let callee_call_id = dialog.dialog().id().call_id.clone();
+        let entry = super::intercom::InternalCallEntry::new(
+            caller_call_id,
+            callee_call_id,
+            from_aor.clone(),
+            callee_aor.clone(),
+            bridge_call_id,
+        );
+        intercom_svc.register_call(entry).await;
+        self.metrics.record_invite_extension(InviteResult::Answered);
+        info!(
+            %from_aor, %callee_aor,
+            bridge_call_id = %bridge_call_id,
+            "SIP UA → SIP UA intercom 確立 (Issue #317)"
+        );
+
+        // Note: callee 側 dialog は drop される。 SIP UA からの BYE 受信は
+        // 内線 UAS (`src/sip/uas.rs`) が処理する。 sabiden 発の BYE 連動
+        // (= caller BYE → callee BYE / 逆方向) は follow-up Issue で扱う
+        // (PWA→SIP UA 経路と同様 `webrtc_outbound_active` 相当の SIP-leg
+        // dialog テーブルが必要、 RFC 3261 §15.1.1 双方向)。
+        Ok(())
+    }
+
+    /// Issue #317 case B: SIP UA → PWA 内線通話 full multi-leg orchestration。
+    ///
+    /// # シーケンス (RFC 3261 §17.1 / §13 / RFC 8829)
+    ///
+    /// 1. (caller-leg socket は呼出側で bind 済) callee PWA `peer.create_offer()` で
+    ///    SAVPF offer を生成 (RFC 8829 §5.2: sabiden は callee に対する offerer)。
+    /// 2. callee WS に `ServerMessage::Offer { call_id, sdp }` push、 `PendingAnswers`
+    ///    で answer 待ち (RFC 3261 §13.2、 30 秒 timeout)。
+    /// 3. callee `peer.accept_answer(answer)` (RFC 8829 §5.3)。
+    /// 4. callee `peer.take_media_rx()` で MediaFrame source 取得
+    ///    (RFC 8829 §4: 1 度だけ取得可能)。
+    /// 5. sabiden caller-leg socket addr に c=/m= を書換えた 200 OK SDP
+    ///    (PCMU AVP) を caller SIP UA に返却 (B2BUA SDP anchoring、 RFC 4566)。
+    /// 6. `WebRtcAudioBridge` (`direct_pcmu_passthrough = true`、 PCMU 透過) を
+    ///    起動: caller-leg UDP socket ⇄ sabiden ⇄ callee PWA peer。
+    /// 7. `IntercomService::register_call` で `InternalCallRegistry` 登録。
+    ///
+    /// # Err cleanup (RFC 8829 §5.1)
+    ///
+    /// 1 〜 6 のいずれかで失敗した場合、 callee PWA peer `close()` を best-effort で
+    /// 呼んで DTLS-SRTP / ICE state を解放する。 caller 側は `responder.quick(5xx)`
+    /// で済む (SIP UA は state を持たない)。 callee answer timeout (30 秒) は
+    /// 408 Request Timeout に変換 (RFC 3261 §21.4.8)。
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_sip_ua_to_pwa_intercom(
+        &self,
+        from_aor: String,
+        request: SipRequest,
+        responder: ResponderHandle,
+        callee_peer: Arc<dyn PeerSession>,
+        callee_ws: WsSink,
+        callee_pending: PendingAnswers,
+        callee_aor: String,
+        intercom_svc: Arc<super::intercom::IntercomService>,
+        call_manager: Arc<CallManager>,
+        caller_rtp_peer: SocketAddr,
+        caller_leg_sock: Arc<UdpSocket>,
+        caller_leg_addr: SocketAddr,
+    ) -> Result<()> {
+        let caller_call_id = request
+            .headers
+            .get("call-id")
+            .map(str::to_string)
+            .unwrap_or_else(|| "<no-call-id>".to_string());
+
+        // sabiden 内で生成する callee-side intercom Call-ID (RFC 3261 §8.1.1.4
+        // locally unique で十分; NGN dialog は持たない、 PWA WS で oneshot key
+        // としてだけ使う)。
+        let ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let callee_call_id = format!("intercom-sipua-pwa-{}-{}", callee_aor, ts_ns);
+
+        // (1) callee PWA peer.create_offer (RFC 8829 §5.2)。
+        let callee_offer = match callee_peer.create_offer().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → PWA intercom: callee.create_offer 失敗 → 500 (Issue #317)"
+                );
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (2) PendingAnswers 登録は WS push 前にやる (race 回避、 §3 順序問題)。
+        let waiter = callee_pending.register(&callee_call_id).await;
+
+        // (3) callee WS に Offer push。
+        if let Err(e) = callee_ws.send(ServerMessage::Offer {
+            call_id: callee_call_id.clone(),
+            sdp: callee_offer,
+        }) {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → PWA intercom: callee WS push 失敗 → 480 (RFC 3261 §21.4.18 callee unreachable)"
+            );
+            callee_pending.cancel(&callee_call_id).await;
+            let _ = callee_peer.close().await;
+            let _ = responder.quick(480, "Temporarily Unavailable").await;
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (4) Answer 待ち (30 秒 timeout、 PWA→SIP UA 経路と対称)。
+        let answer = match tokio::time::timeout(Duration::from_secs(30), waiter).await {
+            Ok(Ok(crate::webrtc::signaling::AnswerOutcome::Sdp(sdp))) => sdp,
+            Ok(Ok(crate::webrtc::signaling::AnswerOutcome::Decline { status })) => {
+                info!(
+                    %from_aor, %callee_aor, status,
+                    "SIP UA → PWA intercom: callee が拒否 → caller に same-status echo (RFC 3261 §13.2.2.3)"
+                );
+                let _ = callee_peer.close().await;
+                let reason = reason_phrase_for_status(status);
+                let _ = responder.quick(status, reason).await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+            Ok(Err(_)) => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → PWA intercom: callee pending oneshot cancelled (WS close?) → 480"
+                );
+                let _ = callee_peer.close().await;
+                let _ = responder.quick(480, "Temporarily Unavailable").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → PWA intercom: callee answer timeout (30s) → 408 (RFC 3261 §21.4.8)"
+                );
+                callee_pending.cancel(&callee_call_id).await;
+                let _ = callee_peer.close().await;
+                let _ = responder.quick(408, "Request Timeout").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (5) callee str0m に answer を流し込み DTLS/ICE 確立 (RFC 8829 §5.3)。
+        if let Err(e) = callee_peer.accept_answer(&answer).await {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → PWA intercom: callee.accept_answer 失敗 → 500"
+            );
+            let _ = callee_peer.close().await;
+            let _ = responder.quick(500, "Server Internal Error").await;
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (6) callee PWA peer の MediaFrame rx を取り出す (RFC 8829 §4: 1 度のみ)。
+        let callee_media_rx = match callee_peer.take_media_rx().await {
+            Some(rx) => rx,
+            None => {
+                warn!(
+                    %from_aor, %callee_aor,
+                    "SIP UA → PWA intercom: callee.take_media_rx None (stub backend?) → 500"
+                );
+                let _ = callee_peer.close().await;
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+
+        // (7) caller に返す 200 OK SDP を組み立てる (RFC 3261 §13.2 / RFC 4566)。
+        //     callee SAVPF answer を AVP に変換 → PCMU only 正規化 → c=/m= を
+        //     sabiden caller-leg socket addr に書換える。 caller (SIP UA / PCMU AVP)
+        //     からは sabiden の caller-leg socket を peer として見える。
+        let avp_sdp = match convert_savpf_to_avp(answer.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error=%e, %from_aor, %callee_aor,
+                    "SIP UA → PWA intercom: SAVPF→AVP 変換失敗 → 500"
+                );
+                let _ = callee_peer.close().await;
+                let _ = responder.quick(500, "Server Internal Error").await;
+                self.metrics.record_invite_extension(InviteResult::Error);
+                return Ok(());
+            }
+        };
+        let pcmu_only = Negotiator::for_ngn().rewrite_offer(&avp_sdp);
+        let sdp_for_caller =
+            match rewrite_rtp_endpoint(&pcmu_only, caller_leg_addr.ip(), caller_leg_addr.port()) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        error=%e, %from_aor, %callee_aor,
+                        "SIP UA → PWA intercom: caller 向け 200 OK SDP rewrite 失敗 → 500"
+                    );
+                    let _ = callee_peer.close().await;
+                    let _ = responder.quick(500, "Server Internal Error").await;
+                    self.metrics.record_invite_extension(InviteResult::Error);
+                    return Ok(());
+                }
+            };
+
+        // (8) caller に 200 OK + PCMU SDP 返却。
+        if let Err(e) = responder
+            .respond_with_body(200, "OK", "application/sdp", sdp_for_caller)
+            .await
+        {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → PWA intercom: caller への 200 OK 送出失敗 → callee.close (Issue #317)"
+            );
+            let _ = callee_peer.close().await;
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (9) `WebRtcAudioBridge` を起動 (RFC 3551 PCMU PT 0 / direct passthrough)。
+        //     caller-leg UDP socket ⇄ sabiden ⇄ callee PWA peer。
+        let opus_pt = super::transcoder::find_opus_payload_type(answer.as_bytes())
+            .unwrap_or(super::transcoder::DEFAULT_OPUS_PT);
+        let bridge: MediaBridge =
+            super::transcoder::WebRtcAudioBridge::start(super::transcoder::WebRtcAudioConfig {
+                ngn_socket: caller_leg_sock,
+                ngn_peer: Some(caller_rtp_peer),
+                peer: callee_peer.clone(),
+                peer_media_rx: callee_media_rx,
+                opus_payload_type: opus_pt,
+                direct_pcmu_passthrough: true,
+                metrics: Some(self.metrics.clone()),
+            })
+            .into();
+
+        let bridge_call_id = call_manager.create_call().await;
+        if let Err(e) = call_manager
+            .attach_media_bridge(bridge_call_id, bridge)
+            .await
+        {
+            warn!(
+                error=%e, %from_aor, %callee_aor,
+                "SIP UA → PWA intercom: attach_media_bridge 失敗 → callee.close (200 OK 送出済、 SIP UA 側は ACK で 1 度成立してから即終話する形になる、 RFC 3261 §15.1.1)"
+            );
+            let _ = call_manager.terminate(bridge_call_id).await;
+            let _ = callee_peer.close().await;
+            self.metrics.record_invite_extension(InviteResult::Error);
+            return Ok(());
+        }
+
+        // (10) `InternalCallRegistry` 登録。
+        let entry = super::intercom::InternalCallEntry::new(
+            caller_call_id,
+            callee_call_id,
+            from_aor.clone(),
+            callee_aor.clone(),
+            bridge_call_id,
+        );
+        intercom_svc.register_call(entry).await;
+        self.metrics.record_invite_extension(InviteResult::Answered);
+        info!(
+            %from_aor, %callee_aor,
+            bridge_call_id = %bridge_call_id,
+            "SIP UA → PWA intercom 確立 (Issue #317)"
+        );
+
+        Ok(())
+    }
+
     /// 既存 NGN プロキシ実装 (target dispatcher による Internal 振分の対象外の
     /// 全パス)。 Issue #313 の dispatcher は本関数の冒頭でガードする (= 内線 AOR
     /// にヒットしない場合のみ本ロジックに入る)。
@@ -7695,10 +8407,18 @@ fn final_response_class_rank(code: u16) -> u8 {
 ///
 /// 本関数は `AllFailed` 経路で使う final response (3xx-6xx) のみを想定する。
 /// 未知 code は中立的な "Decline" (= 603 と同じ semantics の汎用拒否) を返す。
+///
+/// Issue #317 (SIP UA → 内線 intercom B2BUA echo) で 408 / 480 / 488 / 500 /
+/// 503 を追加。 RFC 3261 §21.4 / §21.5 の標準 reason phrase を踏襲する。
 fn reason_phrase_for_status(code: u16) -> &'static str {
     match code {
+        408 => "Request Timeout",
+        480 => "Temporarily Unavailable",
         486 => "Busy Here",
         487 => "Request Terminated",
+        488 => "Not Acceptable Here",
+        500 => "Server Internal Error",
+        503 => "Service Unavailable",
         603 => "Decline",
         _ => "Decline",
     }
@@ -9489,21 +10209,26 @@ mod tests {
         );
     }
 
-    /// Issue #313 / PR #314 review fix: SIP UA → 内線 AOR (= ExtensionRegistrar
-    /// に登録済 AOR) を Request-URI user 部に取った INVITE は、 `handle_invite`
-    /// 冒頭の intercom dispatcher gate で **480 Temporarily Unavailable** で
-    /// fail-fast し、 NGN socket に INVITE が 1 通も飛ばないことを確認する。
+    /// Issue #313 / #317: SIP UA → 内線 AOR (= ExtensionRegistrar に登録済 AOR)
+    /// を Request-URI user 部に取った INVITE は、 `handle_invite` 冒頭の
+    /// intercom dispatcher gate で **`enabled = false` 構成のとき 480 Temporarily
+    /// Unavailable** で fail-fast し、 NGN socket に INVITE が 1 通も飛ばない
+    /// ことを確認する。
     ///
     /// これは CLAUDE.md §6.1 (band-aid 禁止) の決定的防御テスト:
     /// dispatcher が壊れて NGN proxy 経路に落ちると、 内線 AOR が NGN に漏れて
     /// 404 が帰ってくる band-aid 経路に逆戻りする (Issue #313 が解決する根本問題)。
+    /// 「intercom を意図的に切った構成 (= `enabled = false`)」 でも内線 AOR が
+    /// NGN に漏れないことを担保するための gate (Issue #317 で full multi-leg
+    /// は `enabled = true` 経路に格上げされたため、 fail-fast は disabled 構成
+    /// 専用に scope 限定)。
     ///
     /// RFC 3261 §21.4.18 (480 Temporarily Unavailable): "The callee's end
     /// system was contacted successfully but the callee is currently
-    /// unavailable". intercom multi-leg orchestration は本 PR では未実装の
-    /// ため、 fail-fast 480 を返す (follow-up Issue で full impl)。
+    /// unavailable". intercom service が disabled のときの fail-fast 経路 は
+    /// 「callee は管理内にあるが service が使えない」 状況に該当する。
     #[tokio::test]
-    async fn rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_temporarily_unavailable() {
+    async fn rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_when_intercom_disabled() {
         use crate::sip::registrar::ExtensionRegistrar;
         use crate::sip::transaction::ServerTransaction;
         use crate::sip::uac::UacConfig;
@@ -9579,9 +10304,14 @@ mod tests {
             targets: HashMap::new(),
         });
         handler.attach_ext_inviter(forker, registrar.clone()).await;
-        let svc = crate::call::intercom::IntercomService::new(
-            crate::call::intercom::IntercomConfig::default(),
-        );
+        // Issue #317: `enabled = false` で intercom を切る (= キルスイッチ)。
+        // 通常構成 (= enabled = true) では full multi-leg orchestration が走り
+        // 200 OK が返るため、 fail-fast 480 は disabled 経路でのみ観測される。
+        let svc =
+            crate::call::intercom::IntercomService::new(crate::call::intercom::IntercomConfig {
+                enabled: false,
+                max_concurrent_internal_calls: 4,
+            });
         handler.set_intercom_service(svc).await;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -9658,8 +10388,8 @@ mod tests {
         };
         assert_eq!(
             resp.status_code, 480,
-            "SIP UA → 内線 AOR は intercom dispatcher gate で 480 Temporarily Unavailable に \
-             fail-fast されるべき (Issue #313 / CLAUDE.md §6.1 band-aid 防止)"
+            "intercom disabled で SIP UA → 内線 AOR は 480 Temporarily Unavailable に \
+             fail-fast されるべき (Issue #313 / #317 / CLAUDE.md §6.1 band-aid 防止)"
         );
         assert_eq!(resp.reason, "Temporarily Unavailable");
 

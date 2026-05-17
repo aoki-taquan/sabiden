@@ -21,7 +21,7 @@
 
 pub mod auth;
 pub mod peer;
-// pub mod push; // Issue #294 skeleton、 production wiring + web-push 0.11 API 修正待ち (quota 制約で完成しなかった)
+pub mod push;
 pub mod signaling;
 pub mod str0m_session;
 

@@ -551,6 +551,34 @@ impl std::fmt::Display for RecordingControlError {
 
 impl std::error::Error for RecordingControlError {}
 
+/// PWA Web Push 通知 (Issue #294) のハンドラ。
+///
+/// `ClientMessage::PushSubscribe { endpoint, keys: { p256dh, auth } }` を
+/// 受信した signaling 層が本 trait を呼び、 [`crate::webrtc::push::PushSubscriptionStore`]
+/// に AOR (= 認証済 `ext_id`) に紐づけて購読を登録する。
+///
+/// 戻り値:
+/// - `Ok(())`: store への upsert 成功 (新規登録 or 同 endpoint 上書き)
+/// - `Err`: validate 失敗 (HTTPS 以外 / base64url 違反 / 空鍵 等)
+///
+/// # RFC 引用
+/// - **RFC 8030 §3**: `endpoint` は HTTPS URL
+/// - **RFC 8291 §4.1**: `p256dh` (ECDH 公開鍵) と `auth` (16 byte secret) は
+///   base64url (no padding)
+/// - **RFC 8292**: VAPID 公開鍵は `GET /api/push/vapid-public-key` で PWA に配信
+#[async_trait::async_trait]
+pub trait PwaPushHandler: Send + Sync {
+    /// AOR (`ext_id`) に Push 購読を upsert する。 同一 endpoint の再 subscribe
+    /// は既存 entry を置き換える (= 鍵 rotation 許容)。
+    async fn upsert_subscription(
+        &self,
+        aor: &str,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> Result<()>;
+}
+
 /// 発信先 `target` の文字種ホワイトリスト (Issue #145, PR #146 review #1 🔴#1)。
 ///
 /// browser からの任意文字列が NGN INVITE の Request-URI user 部に流れる
@@ -624,6 +652,11 @@ pub struct SignalingState {
     /// `RecordStop` 受信時に呼ぶ。 `None` のときは recording 機能無効 = PWA
     /// 側に `code:"recording_unavailable"` を返す。
     pub pwa_record: Option<Arc<dyn PwaRecordHandler>>,
+    /// PWA Web Push 通知 (Issue #294)。 `ClientMessage::PushSubscribe` 受信時に
+    /// 呼ぶ。 `None` のときは push 機能無効 = PWA に `code:"push_unavailable"`
+    /// を返す。 production では [`crate::webrtc::push::PushSubscriptionStore`]
+    /// に書き込む impl を `Arc::clone` で渡す。
+    pub pwa_push: Option<Arc<dyn PwaPushHandler>>,
 }
 
 impl SignalingState {
@@ -646,6 +679,7 @@ impl SignalingState {
             pwa_hold_handler: None,
             pwa_dtmf: None,
             pwa_record: None,
+            pwa_push: None,
         }
     }
 
@@ -698,6 +732,14 @@ impl SignalingState {
     /// active call recording ハンドラを差し込む (Issue #296)。
     pub fn with_pwa_record(mut self, h: Arc<dyn PwaRecordHandler>) -> Self {
         self.pwa_record = Some(h);
+        self
+    }
+
+    /// PWA Web Push ハンドラを差し込む (Issue #294)。
+    /// 通常は [`crate::webrtc::push::PushSubscriptionStore`] を包む
+    /// `PushStoreHandler` (本 module) を `Arc` で渡す。
+    pub fn with_pwa_push(mut self, h: Arc<dyn PwaPushHandler>) -> Self {
+        self.pwa_push = Some(h);
         self
     }
 }
@@ -813,7 +855,37 @@ pub enum ClientMessage {
     RecordStop {
         call_id: String,
     },
+    /// Issue #294: PWA Web Push 購読を sabiden に登録する。
+    ///
+    /// PWA Service Worker が `PushManager.subscribe({ userVisibleOnly: true,
+    /// applicationServerKey: <VAPID public> })` で得た [`PushSubscription`][1]
+    /// を sabiden に渡す。 sabiden は AOR (= 認証済 `ext_id`) に紐づけて
+    /// [`crate::webrtc::push::PushSubscriptionStore`] に保存し、 NGN inbound
+    /// INVITE 受領時に当該 AOR の購読へ Web Push (RFC 8030) を fan-out する。
+    ///
+    /// `keys.p256dh` は ECDH 公開鍵 (uncompressed, base64url, RFC 8291 §4.1)、
+    /// `keys.auth` は 16 byte の認証 secret (base64url, RFC 8291 §4.1)。
+    /// `endpoint` は push service が割り当てる HTTPS URL (RFC 8030 §3)。
+    ///
+    /// 成功時は `ServerMessage::PushSubscribed { endpoint }`、 機能無効 /
+    /// validate 失敗時は `ServerMessage::Error { code: ..., message }`。
+    ///
+    /// [1]: https://developer.mozilla.org/en-US/docs/Web/API/PushSubscription
+    PushSubscribe {
+        endpoint: String,
+        keys: PushSubscribeKeys,
+    },
     Bye,
+}
+
+/// `ClientMessage::PushSubscribe` の `keys` フィールド。
+///
+/// W3C Push API の `PushSubscription.toJSON()` 互換: `{ p256dh, auth }` を
+/// browser 側で `keys` ネストに丸めて送る (RFC 8291 §4.1)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushSubscribeKeys {
+    pub p256dh: String,
+    pub auth: String,
 }
 
 /// サーバ → クライアント メッセージ。
@@ -867,6 +939,12 @@ pub enum ServerMessage {
     RecordingStopped {
         recording_id: String,
         duration_ms: u64,
+    },
+    /// Issue #294: PWA Web Push 購読登録成功。 PWA UI は本 message を観測して
+    /// 「通知を有効化」 ボタンを「通知 ON」 状態に遷移させる。 `endpoint` は
+    /// 要求時の同値を echo (= browser 側 idempotency 判定材料)。
+    PushSubscribed {
+        endpoint: String,
     },
     Bye,
 }
@@ -1826,6 +1904,38 @@ pub async fn process_client_message(
                 Err(RecordingControlError::Internal { reason }) => {
                     warn!(%call_id, %reason, "PWA record stop: 内部エラー");
                     SessionAction::Reply(ServerMessage::error("recording_failed", reason))
+                }
+            }
+        }
+        ClientMessage::PushSubscribe { endpoint, keys } => {
+            // Issue #294 / RFC 8030 §3 / RFC 8291 §4.1: PWA Service Worker が
+            // `PushManager.subscribe` で得た subscription を sabiden に登録。
+            // 認証済 `ext_id` を AOR として store に保存する。 push 機能未配線
+            // (= `[push] enabled = false` / VAPID 鍵未設定) なら `push_unavailable`
+            // で拒否する。
+            let Some(handler) = state.pwa_push.as_ref() else {
+                debug!("PWA push ハンドラ未配線 → push_unavailable");
+                return SessionAction::Reply(ServerMessage::error(
+                    "push_unavailable",
+                    "push 機能が未配線 (config [push] enabled?)",
+                ));
+            };
+            // AOR は token claims の ext_id (= REGISTER 済の AOR と同じ
+            // semantics)。 別 ext で送られても認証ヘッダで弾かれている前提。
+            match handler
+                .upsert_subscription(&claims.ext_id, &endpoint, &keys.p256dh, &keys.auth)
+                .await
+            {
+                Ok(()) => {
+                    info!(aor=%claims.ext_id, endpoint=%endpoint, "PWA push 購読登録");
+                    SessionAction::Reply(ServerMessage::PushSubscribed { endpoint })
+                }
+                Err(e) => {
+                    warn!(aor=%claims.ext_id, error=%e, "PWA push 購読登録失敗");
+                    SessionAction::Reply(ServerMessage::error(
+                        "invalid_subscription",
+                        e.to_string(),
+                    ))
                 }
             }
         }
@@ -4563,5 +4673,209 @@ mod tests {
         .await;
         assert!(matches!(action, SessionAction::Continue));
         assert_eq!(mock.observed().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #294: PushSubscribe テスト
+    // -------------------------------------------------------------------------
+
+    /// `PwaPushHandler` のテストダブル: upsert された AOR + endpoint を記録し、
+    /// 戻り値を制御できる。 Production 型 (`PushSubscriptionStore`) は別途
+    /// `webrtc::push::tests` で round-trip 検証済 (CLAUDE.md §6.3、 trait の
+    /// 境界だけを最小実装)。
+    struct MockPushHandler {
+        calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
+        outcome: std::sync::Mutex<std::result::Result<(), String>>,
+    }
+
+    impl MockPushHandler {
+        fn new(outcome: std::result::Result<(), String>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                outcome: std::sync::Mutex::new(outcome),
+            })
+        }
+        fn observed(&self) -> Vec<(String, String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PwaPushHandler for MockPushHandler {
+        async fn upsert_subscription(
+            &self,
+            aor: &str,
+            endpoint: &str,
+            p256dh: &str,
+            auth: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push((
+                aor.to_string(),
+                endpoint.to_string(),
+                p256dh.to_string(),
+                auth.to_string(),
+            ));
+            match &*self.outcome.lock().unwrap() {
+                Ok(()) => Ok(()),
+                Err(s) => Err(anyhow::anyhow!(s.clone())),
+            }
+        }
+    }
+
+    /// RFC 8030 §3 + RFC 8291 §4.1: `PushSubscribe` の JSON round-trip が
+    /// `{endpoint, keys: {p256dh, auth}}` 形式で安定して動く。
+    #[test]
+    fn rfc8030_push_subscribe_json_round_trip() {
+        let m = ClientMessage::PushSubscribe {
+            endpoint: "https://updates.push.services.mozilla.com/wpush/v1/abc".into(),
+            keys: PushSubscribeKeys {
+                p256dh: "BPq-test".into(),
+                auth: "AAAA".into(),
+            },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"pushsubscribe\""));
+        assert!(s.contains("\"endpoint\":\"https://"));
+        assert!(s.contains("\"p256dh\":\"BPq-test\""));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::PushSubscribe { endpoint, keys } => {
+                assert!(endpoint.starts_with("https://"));
+                assert_eq!(keys.p256dh, "BPq-test");
+                assert_eq!(keys.auth, "AAAA");
+            }
+            _ => panic!("PushSubscribe に decode されなかった"),
+        }
+    }
+
+    /// Issue #294: `PushSubscribe` を `pwa_push` 配線済みで受信したら、
+    /// AOR (= 認証 ext_id) + endpoint + p256dh + auth が handler に正しく渡り、
+    /// 成功時は `ServerMessage::PushSubscribed { endpoint }` が返る。
+    #[tokio::test]
+    async fn issue294_push_subscribe_dispatches_to_handler_and_replies_subscribed() {
+        let mock = MockPushHandler::new(Ok(()));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_push = Some(mock.clone() as Arc<dyn PwaPushHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let endpoint = "https://updates.push.services.mozilla.com/wpush/v1/abc";
+        let action = process_client_message(
+            ClientMessage::PushSubscribe {
+                endpoint: endpoint.into(),
+                keys: PushSubscribeKeys {
+                    p256dh: "BPq".into(),
+                    auth: "AAAA".into(),
+                },
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::PushSubscribed { endpoint: e }) => {
+                assert_eq!(e, endpoint);
+            }
+            other => panic!(
+                "PushSubscribed 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+        let calls = mock.observed();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "alice"); // AOR
+        assert_eq!(calls[0].1, endpoint);
+        assert_eq!(calls[0].2, "BPq");
+        assert_eq!(calls[0].3, "AAAA");
+    }
+
+    /// Issue #294: `pwa_push` 未配線 (= push 機能無効) なら `push_unavailable`。
+    #[tokio::test]
+    async fn issue294_push_subscribe_without_handler_returns_push_unavailable() {
+        let (state, _reg) = make_state(b"k");
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::PushSubscribe {
+                endpoint: "https://example.com/p".into(),
+                keys: PushSubscribeKeys {
+                    p256dh: "BPq".into(),
+                    auth: "AAAA".into(),
+                },
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "push_unavailable");
+            }
+            other => panic!(
+                "Error 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
+    }
+
+    /// Issue #294: handler が `invalid_subscription` 系の Err を返したら、
+    /// `ServerMessage::Error { code: "invalid_subscription" }` を返す。
+    /// validate 失敗 (HTTPS 以外 / base64url 違反 等) の代表経路。
+    #[tokio::test]
+    async fn issue294_push_subscribe_handler_error_returns_invalid_subscription() {
+        let mock = MockPushHandler::new(Err("endpoint must be an http(s) URL".to_string()));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_push = Some(mock.clone() as Arc<dyn PwaPushHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::PushSubscribe {
+                endpoint: "ftp://bad/p".into(),
+                keys: PushSubscribeKeys {
+                    p256dh: "BPq".into(),
+                    auth: "AAAA".into(),
+                },
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "invalid_subscription");
+            }
+            other => panic!(
+                "Error 期待: matched_reply={}",
+                matches!(other, SessionAction::Reply(_))
+            ),
+        }
     }
 }

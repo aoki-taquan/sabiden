@@ -24,6 +24,7 @@ import {
   loadToken,
   saveSignalUrl,
 } from "./lib/storage";
+import { enablePushNotifications } from "./lib/push";
 
 /**
  * View 状態 (Issue #142): `login` は再ログイン理由 `reason` を optional で
@@ -72,6 +73,14 @@ export const App: Component = () => {
     return remaining > 0 ? remaining : null;
   };
   let countdownTimer: number | undefined;
+
+  /**
+   * Issue #294: PWA Web Push 機能の状態。
+   * - `pushAvailable`: backend が VAPID 公開鍵を返す (= 機能有効) かを起動時 probe
+   * - `pushSubscribed`: 現在 push subscription を持っている (= 通知が来る) か
+   */
+  const [pushAvailable, setPushAvailable] = createSignal(false);
+  const [pushSubscribed, setPushSubscribed] = createSignal(false);
 
   let signaling: SignalingClient | null = null;
   let call: WebRtcCall | null = null;
@@ -232,6 +241,12 @@ export const App: Component = () => {
         setView((v) => (v.kind === "call" ? { ...v, state: "ended", stream: null } : v));
         teardownCall();
         break;
+      case "pushsubscribed":
+        // Issue #294: backend が push 購読登録を受理した。 UI 上の「通知 ON」
+        // 状態をサーバ側 ack で確定させる (= browser 内 race で button が
+        // 一瞬戻るのを防ぐ defensive update)。
+        setPushSubscribed(true);
+        break;
     }
   };
 
@@ -383,6 +398,19 @@ export const App: Component = () => {
     const hashTok = consumeTokenFromHash();
     const stored = hashTok ?? loadToken();
     if (stored) await connect(stored);
+
+    // Issue #294: backend が VAPID 公開鍵を配信できるか (= [push] enabled で
+    // 鍵が設定されている) を probe する。 200 OK なら機能有効、 503 なら無効
+    // (= ボタン非表示)。 失敗時は機能無効に倒す (= 既存挙動完全互換)。
+    try {
+      const res = await fetch("/api/push/vapid-public-key", {
+        method: "GET",
+        credentials: "same-origin",
+      });
+      setPushAvailable(res.ok);
+    } catch (_e) {
+      setPushAvailable(false);
+    }
   });
 
   onCleanup(() => {
@@ -394,6 +422,29 @@ export const App: Component = () => {
 
   const handleLogin = async (tok: string) => {
     await connect(tok);
+  };
+
+  /**
+   * Issue #294: 通知有効化ボタン押下時のハンドラ。
+   * Service Worker 登録 + `Notification.requestPermission()` +
+   * `PushManager.subscribe` + WS `pushsubscribe` 送信を直列実行する。
+   * 失敗は status text に出す (UI は disable せず再試行可能)。
+   */
+  const handleEnablePush = async () => {
+    if (!signaling) {
+      setStatus("通知有効化失敗: 未接続");
+      return;
+    }
+    try {
+      const endpoint = await enablePushNotifications(signaling, "");
+      console.info("push subscription registered", endpoint);
+      setPushSubscribed(true);
+      setStatus("通知を有効化しました");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("enable push failed", msg);
+      setStatus(`通知有効化失敗: ${msg}`);
+    }
   };
 
   const handleLogout = () => {
@@ -548,6 +599,8 @@ export const App: Component = () => {
           status={status()}
           statusOk={statusOk()}
           rateLimitedSeconds={rateLimitedSeconds()}
+          onEnablePush={pushAvailable() ? handleEnablePush : undefined}
+          pushSubscribed={pushSubscribed()}
         />
       </Match>
       <Match when={view().kind === "call"}>

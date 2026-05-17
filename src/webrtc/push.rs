@@ -320,7 +320,9 @@ impl From<WebPushError> for PushSendError {
         // (= 暗号生成失敗等は 5xx 相当) または rejected (= 不正な鍵) に
         // 振り分ける。
         match e {
-            WebPushError::EndpointNotValid | WebPushError::EndpointNotFound => PushSendError::Gone,
+            WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_) => {
+                PushSendError::Gone
+            }
             WebPushError::InvalidCryptoKeys
             | WebPushError::InvalidPackageName
             | WebPushError::InvalidTtl
@@ -365,8 +367,8 @@ impl PushNotifier for WebPushNotifier {
         // 含む JWT。 `from_pem` で都度署名するのは web-push crate の API 設計上
         // やむを得ない (PartialVapidSignatureBuilder から add_sub_info する手も
         // ある)。
-        let mut sig_builder =
-            VapidSignatureBuilder::from_pem(self.keys.pem_cursor(), &info).map_err(|e| {
+        let mut sig_builder = VapidSignatureBuilder::from_pem(self.keys.pem_cursor(), &info)
+            .map_err(|e| {
                 PushSendError::Rejected(format!("VAPID PEM 再パース失敗 (config を確認): {e}"))
             })?;
         // RFC 8292 §2.1.1 `sub` claim。
@@ -375,9 +377,8 @@ impl PushNotifier for WebPushNotifier {
             .build()
             .map_err(|e| PushSendError::Rejected(format!("VAPID signature build: {e}")))?;
 
-        let body = serde_json::to_vec(payload).map_err(|e| {
-            PushSendError::Rejected(format!("payload JSON serialize 失敗: {e}"))
-        })?;
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| PushSendError::Rejected(format!("payload JSON serialize 失敗: {e}")))?;
         let mut builder = WebPushMessageBuilder::new(&info);
         // RFC 8030 §5.2: TTL (秒)。 着信通知は短く保つ (5 分 = 300 秒)。
         // それを超えて未配送なら通話は既に終わっている可能性が高い。
@@ -390,6 +391,31 @@ impl PushNotifier for WebPushNotifier {
         let msg = builder.build().map_err(PushSendError::from)?;
         self.client.send(msg).await.map_err(PushSendError::from)?;
         Ok(())
+    }
+}
+
+/// signaling 層 [`crate::webrtc::signaling::PwaPushHandler`] の本番実装。
+///
+/// `ClientMessage::PushSubscribe` を受領した signaling 層が本 trait 経由で
+/// AOR + endpoint + keys を渡すと、 内部の [`PushSubscriptionStore`] に upsert
+/// する。 validate は [`PushSubscription::validate`] (HTTPS / base64url / 空鍵
+/// 検査) に委譲する。
+#[async_trait]
+impl crate::webrtc::signaling::PwaPushHandler for PushSubscriptionStore {
+    async fn upsert_subscription(
+        &self,
+        aor: &str,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> Result<()> {
+        let sub = PushSubscription {
+            endpoint: endpoint.to_string(),
+            p256dh: p256dh.to_string(),
+            auth: auth.to_string(),
+        };
+        // store.upsert は validate を内部で呼ぶ (HTTPS / base64url / 空鍵検査)。
+        self.upsert(aor, sub).await
     }
 }
 
@@ -624,9 +650,9 @@ mod tests {
         //
         // 以下は本テスト専用の使い捨て鍵。 production secret ではない。
         const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRG-cuYUu62Fc44CT\n\
-0OdiP_-8KqIvYBn9bdpC6OEKpEKhRANCAAS56_8FBaaTwjI3O2RDIhxObmnaVrol\n\
-JKEJgUxKMNUAfDpsa6tT1HXi6gp_TZx1OqExglCw0XEdoNUtCi2VrLZh\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgb2gYuG8JTWzkrOXL\n\
+Ysmtx3EJ1admqAJc8UwOexy1MFKhRANCAAQtqZ42q5xPHcPSMGdo7DdS9vaFSB4w\n\
+QdPnU3DA4y5ptWiM3WQVvw8Xvk6BWnZcrNr1fh1uP9V/w+CG76Ya0gKP\n\
 -----END PRIVATE KEY-----\n";
         let keys = VapidKeys::from_pem(TEST_PEM, "mailto:test@example.com").unwrap();
         assert_eq!(keys.subject(), "mailto:test@example.com");

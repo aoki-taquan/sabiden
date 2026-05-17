@@ -35,6 +35,7 @@ use crate::call::recording::CallRecorder;
 use crate::call::voicemail::{sanitize_id, VoicemailRecorder};
 use crate::observability::call_log::CallLog;
 use crate::observability::Metrics;
+use crate::webrtc::push::VapidKeys;
 use crate::webrtc::signaling::{signal_ws_handler, SignalingState};
 
 /// `GET /api/call-log/recent?n=20` のクエリパラメータ (Issue #278)。
@@ -66,6 +67,11 @@ pub struct HealthState {
     /// `/api/recording/*` は 503 Service Unavailable を返す (voicemail と
     /// 別 path + 別 storage_dir)。
     pub recording: Option<Arc<CallRecorder>>,
+    /// Issue #294: VAPID 公開鍵 (RFC 8292) を PWA に配信する。 PWA は
+    /// `PushManager.subscribe({ applicationServerKey })` の引数として使う。
+    /// `None` の場合 `/api/push/vapid-public-key` は 503 Service Unavailable
+    /// を返す (= push 機能無効 / VAPID 鍵未設定)。
+    pub vapid_keys: Option<Arc<VapidKeys>>,
 }
 
 impl HealthState {
@@ -76,6 +82,7 @@ impl HealthState {
             call_log,
             voicemail: None,
             recording: None,
+            vapid_keys: None,
         }
     }
 
@@ -88,6 +95,13 @@ impl HealthState {
     /// Issue #296: active call recording recorder を attach する。
     pub fn with_recording(mut self, recorder: Arc<CallRecorder>) -> Self {
         self.recording = Some(recorder);
+        self
+    }
+
+    /// Issue #294: VAPID 公開鍵 (RFC 8292) を attach する builder 風メソッド。
+    /// `GET /api/push/vapid-public-key` で公開する。
+    pub fn with_vapid(mut self, keys: Arc<VapidKeys>) -> Self {
+        self.vapid_keys = Some(keys);
         self
     }
 }
@@ -111,6 +125,7 @@ pub fn router(state: HealthState) -> Router {
         // transcript 不在 (= まだ生成されていない / backend disable) は 404。
         .route("/api/voicemail/:id/transcript", get(voicemail_transcript))
         .route("/api/recording/:id/transcript", get(recording_transcript))
+        .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .with_state(state)
 }
 
@@ -410,6 +425,29 @@ async fn recording_delete(State(state): State<HealthState>, Path(id): Path<Strin
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
         }
     }
+}
+
+/// Issue #294: `GET /api/push/vapid-public-key` — VAPID 公開鍵を PWA に配信。
+///
+/// PWA Service Worker は `PushManager.subscribe({ userVisibleOnly: true,
+/// applicationServerKey: <ここで返す値を decode した Uint8Array> })` で使う。
+/// RFC 8292 §3.2: 公開鍵は uncompressed P-256 (= 65 byte) を base64url
+/// (no padding) で encode したものを返す。
+///
+/// `[push] enabled = false` / VAPID 鍵未設定なら 503 Service Unavailable。
+async fn push_vapid_public_key(State(state): State<HealthState>) -> Response {
+    let Some(keys) = state.vapid_keys.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "push disabled or VAPID keys missing\n",
+        )
+            .into_response();
+    };
+    let body = serde_json::json!({
+        "publicKey": keys.public_key_b64url(),
+        "subject": keys.subject(),
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[cfg(test)]

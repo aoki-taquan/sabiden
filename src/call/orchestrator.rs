@@ -127,7 +127,7 @@ use crate::sip::uas::{ResponderHandle, UasEvent};
 use crate::webrtc::peer::PeerSession;
 use crate::webrtc::signaling::{
     HoldError, PendingAnswers, PwaDtmfHandler, PwaHoldHandler, PwaInboundCloser, PwaOutboundCloser,
-    PwaOutboundHandler, PwaOutboundOutcome, ServerMessage, WsSink,
+    PwaOutboundHandler, PwaOutboundOutcome, PwaSmsHandler, ServerMessage, SmsSendOutcome, WsSink,
 };
 
 /// RFC 3261 §8.2.1 / §20.5: 405 / 489 / 481 等の拒否応答に必ず添える
@@ -918,6 +918,11 @@ pub struct NgnInboundHandler {
     /// `set_push` から注入する。 `Arc<dyn PushNotifier>` で抽象化し、 test
     /// では `MockPushNotifier` を差し込める設計 (push.rs § tests)。
     push_notifier: Mutex<Option<Arc<dyn super::super::webrtc::push::PushNotifier>>>,
+    /// Issue #299: 受信した MESSAGE 本文を保存する ring buffer (RFC 3428 §7)。
+    /// NGN inbound では carrier IMS 由来の即時メッセージ (例: SMS over IMS) を
+    /// store する。 未注入なら従来通り body 破棄で 200 OK のみ返す。
+    /// `set_call_log` と同じ pattern (`Mutex<Option<_>>`、 Arc::clone 後 setter)。
+    message_log: Mutex<Option<Arc<super::message_log::MessageLog>>>,
 }
 
 impl NgnInboundHandler {
@@ -958,6 +963,7 @@ impl NgnInboundHandler {
             recording_recorder: Mutex::new(None),
             push_store: Mutex::new(None),
             push_notifier: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -1008,6 +1014,7 @@ impl NgnInboundHandler {
             recording_recorder: Mutex::new(None),
             push_store: Mutex::new(None),
             push_notifier: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -1043,6 +1050,7 @@ impl NgnInboundHandler {
             recording_recorder: Mutex::new(None),
             push_store: Mutex::new(None),
             push_notifier: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -1081,6 +1089,7 @@ impl NgnInboundHandler {
             recording_recorder: Mutex::new(None),
             push_store: Mutex::new(None),
             push_notifier: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -1136,6 +1145,19 @@ impl NgnInboundHandler {
     ) {
         let mut slot = self.recording_recorder.lock().await;
         *slot = Some(recorder);
+    }
+
+    /// Issue #299: SMS / MESSAGE 履歴 ring buffer を注入する (setter)。
+    /// `set_call_log` / `set_recording_recorder` と同じ pattern。 NGN 着 MESSAGE
+    /// (RFC 3428 §7) 受信時に body を抽出して push する。 未注入なら従来通り
+    /// 200 OK 受け流しのみ。
+    pub async fn set_message_log(self: &Arc<Self>, log: Arc<super::message_log::MessageLog>) {
+        *self.message_log.lock().await = Some(log);
+    }
+
+    /// 注入済 message_log の Arc clone (NGN 着 MESSAGE 経路から push する helper)。
+    async fn message_log_clone(&self) -> Option<Arc<super::message_log::MessageLog>> {
+        self.message_log.lock().await.clone()
     }
 
     /// Issue #296: 注入済 recording recorder の Arc clone (BYE 経路から呼ぶ
@@ -1429,13 +1451,24 @@ impl NgnInboundHandler {
             }
             // RFC 3428 §7: UAS が MESSAGE をサポートしないと判断した場合でも、
             // 200 OK で受け流すのが推奨される (UA が再送し続けるのを止める)。
-            // sabiden は MESSAGE の dispatch 経路を持たないが、 NGN 側で
-            // IMS 由来の即時メッセージが来た場合に再送ストームを避けるため
-            // 200 OK で素直に応答する (本文は破棄)。
+            //
+            // Issue #299: `message_log` 注入時は body を抽出して ring buffer に
+            // push する (RFC 3428 §10: text/plain;charset=utf-8 が IETF default)。
+            // 200 OK 自体は本文の利用可否に関わらず常に返す。
             SipMethod::Message => {
+                if let Some(log) = self.message_log_clone().await {
+                    if let Some(sms) = super::message_log::sms_from_inbound_message(&request) {
+                        log.push(sms);
+                    } else {
+                        debug!(
+                            call_id = ?request.headers.get("call-id"),
+                            "NGN 側 MESSAGE: text/plain でないため body 破棄 (RFC 3428 §10)"
+                        );
+                    }
+                }
                 debug!(
                     call_id = ?request.headers.get("call-id"),
-                    "NGN 側 MESSAGE: 200 OK で受け流し (RFC 3428 §7、 本文は破棄)"
+                    "NGN 側 MESSAGE: 200 OK (RFC 3428 §7)"
                 );
                 let mut tx = ServerTransaction::new(request, remote, self.socket.clone())?;
                 let mut resp = build_response_skeleton(tx.request(), 200, "OK");
@@ -3434,6 +3467,11 @@ pub struct UasEventHandler {
     /// 付随リソースを cleanup する責務。 `Mutex<Option<_>>` は `set_call_log` /
     /// `ext_inviter` と同じ pattern (spawn 後の注入を許す)。
     recording_recorder: Mutex<Option<Arc<super::recording::CallRecorder>>>,
+    /// Issue #299: 受信 / 送信 MESSAGE 履歴 ring buffer (RFC 3428)。 PWA から
+    /// `ClientMessage::SendSms` で送信する `Outbound` MESSAGE と、 NGN / 内線
+    /// から受信した `Inbound` MESSAGE をここに集約する。 未注入なら hook 全 no-op
+    /// (= 旧挙動: NGN 着 MESSAGE は 200 OK 受け流し、 PWA SMS 送信は不可)。
+    message_log: Mutex<Option<Arc<super::message_log::MessageLog>>>,
 }
 
 impl UasEventHandler {
@@ -3458,6 +3496,7 @@ impl UasEventHandler {
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -3500,6 +3539,7 @@ impl UasEventHandler {
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -3530,6 +3570,7 @@ impl UasEventHandler {
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -3626,6 +3667,18 @@ impl UasEventHandler {
         *self.ext_registrar.lock().await = Some(registrar);
     }
 
+    /// Issue #299: SMS 履歴 ring buffer を注入する (RFC 3428)。
+    /// `set_call_log` / `set_recording_recorder` と同じ pattern (Arc shared
+    /// 後でも setter で安全に embed)。
+    pub async fn set_message_log(self: &Arc<Self>, log: Arc<super::message_log::MessageLog>) {
+        *self.message_log.lock().await = Some(log);
+    }
+
+    /// 注入済 message_log の Arc clone (PWA SMS 送信経路から push する helper)。
+    async fn message_log_clone(&self) -> Option<Arc<super::message_log::MessageLog>> {
+        self.message_log.lock().await.clone()
+    }
+
     /// `OutboundCallRegistry` の参照を返す。`NgnInboundHandler` と共有するため、
     /// 同じ Arc を渡すことで NGN→内線方向の BYE が同じ通話エントリを引ける。
     pub fn registry(&self) -> Arc<OutboundCallRegistry> {
@@ -3657,6 +3710,7 @@ impl UasEventHandler {
             ext_inviter: Mutex::new(None),
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
+            message_log: Mutex::new(None),
         })
     }
 
@@ -6222,6 +6276,79 @@ impl PwaHoldHandler for UasEventHandler {
 /// 対象 `call_id` が `webrtc_outbound_active` に無い場合 (= 当該ハンドラが
 /// 知らない通話 / 既に終了 / NGN→PWA 着信通話) は `Ok(false)` を返し、
 /// 上位 composite handler に inbound 経路の lookup を委ねる。
+#[async_trait::async_trait]
+/// Issue #299: PWA → NGN SMS 送出ハンドラ実装 (RFC 3428 §4)。
+///
+/// `UasEventHandler` の `ngn_uac` で MESSAGE を組み立て、 P-CSCF 直送で 200 OK
+/// を待つ。 ロジックは:
+///
+/// 1. `to` を `is_valid_pwa_dial_target` で再検証 (defense in depth、 signaling
+///    層と同じホワイトリスト)。
+/// 2. P-CSCF IP+port を host に補い Request-URI を組み立て、
+///    `normalize_request_uri_for_ngn` で正規化 (NGN 制約: Request-URI host =
+///    P-CSCF IP+port、 `docs/asterisk-real-invite.md` §5.1)。
+/// 3. `ngn_uac.build_message` + `send_message` で 200 OK / 4xx 等の final response
+///    を取得する (RFC 3428 §7、 dialog 無し)。
+/// 4. 履歴 (message_log) に Outbound entry を push (注入済の場合のみ)。
+///
+/// rate limiter は **使わない**: SMS は INVITE のような session establishment
+/// ではなく単発 request (RFC 3428 §4) で carrier 上の cost も低い。 必要に応じて
+/// 後続 issue で SMS 専用 rate limiter を入れる。
+#[async_trait::async_trait]
+impl PwaSmsHandler for UasEventHandler {
+    async fn send_sms(&self, to: &str, body: &str) -> Result<SmsSendOutcome> {
+        // (a) defense-in-depth: signaling 層と同じホワイトリストで再検証する。
+        //     trait 経由でテスト / 別経路から呼ばれた場合に違反入力を NGN まで
+        //     運ばないため。
+        if !is_valid_pwa_dial_target(to) {
+            return Err(anyhow!(
+                "invalid SMS target charset (defense-in-depth assert): {:?}",
+                to.escape_default().to_string()
+            ));
+        }
+
+        // (b) Request-URI 組み立て (`docs/asterisk-real-invite.md` §5.1、
+        //     NGN 制約: Request-URI host = P-CSCF IP+port)。
+        let ngn_server = self.ngn_uac.server_addr();
+        let raw_uri = format!("sip:{}@{}:{}", to, ngn_server.ip(), ngn_server.port());
+        let target_uri = normalize_request_uri_for_ngn(
+            &raw_uri,
+            &ngn_server.ip().to_string(),
+            ngn_server.port(),
+        );
+
+        // (c) MESSAGE build & send (RFC 3428 §4 / §7)。
+        let plan = self.ngn_uac.build_message(&target_uri, body);
+        let resp = self
+            .ngn_uac
+            .send_message(plan)
+            .await
+            .map_err(|e| anyhow!("MESSAGE 送出失敗: {}", e))?;
+        let status = resp.status_code;
+
+        // (d) Outbound entry を message_log に push (注入時のみ)。
+        //     RFC 3428 §7 受領 ack (2xx) でない場合も「送信試行ログ」として
+        //     残す: PWA UI が「sent / rejected」を区別できる。
+        if let Some(log) = self.message_log_clone().await {
+            // From / To は sabiden 側の AOR / 入力 target を反映する。
+            // 表示用 URI へ整形は PWA 側の責務 (本 ring buffer は観測ログ)。
+            let from = self.ngn_uac.config().local_addr_of_record().to_string();
+            log.push(super::message_log::SmsMessage::new_now(
+                super::message_log::Direction::Outbound,
+                from,
+                target_uri.clone(),
+                body.to_string(),
+            ));
+        }
+
+        if (200..300).contains(&status) {
+            Ok(SmsSendOutcome::Sent { status })
+        } else {
+            Ok(SmsSendOutcome::Rejected { status })
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl PwaDtmfHandler for UasEventHandler {
     async fn inject_dtmf_to_ngn(&self, call_id: &str, digit: char) -> Result<bool> {
@@ -12891,6 +13018,7 @@ mod tests {
             recording_recorder: Mutex::new(None),
             push_store: Mutex::new(None),
             push_notifier: Mutex::new(None),
+            message_log: Mutex::new(None),
         });
         // inbound_rx は不要 (今回 INVITE 経路は走らせず webrtc_active を直接操作する)
         drop(sabiden_inbound_rx);

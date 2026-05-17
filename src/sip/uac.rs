@@ -253,6 +253,133 @@ impl Uac {
         }
     }
 
+    /// `MESSAGE` リクエストを組み立てる (RFC 3428 §4)。
+    ///
+    /// # RFC 3428 §4 (MESSAGE method)
+    ///
+    /// > "The MESSAGE method is an extension to the Session Initiation
+    /// >  Protocol (SIP) that allows the transfer of instant messages.
+    /// >  ... A MESSAGE request MAY be sent within a dialog or outside a
+    /// >  dialog. ... The body of the message MUST be carried as a MIME
+    /// >  attachment, with a corresponding Content-Type header field."
+    ///
+    /// 本実装は **dialog 外の単発 MESSAGE** を組み立てる (RFC 3428 §4 / §7:
+    /// MESSAGE は in-dialog でも使えるが、 SMS-like の pager mode が主用途で
+    /// dialog を張らないのが一般的)。 そのため戻り値は [`MessagePlan`] であり
+    /// `Dialog` ではない。
+    ///
+    /// # ヘッダ規約 (RFC 3428 §4 + §6)
+    ///
+    /// - `Via` / `From` / `To` / `Call-ID` / `CSeq` / `Max-Forwards`: SIP common
+    ///   (RFC 3261 §8.1.1)。 `Call-ID` は per-message 新規 (dialog 無し)。
+    /// - `From` tag は MUST (RFC 3261 §8.1.1.3)。 `To` tag は **付けない**
+    ///   (RFC 3261 §8.1.1.2: out-of-dialog request では To-tag 不在)。
+    /// - `Contact`: RFC 3428 §6 では MUST ではないが、 carrier UA に応答ルートを
+    ///   伝えるため `INVITE` と同じ contact_uri で広告する。
+    /// - `Content-Type`: text/plain;charset=utf-8 (RFC 3428 §10 推奨 IETF default)。
+    /// - `Content-Length`: `to_bytes` が自動付与 (`SipRequest::to_bytes`)。
+    /// - `Route`: REGISTER 200 OK の Service-Route または outbound_proxy を echo
+    ///   (RFC 3608 §3.2、 INVITE と共通)。
+    /// - `Expires`: 付けない (RFC 3428 §6 ではオプション; pager-mode で TTL を
+    ///   切る用途のみ。 sabiden は即配送前提なので未指定 = recipient policy)。
+    ///
+    /// # `P-Preferred-Identity` / `Privacy`
+    ///
+    /// INVITE と同様に **付けない** (`docs/asterisk-real-invite.md` §5.3 / NGN
+    /// 実機証拠)。 RFC 3325 由来の IMS ヘッダは Asterisk pcap でも無しで通る。
+    ///
+    /// # CSeq
+    ///
+    /// 新規 Call-ID なので CSeq=1 から始める (RFC 3261 §8.1.1.5、 INVITE と同様
+    /// に dialog 外で番号空間がリセットされる、 `build_invite` の docstring 参照)。
+    ///
+    /// # 引数
+    /// - `target_uri`: 宛先 SIP URI (例 `"sip:117@118.177.125.1:5060"`)。 NGN
+    ///   宛なら呼出側 (orchestrator) が `normalize_request_uri_for_ngn` で正規化
+    ///   済 (Request-URI = P-CSCF IP+port、 To URI = identity)。
+    /// - `body`: text/plain UTF-8 本文。 RFC 3428 §10 上限は recipient policy 依存
+    ///   (本実装は呼出側で truncation を行う前提、 strict な byte 上限は持たない)。
+    pub fn build_message(&self, target_uri: &str, body: &str) -> MessagePlan {
+        // RFC 3261 §8.1.1.5: 新規 Call-ID では CSeq=1 から。
+        let cseq = 1u32;
+        let call_id = new_call_id();
+        let local_tag = new_tag();
+        let branch = new_branch();
+
+        let mut req = SipRequest::new(SipMethod::Message, target_uri.to_string());
+        // RFC 3581 / Asterisk 実機準拠: Via に `;rport` (INVITE と同形)。
+        req.headers.set(
+            "Via",
+            format!(
+                "SIP/2.0/UDP {};rport;branch={}",
+                self.config.sent_by(),
+                branch
+            ),
+        );
+        req.headers.set("Max-Forwards", "70");
+        // From: display-name "Anonymous" + tag。 INVITE と揃える (Asterisk 互換)。
+        req.headers.set(
+            "From",
+            format!(
+                "\"Anonymous\" <{}>;tag={}",
+                self.config.local_addr_of_record(),
+                local_tag
+            ),
+        );
+        // RFC 3261 §8.1.1.2: out-of-dialog request → To-tag 不在。 identity only。
+        let to_uri = strip_port_from_sip_uri(target_uri);
+        req.headers.set("To", format!("<{}>", to_uri));
+        req.headers.set("Call-ID", &call_id);
+        // RFC 3261 §8.1.1.5: CSeq の method は request method と一致。
+        req.headers.set("CSeq", format!("{} MESSAGE", cseq));
+        // RFC 3428 §6: Contact は MUST ではないが INVITE と揃えて常時広告。
+        req.headers
+            .set("Contact", format!("<{}>", self.config.contact_uri()));
+        // RFC 3261 §20.5: Allow には UA が実装する method を列挙 (INVITE で
+        // 宣言したものと整合)。
+        req.headers
+            .set("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE");
+        // RFC 3608 §3.2: Service-Route / outbound_proxy を Route として echo
+        // (INVITE と共通)。
+        let route_value =
+            crate::sip::current_outbound_proxy_route().or_else(crate::sip::current_service_route);
+        if let Some(route) = route_value {
+            req.headers.set("Route", &route);
+        }
+        req.headers.set("User-Agent", &self.config.user_agent);
+        // RFC 3428 §10: Content-Type は text/plain;charset=utf-8 が IETF 推奨。
+        req.headers.set("Content-Type", "text/plain;charset=utf-8");
+        req.body = body.as_bytes().to_vec();
+
+        MessagePlan {
+            request: req,
+            cseq,
+            target_uri: target_uri.to_string(),
+            call_id,
+        }
+    }
+
+    /// `MESSAGE` を送信し最終応答を待つ (RFC 3428 §7)。
+    ///
+    /// RFC 3428 §7: 受信側の応答は `200 OK` (受領 ack) もしくは 4xx/5xx/6xx
+    /// (例 480 Temporarily Unavailable / 486 Busy Here / 487 Request
+    /// Terminated)。 戻り値はそのまま `SipResponse` を返し、 呼出側 (orchestrator
+    /// / REST API ハンドラ) が `status_code` で成否を判定する。
+    ///
+    /// dialog を作らない (RFC 3428 §4 「outside a dialog」 が一般的) ため、
+    /// `invite` のような `Dialog` 構築や ACK 送信は **行わない**。
+    pub async fn send_message(&self, plan: MessagePlan) -> Result<SipResponse> {
+        let request = plan.request.clone();
+        let response = self.layer.send_request(request, self.server_addr).await?;
+        debug!(
+            code = response.status_code,
+            target = %plan.target_uri,
+            call_id = %plan.call_id,
+            "MESSAGE 最終応答"
+        );
+        Ok(response)
+    }
+
     /// INVITE → 最終応答までを駆動する。
     ///
     /// 戻り値:
@@ -589,6 +716,19 @@ pub struct InvitePlan {
     pub cseq: u32,
     pub target_uri: String,
     pub session_expires: u32,
+}
+
+/// 構築済み `MESSAGE` リクエスト (RFC 3428 §4) とそのメタデータ。
+///
+/// dialog を張らない (RFC 3428 §4 / §7) ので `session_expires` を持たない。
+/// `call_id` は per-message 新規発行 (= `new_call_id`)、 観測 / 履歴突合用に
+/// 公開する。
+#[derive(Debug, Clone)]
+pub struct MessagePlan {
+    pub request: SipRequest,
+    pub cseq: u32,
+    pub target_uri: String,
+    pub call_id: String,
 }
 
 /// INVITE 結果。
@@ -963,6 +1103,144 @@ mod tests {
         );
         assert_eq!(cancel.headers.get("cseq").unwrap(), "5 CANCEL");
         assert_eq!(cancel.headers.get("call-id").unwrap(), "cidA");
+    }
+
+    /// RFC 3428 §4 / §10: `build_message` の最小要件確認。
+    ///
+    /// - Request-URI = target、 method = MESSAGE
+    /// - From に tag、 To には tag 無し (out-of-dialog)
+    /// - Call-ID は per-message 新規 (空文字でない)
+    /// - CSeq = `1 MESSAGE`
+    /// - Content-Type = text/plain;charset=utf-8 (RFC 3428 §10 推奨)
+    /// - body は UTF-8 で格納
+    /// - Via に `;rport` (RFC 3581 / Asterisk 互換)
+    /// - PPI / Privacy は **付けない** (CLAUDE.md §5 NGN 制約)
+    #[tokio::test]
+    async fn rfc3428_4_build_message_assembles_pager_mode_request() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(socket);
+        let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let uac = Uac::new(cfg(), layer, server);
+
+        let plan = uac.build_message("sip:117@118.177.125.1:5060", "hello world");
+        let req = &plan.request;
+        // method + URI
+        assert_eq!(req.method, SipMethod::Message);
+        assert_eq!(req.uri, "sip:117@118.177.125.1:5060");
+        // From: tag 付き (RFC 3261 §8.1.1.3)
+        let from = req.headers.get("from").expect("From");
+        assert!(from.contains(";tag="), "From は tag 必須: {}", from);
+        // To: tag 無し (RFC 3261 §8.1.1.2 out-of-dialog)
+        let to = req.headers.get("to").expect("To");
+        assert!(
+            !to.contains(";tag="),
+            "To は tag 不可 (out-of-dialog): {}",
+            to
+        );
+        // Call-ID: 非空
+        let call_id = req.headers.get("call-id").expect("Call-ID");
+        assert!(!call_id.is_empty());
+        assert_eq!(plan.call_id, call_id);
+        // CSeq: `1 MESSAGE` (RFC 3261 §8.1.1.5)
+        assert_eq!(req.headers.get("cseq"), Some("1 MESSAGE"));
+        assert_eq!(plan.cseq, 1);
+        // Content-Type: RFC 3428 §10 推奨
+        assert_eq!(
+            req.headers.get("content-type"),
+            Some("text/plain;charset=utf-8")
+        );
+        // Body は UTF-8 で格納
+        assert_eq!(req.body, b"hello world");
+        // Via に rport
+        let via = req.headers.get("via").expect("Via");
+        assert!(via.contains(";rport"), "Via に rport 必須: {}", via);
+        // PPI / Privacy は付けない (Asterisk 実機証拠、 CLAUDE.md §5)
+        assert!(req.headers.get("p-preferred-identity").is_none());
+        assert!(req.headers.get("privacy").is_none());
+        // Contact 広告 (RFC 3428 §6)
+        let contact = req.headers.get("contact").expect("Contact");
+        assert!(contact.contains("sip:0312345678@"));
+        // RFC 3261 §20.5 Allow に MESSAGE が含まれる
+        let allow = req.headers.get("allow").expect("Allow");
+        assert!(allow.contains("MESSAGE"));
+    }
+
+    /// RFC 3428 §4 / §8.1.1.2: To URI には port を入れない (identity)、
+    /// Request-URI には P-CSCF 直送のため port を保持する。 INVITE と同じ shape
+    /// (`rfc3261_8_1_1_2_to_uri_drops_port_request_uri_keeps_port` を踏襲)。
+    #[tokio::test]
+    async fn rfc3428_4_to_uri_drops_port_request_uri_keeps_port() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(socket);
+        let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let uac = Uac::new(cfg(), layer, server);
+        let plan = uac.build_message("sip:117@118.177.125.1:5060", "hi");
+        assert!(
+            plan.request.uri.contains(":5060"),
+            "Request-URI には port 保持 (P-CSCF 直送): {}",
+            plan.request.uri
+        );
+        let to = plan.request.headers.get("to").expect("To");
+        assert!(
+            !to.contains(":5060"),
+            "To URI から port を剥がす (RFC 3261 §8.1.1.2): {}",
+            to
+        );
+    }
+
+    /// RFC 3428 §10 / RFC 3261 §20.14: body の UTF-8 byte 長と Content-Length
+    /// (= `to_bytes` 出力に含まれる) が一致すること。 multibyte (= 日本語) でも
+    /// byte 単位の長さが Content-Length に反映される。
+    #[tokio::test]
+    async fn rfc3428_10_message_body_content_length_matches_utf8_bytes() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (layer, _rx) = TransactionLayer::spawn(socket);
+        let server: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let uac = Uac::new(cfg(), layer, server);
+
+        let body = "こんにちは"; // 5 文字 × 3 bytes = 15 bytes (UTF-8)
+        let plan = uac.build_message("sip:bob@example.test", body);
+        assert_eq!(plan.request.body.len(), body.len());
+        // to_bytes 経由で Content-Length が body 長と一致する。
+        let serialized = String::from_utf8(plan.request.to_bytes()).expect("UTF-8 serialize");
+        let expected_cl = format!("Content-Length: {}", body.len());
+        assert!(
+            serialized.contains(&expected_cl),
+            "Content-Length が body byte 長と一致すべき: expected {}, serialized {}",
+            expected_cl,
+            serialized
+        );
+    }
+
+    /// RFC 3428 §7: 送出された MESSAGE に対し 200 OK が返る経路を end-to-end で
+    /// 確認する。 fake server は MESSAGE を受信したら 200 OK を返すだけ。
+    /// `send_message` は dialog を作らず response をそのまま返す。
+    #[tokio::test]
+    async fn rfc3428_7_send_message_returns_200_ok_without_dialog() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let server_clone = server_sock.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, peer) = server_clone.recv_from(&mut buf).await.unwrap();
+            let parsed = crate::sip::message::parse_message(&buf[..n]).unwrap();
+            let SipMessage::Request(msg_req) = parsed else {
+                panic!("MESSAGE request expected");
+            };
+            assert_eq!(msg_req.method, SipMethod::Message);
+            assert_eq!(msg_req.body, b"hi");
+            let resp = crate::sip::transaction::build_response_skeleton(&msg_req, 200, "OK");
+            server_clone.send_to(&resp.to_bytes(), peer).await.unwrap();
+        });
+
+        let (layer, _rx) = TransactionLayer::spawn(client_sock);
+        let uac = Uac::new(cfg(), layer, server_addr);
+        let plan = uac.build_message("sip:bob@example.test", "hi");
+        let resp = uac.send_message(plan).await.expect("send_message");
+        assert_eq!(resp.status_code, 200);
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]

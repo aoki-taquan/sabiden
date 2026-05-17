@@ -506,6 +506,49 @@ pub trait PwaRecordHandler: Send + Sync {
     ) -> Result<RecordingStoppedInfo, RecordingControlError>;
 }
 
+/// SMS / RFC 3428 MESSAGE 送出ハンドラ (Issue #299)。
+///
+/// `ClientMessage::SendSms { to, body }` を受けたとき signaling 層が呼ぶ。
+/// 実装側 (本番は [`crate::call::orchestrator::UasEventHandler`]) は:
+///
+/// 1. `to` を NGN dial-target ホワイトリスト ([`is_valid_dial_target`]) で再検証
+///    (browser 改造 / 直 WS 接続による迂回防止、 OWASP A03:2021 Injection)。
+/// 2. P-CSCF IP+port を host に補い Request-URI を組み立てる
+///    (`docs/asterisk-real-invite.md` §5.1)。
+/// 3. [`crate::sip::uac::Uac::build_message`] で MESSAGE を組み立て、
+///    `send_message` で 200 OK を待つ (RFC 3428 §4 / §7、 dialog なし)。
+/// 4. 送信履歴を [`crate::call::message_log::MessageLog`] に push する
+///    (direction = Outbound)。 未注入なら hook は no-op、 status のみ
+///    [`SmsSendOutcome`] で返す。
+///
+/// # 戻り値
+///
+/// - `Ok(SmsSendOutcome::Sent { status })` : 200-299 が返って sabiden 内で
+///   accepted (RFC 3428 §7 受領 ack)。 PWA UI には `SmsSent` を返す。
+/// - `Ok(SmsSendOutcome::Rejected { status })` : 非 2xx 最終応答
+///   (例 480 / 486 / 500)。 PWA UI には `Error { code = "sms_rejected" }` を返す。
+/// - `Err(_)`: I/O / 構築失敗。 PWA UI には `Error { code = "sms_failed" }`。
+#[async_trait::async_trait]
+pub trait PwaSmsHandler: Send + Sync {
+    /// PWA → NGN / 内線 SMS 送出を駆動する。 詳細は trait docstring。
+    async fn send_sms(&self, to: &str, body: &str) -> Result<SmsSendOutcome>;
+}
+
+/// [`PwaSmsHandler::send_sms`] の結果 (Issue #299)。
+#[derive(Debug, Clone)]
+pub enum SmsSendOutcome {
+    /// 2xx (= RFC 3428 §7 受領 ack)。 PWA UI には `SmsSent` を返す。
+    Sent {
+        /// 受信した final response status (200 / 202 等)。
+        status: u16,
+    },
+    /// 非 2xx 最終応答。 PWA UI には `Error { code = "sms_rejected" }`。
+    Rejected {
+        /// 受信した final response status (例 480 / 486 / 500)。
+        status: u16,
+    },
+}
+
 /// recording 開始成功時の戻り値 (Issue #296)。
 #[derive(Debug, Clone)]
 pub struct RecordingStartedInfo {
@@ -657,6 +700,9 @@ pub struct SignalingState {
     /// を返す。 production では [`crate::webrtc::push::PushSubscriptionStore`]
     /// に書き込む impl を `Arc::clone` で渡す。
     pub pwa_push: Option<Arc<dyn PwaPushHandler>>,
+    /// SMS / RFC 3428 MESSAGE 送出 (Issue #299)。 `ClientMessage::SendSms`
+    /// 受信時に呼ぶ。 `None` なら `code:"sms_unavailable"` で拒否。
+    pub pwa_sms: Option<Arc<dyn PwaSmsHandler>>,
 }
 
 impl SignalingState {
@@ -680,6 +726,7 @@ impl SignalingState {
             pwa_dtmf: None,
             pwa_record: None,
             pwa_push: None,
+            pwa_sms: None,
         }
     }
 
@@ -740,6 +787,12 @@ impl SignalingState {
     /// `PushStoreHandler` (本 module) を `Arc` で渡す。
     pub fn with_pwa_push(mut self, h: Arc<dyn PwaPushHandler>) -> Self {
         self.pwa_push = Some(h);
+        self
+    }
+
+    /// SMS / RFC 3428 MESSAGE 送出ハンドラを差し込む (Issue #299)。
+    pub fn with_pwa_sms(mut self, h: Arc<dyn PwaSmsHandler>) -> Self {
+        self.pwa_sms = Some(h);
         self
     }
 }
@@ -875,6 +928,22 @@ pub enum ClientMessage {
         endpoint: String,
         keys: PushSubscribeKeys,
     },
+    /// Issue #299: PWA → 宛先 SMS 送出 (RFC 3428 §4 / §10)。
+    ///
+    /// `to` は宛先 (例 `"117"` / `"0312345678"`)。 sabiden 側で
+    /// [`is_valid_dial_target`] でホワイトリスト検証 + P-CSCF IP+port を host に
+    /// 補完する (= dial-pad と同等のセキュリティ境界)。 `body` は text/plain
+    /// UTF-8 (RFC 3428 §10、 char 数上限は受信側 policy 依存だが本実装は
+    /// 1024 byte で打ち切る、 `process_client_message` 側で truncate)。
+    ///
+    /// 成功時は `ServerMessage::SmsSent { status }` (200 受領 ack 等)。
+    /// NGN UA が拒否した場合 (480 / 486 等) は `Error { code:"sms_rejected" }`、
+    /// 機能未配線 (= NGN UAC 無し構成 / `pwa_sms = None`) は
+    /// `Error { code:"sms_unavailable" }`、 I/O 失敗は `Error { code:"sms_failed" }`。
+    SendSms {
+        to: String,
+        body: String,
+    },
     Bye,
 }
 
@@ -945,6 +1014,12 @@ pub enum ServerMessage {
     /// 要求時の同値を echo (= browser 側 idempotency 判定材料)。
     PushSubscribed {
         endpoint: String,
+    },
+    /// Issue #299: SMS 送出成功通知 (RFC 3428 §7 受領 ack)。 `status` は受領した
+    /// final response の status code (200 / 202 等)。 PWA UI は本 message を
+    /// 観測してメッセージタイムラインを「送信済」 表示にする。
+    SmsSent {
+        status: u16,
     },
     Bye,
 }
@@ -1936,6 +2011,67 @@ pub async fn process_client_message(
                         "invalid_subscription",
                         e.to_string(),
                     ))
+                }
+            }
+        }
+        ClientMessage::SendSms { to, body } => {
+            // Issue #299: PWA → NGN / 内線 SMS 送出 (RFC 3428 §4)。
+            //
+            // セキュリティ境界:
+            // 1. `to` は dial-pad と同じホワイトリスト ([`is_valid_dial_target`]) で
+            //    再検証する (browser 改造 / 直 WS 接続でも `Outbound INVITE と同じ
+            //    user 文法 (RFC 3261 §25.1) 範囲に絞る、 OWASP A03:2021)。
+            // 2. `body` は SIP MESSAGE-Length recommendation (RFC 3428 §8: 1300
+            //    bytes 以下を推奨) を踏まえ 1024 byte で切る。 carrier 側 policy
+            //    で長文 SMS は分割発信が一般的だが、 本実装は単発のみ (= 1 通分)。
+            // 3. ハンドラ未配線 (= `pwa_sms = None`) は機能無効として
+            //    `sms_unavailable` で拒否。
+            if !is_valid_dial_target(&to) {
+                debug!(target = %to, "SendSms: target ホワイトリスト違反 → 拒否");
+                return SessionAction::Reply(ServerMessage::error(
+                    "invalid_target",
+                    "SMS の宛先が無効",
+                ));
+            }
+            // RFC 3428 §8: aggregate request size SHOULD NOT exceed 1300 bytes
+            // unless the UA has positive knowledge that the network path can
+            // handle larger messages. body だけで 1024 byte に絞ることで、
+            // ヘッダ込みで通常 1300 byte 内に収まる安全圏に置く。
+            const SMS_BODY_MAX_BYTES: usize = 1024;
+            let body_trim = if body.len() > SMS_BODY_MAX_BYTES {
+                // UTF-8 boundary に切り戻して truncate (multibyte 中間で
+                // 切ると invalid UTF-8 になるため)。 floor_char_boundary
+                // は unstable なので手で実装。
+                let mut end = SMS_BODY_MAX_BYTES;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body[..end].to_string()
+            } else {
+                body
+            };
+            let Some(handler) = state.pwa_sms.as_ref() else {
+                debug!(target = %to, "SendSms: ハンドラ未配線 → sms_unavailable");
+                return SessionAction::Reply(ServerMessage::error(
+                    "sms_unavailable",
+                    "SMS 機能が無効",
+                ));
+            };
+            match handler.send_sms(&to, &body_trim).await {
+                Ok(SmsSendOutcome::Sent { status }) => {
+                    debug!(target = %to, status, "SendSms: 送出完了");
+                    SessionAction::Reply(ServerMessage::SmsSent { status })
+                }
+                Ok(SmsSendOutcome::Rejected { status }) => {
+                    warn!(target = %to, status, "SendSms: 相手側拒否");
+                    SessionAction::Reply(ServerMessage::error(
+                        "sms_rejected",
+                        format!("SMS が拒否されました (status={})", status),
+                    ))
+                }
+                Err(e) => {
+                    warn!(target = %to, error=%e, "SendSms: 送出失敗");
+                    SessionAction::Reply(ServerMessage::error("sms_failed", e.to_string()))
                 }
             }
         }
@@ -4722,6 +4858,41 @@ mod tests {
         }
     }
 
+    // ==================== Issue #299: SendSms tests ====================
+
+    /// Issue #299: `ClientMessage::SendSms` 観測テスト用 mock。
+    struct MockSmsHandler {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+        outcome: std::sync::Mutex<Result<SmsSendOutcome, String>>,
+    }
+
+    impl MockSmsHandler {
+        fn new(outcome: Result<SmsSendOutcome, String>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                outcome: std::sync::Mutex::new(outcome),
+            })
+        }
+
+        fn observed(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PwaSmsHandler for MockSmsHandler {
+        async fn send_sms(&self, to: &str, body: &str) -> Result<SmsSendOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((to.to_string(), body.to_string()));
+            match &*self.outcome.lock().unwrap() {
+                Ok(o) => Ok(o.clone()),
+                Err(s) => Err(anyhow::anyhow!(s.clone())),
+            }
+        }
+    }
+
     /// RFC 8030 §3 + RFC 8291 §4.1: `PushSubscribe` の JSON round-trip が
     /// `{endpoint, keys: {p256dh, auth}}` 形式で安定して動く。
     #[test]
@@ -4877,5 +5048,227 @@ mod tests {
                 matches!(other, SessionAction::Reply(_))
             ),
         }
+    }
+
+    /// Issue #299: RFC 3428 §7 で 200 OK が返れば `SmsSent { status }` を browser
+    /// に返す。 handler には正規化前の `to` / `body` がそのまま渡る (URI 補完は
+    /// handler 側責務)。
+    #[tokio::test]
+    async fn rfc3428_7_send_sms_dispatches_and_returns_smssent_on_200() {
+        let mock = MockSmsHandler::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_sms = Some(mock.clone() as Arc<dyn PwaSmsHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::SendSms {
+                to: "117".into(),
+                body: "hello".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::SmsSent { status }) => {
+                assert_eq!(status, 200);
+            }
+            _ => panic!("expected SmsSent"),
+        }
+        assert_eq!(
+            mock.observed(),
+            vec![("117".to_string(), "hello".to_string())]
+        );
+    }
+
+    /// Issue #299: handler が `Rejected` を返すと `Error { code: "sms_rejected" }`
+    /// を browser に返す (RFC 3428 §7 非 2xx 最終応答)。
+    #[tokio::test]
+    async fn rfc3428_7_send_sms_returns_sms_rejected_for_non_2xx() {
+        let mock = MockSmsHandler::new(Ok(SmsSendOutcome::Rejected { status: 486 }));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_sms = Some(mock.clone() as Arc<dyn PwaSmsHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::SendSms {
+                to: "117".into(),
+                body: "hi".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "sms_rejected");
+            }
+            _ => panic!("expected Error sms_rejected"),
+        }
+    }
+
+    /// Issue #299: 不正 target (= dial-pad 規格外) は handler を呼ばずに
+    /// `Error { code: "invalid_target" }` で拒否する (defense in depth、
+    /// OWASP A03:2021 Injection)。
+    #[tokio::test]
+    async fn issue299_send_sms_rejects_invalid_target_before_handler() {
+        let mock = MockSmsHandler::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_sms = Some(mock.clone() as Arc<dyn PwaSmsHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        for bad in ["117\r\nINJECT", "abc", "", "<script>", "../"] {
+            let action = process_client_message(
+                ClientMessage::SendSms {
+                    to: bad.into(),
+                    body: "hi".into(),
+                },
+                &state,
+                &claims,
+                &peer,
+                dummy_addr(),
+                &mut aor,
+                &sink,
+                &pending,
+            )
+            .await;
+            match action {
+                SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                    assert_eq!(code, "invalid_target");
+                }
+                _ => panic!("expected Error invalid_target for {:?}", bad),
+            }
+        }
+        assert!(
+            mock.observed().is_empty(),
+            "不正 target は handler に到達しない"
+        );
+    }
+
+    /// Issue #299: `pwa_sms` 未配線時 (= NGN UAC 無し構成 / `sms.enabled=false`)
+    /// は `Error { code: "sms_unavailable" }` で拒否。
+    #[tokio::test]
+    async fn issue299_send_sms_without_handler_returns_sms_unavailable() {
+        let (state, _reg) = make_state(b"k"); // pwa_sms = None
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        let action = process_client_message(
+            ClientMessage::SendSms {
+                to: "117".into(),
+                body: "hi".into(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        match action {
+            SessionAction::Reply(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, "sms_unavailable");
+            }
+            _ => panic!("expected sms_unavailable"),
+        }
+    }
+
+    /// Issue #299 / RFC 3428 §8: body が 1024 byte を超えると char_boundary で
+    /// truncate されてから handler に渡る (multibyte UTF-8 を中で割らない)。
+    #[tokio::test]
+    async fn rfc3428_8_send_sms_truncates_body_at_1024_bytes_on_char_boundary() {
+        let mock = MockSmsHandler::new(Ok(SmsSendOutcome::Sent { status: 200 }));
+        let (mut state, _reg) = make_state(b"k");
+        state.pwa_sms = Some(mock.clone() as Arc<dyn PwaSmsHandler>);
+
+        let claims = dummy_claims("alice");
+        let peer: Arc<dyn PeerSession> = StubPeerSession::new();
+        let mut aor: Option<String> = None;
+        let (sink, pending, _c, _kg) = ws_sink_and_recv();
+
+        // 「あ」 = 3 bytes (UTF-8)。 400 文字 = 1200 bytes (> 1024)。
+        let long: String = "あ".repeat(400);
+        let action = process_client_message(
+            ClientMessage::SendSms {
+                to: "117".into(),
+                body: long.clone(),
+            },
+            &state,
+            &claims,
+            &peer,
+            dummy_addr(),
+            &mut aor,
+            &sink,
+            &pending,
+        )
+        .await;
+        assert!(matches!(
+            action,
+            SessionAction::Reply(ServerMessage::SmsSent { .. })
+        ));
+        let observed = mock.observed();
+        assert_eq!(observed.len(), 1);
+        let truncated = &observed[0].1;
+        // truncate 後の byte 長は 1024 以下、 かつ valid UTF-8。
+        assert!(
+            truncated.len() <= 1024,
+            "truncated body must be <= 1024 bytes, got {}",
+            truncated.len()
+        );
+        // 「あ」 = 3 byte なので 1024 / 3 = 341 文字までは入る (= 1023 bytes)。
+        assert_eq!(truncated.chars().count(), 341);
+    }
+
+    /// Issue #299: `ClientMessage::SendSms` / `ServerMessage::SmsSent` の
+    /// JSON serde round-trip。
+    #[test]
+    fn issue299_send_sms_and_smssent_serde_round_trip() {
+        let m = ClientMessage::SendSms {
+            to: "0312345678".into(),
+            body: "hi".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"sendsms\""));
+        assert!(s.contains("\"to\":\"0312345678\""));
+        assert!(s.contains("\"body\":\"hi\""));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::SendSms { to, body } => {
+                assert_eq!(to, "0312345678");
+                assert_eq!(body, "hi");
+            }
+            _ => panic!("SendSms に decode されなかった"),
+        }
+
+        let sent = ServerMessage::SmsSent { status: 202 };
+        let s = serde_json::to_string(&sent).unwrap();
+        assert!(s.contains("\"type\":\"smssent\""));
+        assert!(s.contains("\"status\":202"));
     }
 }

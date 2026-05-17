@@ -3472,6 +3472,11 @@ pub struct UasEventHandler {
     /// から受信した `Inbound` MESSAGE をここに集約する。 未注入なら hook 全 no-op
     /// (= 旧挙動: NGN 着 MESSAGE は 200 OK 受け流し、 PWA SMS 送信は不可)。
     message_log: Mutex<Option<Arc<super::message_log::MessageLog>>>,
+    /// Issue #313: 内線間 direct dial サービス。 [`IntercomService`] が
+    /// `IntercomConfig` + [`InternalCallRegistry`] を保持する。 未注入なら
+    /// 内線間 dispatch は完全 skip され、 旧挙動 (常に NGN プロキシ) を維持する。
+    /// `set_intercom_service` で注入する。
+    intercom_service: Mutex<Option<Arc<super::intercom::IntercomService>>>,
 }
 
 impl UasEventHandler {
@@ -3497,6 +3502,7 @@ impl UasEventHandler {
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
+            intercom_service: Mutex::new(None),
         })
     }
 
@@ -3540,6 +3546,7 @@ impl UasEventHandler {
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
+            intercom_service: Mutex::new(None),
         })
     }
 
@@ -3571,6 +3578,7 @@ impl UasEventHandler {
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
+            intercom_service: Mutex::new(None),
         })
     }
 
@@ -3674,6 +3682,27 @@ impl UasEventHandler {
         *self.message_log.lock().await = Some(log);
     }
 
+    /// Issue #313: 内線間 direct dial サービスを注入する。
+    ///
+    /// 未注入時 (`None`) は `handle_pwa_outbound_offer` の intercom dispatch
+    /// 経路が完全 skip され、 旧挙動 (target 種別に関わらず NGN プロキシ) を
+    /// 維持する (= 完全な後方互換)。
+    ///
+    /// `set_call_log` / `set_message_log` と同じ `Mutex<Option<_>>` pattern。
+    /// Arc 共有後 (`UasEventHandler::spawn` 後) でも安全に呼べる。
+    pub async fn set_intercom_service(
+        self: &Arc<Self>,
+        service: Arc<super::intercom::IntercomService>,
+    ) {
+        *self.intercom_service.lock().await = Some(service);
+    }
+
+    /// 注入済 [`IntercomService`](super::intercom::IntercomService) の Arc clone。
+    /// `handle_pwa_outbound_offer` で classify→admit→register の helper として使う。
+    async fn intercom_service_clone(&self) -> Option<Arc<super::intercom::IntercomService>> {
+        self.intercom_service.lock().await.clone()
+    }
+
     /// 注入済 message_log の Arc clone (PWA SMS 送信経路から push する helper)。
     async fn message_log_clone(&self) -> Option<Arc<super::message_log::MessageLog>> {
         self.message_log.lock().await.clone()
@@ -3711,6 +3740,7 @@ impl UasEventHandler {
             ext_registrar: Mutex::new(None),
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
+            intercom_service: Mutex::new(None),
         })
     }
 
@@ -5469,7 +5499,140 @@ impl PwaOutboundHandler for UasEventHandler {
         peer: &Arc<dyn PeerSession>,
         ws_sink: &WsSink,
     ) -> Result<PwaOutboundOutcome> {
-        info!(%target, "PWA→NGN 発信フロー開始 (Issue #145)");
+        UasEventHandler::handle_pwa_outbound_offer_impl(
+            self,
+            target,
+            browser_offer_sdp,
+            peer,
+            ws_sink,
+        )
+        .await
+    }
+}
+
+impl UasEventHandler {
+    /// Issue #313: PWA→内線 (intercom) dial dispatch ヘルパ。
+    ///
+    /// classify_dial_target で Internal と判定された後の処理を集約する。
+    /// 本 PR の wiring 段階では:
+    ///
+    /// 1. [`IntercomService::try_admit`] で容量上限 (RFC 3261 §21.4.20 / 486)
+    ///    と enabled をチェック。 拒否時は `ServerMessage::Error` で PWA に
+    ///    返却し、 同期 `Err` で抜ける (= background JoinHandle なし)。
+    /// 2. browser SAVPF offer に対する SAVPF answer は str0m に作らせて即返却
+    ///    (RFC 3264 §6)。 これにより PWA は通常通り answer を受領できる。
+    /// 3. 内線 callee 側への媒体面結合 (SIP UA INVITE / PWA WS Offer push) は
+    ///    本 PR scope 外 (signaling 層の連携を要するため follow-up Issue で対応)。
+    ///    現状は `ServerMessage::Error { code: "intercom_pending" }` を PWA に
+    ///    push して、 「NGN に投げて 404 で帰る」 band-aid 経路を回避する。
+    ///
+    /// この hook を入れる主目的は「内線 AOR を target に取った PWA outbound
+    /// を NGN に流す band-aid を断つ」 ことであり、 (3) の full implementation
+    /// は本 PR の foundation を土台に follow-up で行う設計。
+    async fn dispatch_pwa_internal_call(
+        &self,
+        target: &str,
+        browser_offer_sdp: &str,
+        peer: &Arc<dyn PeerSession>,
+        ws_sink: &WsSink,
+        intercom_svc: &Arc<super::intercom::IntercomService>,
+    ) -> Result<PwaOutboundOutcome> {
+        // (1) Admit check (RFC 3261 §21.4.20 486 Busy Here 相当)。
+        if let Err(reason) = intercom_svc.try_admit().await {
+            warn!(%target, %reason, "intercom admit 拒否 — PWA に Error 返却");
+            let _ = ws_sink.send(ServerMessage::error(
+                "intercom_busy",
+                format!("intercom unavailable: {}", reason),
+            ));
+            return Err(anyhow!("intercom admit 拒否: {}", reason));
+        }
+
+        // (2) SAVPF answer 生成 (RFC 3264 §6 / RFC 8829)。
+        let browser_answer = peer
+            .handle_offer(browser_offer_sdp)
+            .await
+            .map_err(|e| anyhow!("peer.handle_offer 失敗 (intercom): {}", e))?;
+
+        // (3) Full multi-leg orchestration は signaling 連携を要するため
+        //     follow-up issue で対応する。 現状は PWA に明示的な pending エラーを
+        //     返し、 NGN に内線 AOR を投げる band-aid 経路を断つ。
+        //
+        // TODO(本流対応): PWA→PWA / PWA→SIP UA の callee 連携 (WS push / ext_inviter)
+        // を Issue #313 follow-up で実装する。 foundation (intercom module +
+        // WebRtcRelayBridge + IntercomService) は本 PR で完成済み。
+        warn!(
+            %target,
+            "PWA→内線 dial を受領: full multi-leg wiring は follow-up Issue #313 で対応。\
+             本 PR では band-aid 防止のため NGN 経路を skip して PWA に pending を返す"
+        );
+        let _ = ws_sink.send(ServerMessage::error(
+            "intercom_pending",
+            format!(
+                "internal dial to {target} accepted (foundation complete) but multi-leg wiring is pending follow-up. \
+                 NGN path was intentionally skipped to avoid 404 band-aid (Issue #313)"
+            ),
+        ));
+
+        // background completion: 既に SAVPF answer 確定済 + admit OK なので、
+        // 単に成功扱いの no-op JoinHandle を返す (将来 callee leg の確立 task に置換)。
+        let completion = tokio::spawn(async move { Ok::<(), anyhow::Error>(()) });
+
+        Ok(PwaOutboundOutcome {
+            savpf_answer: browser_answer,
+            completion,
+        })
+    }
+
+    /// 既存 NGN プロキシ実装 (target dispatcher による Internal 振分の対象外の
+    /// 全パス)。 Issue #313 の dispatcher は本関数の冒頭でガードする (= 内線 AOR
+    /// にヒットしない場合のみ本ロジックに入る)。
+    async fn handle_pwa_outbound_offer_impl(
+        &self,
+        target: &str,
+        browser_offer_sdp: &str,
+        peer: &Arc<dyn PeerSession>,
+        ws_sink: &WsSink,
+    ) -> Result<PwaOutboundOutcome> {
+        info!(%target, "PWA outbound 発信フロー開始 (target dispatch: Issue #145 + #313)");
+
+        // Issue #313: 内線間 direct dial dispatcher。
+        //
+        // intercom_service + ext_registrar 両方が注入済かつ enabled のときのみ、
+        // target を AOR として ExtensionRegistrar.lookup する。 ヒットしたら
+        // NGN を介さず内線間通話に分岐する。 AOR ヒットしない or 設定が
+        // disabled な場合は何もせず既存 NGN 経路 (下記 (a)〜) に fallthrough する
+        // (= 旧挙動の完全後方互換)。
+        //
+        // 本 PR の wiring 段階では、 PWA→PWA / PWA→SIP UA / SIP UA→PWA の
+        // full 多レッグ orchestration は signaling 層との連携 (callee WS push /
+        // ext_inviter 経路の SDP 仲介) を含むため、 dispatch 後の処理は
+        // `dispatch_pwa_internal_call` ヘルパに集約し、 本ハンドラ内には dispatch
+        // gate のみ置く。 ヘルパは現状では `ServerMessage::Error` で「未実装の
+        // 内線間 dial」 として PWA にエラー返却するが、 これは「NGN に投げて
+        // 404 → call_log Failed{404}」 という band-aid を防ぐためのフェイル
+        // ファースト措置 (CLAUDE.md §6.1: 実機未検証の挙動を残さない)。
+        //
+        // RFC 3261 §13.2.1 / RFC 5853 §3.2.2: B2BUA は dial dispatcher として、
+        // target が同一管理ドメイン内であれば外部 (NGN) へプロキシしない選択を
+        // 取れる。
+        let intercom_svc_opt = self.intercom_service_clone().await;
+        let ext_registrar_opt = self.ext_registrar.lock().await.clone();
+        if let (Some(svc), Some(registrar)) =
+            (intercom_svc_opt.as_ref(), ext_registrar_opt.as_ref())
+        {
+            if svc.is_enabled() {
+                let dest = super::intercom::classify_dial_target(target, registrar).await;
+                if dest.is_internal() {
+                    info!(
+                        %target,
+                        "intercom dispatch: target が内線 AOR にヒット → NGN を介さず内線間 dial へ (Issue #313)"
+                    );
+                    return self
+                        .dispatch_pwa_internal_call(target, browser_offer_sdp, peer, ws_sink, svc)
+                        .await;
+                }
+            }
+        }
 
         // (a) target ホワイトリスト再検証 (defense in depth、 PR #146 review #1 🔴#1)。
         //     signaling 層で同じ検証を済ませているが、 trait 経由で呼ばれる

@@ -16,6 +16,9 @@ pub mod bridge;
 pub mod carrier_retry;
 pub mod codec_pipeline;
 pub mod dtmf;
+/// Issue #313: 内線間 direct dial (intercom)。 PWA / SIP UA → 内線 AOR
+/// dispatcher、 `InternalCallRegistry` (NGN 無し通話)、 `IntercomConfig`。
+pub mod intercom;
 pub mod manager;
 /// Issue #299: SMS (RFC 3428 MESSAGE) ring buffer。 受信 / 送信履歴を保持し、
 /// `GET /api/sms/recent` (PWA UI) で公開する。

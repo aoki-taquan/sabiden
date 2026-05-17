@@ -20,13 +20,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
 use super::transcoder::{TranscodingBridge, WebRtcAudioBridge};
 use crate::observability::Metrics;
 use crate::rtp::{set_rtp_dscp, RECV_BUF_SIZE};
+use crate::webrtc::peer::{MediaFrame, PeerSession};
 
 /// NGN レッグと内線レッグの SDP に応じて、純リレーまたはトランスコードの
 /// どちらかで動く統一ブリッジハンドル (Issue #29)。
@@ -60,6 +61,18 @@ pub enum MediaBridge {
     /// NGN ⇄ peer の双方向に Opus ⇔ μ-law トランスコードを噛ませる
     /// (RFC 7587 ↔ RFC 3551)。
     WebRtcAudio(WebRtcAudioBridge),
+    /// Issue #313: WebRTC peer (PWA) ⇔ WebRTC peer (PWA) 直結リレー。
+    ///
+    /// 内線間 direct dial で PWA 同士の通話を NGN を介さずブリッジする経路。
+    /// 両 peer は sabiden の str0m バックエンドで PCMU only 構成
+    /// (`webrtc/str0m_session.rs::enable_pcmu`) のため、 `MediaFrame { pt: 0 }`
+    /// (RFC 3551 §4.5.14) を caller↔callee に往復させるだけで済み、
+    /// transcode 不要。 sabiden 側に UDP socket は持たない。
+    ///
+    /// RFC 5853 §3.2.2: B2BUA として両 leg の media plane を別 SRTP context
+    /// で終端し、 中継する。 SRTP key は str0m 各 peer で独立 (= 1 leg の
+    /// DTLS-SRTP 鍵を他 leg に晒さない、 RFC 8827 §5)。
+    WebRtcRelay(WebRtcRelayBridge),
 }
 
 impl MediaBridge {
@@ -70,6 +83,7 @@ impl MediaBridge {
             MediaBridge::Relay(b) => b.stop().await,
             MediaBridge::Transcode(b) => b.stop().await,
             MediaBridge::WebRtcAudio(b) => b.stop().await,
+            MediaBridge::WebRtcRelay(b) => b.stop().await,
         }
     }
 
@@ -87,6 +101,7 @@ impl MediaBridge {
                 let (n2w, w2n, _err) = b.stats();
                 (n2w, w2n)
             }
+            MediaBridge::WebRtcRelay(b) => b.stats(),
         }
     }
 
@@ -102,6 +117,9 @@ impl MediaBridge {
             MediaBridge::Relay(b) => b.send_to_ngn(datagram).await,
             MediaBridge::Transcode(b) => b.send_to_ngn(datagram).await,
             MediaBridge::WebRtcAudio(b) => b.send_to_ngn(datagram).await,
+            MediaBridge::WebRtcRelay(_) => Err(anyhow::anyhow!(
+                "WebRtcRelay bridge には NGN レッグが無い (内線間直結、 Issue #313)"
+            )),
         }
     }
 
@@ -115,6 +133,9 @@ impl MediaBridge {
             MediaBridge::Transcode(b) => b.send_to_web(datagram).await,
             MediaBridge::WebRtcAudio(_) => Err(anyhow::anyhow!(
                 "WebRtcAudio bridge では send_to_ext は未対応 (DTMF over WebRTC は別 issue)"
+            )),
+            MediaBridge::WebRtcRelay(_) => Err(anyhow::anyhow!(
+                "WebRtcRelay bridge では send_to_ext は未対応 (DTMF over PWA-PWA は別 issue)"
             )),
         }
     }
@@ -136,6 +157,161 @@ impl From<WebRtcAudioBridge> for MediaBridge {
     fn from(b: WebRtcAudioBridge) -> Self {
         MediaBridge::WebRtcAudio(b)
     }
+}
+
+impl From<WebRtcRelayBridge> for MediaBridge {
+    fn from(b: WebRtcRelayBridge) -> Self {
+        MediaBridge::WebRtcRelay(b)
+    }
+}
+
+/// 内線間 (PWA ↔ PWA) 直結リレー (Issue #313)。
+///
+/// 両 [`PeerSession`] の `take_media_rx` を spawn 1 つずつで pull し、
+/// 反対側の peer の `send_media` に push する。 sabiden 側に UDP socket は
+/// 持たない (str0m が ICE/DTLS-SRTP 経路で多重化済み)。
+///
+/// # 設計上の注意
+///
+/// - **codec 透過**: sabiden の str0m バックエンドは PCMU only 構成
+///   (`webrtc/str0m_session.rs::enable_pcmu`) なので [`MediaFrame`] の
+///   `pt` / `payload` をそのまま反対側に渡せば良い (RFC 3551 §4.5.14)。
+/// - **SRTP 鍵分離 (RFC 8827 §5)**: 各 peer の DTLS-SRTP 鍵は str0m が独立に
+///   管理する。 sabiden は decoded MediaFrame のみを扱うので、 caller の
+///   SRTP context が callee に漏れることは無い。
+/// - **片側 close 時の挙動**: どちらかの `take_media_rx` channel が close
+///   (= peer 切断) すると、 対応する forwarder loop が抜けて終了する。
+///   反対側の loop は次の peer.send_media が `Err` を返した時点で抜けるが、
+///   `stop()` で明示的に止めれば即座に畳める。
+///
+/// # 統計
+///
+/// `stats()` は `(caller→callee 転送数, callee→caller 転送数)` を返す。
+pub struct WebRtcRelayBridge {
+    caller_to_callee: Option<JoinHandle<()>>,
+    callee_to_caller: Option<JoinHandle<()>>,
+    state: Arc<WebRtcRelayState>,
+}
+
+#[derive(Default)]
+struct WebRtcRelayState {
+    forwarded_caller_to_callee: std::sync::atomic::AtomicU64,
+    forwarded_callee_to_caller: std::sync::atomic::AtomicU64,
+}
+
+/// [`WebRtcRelayBridge::start`] 起動パラメータ。
+pub struct WebRtcRelayConfig {
+    /// caller 側 [`PeerSession`] (PWA caller の str0m peer)。
+    pub caller_peer: Arc<dyn PeerSession>,
+    /// caller 側 `take_media_rx().await` で取り出した受信フレーム channel。
+    pub caller_media_rx: mpsc::Receiver<MediaFrame>,
+    /// callee 側 [`PeerSession`] (PWA callee の str0m peer)。
+    pub callee_peer: Arc<dyn PeerSession>,
+    /// callee 側 `take_media_rx().await` で取り出した受信フレーム channel。
+    pub callee_media_rx: mpsc::Receiver<MediaFrame>,
+}
+
+impl WebRtcRelayBridge {
+    /// 両 peer の forwarder loop を spawn する。 起動失敗 path は無く、
+    /// `WebRtcAudioBridge` と同じく `Self` 直接返却。
+    pub fn start(cfg: WebRtcRelayConfig) -> Self {
+        let WebRtcRelayConfig {
+            caller_peer,
+            caller_media_rx,
+            callee_peer,
+            callee_media_rx,
+        } = cfg;
+        let state = Arc::new(WebRtcRelayState::default());
+
+        // caller → callee: caller_media_rx → callee.send_media
+        let caller_to_callee = tokio::spawn(relay_loop(
+            "caller→callee",
+            caller_media_rx,
+            callee_peer.clone(),
+            state.clone(),
+            true,
+        ));
+
+        // callee → caller: callee_media_rx → caller.send_media
+        let callee_to_caller = tokio::spawn(relay_loop(
+            "callee→caller",
+            callee_media_rx,
+            caller_peer.clone(),
+            state.clone(),
+            false,
+        ));
+
+        Self {
+            caller_to_callee: Some(caller_to_callee),
+            callee_to_caller: Some(callee_to_caller),
+            state,
+        }
+    }
+
+    /// 両ループを停止する。
+    pub async fn stop(mut self) {
+        if let Some(h) = self.caller_to_callee.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = self.callee_to_caller.take() {
+            h.abort();
+            let _ = h.await;
+        }
+    }
+
+    /// 統計: `(caller→callee, callee→caller)` の転送フレーム数。
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.state
+                .forwarded_caller_to_callee
+                .load(Ordering::Relaxed),
+            self.state
+                .forwarded_callee_to_caller
+                .load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Drop for WebRtcRelayBridge {
+    fn drop(&mut self) {
+        if let Some(h) = self.caller_to_callee.take() {
+            h.abort();
+        }
+        if let Some(h) = self.callee_to_caller.take() {
+            h.abort();
+        }
+    }
+}
+
+/// 1 方向の forwarder。 受信 channel が close したら抜ける。
+async fn relay_loop(
+    direction: &'static str,
+    mut from_rx: mpsc::Receiver<MediaFrame>,
+    to_peer: Arc<dyn PeerSession>,
+    state: Arc<WebRtcRelayState>,
+    increment_caller_to_callee: bool,
+) {
+    use std::sync::atomic::Ordering;
+    let span = tracing::trace_span!("webrtc_relay", direction);
+    let _enter = span.enter();
+    while let Some(frame) = from_rx.recv().await {
+        if let Err(e) = to_peer.send_media(frame).await {
+            warn!(direction, error=%e, "WebRTC relay 送出失敗");
+            break;
+        }
+        if increment_caller_to_callee {
+            state
+                .forwarded_caller_to_callee
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            state
+                .forwarded_callee_to_caller
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    debug!(direction, "WebRTC relay loop 終了");
 }
 
 /// 1 つのリレー方向 (片側ソケット → 反対側) を表す共有状態。
@@ -854,6 +1030,165 @@ mod tests {
         let recv = RtpPacket::from_bytes(&buf[..n]).unwrap();
         assert_eq!(recv.ssrc, 0xAAAA_BBBB);
 
+        bridge.stop().await;
+    }
+
+    /// Issue #313: `WebRtcRelayBridge` は caller→callee / callee→caller の
+    /// 両方向で `MediaFrame` を forward する (PWA-PWA 内線間直結)。
+    /// `pt` / `rtp_time` / `payload` をそのまま透過することを確認。
+    #[tokio::test]
+    async fn rfc3551_webrtc_relay_forwards_media_frames_in_both_directions() {
+        use crate::webrtc::peer::{MediaFrame, PeerSession};
+        use std::sync::atomic::{AtomicU32, Ordering as AOrd};
+        use tokio::sync::Mutex as TMutex;
+
+        /// 受信を蓄積する mock peer。
+        struct CapturePeer {
+            received: Arc<TMutex<Vec<MediaFrame>>>,
+            count: Arc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl PeerSession for CapturePeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn send_media(&self, frame: MediaFrame) -> anyhow::Result<()> {
+                self.count.fetch_add(1, AOrd::SeqCst);
+                self.received.lock().await.push(frame);
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let caller_received = Arc::new(TMutex::new(Vec::new()));
+        let callee_received = Arc::new(TMutex::new(Vec::new()));
+        let caller_count = Arc::new(AtomicU32::new(0));
+        let callee_count = Arc::new(AtomicU32::new(0));
+
+        let caller_peer: Arc<dyn PeerSession> = Arc::new(CapturePeer {
+            received: caller_received.clone(),
+            count: caller_count.clone(),
+        });
+        let callee_peer: Arc<dyn PeerSession> = Arc::new(CapturePeer {
+            received: callee_received.clone(),
+            count: callee_count.clone(),
+        });
+
+        // caller の上り (browser→sabiden) / callee の上り (browser→sabiden) を mpsc で渡す。
+        let (caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+        let (callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+
+        let bridge: MediaBridge = WebRtcRelayBridge::start(WebRtcRelayConfig {
+            caller_peer: caller_peer.clone(),
+            caller_media_rx: caller_up_rx,
+            callee_peer: callee_peer.clone(),
+            callee_media_rx: callee_up_rx,
+        })
+        .into();
+
+        // caller の上り frame → callee へ forward されるべき
+        let frame1 = MediaFrame {
+            pt: 0, // PCMU
+            rtp_time: 160,
+            payload: vec![0xCA; 160],
+            network_time: std::time::Instant::now(),
+        };
+        caller_up_tx.send(frame1.clone()).await.unwrap();
+
+        // callee の上り frame → caller へ forward されるべき
+        let frame2 = MediaFrame {
+            pt: 0,
+            rtp_time: 320,
+            payload: vec![0xFE; 160],
+            network_time: std::time::Instant::now(),
+        };
+        callee_up_tx.send(frame2.clone()).await.unwrap();
+
+        // 両方向の受信を待つ
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while callee_count.load(AOrd::SeqCst) == 0 || caller_count.load(AOrd::SeqCst) == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "PWA-PWA relay 未配送: caller_recv_count={}, callee_recv_count={}",
+                    caller_count.load(AOrd::SeqCst),
+                    callee_count.load(AOrd::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 内容透過確認 (pt / rtp_time / payload)
+        let callee_got = callee_received.lock().await;
+        assert_eq!(callee_got.len(), 1, "caller→callee 1 frame");
+        assert_eq!(callee_got[0].pt, 0);
+        assert_eq!(callee_got[0].rtp_time, 160);
+        assert_eq!(callee_got[0].payload, frame1.payload);
+
+        let caller_got = caller_received.lock().await;
+        assert_eq!(caller_got.len(), 1, "callee→caller 1 frame");
+        assert_eq!(caller_got[0].pt, 0);
+        assert_eq!(caller_got[0].rtp_time, 320);
+        assert_eq!(caller_got[0].payload, frame2.payload);
+
+        let (c2cc, cc2c) = bridge.stats();
+        assert_eq!(c2cc, 1, "stats: caller→callee = 1");
+        assert_eq!(cc2c, 1, "stats: callee→caller = 1");
+
+        bridge.stop().await;
+    }
+
+    /// Issue #313: `WebRtcRelay` variant で `send_to_ngn` / `send_to_ext` は
+    /// 「NGN レッグが無い」 「DTMF over PWA-PWA は別 issue」 として `Err` で
+    /// 返す (silent な no-op にしないことが重要 — band-aid 禁止)。
+    #[tokio::test]
+    async fn rfc5853_webrtc_relay_rejects_ngn_and_ext_injection() {
+        use crate::webrtc::peer::PeerSession;
+
+        struct NoopPeer;
+        #[async_trait::async_trait]
+        impl PeerSession for NoopPeer {
+            async fn handle_offer(&self, _sdp: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn create_offer(&self) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn accept_answer(&self, _sdp: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn add_ice_candidate(&self, _c: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let p1: Arc<dyn PeerSession> = Arc::new(NoopPeer);
+        let p2: Arc<dyn PeerSession> = Arc::new(NoopPeer);
+        let (_t1, r1) = mpsc::channel::<crate::webrtc::peer::MediaFrame>(1);
+        let (_t2, r2) = mpsc::channel::<crate::webrtc::peer::MediaFrame>(1);
+        let bridge: MediaBridge = WebRtcRelayBridge::start(WebRtcRelayConfig {
+            caller_peer: p1,
+            caller_media_rx: r1,
+            callee_peer: p2,
+            callee_media_rx: r2,
+        })
+        .into();
+        assert!(bridge.send_to_ngn(b"dtmf").await.is_err());
+        assert!(bridge.send_to_ext(b"dtmf").await.is_err());
         bridge.stop().await;
     }
 }

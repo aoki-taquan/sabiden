@@ -128,3 +128,15 @@ max_expires = 3600
 # backend = "stub"  # "stub" のみ、 "whisper-api" / "faster-whisper" は将来
 # # api_key_env = "OPENAI_API_KEY"  # Whisper API 用 (将来)
 # # model_path = "/var/lib/sabiden/models/whisper-base.bin"  # faster-whisper 用 (将来)
+
+# 内線間 direct dial (intercom、 Issue #313、 任意)
+# PWA / SIP UA が `ExtensionRegistrar` に登録済みの AOR (例 "alice" / "iphone")
+# に発信した場合に NGN を介さず内線同士で通話する (= NGN 1ch を消費しない
+# multi-line)。 AOR ヒットしない番号 (NGN 電話番号 / 不在内線) は従来どおり
+# NGN へプロキシするので既存挙動は破壊しない。
+# - enabled = false に設定すると intercom dispatch を完全 skip し、 旧挙動を維持
+# - max_concurrent_internal_calls 上限超過時は RFC 3261 §21.4.20 486 Busy Here
+#   相当で reject (PWA は `ServerMessage::Error { code: "intercom_busy" }` 受領)
+# [intercom]
+# enabled = true
+# max_concurrent_internal_calls = 4

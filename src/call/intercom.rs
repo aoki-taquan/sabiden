@@ -650,16 +650,20 @@ max_concurrent_internal_calls = 8
         ));
     }
 
-    /// Issue #313 DoD: PWA→PWA 内線間通話で双方向 audio が成立する
-    /// (integration test、 mock peer 2 個 + 実 CallManager + 実 MediaBridge::WebRtcRelay)。
+    /// PR #314 review fix: 旧名 `rfc5853_pwa_to_pwa_intercom_integration_bidirectional`
+    /// は INVITE→200 OK→ACK の full flow を通っていない (dispatcher も経由しない)
+    /// ため "integration" を詐称していた。 本 test は **MediaBridge 単体テスト**
+    /// (= `WebRtcRelayBridge` が caller/callee 両 PeerSession 間で `MediaFrame`
+    /// を双方向 relay できることのみを検証) であることを名前で明示する。
     ///
-    /// orchestrator 抜きの shell test だが、 [`IntercomService`] +
-    /// [`start_webrtc_relay_bridge_with_explicit_rx`] + [`CallManager`] +
-    /// [`MediaBridge::WebRtcRelay`] の組み合わせで PWA caller →
-    /// sabiden → PWA callee の片方向 frame 配送が成立することを確認する。
-    /// 反対方向も対称に動く。
+    /// 真の integration (= `handle_pwa_outbound_offer` API 経由で dispatch →
+    /// callee WS Offer push → answer 受信 → bridge attach の full path) は
+    /// `tests/intercom_integration.rs` の e2e test で別途検証する。
+    ///
+    /// RFC 3551 §4.5.14 PCMU PT 0 / 8kHz: caller→callee 方向 (媒体 relay)
+    /// が `PeerSession::send_media` 経由で届く。 反対方向も対称。
     #[tokio::test]
-    async fn rfc5853_pwa_to_pwa_intercom_integration_bidirectional() {
+    async fn rfc3551_webrtc_relay_bridge_forwards_pcmu_both_directions() {
         use crate::webrtc::peer::MediaFrame;
         use std::sync::atomic::{AtomicU32, Ordering as AOrd};
         use std::time::Instant;
@@ -810,21 +814,21 @@ max_concurrent_internal_calls = 8
         assert_eq!(svc.registry().len().await, 0);
     }
 
-    /// Issue #313 DoD: PWA caller → SIP UA callee の内線間通話で双方向 audio が
-    /// 成立する (integration test、 mock SIP peer = UDP socket、 mock PWA peer =
-    /// `PeerSession` 実装)。
+    /// PR #314 review fix: 旧名
+    /// `rfc5853_pwa_to_sip_ua_intercom_integration_bidirectional` も同様に
+    /// dispatcher を経由しない **bridge プリミティブ単体テスト** だったため
+    /// 命名を honest にする。 `WebRtcAudioBridge` (str0m PeerSession ↔ UDP
+    /// PCMU socket) が双方向に PCMU を渡すことを確認する。
     ///
-    /// この経路では sabiden は:
-    /// - PWA leg = `WebRtcAudioBridge` の peer 側 I/O を使う (str0m MediaFrame)
-    /// - SIP UA leg = `WebRtcAudioBridge` の `ngn_socket` を流用して UDP RTP を
-    ///   端末へ流す。 SIP UA は両側 PCMU 構成 (RFC 3551 §4.5.14) を前提とし
-    ///   `direct_pcmu_passthrough = true` で transcode を skip する。
+    /// 実装上 `WebRtcAudioBridge::ngn_socket` 名は NGN 専用ではなく
+    /// 「PCMU UDP socket」 として汎用に使える (= PWA → SIP UA 内線経路でも
+    /// 同じ bridge を流用予定)。
     ///
-    /// 実装上 `WebRtcAudioBridge` の "ngn_socket" 名は NGN 専用ではなく
-    /// 「PCMU UDP socket」 として汎用に使えるため、 内線 SIP UA 側にそのまま
-    /// repurpose できる (= 既存実装の再利用)。
+    /// 真の PWA→SIP UA intercom integration は本 PR では未実装
+    /// (`dispatch_pwa_internal_call` の SIP arm で `intercom_sip_callee_unsupported`
+    /// を返す follow-up 待ち)。
     #[tokio::test]
-    async fn rfc5853_pwa_to_sip_ua_intercom_integration_bidirectional() {
+    async fn rfc3551_webrtc_audio_bridge_pcmu_udp_passthrough_both_directions() {
         use crate::call::transcoder::{WebRtcAudioBridge, WebRtcAudioConfig, DEFAULT_OPUS_PT};
         use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW};
         use crate::webrtc::peer::MediaFrame;
@@ -941,11 +945,17 @@ max_concurrent_internal_calls = 8
         bridge_arc.stop().await;
     }
 
-    /// Issue #313 DoD: SIP UA → SIP UA の内線間通話で双方向 RTP が成立する
-    /// (integration test、 既存 `RtpBridge` を流用)。 両側とも PCMU UDP なので
-    /// `MediaBridge::Relay` で純リレーするだけで十分。
+    /// PR #314 review fix: 旧名
+    /// `rfc3551_sip_ua_to_sip_ua_intercom_integration_bidirectional` も
+    /// dispatcher を経由しない **bridge プリミティブ単体テスト**。 既存
+    /// `RtpBridge::start` (PCMU↔PCMU 純リレー) が caller-leg / callee-leg の
+    /// 両 UDP socket 間で RTP packet を双方向に転送できることを確認する。
+    ///
+    /// 真の SIP UA → SIP UA intercom integration (= `handle_invite` 内
+    /// dispatcher → ext_inviter → RtpBridge) は本 PR では未実装 (480 で
+    /// fail-fast、 follow-up Issue で対応)。
     #[tokio::test]
-    async fn rfc3551_sip_ua_to_sip_ua_intercom_integration_bidirectional() {
+    async fn rfc3551_rtp_bridge_pcmu_udp_relay_both_directions() {
         use crate::call::bridge::{BridgeConfig, RtpBridge};
         use crate::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW};
         use tokio::net::UdpSocket;
@@ -1019,13 +1029,16 @@ max_concurrent_internal_calls = 8
         bridge.stop().await;
     }
 
-    /// Issue #313 multi-line DoD: 内線間通話 (caller→callee) と NGN 発着信
-    /// (= 別 CallId の `MediaBridge::Relay` を想定) が同時に立っても registry / mgr
-    /// 上で独立に扱われ、 互いの停止が他方を巻き込まないことを確認する。
-    /// 実 NGN UDP ソケットは使わず、 「NGN 側通話を表す `Relay` の `CallId`
-    /// と intercom の `CallId` が独立に管理される」 ことだけを検証する。
+    /// Issue #313 multi-line: 「2 個の独立した `MediaBridge` (内線間 RelayBridge と
+    /// NGN レッグ想定の RtpBridge) を `CallManager` に持ち、 一方を terminate しても
+    /// 他方が残る」 ことを確認する registry 単体テスト。 SIP dialog や WS は
+    /// 通さないため "integration" は名乗らない (= レジストリ独立性のスモーク)。
+    ///
+    /// 真の multi-line integration (= 内線間 dial 確立中に NGN inbound INVITE が
+    /// dispatcher を独立に通って成立する) は `tests/intercom_integration.rs` の
+    /// e2e test で検証する。
     #[tokio::test]
-    async fn issue313_multi_line_internal_and_ngn_coexist_independently() {
+    async fn intercom_and_ngn_call_registries_are_independent_smoke() {
         use crate::call::bridge::{BridgeConfig, RtpBridge};
         use tokio::net::UdpSocket;
 

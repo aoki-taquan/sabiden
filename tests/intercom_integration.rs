@@ -110,16 +110,32 @@ impl RecordingPeer {
 #[async_trait::async_trait]
 impl PeerSession for RecordingPeer {
     async fn handle_offer(&self, _sdp: &str) -> Result<String> {
-        // 受信した SAVPF offer に対する answer は固定文字列で十分 (テストは
-        // SDP 内容ではなく dispatcher の挙動と媒体 relay を見る)。
+        // SDP 完全形 (RFC 4566 §5): v=/o=/s=/t= 必須、 m=audio + c= で media
+        // も提供する。 Issue #316 で導入された PWA→SIP UA 経路は
+        // `convert_savpf_to_avp` でこの SDP を AVP に変換するため、 t=0 0 と
+        // m=/c= が欠けると `t= 行が必須` 等で parse 失敗する。 SAVPF プロファイル
+        // を模した最小形 (SDP 内容自体はテストの検証対象ではない: sdp_marker で
+        // 経路をトレースする用途)。
         Ok(format!(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns={}-answer\r\n",
+            "v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s={}-answer\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 40000 RTP/SAVPF 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n",
             self.sdp_marker
         ))
     }
     async fn create_offer(&self) -> Result<String> {
         Ok(format!(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns={}-offer\r\n",
+            "v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s={}-offer\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 40000 RTP/SAVPF 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n",
             self.sdp_marker
         ))
     }
@@ -424,81 +440,263 @@ async fn rfc5853_pwa_to_pwa_dispatcher_e2e_no_ngn_traffic_and_bridge_forwards_me
     let _ = callee_up_tx;
 }
 
-/// DoD: PWA→SIP UA 内線通話は本 PR scope 外 (follow-up)。 dispatcher は
-/// `ServerMessage::Error { code: "intercom_sip_callee_unsupported" }` を
-/// caller に返し、 NGN 経路に流れないことを確認する。
+/// Issue #316 DoD: PWA → SIP UA 内線通話の **本物の e2e integration test**。
 ///
-/// これは「band-aid 防止 (CLAUDE.md §6.1)」 を担保する重要なテスト: dispatcher
-/// が落ちると NGN に内線 AOR が漏れて 404 が帰る band-aid 経路に逆戻りする。
+/// dispatcher が PWA caller の SAVPF leg と内線 SIP UA leg を WebRtcAudioBridge
+/// で結合し、 NGN を介さず双方向 PCMU 通信を成立させる full multi-leg orchestration
+/// を検証する。 fake SIP UA は `UdpSocket` 直叩きで実装 (CLAUDE.md §6.3 / PR #176:
+/// production-side test hook 禁止)、 INVITE を受信して 200 OK + SDP を返し、
+/// その後 PCMU RTP を sabiden の bridge 経由で送受信できることを確認する。
 ///
-/// テスト層: **trait-API direct** (WS validator bypass、 alphabetic AOR を使う)。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pwa_to_sip_callee_intercom_returns_unsupported_error_and_no_ngn_traffic() {
-    // (a) fake NGN
+/// # 検証項目
+///
+/// 1. caller (PWA) には SAVPF answer (= `caller-answer`) が同期で返る
+/// 2. fake SIP UA に INVITE が届く (= dispatcher が NGN ではなく SIP UA leg に分岐)
+/// 3. fake SIP UA からの 200 OK (PCMU SDP) を sabiden が受領
+/// 4. NGN socket に hit が 1 件も無い (band-aid 防止)
+/// 5. PWA caller → SIP UA 方向の MediaFrame が PCMU RTP として SIP UA に届く
+/// 6. SIP UA → PWA caller 方向の RTP が PCMU MediaFrame として caller peer に届く
+/// 7. `InternalCallRegistry` (intercom service) に entry が 1 件入る
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §17.1 / §13: client transaction → 200 OK → dialog 確立。 ACK は
+///   `Uac::invite_to` 内で送出。
+/// - RFC 3551 §4.5.14 / PT 0: PCMU 8 kHz / 160 sample = 20 ms。
+/// - RFC 8829 §5.1: caller cleanup; Err path で `caller_peer.close()` 必須。
+/// - RFC 5853 §3.2.2: B2BUA で両 leg を anchoring。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic() {
+    use sabiden::rtp::packet::{RtpPacket, PAYLOAD_TYPE_ULAW};
+    use sabiden::sip::message::{parse_message, SipHeaders, SipMessage};
+
+    // (a) fake NGN (応答しない、 hit count を監視)
     let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
 
-    // (b) registrar に SIP UA callee を登録 (= ExtTransport::Sip)
+    // (b) fake SIP UA: SIP signaling socket と RTP socket を別 port で bind する。
+    //     SIP signaling は INVITE を受け取り 200 OK を返す (PCMU SDP 付き)。
+    //     RTP は別 port で待ち受け、 sabiden が bridge 経由で送ってくる PCMU を観測。
+    let fake_ua_sip_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let fake_ua_sip_addr = fake_ua_sip_sock.local_addr().unwrap();
+    let fake_ua_rtp_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let fake_ua_rtp_addr = fake_ua_rtp_sock.local_addr().unwrap();
+
+    let invite_received = Arc::new(AtomicU32::new(0));
+    let invite_received_clone = invite_received.clone();
+    let fake_ua_sip_clone = fake_ua_sip_sock.clone();
+    let fake_ua_rtp_addr_for_resp = fake_ua_rtp_addr;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match fake_ua_sip_clone.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let msg = match parse_message(&buf[..n]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let req = match msg {
+                SipMessage::Request(r) => r,
+                SipMessage::Response(_) => continue,
+            };
+            // INVITE / ACK / BYE 等の振分。 本テストでは INVITE に 200 OK を
+            // 返すだけで他は no-op (ACK 受信は parse して数えるだけ)。
+            let method_str = req.method.as_str();
+            if method_str != "INVITE" {
+                continue;
+            }
+            invite_received_clone.fetch_add(1, Ordering::SeqCst);
+
+            // 200 OK 応答を組み立てる (RFC 3261 §8.2.6.2)。
+            //   - Via / From / To / Call-ID / CSeq は INVITE から echo
+            //   - To に tag を付加 (RFC 3261 §12.1.1)
+            //   - Contact は fake UA SIP addr
+            //   - SDP body: PCMU only AVP (RTP は fake_ua_rtp_sock の port)
+            let mut headers = SipHeaders::new();
+            if let Some(v) = req.headers.get("via") {
+                headers.set("Via", v);
+            }
+            if let Some(f) = req.headers.get("from") {
+                headers.set("From", f);
+            }
+            // To に tag を付加
+            let to_with_tag = match req.headers.get("to") {
+                Some(t) if !t.contains(";tag=") => format!("{};tag=fakeua-tag-1", t),
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            headers.set("To", &to_with_tag);
+            if let Some(c) = req.headers.get("call-id") {
+                headers.set("Call-ID", c);
+            }
+            if let Some(cs) = req.headers.get("cseq") {
+                headers.set("CSeq", cs);
+            }
+            headers.set("Contact", format!("<sip:fakeua@{}>", fake_ua_sip_addr));
+            let sdp = format!(
+                "v=0\r\n\
+o=- 1 1 IN IP4 {ip}\r\n\
+s=fake-ua\r\n\
+c=IN IP4 {ip}\r\n\
+t=0 0\r\n\
+m=audio {port} RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=ptime:20\r\n",
+                ip = fake_ua_rtp_addr_for_resp.ip(),
+                port = fake_ua_rtp_addr_for_resp.port(),
+            );
+            headers.set("Content-Type", "application/sdp");
+            let resp = sabiden::sip::message::SipResponse {
+                status_code: 200,
+                reason: "OK".to_string(),
+                headers,
+                body: sdp.into_bytes(),
+            };
+            let bytes = resp.to_bytes();
+            let _ = fake_ua_sip_clone.send_to(&bytes, peer).await;
+        }
+    });
+
+    // (c) registrar に SIP UA callee を登録 (binding.remote = fake UA SIP addr)
     let registrar = ExtensionRegistrar::new();
     registrar
         .register(
             "linphone-bob",
-            "sip:linphone-bob@192.0.2.10:5060".to_string(),
-            "192.0.2.10:5060".parse().unwrap(),
+            format!("sip:linphone-bob@{}", fake_ua_sip_addr),
+            fake_ua_sip_addr,
             Duration::from_secs(300),
         )
         .await;
 
-    // (c) UasEventHandler を組み立て
-    let (uas_handler, _call_manager) =
+    // (d) UasEventHandler を組み立て (ext_inviter / intercom service 注入済)
+    let (uas_handler, call_manager) =
         build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
 
-    // (d) caller PWA peer
-    let (_caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
-    let caller_peer: Arc<dyn PeerSession> =
-        Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
-    let (caller_ws_tx, mut caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    // (e) caller PWA peer (RecordingPeer は SAVPF SDP を返す)
+    let (caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer_inner = Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
+    let caller_peer: Arc<dyn PeerSession> = caller_peer_inner.clone();
+    let (caller_ws_tx, _caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let caller_ws_sink = WsSink::new(caller_ws_tx);
 
-    // (e) dispatcher を駆動
+    // (f) dispatcher 駆動
     let handler_trait: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
     let outcome = handler_trait
         .handle_pwa_outbound_offer(
             "linphone-bob",
-            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=caller-offer\r\n",
+            // 完全形 SDP (RFC 4566): v=/o=/s=/t=/c=/m= 揃える
+            "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=caller-offer\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/SAVPF 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n",
             &caller_peer,
             &caller_ws_sink,
         )
         .await
-        .expect("dispatcher returned Err");
+        .expect("dispatcher 同期 path で Err");
 
-    // (f) caller には answer が返る (intercom_sip_callee_unsupported でも
-    //     handle_offer は実行されるので savpf_answer は確定する)。
-    assert!(outcome.savpf_answer.contains("caller-answer"));
+    // (g) caller には SAVPF answer が即時に返る
+    assert!(
+        outcome.savpf_answer.contains("caller-answer"),
+        "caller SAVPF answer が dispatcher から返らない: {}",
+        outcome.savpf_answer
+    );
 
-    // (g) caller WS に intercom_sip_callee_unsupported Error が push される
-    let pushed = timeout(Duration::from_secs(1), caller_ws_rx.recv())
+    // (h) background completion を待つ (INVITE → 200 OK → bridge attach → registry insert)
+    outcome
+        .completion
         .await
-        .expect("caller WS に Error が push されない")
-        .expect("caller WS rx closed");
-    match pushed {
-        ServerMessage::Error { code, message: _ } => {
-            assert_eq!(
-                code, "intercom_sip_callee_unsupported",
-                "PWA→SIP UA 内線経路は follow-up 待ちのため intercom_sip_callee_unsupported が期待値"
-            );
-        }
-        other => panic!("Error 期待だが {:?}", other),
-    }
+        .expect("completion JoinHandle paniced")
+        .expect("background completion returned Err (PWA→SIP UA orchestration が失敗)");
 
-    // (h) NGN socket には何も飛ばない (band-aid 防止 — 内線 AOR が NGN に
-    //     漏れる経路は dispatcher が遮断する)。
-    let _ = outcome.completion.await;
+    // (i) NGN socket には何も到達していない (= dispatcher が NGN proxy 経路に
+    //     落ちていない、 band-aid 防止の決定的証拠)
     assert_eq!(
         ngn_hit_count.load(Ordering::SeqCst),
         0,
-        "PWA→SIP UA は follow-up 待ちだが NGN に内線 AOR を漏らしてはならない \
-         (CLAUDE.md §6.1 band-aid 防止)"
+        "PWA→SIP UA dispatch だったのに NGN socket に {} 通の SIP message が漏れた \
+         (CLAUDE.md §6.1 band-aid 防止 / NGN regression 防御)",
+        ngn_hit_count.load(Ordering::SeqCst)
     );
+
+    // (j) fake SIP UA は少なくとも 1 通の INVITE を受領している (= dispatcher が
+    //     ext_inviter.invite_intercom 経由で SIP UA leg を確実に呼んだ証拠)
+    assert!(
+        invite_received.load(Ordering::SeqCst) >= 1,
+        "fake SIP UA に INVITE が届かない (dispatcher が SIP UA leg を呼ばなかった可能性)"
+    );
+
+    // (k) CallManager に bridge が 1 件 attach 済 (= WebRtcAudioBridge attach 成功)
+    assert_eq!(
+        call_manager.len().await,
+        1,
+        "PWA→SIP UA full orchestration で CallManager に bridge が 1 件あるべき"
+    );
+
+    // (l) caller → SIP UA 方向の MediaFrame が WebRtcAudioBridge 経由で PCMU RTP
+    //     として fake SIP UA RTP socket に届くこと (RFC 3551 PT 0)。
+    use std::time::Instant;
+    let caller_payload = vec![0xAB; 160];
+    caller_up_tx
+        .send(MediaFrame {
+            pt: 0,
+            rtp_time: 160,
+            payload: caller_payload.clone(),
+            network_time: Instant::now(),
+        })
+        .await
+        .unwrap();
+    let mut rtp_buf = vec![0u8; 1500];
+    let (n, _src) = timeout(
+        Duration::from_secs(3),
+        fake_ua_rtp_sock.recv_from(&mut rtp_buf),
+    )
+    .await
+    .expect("caller→SIP UA RTP が fake UA に届かない (WebRtcAudioBridge attach 失敗?)")
+    .unwrap();
+    let recv_rtp = RtpPacket::from_bytes(&rtp_buf[..n]).expect("RTP parse");
+    assert_eq!(
+        recv_rtp.payload_type, PAYLOAD_TYPE_ULAW,
+        "caller→SIP UA は PCMU PT 0 で届くべき (RFC 3551)"
+    );
+    assert_eq!(
+        recv_rtp.payload, caller_payload,
+        "PCMU payload が変質している (transcode bug)"
+    );
+
+    // (m) SIP UA → caller 方向の RTP が PCMU MediaFrame として caller peer に届く
+    //     (`WebRtcAudioBridge::ngn_to_peer` 方向の検証)。 fake UA は sabiden 内線
+    //     RTP socket に向けて送る。 sabiden 内線 socket の addr は `recv_rtp` の
+    //     送信元 (RTP packet 受信時の `_src`) と一致する。
+    let sabi_rtp_addr = _src;
+    let pkt = RtpPacket {
+        payload_type: PAYLOAD_TYPE_ULAW,
+        marker: false,
+        sequence: 100,
+        timestamp: 0,
+        ssrc: 0xBEEF,
+        payload: vec![0xCD; 160],
+    }
+    .to_bytes();
+    fake_ua_rtp_sock.send_to(&pkt, sabi_rtp_addr).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while caller_peer_inner.received_count.load(Ordering::SeqCst) == 0 {
+        if Instant::now() > deadline {
+            panic!("SIP UA→caller RTP が WebRtcAudioBridge 経由で caller peer に届かない");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = caller_peer_inner.received.lock().await;
+    assert_eq!(got[0].pt, 0, "caller peer に届く MediaFrame は PCMU PT 0");
+    assert_eq!(got[0].payload, vec![0xCD; 160], "PCMU payload 透過");
+    drop(got);
+
+    // 後始末
+    let _ = caller_up_tx;
 }
 
 /// DoD: 同時通話上限超過 (`max_concurrent_internal_calls = 1`) のとき、 2 件目

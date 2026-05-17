@@ -5853,23 +5853,294 @@ impl UasEventHandler {
                 })
             }
             ExtTransport::Sip => {
-                // PWA→SIP UA は本 PR の wiring scope 外 (follow-up)。
-                // SAVPF→AVP→PCMU 変換 + sabiden 側 UDP socket bind +
-                // ext_inviter.invite + WebRtcAudioBridge 結線が必要で、
-                // 既存 `handle_pwa_outbound_offer_impl` の NGN 経路と類似の規模。
-                // 安全な実装には NGN 側 SDP 構築ロジックの抽出 (rewrite_rtp_endpoint
-                // 共通化) を含む大幅 refactor が必要なため、 follow-up Issue で対応。
-                // TODO(本流対応): PR #314 review 対応 follow-up Issue で
-                //   PWA→SIP UA intercom 経路を実装する (ext_inviter + WebRtcAudioBridge)。
-                warn!(
-                    %target,
-                    "intercom dispatch: PWA → SIP UA 内線経路は本 PR scope 外 (follow-up)"
-                );
-                let _ = ws_sink.send(ServerMessage::error(
-                    "intercom_sip_callee_unsupported",
-                    "PWA→SIP UA intercom is not yet wired (follow-up Issue)",
-                ));
-                let completion = tokio::spawn(async move { Ok::<(), anyhow::Error>(()) });
+                // Issue #316: PWA → SIP UA 内線通話 full multi-leg orchestration。
+                //
+                // # シーケンス (RFC 3261 §17.1 / §13 / RFC 5853 §3.2.2 B2BUA)
+                //
+                // 1. caller `peer.handle_offer` で SAVPF answer 即時返却 (= 既出)
+                // 2. caller `peer.take_media_rx` で MediaFrame source を吸う
+                //    (PWA peer は str0m 1 回しか rx を渡せない、 RFC 8829 §4)
+                // 3. sabiden 側 RTP socket を内線 NIC に bind (RFC 3550 §11)
+                // 4. SAVPF answer を AVP → PCMU only subset に書換え (RFC 3551 PT 0、
+                //    `docs/asterisk-real-invite.md` §2)。 c=/o= は sabiden 内線 NIC IP、
+                //    m=audio port は (3) の socket port にする (`rewrite_rtp_endpoint`)
+                // 5. `ext_inviter.invite_intercom` で内線 SIP UA (binding.remote 宛、
+                //    RFC 5626) に INVITE 送出 (PCMU SDP offer 付き)
+                // 6. 200 OK SDP から callee RTP endpoint を抽出 (RFC 3264 §6)
+                // 7. `WebRtcAudioBridge` を起動 (caller peer ↔ sabiden RTP socket ↔
+                //    SIP UA endpoint) で双方向 PCMU 透過 (`direct_pcmu_passthrough = true`)
+                // 8. `IntercomService::register_call` で `InternalCallRegistry` に登録
+                //
+                // Err path での caller cleanup (RFC 8829 §5.1): caller peer は (1) で
+                // DTLS-SRTP / ICE が走り出しているため、 (5)〜(7) いずれかの失敗で
+                // `caller_peer.close()` を best-effort で呼んで livelock を防ぐ。
+                // 内線 SIP UA leg が 2xx で confirmed 後に bridge attach 失敗した場合は
+                // `dialog.send_bye()` で SIP UA 側にも BYE を撃って leak を防ぐ
+                // (RFC 3261 §15.1.1)。
+                let call_manager = match self.call_manager.clone() {
+                    Some(m) => m,
+                    None => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_unavailable",
+                            "CallManager 未注入 — intercom bridge を保持できない",
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("CallManager 未注入 (intercom SIP arm)"));
+                    }
+                };
+
+                let ext_inviter = match self.ext_inviter.lock().await.clone() {
+                    Some(i) => i,
+                    None => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_unavailable",
+                            "ext_inviter 未注入 — PWA→SIP UA 内線経路は構成不可",
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("ext_inviter 未注入 (intercom SIP arm)"));
+                    }
+                };
+
+                // caller の MediaFrame source は同期で吸い取る (1 度しか取れない、
+                // RFC 8829 §4 / PR #146 review #1 🟡#4 と同じ理由)。
+                let peer_media_rx = match peer.take_media_rx().await {
+                    Some(rx) => rx,
+                    None => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_caller_media_unavailable",
+                            "caller peer media not available (take_media_rx None)",
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("caller take_media_rx None (intercom SIP arm)"));
+                    }
+                };
+
+                // sabiden 内線 NIC 側 RTP socket bind。 `bridge_ext_bind_ip` 未設定は
+                // loopback fallback (テストでも 127.0.0.1 で動く)。 NGN の even-port
+                // allocator は carrier IMS の odd-port aversion 対応 (project memory
+                // `project_ngn_500_FINAL.md`) であって内線 SIP UA leg では不要なため、
+                // 通常の `UdpSocket::bind(*, 0)` で ephemeral port を取る。
+                let ext_bind_ip = self
+                    .bridge_ext_bind_ip
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+                let intercom_sock = match UdpSocket::bind(SocketAddr::new(ext_bind_ip, 0)).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_socket_bind_failed",
+                            format!("internal RTP socket bind failed: {}", e),
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("intercom socket bind: {}", e));
+                    }
+                };
+                let sabi_local = match intercom_sock.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_socket_bind_failed",
+                            format!("local_addr after bind: {}", e),
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("intercom socket local_addr: {}", e));
+                    }
+                };
+
+                // PCMU SDP offer を組み立てる。 caller の SAVPF answer を AVP →
+                // PCMU only subset に正規化し、 c=/o= IP と m=audio port を sabiden
+                // 内線 socket のものに書換える (RFC 4566 §5.2 §5.7)。
+                // browser_answer は SAVPF (= a=rtcp-mux / DTLS-SRTP / ICE 属性付き) の
+                // ため、 AVP プロファイルの一般的 SIP UA (Linphone / Zoiper) には
+                // そのまま送れない。 既存 NGN 経路の正規化 (`convert_savpf_to_avp` →
+                // `Negotiator::for_ngn` → `rewrite_rtp_endpoint`) を再利用する
+                // (NGN 仕様向け正規化と「PCMU only / WebRTC attr 剥離」 という意図は
+                // 内線 SIP UA でも同じ; carrier-specific 制約は乗らない)。
+                let avp_sdp = match convert_savpf_to_avp(browser_answer.as_bytes()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = ws_sink.send(ServerMessage::error(
+                            "intercom_sdp_convert_failed",
+                            format!("SAVPF→AVP convert failed: {}", e),
+                        ));
+                        let _ = peer.close().await;
+                        return Err(anyhow!("SAVPF→AVP convert (intercom): {}", e));
+                    }
+                };
+                let pcmu_only = Negotiator::for_ngn().rewrite_offer(&avp_sdp);
+                let sdp_for_sip_ua =
+                    match rewrite_rtp_endpoint(&pcmu_only, sabi_local.ip(), sabi_local.port()) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = ws_sink.send(ServerMessage::error(
+                                "intercom_sdp_rewrite_failed",
+                                format!("SDP rewrite failed: {}", e),
+                            ));
+                            let _ = peer.close().await;
+                            return Err(anyhow!("SDP rewrite (intercom): {}", e));
+                        }
+                    };
+
+                let metrics = self.metrics.clone();
+                let registry = intercom_svc.registry();
+                let caller_peer = peer.clone();
+                let ws_sink_clone = ws_sink.clone();
+                let target_owned = target.to_string();
+                let dest_aor_owned = dest_aor;
+                let callee_target_uri = dest_binding.contact_uri.clone();
+                let callee_dest_addr = dest_binding.remote;
+
+                // intercom 用 Call-ID は sabiden 内で生成 (RFC 3261 §8.1.1.4 locally
+                // unique で十分; NGN dialog は持たない)。
+                let ts_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let intercom_call_id = format!("intercom-sip-{}-{}", target_owned, ts_ns);
+                let caller_call_id = format!("{}-caller", intercom_call_id);
+                let callee_call_id_placeholder = format!("{}-callee", intercom_call_id);
+
+                let completion = tokio::spawn(async move {
+                    // (5) callee SIP UA に INVITE 送出。
+                    info!(
+                        target = %target_owned,
+                        target_uri = %callee_target_uri,
+                        dest = %callee_dest_addr,
+                        sabi_local = %sabi_local,
+                        "intercom (PWA→SIP UA): INVITE 送出 (Issue #316, RFC 3261 §17.1)"
+                    );
+                    let outcome = ext_inviter
+                        .invite_intercom(&callee_target_uri, callee_dest_addr, &sdp_for_sip_ua)
+                        .await;
+                    let (mut dialog, response) = match outcome {
+                        Ok(super::manager::IntercomLegOutcome::Established {
+                            dialog,
+                            response,
+                        }) => (dialog, response),
+                        Ok(super::manager::IntercomLegOutcome::Failed { status, .. }) => {
+                            warn!(
+                                target = %target_owned,
+                                status,
+                                "intercom (PWA→SIP UA): callee が拒否 ({}xx)",
+                                status / 100
+                            );
+                            metrics.record_invite_extension(InviteResult::Error);
+                            let _ = ws_sink_clone.send(ServerMessage::error(
+                                "intercom_callee_rejected",
+                                format!("callee SIP UA rejected with {}", status),
+                            ));
+                            let _ = caller_peer.close().await;
+                            return Err(anyhow!(
+                                "intercom callee rejected ({}, Issue #316)",
+                                status
+                            ));
+                        }
+                        Ok(super::manager::IntercomLegOutcome::Errored) => {
+                            warn!(target = %target_owned, "intercom (PWA→SIP UA): INVITE transport error");
+                            metrics.record_invite_extension(InviteResult::Error);
+                            let _ = ws_sink_clone.send(ServerMessage::error(
+                                "intercom_callee_unreachable",
+                                "callee SIP UA unreachable (transport error)",
+                            ));
+                            let _ = caller_peer.close().await;
+                            return Err(anyhow!("intercom callee transport error (Issue #316)"));
+                        }
+                        Err(e) => {
+                            warn!(error=%e, "intercom (PWA→SIP UA): ext_inviter API 失敗");
+                            metrics.record_invite_extension(InviteResult::Error);
+                            let _ = ws_sink_clone.send(ServerMessage::error(
+                                "intercom_callee_invite_failed",
+                                format!("invite_intercom failed: {}", e),
+                            ));
+                            let _ = caller_peer.close().await;
+                            return Err(anyhow!("invite_intercom: {}", e));
+                        }
+                    };
+
+                    // (6) callee 200 OK SDP から RTP endpoint 抽出。
+                    let callee_rtp_peer = match extract_rtp_endpoint(&response.body) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(error=%e, "intercom (PWA→SIP UA): callee 200 OK SDP に RTP endpoint なし");
+                            metrics.record_invite_extension(InviteResult::Error);
+                            let _ = ws_sink_clone.send(ServerMessage::error(
+                                "intercom_callee_sdp_invalid",
+                                format!("callee 200 OK SDP parse failed: {}", e),
+                            ));
+                            if let Err(be) = dialog.send_bye().await {
+                                warn!(error=%be, "intercom callee BYE (cleanup) 失敗");
+                            }
+                            let _ = caller_peer.close().await;
+                            return Err(anyhow!("intercom callee 200 OK SDP parse: {}", e));
+                        }
+                    };
+
+                    // (7) WebRtcAudioBridge 起動 (PWA SAVPF leg ↔ PCMU UDP socket ↔
+                    //     SIP UA endpoint)。 sabiden の str0m は PCMU only 構成
+                    //     (`webrtc/str0m_session.rs::enable_pcmu`) なので
+                    //     direct_pcmu_passthrough = true、 transcode は不要
+                    //     (RFC 3551 §4.5.14 PCMU PT 0 / 8 kHz)。
+                    let bridge: MediaBridge = super::transcoder::WebRtcAudioBridge::start(
+                        super::transcoder::WebRtcAudioConfig {
+                            ngn_socket: intercom_sock,
+                            ngn_peer: Some(callee_rtp_peer),
+                            peer: caller_peer.clone(),
+                            peer_media_rx,
+                            opus_payload_type: super::transcoder::DEFAULT_OPUS_PT,
+                            direct_pcmu_passthrough: true,
+                            metrics: Some(metrics.clone()),
+                        },
+                    )
+                    .into();
+
+                    let bridge_call_id = call_manager.create_call().await;
+                    if let Err(e) = call_manager
+                        .attach_media_bridge(bridge_call_id, bridge)
+                        .await
+                    {
+                        warn!(error=%e, "intercom (PWA→SIP UA): attach_media_bridge 失敗");
+                        metrics.record_invite_extension(InviteResult::Error);
+                        let _ = call_manager.terminate(bridge_call_id).await;
+                        let _ = ws_sink_clone.send(ServerMessage::error(
+                            "intercom_bridge_attach_failed",
+                            format!("attach_media_bridge failed: {}", e),
+                        ));
+                        if let Err(be) = dialog.send_bye().await {
+                            warn!(error=%be, "intercom callee BYE (cleanup) 失敗");
+                        }
+                        let _ = caller_peer.close().await;
+                        return Err(anyhow!("intercom attach_media_bridge: {}", e));
+                    }
+
+                    // (8) IntercomService に確立 entry を登録 (NGN を含まないので
+                    //     `OutboundCallRegistry` ではなく `InternalCallRegistry` を使う)。
+                    //     SIP UA leg の Call-ID は dialog から取得。
+                    let callee_call_id = dialog.dialog().id().call_id.clone();
+                    let _ = callee_call_id_placeholder; // sentinel; 実 Call-ID は dialog 由来
+
+                    let entry = super::intercom::InternalCallEntry::new(
+                        caller_call_id,
+                        callee_call_id,
+                        target_owned.clone(),
+                        dest_aor_owned,
+                        bridge_call_id,
+                    );
+                    registry.insert(entry).await;
+                    metrics.record_invite_extension(InviteResult::Answered);
+                    info!(
+                        target = %target_owned,
+                        bridge_call_id = %bridge_call_id,
+                        "intercom (PWA→SIP UA) 確立 (Issue #316)"
+                    );
+
+                    // Note: dialog はここで drop される。 SIP UA からの BYE 受信は
+                    // 内線 UAS 側 (`src/sip/uas.rs`) が処理する。 sabiden 発の BYE
+                    // (= PWA WS close 経路) を sabiden 側から SIP UA に流すには
+                    // dialog 保持が要るが、 本 PR scope は establish までで、 BYE
+                    // 連動は follow-up (NGN PWA 経路と同じ
+                    // `webrtc_outbound_active` 相当の SIP-leg テーブルが必要)。
+                    Ok(())
+                });
+
                 Ok(PwaOutboundOutcome {
                     savpf_answer: browser_answer,
                     completion,

@@ -54,7 +54,7 @@ use super::{CallId, CallState};
 use crate::sdp::SessionDescription;
 use crate::sip::message::SipResponse;
 use crate::sip::registrar::ExtensionRegistrar;
-use crate::sip::uac::{InviteOutcome, InvitePlan, Uac};
+use crate::sip::uac::{InviteOutcome, InvitePlan, Uac, UacDialog};
 
 /// 1 内線レッグへ 1 INVITE を送ってフォーク結果を返すワーカ。
 ///
@@ -65,6 +65,52 @@ pub trait LegInviter: Send + Sync {
     /// 1 つの宛先に対して INVITE を送り、最終応答を返す。
     /// CANCEL 用に `InvitePlan` も返す。
     async fn invite(&self, target_uri: &str, sdp_offer: &[u8]) -> Result<LegOutcome>;
+
+    /// Issue #316: 宛先 `SocketAddr` を明示し、 確立済 `UacDialog` も返す
+    /// 内線 SIP UA 向け INVITE 発行。
+    ///
+    /// `invite` (= fork 用) は dialog を捨て fork 結果しか返さないので、
+    /// 内線 PWA→SIP UA intercom 経路で **2xx 後の BYE 送出** が出来ない。
+    /// 本メソッドは `binding.remote` (RFC 5626 受信元 = 内線 SIP UA 実機 addr) を
+    /// destination として渡し、 結果として [`IntercomLegOutcome::Established`] では
+    /// `UacDialog` を保持して返す。 既定実装は `Err` (= 内線 intercom 非対応の
+    /// 実装、 例: テスト stub) のため、 [`UacForker`] 等本番 LegInviter は override する。
+    ///
+    /// # RFC 引用
+    ///
+    /// - RFC 3261 §17.1 / §13: INVITE → 200 OK で dialog 確立。
+    /// - RFC 5626: REGISTER で学習した contact remote address (= "received") を
+    ///   後続 INVITE の destination として使う。
+    async fn invite_intercom(
+        &self,
+        target_uri: &str,
+        dest_addr: SocketAddr,
+        sdp_offer: &[u8],
+    ) -> Result<IntercomLegOutcome> {
+        let _ = (target_uri, dest_addr, sdp_offer);
+        Err(anyhow!(
+            "LegInviter::invite_intercom is not supported by this implementation"
+        ))
+    }
+}
+
+/// Issue #316: 内線 SIP UA 向け intercom INVITE の結果。
+///
+/// [`LegOutcome`] と違い、 `Established` 時に [`UacDialog`] を保持する
+/// (= 2xx 後の BYE 送出 / cleanup 路で使う)。 `UacDialog` は内部で
+/// `Dialog` + `TransactionLayer` Arc + cseq 等を保持しサイズが大きいため、
+/// clippy `large_enum_variant` 回避のため `Box` で wrap する
+/// (`InviteOutcome::Established` と同じパターン)。
+pub enum IntercomLegOutcome {
+    /// 200 OK を受信し dialog 確立済。 ACK は内部で送出済 (RFC 3261 §13.2.2.4)。
+    Established {
+        dialog: Box<UacDialog>,
+        response: SipResponse,
+    },
+    /// 3xx-6xx で失敗確定。
+    Failed { status: u16, response: SipResponse },
+    /// transport error / timeout 等。
+    Errored,
 }
 
 /// 1 レッグの INVITE 結果。
@@ -111,6 +157,36 @@ impl LegInviter for UacForker {
                 Ok(LegOutcome::Errored {
                     plan: Some(plan_for_return),
                 })
+            }
+        }
+    }
+
+    /// Issue #316: PWA→SIP UA intercom 経路で内線 SIP UA へ送る INVITE。
+    /// dialog を持ち帰り、 confirmed 後の BYE 送出 / Err path cleanup を可能にする。
+    /// RFC 5626 / RFC 3261 §17.1 / §13.2.2.4 (2xx ACK は internal で送出済)。
+    async fn invite_intercom(
+        &self,
+        target_uri: &str,
+        dest_addr: SocketAddr,
+        sdp_offer: &[u8],
+    ) -> Result<IntercomLegOutcome> {
+        let plan = self.uac.build_invite(target_uri, Some(sdp_offer), None);
+        let outcome = self
+            .uac
+            .invite_to(plan, dest_addr, Some(sdp_offer.to_vec()))
+            .await;
+        match outcome {
+            Ok(InviteOutcome::Established(call)) => Ok(IntercomLegOutcome::Established {
+                dialog: Box::new(call.dialog),
+                response: call.response,
+            }),
+            Ok(InviteOutcome::Failed { response }) => Ok(IntercomLegOutcome::Failed {
+                status: response.status_code,
+                response,
+            }),
+            Err(e) => {
+                warn!(target = target_uri, %dest_addr, error=%e, "intercom leg INVITE エラー");
+                Ok(IntercomLegOutcome::Errored)
             }
         }
     }
@@ -511,6 +587,30 @@ mod tests {
             result,
             ForkResult::AllFailed { last_status: None }
         ));
+    }
+
+    /// Issue #316: `LegInviter` trait の default `invite_intercom` 実装は
+    /// "unsupported" Err を返す。 ScriptedInviter (test stub) は
+    /// `invite_intercom` を override していないので default 実装が走り、
+    /// PWA→SIP UA intercom には使えないことを示す (= production の
+    /// `UacForker` のみがサポートする設計)。
+    #[tokio::test]
+    async fn issue316_leg_inviter_default_invite_intercom_returns_err() {
+        let inviter = ScriptedInviter::builder().build();
+        let dest: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let res = inviter
+            .invite_intercom("sip:bob@127.0.0.1:5060", dest, b"v=0\r\n")
+            .await;
+        assert!(
+            res.is_err(),
+            "default LegInviter::invite_intercom は unsupported Err を返すべき"
+        );
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("not supported"),
+            "Err message に not supported が含まれるべき: {}",
+            msg
+        );
     }
 
     #[tokio::test]

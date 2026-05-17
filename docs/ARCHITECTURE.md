@@ -1486,26 +1486,79 @@ PR #314 で landing 済み (production 結線):
    classify を呼び、 Internal hit なら **480 Temporarily Unavailable**
    (RFC 3261 §21.4.18) で fail-fast。 NGN に内線 AOR が漏れる band-aid を
    遮断する (CLAUDE.md §6.1)。
-6. **PWA → SIP UA 内線の dispatcher gate**: classify で hit したが
-   `binding.transport = ExtTransport::Sip` のときは
-   `ServerMessage::Error { code: "intercom_sip_callee_unsupported" }` を
-   caller に返し NGN 経路に流さない (band-aid 防止)。
+6. **PWA → SIP UA full multi-leg orchestration** (Issue #316、 PR で landing):
+   `dispatch_pwa_internal_call` の `ExtTransport::Sip` arm で
+   (a) caller `peer.handle_offer` で SAVPF answer 即時返却、 (b) caller
+   `peer.take_media_rx` で MediaFrame source 取得、 (c) sabiden 内線 NIC に
+   ephemeral RTP socket bind、 (d) SAVPF answer を AVP→PCMU only に正規化し
+   c=/o=/m= を sabiden の bind addr に書換え (RFC 4566)、
+   (e) `LegInviter::invite_intercom`
+   (`Uac::invite_to`: destination = `binding.remote` 明示) で INVITE 送出、
+   (f) 200 OK SDP から callee RTP endpoint 抽出 (RFC 3264 §6)、 (g)
+   `WebRtcAudioBridge` (direct_pcmu_passthrough = true) を起動して PWA peer ⇄
+   sabiden RTP socket ⇄ SIP UA endpoint の双方向 PCMU 透過、 (h)
+   `IntercomService::register_call` で `InternalCallRegistry` 登録、 の full
+   flow を実装。 caller cleanup (RFC 8829 §5.1) は全 Err path で
+   `caller_peer.close()` + (2xx 後の attach 失敗時のみ) `dialog.send_bye()` を
+   送出する。
 
 本 PR review follow-up Issue で残務 (= まだ実装されていない経路):
 
-7. **PWA → SIP UA full multi-leg**: SAVPF→AVP→PCMU 変換 + sabiden 側 UDP
-   socket bind + `ext_inviter.invite` + `WebRtcAudioBridge` attach。
-   `dispatch_pwa_internal_call` の `ExtTransport::Sip` arm で 6 の fail-fast
-   を本来の bridge orchestration に差し替える。
-8. **SIP UA → SIP UA full multi-leg**: `handle_invite` の dispatcher gate で
+7. **SIP UA → SIP UA full multi-leg**: `handle_invite` の dispatcher gate で
    480 を返している箇所を、 `ext_inviter` + `RtpBridge` で実 INVITE proxy +
    PCMU UDP リレーに差し替える。
-9. **SIP UA → PWA full multi-leg**: `run_webrtc_leg` パターンを再利用して
+8. **SIP UA → PWA full multi-leg**: `run_webrtc_leg` パターンを再利用して
    SIP UA INVITE 受信側で peer.create_offer → callee WS → answer → bridge attach。
+9. **PWA→SIP UA 経路の BYE 連動**: 現状は SIP UA 側から BYE を受けると
+   UAS 層で処理されるが、 sabiden 発の BYE (= PWA WS close 経由) を SIP UA
+   に流すには `webrtc_outbound_active` 相当の SIP-leg dialog テーブルが要る。
+   establish までは Issue #316 で完了、 双方向 BYE 連動は別 Issue に切り出す。
 10. **alphabetic AOR 対応** (`"alice"` 等): WS 入口 [`is_valid_dial_target`] の
     charset を拡張するか、 `[extensions]` に numeric ↔ alphabetic alias map を
     入れて WS validator は numeric のまま維持する設計選択。 CRLF injection /
     SIP smuggling 防御 (PR #146 review #1 🔴#1) を破らない範囲で対応する。
+
+#### PWA → SIP UA full multi-leg シーケンス (Issue #316)
+
+```text
+PWA (caller)                sabiden                              SIP UA (callee, registrar 経由)
+  │                            │                                          │
+  │ WS ClientMessage::Offer    │                                          │
+  │  { target="101", sdp(SAVPF) }                                         │
+  ├───────────────────────────►│                                          │
+  │                            │ classify_dial_target → Internal{Sip,..}  │
+  │                            │ try_admit (capacity OK)                  │
+  │                            │ peer.handle_offer → SAVPF answer ─┐      │
+  │ WS ServerMessage::Answer   │                                   │      │
+  │  { sdp(SAVPF answer) }     │                                   │      │
+  │◄───────────────────────────┤                                   │      │
+  │                            │ peer.take_media_rx (caller mpsc)  │      │
+  │                            │ UdpSocket::bind (内線 NIC)        │      │
+  │                            │ SAVPF→AVP→PCMU rewrite c=/m=      │      │
+  │                            │   = sabiden internal addr         │      │
+  │                            │                                          │
+  │                            │ Uac::invite_to(dest=binding.remote)      │
+  │                            │   plan = sip:callee@host (PCMU SDP)      │
+  │                            ├─────────────────────────────────────────►│
+  │                            │                                          │ INVITE 受信 / 200 OK 組立
+  │                            │◄─────────────────────────────────────────┤ 200 OK + PCMU SDP
+  │                            │ ACK 自動送出 (RFC 3261 §13.2.2.4)         │
+  │                            ├─────────────────────────────────────────►│
+  │                            │ extract_rtp_endpoint(callee SDP)         │
+  │                            │ WebRtcAudioBridge::start                 │
+  │                            │   peer ⇄ sabiden internal UDP ⇄ callee   │
+  │                            │ IntercomService::register_call           │
+  │                            │                                          │
+  │ (str0m PCMU 8kHz / 20ms)   │ direct_pcmu_passthrough = true           │ (RTP PCMU PT 0)
+  ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ►│ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─►│
+  │◄─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│◄ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
+```
+
+Err path での caller cleanup (RFC 8829 §5.1) は dispatcher の全 fail-fast 経路に
+仕込まれており、 sabiden 側 socket bind 失敗 / SDP rewrite 失敗 / SIP UA 拒否 /
+200 OK SDP 不正 / `attach_media_bridge` 失敗 のいずれでも `caller_peer.close()`
+を best-effort で呼ぶ。 2xx 確立後の bridge 起動失敗時は `dialog.send_bye()`
+で SIP UA 側 dialog も即時終了させ leak を防ぐ (RFC 3261 §15.1.1)。
 
 実装状況 vs テスト命名 (PR #314 review #1 fix):
 
@@ -1513,7 +1566,7 @@ PR #314 で landing 済み (production 結線):
 |---|---|---|
 | PWA → PWA (numeric AOR) | ✅ full multi-leg orchestration (WS validator pass) | **WS-entry e2e**: `tests/intercom_integration.rs::ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn` (`process_client_message` 経由で numeric AOR `"101"` → validator pass → dispatcher → Internal、 NGN socket 0 件) |
 | PWA → PWA (dispatcher 単体) | dispatcher 層単体 (WS validator bypass、 trait API 直叩き) | **integration**: `tests/intercom_integration.rs::rfc5853_pwa_to_pwa_dispatcher_e2e_no_ngn_traffic_and_bridge_forwards_media` (`handle_pwa_outbound_offer` 経由で実 dispatcher → 実 WS Offer push → 実 bridge attach → caller→callee MediaFrame 配送、 NGN socket 到達 0 件) |
-| PWA → SIP UA | dispatcher gate のみ (`intercom_sip_callee_unsupported`) | integration: `tests/intercom_integration.rs::pwa_to_sip_callee_intercom_returns_unsupported_error_and_no_ngn_traffic` |
+| PWA → SIP UA | ✅ full multi-leg orchestration (Issue #316) | **integration**: `tests/intercom_integration.rs::issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic` (fake SIP UA = UdpSocket 直叩きで INVITE 受信 → 200 OK PCMU SDP 返却 → sabiden が `WebRtcAudioBridge` を attach → 双方向 PCMU RTP forward 観測、 NGN socket 0 件) + lib unit: `call::manager::tests::issue316_leg_inviter_default_invite_intercom_returns_err` (`LegInviter::invite_intercom` の default impl は unsupported Err を返すことの確認) |
 | SIP UA → 内線 | dispatcher gate のみ (480) | lib test: `call::orchestrator::tests::rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_temporarily_unavailable` |
 | 容量上限 reject | ✅ full | integration: `tests/intercom_integration.rs::rfc3261_21_4_20_intercom_capacity_overflow_rejects_with_intercom_busy_error` |
 | caller cleanup (callee timeout) | ✅ `caller_peer.close()` on Err paths (RFC 8829 §5.1) | integration: `tests/intercom_integration.rs::dispatch_pwa_internal_call_closes_caller_peer_on_callee_timeout` |

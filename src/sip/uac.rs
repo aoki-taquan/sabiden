@@ -452,6 +452,69 @@ impl Uac {
         }
     }
 
+    /// Issue #316: 宛先 `SocketAddr` を **plan 単位で明示** して INVITE を駆動する。
+    ///
+    /// 既存 [`Uac::invite`] は `self.server_addr` (構築時の単一 destination、 NGN P-CSCF
+    /// 想定) に送るため、 内線 SIP UA (REGISTER した contact remote addr) のように
+    /// destination が plan 毎に異なるケースで使えない。 PWA→SIP UA intercom 経路では
+    /// `binding.remote` (RFC 5626 "received" 相当) を送信先にする必要があり、 本関数で
+    /// 明示する。
+    ///
+    /// RFC 3261 §17.1 / §13: client transaction は INVITE を destination に送り、 最終
+    /// 応答を受け取って dialog を確立する。 `self.server_addr` への送信を除き、 挙動は
+    /// [`Uac::invite`] と完全に同一 (2xx ACK 送出も含む)。 再認証 (401/407) は本 PR では
+    /// scope 外 (SIP UA 内線レッグでは現状認証なしを想定) のため、 単発で Failed として
+    /// 返す。 将来必要になれば `invite` と同じ retry_invite_with_auth 経路を追加可能。
+    pub async fn invite_to(
+        &self,
+        plan: InvitePlan,
+        dest_addr: SocketAddr,
+        sdp_offer_kept_for_dialog: Option<Vec<u8>>,
+    ) -> Result<InviteOutcome> {
+        let _ = sdp_offer_kept_for_dialog;
+        let request = plan.request.clone();
+        let response = self.layer.send_request(request, dest_addr).await?;
+        let code = response.status_code;
+        debug!(code, %dest_addr, "INVITE 最終応答 (invite_to)");
+        if (200..300).contains(&code) {
+            return self.finalize_2xx_to(&plan, dest_addr, response).await;
+        }
+        warn!(code, %dest_addr, "INVITE 失敗 (invite_to)");
+        Ok(InviteOutcome::Failed { response })
+    }
+
+    /// [`Uac::invite_to`] 専用の 2xx 確立処理。 dialog の next-hop 解決失敗時の
+    /// fallback を `self.server_addr` ではなく **本 INVITE の destination**
+    /// (`dest_addr`) に固定する (= 内線 SIP UA の next-hop は dest_addr が最も
+    /// 妥当)。 RFC 3261 §12.2.1.1: in-dialog request の宛先は dialog の next-hop。
+    async fn finalize_2xx_to(
+        &self,
+        plan: &InvitePlan,
+        dest_addr: SocketAddr,
+        response: SipResponse,
+    ) -> Result<InviteOutcome> {
+        let dialog_cfg = DialogConfig {
+            local_uri: self.config.local_addr_of_record().to_string(),
+            remote_uri: plan.target_uri.clone(),
+            local_contact: self.config.contact_uri(),
+            sent_by: self.config.sent_by(),
+        };
+        let dialog = Dialog::from_uac_response(&plan.request, &response, dialog_cfg)?;
+        let ack = dialog.build_ack_for_2xx(plan.cseq);
+        let next_hop = resolve_next_hop_addr(&dialog, dest_addr);
+        self.layer.send_request_no_wait(ack, next_hop).await?;
+        Ok(InviteOutcome::Established(Box::new(EstablishedCall {
+            dialog: UacDialog::new(
+                dialog,
+                plan.cseq,
+                plan.session_expires,
+                self.layer.clone(),
+                dest_addr,
+            ),
+            response,
+        })))
+    }
+
     /// 2xx を受けた `response` に対して dialog を確立し ACK を送る共通処理。
     /// `plan` は **最初に送った INVITE** を渡す (Call-ID / From-tag /
     /// remote_uri 計算に使う)。 再認証経路の retry 後も `plan` 側で
@@ -1465,6 +1528,13 @@ mod tests {
         assert_eq!(bye_resp.status_code, 200);
         server_handle.await.unwrap();
     }
+
+    // Note: `Uac::invite_to` の unit test は production 経路統合テスト
+    // (`tests/intercom_integration.rs::issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic`)
+    // で full coverage されている (fake SIP UA = UdpSocket で INVITE 受信 → 200 OK →
+    // sabiden が ACK 自動送出 → WebRtcAudioBridge attach の経路全て)。 unit test と
+    // しての追加は重複なので置かない (CLAUDE.md §7 テスト方針: integration で
+    // 1 度通せる経路は unit を増やさない)。
 
     #[tokio::test]
     async fn rfc3261_12_2_1_1_bye_goes_to_dialog_remote_target_not_server_addr() {

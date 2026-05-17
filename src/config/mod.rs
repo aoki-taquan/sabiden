@@ -58,6 +58,13 @@ pub struct Config {
     /// (= 旧挙動: NGN 着 MESSAGE は 200 OK 受け流し、 PWA SMS 送信 API は 503)。
     #[serde(default)]
     pub sms: SmsConfig,
+    /// 内線間 direct dial (intercom, Issue #313)。 PWA / SIP UA から
+    /// `ExtensionRegistrar` に登録済みの AOR に発信した場合、 NGN を介さず
+    /// 直接ブリッジする (= NGN 1ch を消費しない、 multi-line)。 既定
+    /// `enabled = true` / `max_concurrent_internal_calls = 4`。 旧挙動
+    /// (常に NGN プロキシ) を維持したい場合は `enabled = false` で塞ぐ。
+    #[serde(default)]
+    pub intercom: crate::call::intercom::IntercomConfig,
 }
 
 /// PWA Web Push 通知設定 (Issue #294)。
@@ -586,6 +593,7 @@ impl Config {
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
             sms: SmsConfig::default(),
+            intercom: crate::call::intercom::IntercomConfig::default(),
         })
     }
 
@@ -761,6 +769,19 @@ impl Config {
                 self.sms.max_history = n;
             }
         }
+        // [intercom] セクション (Issue #313): 内線間 direct dial。
+        // ENV で個別の通話を弄る用途は薄いが、 enabled キルスイッチ + 上限値
+        // は運用で動的に変えたいので env 経由も用意する (本リポジトリの他 section
+        // と同じ pattern)。
+        if let Ok(v) = std::env::var("SABIDEN_INTERCOM_ENABLED") {
+            let lower = v.to_ascii_lowercase();
+            self.intercom.enabled = matches!(lower.as_str(), "true" | "1" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("SABIDEN_INTERCOM_MAX_CONCURRENT_INTERNAL_CALLS") {
+            if let Ok(n) = v.parse() {
+                self.intercom.max_concurrent_internal_calls = n;
+            }
+        }
     }
 
     pub fn example() -> String {
@@ -886,6 +907,17 @@ max_expires = 3600
 # [sms]
 # enabled = false
 # max_history = 200
+
+# 内線間 direct dial (intercom, Issue #313)。 PWA / SIP UA が
+# `ExtensionRegistrar` に登録済みの AOR (例 "alice"、 "iphone") に発信した
+# 場合に sabiden が B2BUA として両レッグをブリッジし NGN を介さない。
+# - NGN 契約 1ch を消費しない (= NGN 発着信と並列に動く multi-line)
+# - 内線同士は PCMU 固定 (両側とも PCMU 構成のため transcode 不要)
+# AOR ヒットしない番号 (NGN 電話番号 / 不在内線) は常に NGN 経路へ流れるので
+# 既存挙動は破壊しない。
+# [intercom]
+# enabled = true
+# max_concurrent_internal_calls = 4
 "#
         .to_string()
     }
@@ -929,6 +961,7 @@ mod tests {
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
             sms: SmsConfig::default(),
+            intercom: crate::call::intercom::IntercomConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -955,6 +988,7 @@ mod tests {
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
             sms: SmsConfig::default(),
+            intercom: crate::call::intercom::IntercomConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -981,6 +1015,7 @@ mod tests {
             transcription: crate::observability::transcription::TranscriptionConfig::default(),
             push: PushConfig::default(),
             sms: SmsConfig::default(),
+            intercom: crate::call::intercom::IntercomConfig::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -1362,6 +1397,39 @@ backend = "stub"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.transcription.enabled);
         assert_eq!(cfg.transcription.backend, "stub");
+    }
+
+    /// Issue #313: `[intercom]` セクション省略時の既定値は
+    /// `enabled=true` / `max_concurrent_internal_calls=4`。
+    #[test]
+    fn toml_default_intercom_section_is_enabled_with_max_4() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.intercom.enabled);
+        assert_eq!(cfg.intercom.max_concurrent_internal_calls, 4);
+    }
+
+    /// Issue #313: TOML から `[intercom]` を上書きできる (キルスイッチ + 上限変更)。
+    #[test]
+    fn toml_intercom_section_can_be_overridden() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[intercom]
+enabled = false
+max_concurrent_internal_calls = 16
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.intercom.enabled);
+        assert_eq!(cfg.intercom.max_concurrent_internal_calls, 16);
     }
 
     /// Issue #295: 不正な time_range は `Config::load` 経路の validate で

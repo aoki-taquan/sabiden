@@ -53,3 +53,12 @@ tokio-tungstenite = "0.21"
 [[test]]
 name = "e2e_call_sequence"
 path = "tests/e2e_call_sequence/mod.rs"
+
+# Issue #313 / PR #314 review fix: 内線間 direct dial (intercom) の
+# integration test。 production の `UasEventHandler` を組み立て、
+# `set_intercom_service` で結線した状態で `handle_pwa_outbound_offer`
+# (= PwaOutboundHandler trait) を呼び、 dispatcher が NGN 経路を経由せず
+# 内線間 dial に振り分けることを実通信フローで検証する。
+[[test]]
+name = "intercom_integration"
+path = "tests/intercom_integration.rs"

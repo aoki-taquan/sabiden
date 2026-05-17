@@ -670,6 +670,26 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         }
         uas_handler.set_message_log(log).await;
     }
+
+    // Issue #313: 内線間 direct dial (intercom) サービスを `UasEventHandler` に
+    // 注入する。 `[intercom] enabled = false` でも service は構築しておく
+    // (= dispatcher 内で `is_enabled` を見て分岐する)。 注入後は
+    // `handle_pwa_outbound_offer` と `handle_invite` の冒頭 dispatcher が
+    // `classify_dial_target` で内線 AOR ヒットを判定し、 NGN を介さない
+    // 内線間通話に分岐できる。 注入しないと dispatcher は常に dormant で
+    // 旧挙動 (= 内線 AOR を NGN に投げて 404) になる。
+    // RFC 3261 §13.2.1 / RFC 5853 §3.2.2: B2BUA は dial target が同一管理
+    // ドメイン内なら外部 (NGN) へプロキシしない選択を取れる。
+    {
+        let intercom_svc = call::intercom::IntercomService::new(full_config.intercom.clone());
+        uas_handler.set_intercom_service(intercom_svc).await;
+        info!(
+            enabled = %full_config.intercom.enabled,
+            max = %full_config.intercom.max_concurrent_internal_calls,
+            "内線間 direct dial (intercom) service 注入完了 (Issue #313)"
+        );
+    }
+
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ

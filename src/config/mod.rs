@@ -65,6 +65,21 @@ pub struct Config {
     /// (常に NGN プロキシ) を維持したい場合は `enabled = false` で塞ぐ。
     #[serde(default)]
     pub intercom: crate::call::intercom::IntercomConfig,
+    /// numeric → alphabetic AOR の alias map (Issue #315)。 PWA WS validator
+    /// は digit-only (`[0-9*#+]{1,32}`、 CRLF injection 防御) なので alphabetic
+    /// AOR (`"alice"` 等) を PWA から直接 dial できない。 本 alias map で
+    /// PWA dial `"101"` → AOR `"alice"` の解決を実現する。 未設定 (空 map) の
+    /// ときは旧挙動 (target をそのまま AOR として lookup) を維持する。
+    ///
+    /// TOML 表記:
+    /// ```toml
+    /// [dial_aliases]
+    /// "101" = "alice"
+    /// "102" = "bob"
+    /// "103" = "iphone"
+    /// ```
+    #[serde(default)]
+    pub dial_aliases: crate::call::intercom::ExtensionAliases,
 }
 
 /// PWA Web Push 通知設定 (Issue #294)。
@@ -594,6 +609,7 @@ impl Config {
             push: PushConfig::default(),
             sms: SmsConfig::default(),
             intercom: crate::call::intercom::IntercomConfig::default(),
+            dial_aliases: crate::call::intercom::ExtensionAliases::default(),
         })
     }
 
@@ -918,6 +934,19 @@ max_expires = 3600
 # [intercom]
 # enabled = true
 # max_concurrent_internal_calls = 4
+
+# numeric → alphabetic AOR の alias map (Issue #315、 任意)。
+# PWA WS validator は `[0-9*#+]{1,32}` (RFC 3261 §25.1 user 文法サブセット、
+# CRLF injection 防御) を要求するため、 alphabetic AOR (`"alice"` 等) は
+# PWA dialer から直接 dial できない。 本 alias map で PWA dial `"101"` →
+# AOR `"alice"` の解決を行い、 PWA UI は「内線番号 = 数字」 のまま維持する。
+# AOR キー (alias の右辺) は内線 UAS で REGISTER している username と一致
+# させる。 alias map 未設定 (空) のときは旧挙動 (target をそのまま AOR
+# として lookup) が完全互換で維持される。
+# [dial_aliases]
+# "101" = "alice"
+# "102" = "bob"
+# "103" = "iphone"
 "#
         .to_string()
     }
@@ -962,6 +991,7 @@ mod tests {
             push: PushConfig::default(),
             sms: SmsConfig::default(),
             intercom: crate::call::intercom::IntercomConfig::default(),
+            dial_aliases: crate::call::intercom::ExtensionAliases::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(
@@ -989,6 +1019,7 @@ mod tests {
             push: PushConfig::default(),
             sms: SmsConfig::default(),
             intercom: crate::call::intercom::IntercomConfig::default(),
+            dial_aliases: crate::call::intercom::ExtensionAliases::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         let local = cfg.sip.local_addr.expect("auto-detected");
@@ -1016,6 +1047,7 @@ mod tests {
             push: PushConfig::default(),
             sms: SmsConfig::default(),
             intercom: crate::call::intercom::IntercomConfig::default(),
+            dial_aliases: crate::call::intercom::ExtensionAliases::default(),
         };
         cfg.resolve_local_addr().expect("resolve");
         assert_eq!(cfg.sip.local_addr.unwrap().port(), 15060);
@@ -1430,6 +1462,42 @@ max_concurrent_internal_calls = 16
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(!cfg.intercom.enabled);
         assert_eq!(cfg.intercom.max_concurrent_internal_calls, 16);
+    }
+
+    /// Issue #315: `[dial_aliases]` セクションが TOML から HashMap として
+    /// パースできる (numeric → alphabetic AOR alias map)。 未設定時は空 map。
+    #[test]
+    fn issue315_toml_dial_aliases_parses_numeric_to_alphabetic_aor() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+
+[dial_aliases]
+"101" = "alice"
+"102" = "bob"
+"103" = "iphone"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.dial_aliases.resolve("101"), Some("alice"));
+        assert_eq!(cfg.dial_aliases.resolve("102"), Some("bob"));
+        assert_eq!(cfg.dial_aliases.resolve("103"), Some("iphone"));
+        assert_eq!(cfg.dial_aliases.resolve("999"), None);
+    }
+
+    /// Issue #315: `[dial_aliases]` セクション省略時は空 map。 alias 未設定の
+    /// ときは旧挙動 (target をそのまま AOR として lookup) が維持される。
+    #[test]
+    fn issue315_toml_dial_aliases_defaults_to_empty_when_section_missing() {
+        let toml_str = r#"
+[sip]
+server_addr = "127.0.0.1:5060"
+phone_number = "0312345678"
+domain = "ntt-east.ne.jp"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.dial_aliases.is_empty());
     }
 
     /// Issue #295: 不正な time_range は `Config::load` 経路の validate で

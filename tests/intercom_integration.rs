@@ -66,7 +66,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
-use sabiden::call::intercom::{IntercomConfig, IntercomService};
+use sabiden::call::intercom::{ExtensionAliases, IntercomConfig, IntercomService};
 use sabiden::call::manager::CallManager;
 use sabiden::call::orchestrator::UasEventHandler;
 use sabiden::sip::registrar::{ExtTransport, ExtensionRegistrar};
@@ -1163,6 +1163,277 @@ async fn ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn() {
 
     // 後始末
     let _ = callee_up_tx;
+}
+
+/// Issue #315 DoD: numeric `"101"` で WS dial → `[dial_aliases]` で alphabetic
+/// AOR `"alice"` に解決 → dispatcher が内線 AOR にヒット → NGN を介さず内線間
+/// dial に分岐する **production 到達経路の e2e**。
+///
+/// # 背景 (Issue #315)
+///
+/// PWA WS validator [`is_valid_dial_target`] は CRLF injection 防御のため
+/// digit-only (`[0-9*#+]{1,32}`、 RFC 3261 §25.1 user 文法サブセット、 PR #146)。
+/// このため alphabetic AOR (`"alice"` 等) を PWA から直接 dial できない。
+/// 本 test は `[dial_aliases]` (option B) を採用することで:
+///
+/// - PWA UI は引き続き numeric `"101"` を dial (digit-only UX 維持)
+/// - sabiden 内部で `"101"` → `"alice"` を alias 解決
+/// - `ExtensionRegistrar.lookup("alice")` で alphabetic AOR の binding を引き当て
+/// - WS validator は digit-only のまま (= CRLF injection 防御は破らない)
+///
+/// この経路で alphabetic AOR (`"alice"` 等) への dial が production で到達可能
+/// になることを担保する。
+///
+/// # シーケンス
+///
+/// 1. registrar に callee PWA `"alice"` (alphabetic AOR) を登録
+/// 2. `[dial_aliases]` に `"101" = "alice"` を設定して `UasEventHandler` に注入
+/// 3. caller PWA から `process_client_message(Offer { target: "101" })` を発射
+/// 4. WS validator (`is_valid_dial_target`) は numeric を通過させる
+/// 5. dispatcher が alias 解決 → `alice` AOR の binding を発見 → Internal 分岐
+/// 6. callee `"alice"` の WS に `ServerMessage::Offer { call_id, sdp }` が push される
+/// 7. caller には `ServerMessage::Answer { sdp }` が SessionAction::Reply で返る
+/// 8. NGN socket には 1 通も飛ばない (alias 解決失敗時の NGN fallthrough 防止)
+///
+/// # 防御効果
+///
+/// - alphabetic AOR への production 到達経路を解放しつつ、 CRLF injection 防御
+///   (digit-only WS validator) を維持
+/// - alias 未登録 (`"alice"` registrar 不在) で alias hit しても、 dispatcher は
+///   `Ngn { target: "101" }` で元の numeric を NGN へ流す (= alphabetic を NGN
+///   Request-URI に載せない、 NGN P-CSCF 404 防止)
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §25.1 (user 文法): WS validator が許容するサブセット `[0-9*#+]{1,32}`
+/// - RFC 3261 §13.2.1 / RFC 5853 §3.2.2 (SBC): 同一管理ドメイン内の dial は
+///   外部 (NGN) へプロキシしない選択を取れる
+/// - RFC 3264 §6 / RFC 8829: SAVPF offer/answer (browser ↔ sabiden)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue315_ws_entry_numeric_dial_alias_resolves_to_alphabetic_aor_intercom() {
+    // (a) fake NGN socket (応答しない、 hit count を監視)
+    let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) registrar に callee PWA を *alphabetic* AOR `"alice"` で登録 (= alias の右辺)
+    let registrar = ExtensionRegistrar::new();
+    let (callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let callee_peer_inner = Arc::new(RecordingPeer::new("alice", callee_up_rx, "alice"));
+    let callee_peer: Arc<dyn PeerSession> = callee_peer_inner.clone();
+    let (mut callee_ws_rx, callee_pending, _callee_ws_sink) =
+        register_pwa_callee(&registrar, "alice", callee_peer.clone()).await;
+
+    // (c) UasEventHandler を組み立てて、 [dial_aliases] に "101" -> "alice" を注入
+    let (uas_handler, _call_manager) =
+        build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
+    {
+        let mut aliases = ExtensionAliases::empty();
+        aliases.map.insert("101".to_string(), "alice".to_string());
+        uas_handler.set_dial_aliases(Arc::new(aliases)).await;
+    }
+    let pwa_outbound: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
+
+    // (d) SignalingState を組み立てて pwa_outbound を結線 (= main.rs と同じ pattern)
+    let verifier = Arc::new(Verifier::new(b"test-secret".to_vec()));
+    let state = SignalingState::new(verifier, registrar.clone(), Duration::from_secs(60))
+        .with_pwa_outbound(pwa_outbound);
+
+    // (e) caller PWA peer
+    let (_caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer: Arc<dyn PeerSession> =
+        Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
+
+    // (f) caller 側 WS sink + PendingAnswers
+    let (caller_ws_tx, _caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let caller_ws_sink = WsSink::new(caller_ws_tx);
+    let pending_answers = PendingAnswers::new();
+
+    let claims = AuthClaims {
+        ext_id: "caller-pwa".to_string(),
+        expiry: 9_999_999_999,
+    };
+    let mut aor_guard: Option<String> = None;
+    let remote: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+
+    // (g) WS 入口を駆動: target = "101" (numeric)
+    //     → WS validator pass → dispatcher alias 解決 ("101"→"alice")
+    //     → registrar lookup hit → Internal 分岐
+    let action = process_client_message(
+        ClientMessage::Offer {
+            sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=caller-offer\r\n".into(),
+            target: Some("101".into()),
+        },
+        &state,
+        &claims,
+        &caller_peer,
+        remote,
+        &mut aor_guard,
+        &caller_ws_sink,
+        &pending_answers,
+    )
+    .await;
+
+    // (h) caller には ServerMessage::Answer が返る (alias 解決後 dispatcher 到達の証拠)
+    match action {
+        SessionAction::Reply(ServerMessage::Answer { sdp }) => {
+            assert!(
+                sdp.contains("caller-answer"),
+                "alias 解決後 caller に Answer が返るべき: {}",
+                sdp
+            );
+        }
+        SessionAction::Reply(other) => panic!(
+            "alias 解決後 ServerMessage::Answer 期待だが reply 内容が違う: {:?}",
+            other
+        ),
+        SessionAction::Continue => {
+            panic!("alias 解決 (\"101\" → \"alice\") が dispatcher に届かなかった: Continue")
+        }
+        SessionAction::Close => {
+            panic!("alias 解決 (\"101\" → \"alice\") が dispatcher に届かなかった: Close")
+        }
+    }
+
+    // (i) callee `"alice"` WS に sabiden 発 Offer が push される
+    //     (= alias 解決した AOR `"alice"` の binding が引き当てられた決定的証拠)
+    let pushed = timeout(Duration::from_secs(3), callee_ws_rx.recv())
+        .await
+        .expect(
+            "callee `\"alice\"` WS に Offer が push されない \
+             (alias 解決失敗 or dispatcher 未到達)",
+        )
+        .expect("callee WS rx closed prematurely");
+    let callee_call_id = match pushed {
+        ServerMessage::Offer { call_id, sdp } => {
+            assert!(
+                sdp.contains("alice-offer"),
+                "callee `\"alice\"` への push SDP が callee_peer.create_offer 戻り値でない: {}",
+                sdp
+            );
+            call_id
+        }
+        other => panic!(
+            "callee `\"alice\"` WS の最初の ServerMessage が Offer ではない: {:?}",
+            other
+        ),
+    };
+
+    // (j) callee answer
+    callee_pending
+        .deliver(
+            &callee_call_id,
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=alice-answered\r\n".to_string(),
+        )
+        .await;
+
+    // (k) NGN socket には到達 0 件 (alphabetic AOR が NGN に漏れていない決定的証拠)
+    //     alias 解決が失敗して numeric `"101"` のまま NGN に流れると hit_count > 0。
+    //     alias 解決 hit + registrar miss でも `target = "101"` で NGN に流れる経路は
+    //     起きない (registrar に `"alice"` は登録済のため)。
+    assert_eq!(
+        ngn_hit_count.load(Ordering::SeqCst),
+        0,
+        "alias 解決経路でも NGN socket に内線 AOR が漏れている: {} 通到達",
+        ngn_hit_count.load(Ordering::SeqCst)
+    );
+
+    // 後始末
+    let _ = callee_up_tx;
+}
+
+/// Issue #315: `[dial_aliases]` に `"999" = "ghost"` を入れたが `"ghost"` AOR
+/// が registrar に未登録 (= 期限切れ / 設定漏れ) のとき、 dispatcher は
+/// **Internal 分岐に入らない** (= alias hit + registrar miss → Ngn fallback)。
+///
+/// dispatcher の Internal 分岐に入った場合の決定的副作用 (callee `"ghost"` の
+/// WS に Offer が push される、 など) が観測されないことだけを assert する。
+/// 後段の NGN 経路 (SDP 変換 / NGN UAC 送出) が試験 fixture では起動しにくい
+/// (rate limiter / SAVPF→AVP 変換 / DTMF 等の依存) ため、 「Internal 分岐に
+/// 入らない」 = 「callee_ws に Offer が来ない」 だけを観測する。
+///
+/// # 防御効果
+///
+/// alias map に「未稼働内線」 が残ったまま運用されても、 dispatcher が
+/// alphabetic AOR を **強引に** Internal 分岐に流して BYE / 5xx で帰る挙動を
+/// 防ぐ。 alias 解決後 registrar lookup miss は NGN 経路に正しく fallback する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue315_alias_hit_but_aor_unregistered_does_not_enter_internal_branch() {
+    let (_ngn_sock, fake_ngn_addr, _ngn_hit_count) = build_fake_ngn().await;
+    let registrar = ExtensionRegistrar::new();
+
+    // alias 設定: "999" → "ghost"、 「ghost」 は registrar に登録しない
+    // (= 設定漏れ / 期限切れの模擬)
+    let (uas_handler, _call_manager) =
+        build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
+    {
+        let mut aliases = ExtensionAliases::empty();
+        aliases.map.insert("999".to_string(), "ghost".to_string());
+        uas_handler.set_dial_aliases(Arc::new(aliases)).await;
+    }
+
+    // 観測用 callee `"ghost"` を ws-only mode で registrar に登録するが、
+    // **expiry 0** (= 即時期限切れ) にすることで registrar.lookup が None を
+    // 返す状況を模擬する。 これで dispatcher が誤って Internal 経路に分岐
+    // した場合に callee_ws_rx に Offer が届くか観測できる。
+    let (_callee_up_tx, callee_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let callee_peer_inner = Arc::new(RecordingPeer::new("ghost", callee_up_rx, "ghost"));
+    let callee_peer_arc: Arc<dyn PeerSession> = callee_peer_inner.clone();
+    let (callee_ws_tx, mut callee_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let callee_ws_sink = WsSink::new(callee_ws_tx);
+    let callee_pending = PendingAnswers::new();
+    registrar
+        .register_with_transport(
+            "ghost",
+            "sip:ghost@webrtc.peer".to_string(),
+            "127.0.0.1:5060".parse().unwrap(),
+            // expiry を極小値にして lookup 時刻には期限切れに
+            Duration::from_millis(1),
+            ExtTransport::WebRtc {
+                peer: callee_peer_arc.clone(),
+                ws: callee_ws_sink,
+                pending: callee_pending,
+            },
+        )
+        .await;
+    // 期限切れさせる
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // dispatch: target="999" alias → "ghost" registrar miss
+    //          → classify_dial_target は Ngn { target: "999" } を返す
+    //          → Internal 分岐に入らない (= callee_ws に Offer が push されない)
+    let handler_trait: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
+    let (_caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer: Arc<dyn PeerSession> =
+        Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
+    let (caller_ws_tx, _caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let _ = timeout(
+        Duration::from_millis(500),
+        handler_trait.handle_pwa_outbound_offer(
+            "999",
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=caller-offer\r\n",
+            &caller_peer,
+            &WsSink::new(caller_ws_tx),
+        ),
+    )
+    .await;
+
+    // Internal 分岐 (= dispatch_pwa_internal_call) に誤って入った場合のみ、
+    // callee_ws に sabiden 発 Offer が push される。 alias hit + registrar miss で
+    // 正しく Ngn に fallback していれば、 callee_ws は無音 (try_recv = Err(Empty))。
+    match callee_ws_rx.try_recv() {
+        Err(mpsc::error::TryRecvError::Empty) => {
+            // 期待通り: dispatcher が Internal 分岐に入らなかった
+        }
+        Ok(ServerMessage::Offer { .. }) => {
+            panic!(
+                "alias hit + registrar miss で誤って Internal 経路に分岐した \
+                 (= callee `\"ghost\"` の WS に Offer が push された)"
+            );
+        }
+        Ok(other) => panic!("予期しない ServerMessage: {:?}", other),
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            panic!("callee WS チャネルが切断された")
+        }
+    }
 }
 
 /// PR #314 review #2 🟡#2 fix: dispatch_pwa_internal_call の callee 側失敗

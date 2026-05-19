@@ -90,6 +90,10 @@ struct RecordingPeer {
     /// Issue #313: callee 側だけが create_offer を呼ばれる。 caller 側は
     /// handle_offer だけが呼ばれる。 SDP は実 str0m を介さないので形だけ整える。
     sdp_marker: &'static str,
+    /// Issue #321: `close()` 呼出回数を記録。 Err path test で
+    /// `caller_peer.close()` が必ず叩かれることを assert する目的
+    /// (RFC 8829 §5.1 Connection Cleanup)。
+    close_count: AtomicU32,
 }
 
 impl RecordingPeer {
@@ -103,6 +107,7 @@ impl RecordingPeer {
             received: Mutex::new(Vec::new()),
             received_count: AtomicU32::new(0),
             sdp_marker,
+            close_count: AtomicU32::new(0),
         }
     }
 }
@@ -154,6 +159,7 @@ a=rtpmap:0 PCMU/8000\r\n",
         Ok(())
     }
     async fn close(&self) -> Result<()> {
+        self.close_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -694,6 +700,231 @@ a=rtpmap:0 PCMU/8000\r\n",
     assert_eq!(got[0].pt, 0, "caller peer に届く MediaFrame は PCMU PT 0");
     assert_eq!(got[0].payload, vec![0xCD; 160], "PCMU payload 透過");
     drop(got);
+
+    // 後始末
+    let _ = caller_up_tx;
+}
+
+/// Issue #321 DoD #2: PWA → SIP UA 内線通話で **callee SIP UA が 486 で reject**
+/// した時、 SIP arm の Err path が決定的に cleanup を完遂することを検証する。
+///
+/// PR #320 で導入された SIP arm (`dispatch_pwa_internal_call::ExtTransport::Sip`)
+/// は callee 拒否 (3xx-6xx) を `IntercomLegOutcome::Failed { status, .. }` で
+/// 受け取り、 caller への WS Error push + `caller_peer.close()` + 早期 Err 返却
+/// を行う。 happy path (200 OK) は
+/// `issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic`
+/// で検証済だが、 Err path テストが無いと「失敗時に cleanup されないと caller
+/// PWA が leak する」 regression を検出できない (PR #320 🟡#2)。
+///
+/// # 検証項目
+///
+/// 1. caller (PWA) に SAVPF answer が即時返る (= dispatcher 同期 path は成功)
+/// 2. fake SIP UA に INVITE が届く (= dispatcher が SIP UA leg を呼んだ証拠)
+/// 3. fake SIP UA が **486 Busy Here** を返す
+/// 4. completion JoinHandle が `Err` で完了 (= dispatcher が拒否を Err 化)
+/// 5. `caller_peer.close()` が呼ばれている (RFC 8829 §5.1 Connection Cleanup)
+/// 6. caller WS に `intercom_callee_rejected` Error が push されている
+/// 7. `CallManager` に bridge が **0 件** (= attach_media_bridge 前で早期 Err)
+/// 8. NGN socket に何も到達していない (band-aid 防止)
+///
+/// # RFC 引用
+///
+/// - RFC 3261 §21.4.20 (486 Busy Here): callee declines the invitation.
+/// - RFC 8829 §5.1 (Connection Cleanup): "When a connection is being torn
+///   down, the local peer SHOULD send a shutdown message" — PWA caller の
+///   DTLS-SRTP / ICE state を解放する。
+/// - RFC 5853 §3.2.2 (SBC): B2BUA は両 leg の終端で、 一方の leg 失敗時に
+///   もう一方の leg も解放する責務がある。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue321_pwa_to_sip_ua_callee_486_reject_cleans_up_caller_no_ngn_traffic() {
+    use sabiden::sip::message::{parse_message, SipHeaders, SipMessage};
+
+    // (a) fake NGN (応答しない、 hit count を監視)
+    let (_ngn_sock, fake_ngn_addr, ngn_hit_count) = build_fake_ngn().await;
+
+    // (b) fake SIP UA: INVITE を受け取り **486 Busy Here** で reject する。
+    //     RFC 3261 §21.4.20: 486 は callee がそのリクエストを accept できないと示す。
+    let fake_ua_sip_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let fake_ua_sip_addr = fake_ua_sip_sock.local_addr().unwrap();
+
+    let invite_received = Arc::new(AtomicU32::new(0));
+    let invite_received_clone = invite_received.clone();
+    let fake_ua_sip_clone = fake_ua_sip_sock.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match fake_ua_sip_clone.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let msg = match parse_message(&buf[..n]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let req = match msg {
+                SipMessage::Request(r) => r,
+                SipMessage::Response(_) => continue,
+            };
+            let method_str = req.method.as_str();
+            if method_str != "INVITE" {
+                // ACK を受信したら drop (RFC 3261 §17.1.1.3)
+                continue;
+            }
+            invite_received_clone.fetch_add(1, Ordering::SeqCst);
+
+            // 486 Busy Here 応答を組み立てる (RFC 3261 §21.4.20)。
+            let mut headers = SipHeaders::new();
+            if let Some(v) = req.headers.get("via") {
+                headers.set("Via", v);
+            }
+            if let Some(f) = req.headers.get("from") {
+                headers.set("From", f);
+            }
+            // RFC 3261 §8.2.6.2: non-2xx final response でも To に tag を付ける。
+            let to_with_tag = match req.headers.get("to") {
+                Some(t) if !t.contains(";tag=") => format!("{};tag=fakeua-486-tag", t),
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            headers.set("To", &to_with_tag);
+            if let Some(c) = req.headers.get("call-id") {
+                headers.set("Call-ID", c);
+            }
+            if let Some(cs) = req.headers.get("cseq") {
+                headers.set("CSeq", cs);
+            }
+            let resp = sabiden::sip::message::SipResponse {
+                status_code: 486,
+                reason: "Busy Here".to_string(),
+                headers,
+                body: Vec::new(),
+            };
+            let bytes = resp.to_bytes();
+            let _ = fake_ua_sip_clone.send_to(&bytes, peer).await;
+        }
+    });
+
+    // (c) registrar に SIP UA callee を登録 (binding.remote = fake UA SIP addr)
+    let registrar = ExtensionRegistrar::new();
+    registrar
+        .register(
+            "linphone-bob",
+            format!("sip:linphone-bob@{}", fake_ua_sip_addr),
+            fake_ua_sip_addr,
+            Duration::from_secs(300),
+        )
+        .await;
+
+    // (d) UasEventHandler を組み立て
+    let (uas_handler, call_manager) =
+        build_uas_handler(fake_ngn_addr, registrar.clone(), true, 4).await;
+
+    // (e) caller PWA peer (RecordingPeer)。 close_count を後で読むため inner を保持。
+    let (caller_up_tx, caller_up_rx) = mpsc::channel::<MediaFrame>(8);
+    let caller_peer_inner = Arc::new(RecordingPeer::new("caller", caller_up_rx, "caller"));
+    let caller_peer: Arc<dyn PeerSession> = caller_peer_inner.clone();
+    let (caller_ws_tx, mut caller_ws_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let caller_ws_sink = WsSink::new(caller_ws_tx);
+
+    // (f) dispatcher 駆動 (同期 path は成功する: caller SAVPF answer は handle_offer
+    //     から即時返る; callee の 486 は background completion で観測される)
+    let handler_trait: Arc<dyn PwaOutboundHandler> = uas_handler.clone();
+    let outcome = handler_trait
+        .handle_pwa_outbound_offer(
+            "linphone-bob",
+            "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=caller-offer\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/SAVPF 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n",
+            &caller_peer,
+            &caller_ws_sink,
+        )
+        .await
+        .expect("同期 path で Err になるべきでない (caller SAVPF answer は返るはず)");
+
+    // (g) caller には SAVPF answer が即時に返る (dispatcher 同期 path は成功)
+    assert!(
+        outcome.savpf_answer.contains("caller-answer"),
+        "caller SAVPF answer が dispatcher 同期 path から返らない: {}",
+        outcome.savpf_answer
+    );
+
+    // (h) background completion が **Err** で完了する (callee 486 拒否)
+    let completion_result = outcome
+        .completion
+        .await
+        .expect("completion JoinHandle paniced");
+    assert!(
+        completion_result.is_err(),
+        "callee 486 reject なのに background completion が Err にならない \
+         (Err path cleanup が動いていない疑い、 Issue #321)"
+    );
+    let err_str = format!("{}", completion_result.unwrap_err());
+    assert!(
+        err_str.contains("rejected") && err_str.contains("486"),
+        "Err message に callee の 486 status が反映されているべき: {}",
+        err_str
+    );
+
+    // (i) fake SIP UA に INVITE が届いた (= dispatcher が SIP UA leg を呼んだ証拠)
+    assert!(
+        invite_received.load(Ordering::SeqCst) >= 1,
+        "fake SIP UA に INVITE が届かない (dispatcher が SIP UA leg を呼ばなかった)"
+    );
+
+    // (j) caller_peer.close() が呼ばれた (RFC 8829 §5.1 Connection Cleanup)
+    //     PR #320 で導入された Err path cleanup の決定的証拠:
+    //     `IntercomLegOutcome::Failed` arm で `caller_peer.close()` を best-effort
+    //     で叩く実装が無いと PWA caller が leak する。
+    assert!(
+        caller_peer_inner.close_count.load(Ordering::SeqCst) >= 1,
+        "callee 486 reject 時に caller_peer.close() が呼ばれていない \
+         (RFC 8829 §5.1 / Issue #321 DoD #2: cleanup されないと PWA が leak)"
+    );
+
+    // (k) caller WS に `intercom_callee_rejected` Error が push されている
+    //     完了通知が WS 経由でしか取れないので 1 件目以降の Error を回収する。
+    let mut saw_rejected = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), caller_ws_rx.recv()).await {
+            Ok(Some(ServerMessage::Error { code, .. })) => {
+                if code == "intercom_callee_rejected" {
+                    saw_rejected = true;
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_rejected,
+        "callee 486 reject 時に caller WS へ `intercom_callee_rejected` Error が \
+         push されていない (Issue #321 DoD #2)"
+    );
+
+    // (l) CallManager に bridge が **0 件** (= attach_media_bridge 前で早期 Err)。
+    //     dispatcher SIP arm は `IntercomLegOutcome::Failed` を受けた時点で早期に
+    //     Err 返却するため、 `call_manager.create_call()` / `attach_media_bridge`
+    //     には到達しない。 InternalCallRegistry insert も同様に skip される。
+    assert_eq!(
+        call_manager.len().await,
+        0,
+        "callee 486 reject なのに CallManager に bridge が残っている \
+         (= Err path で bridge attach が leak、 Issue #321 regression)"
+    );
+
+    // (m) NGN socket には何も到達していない (band-aid 防止)
+    assert_eq!(
+        ngn_hit_count.load(Ordering::SeqCst),
+        0,
+        "PWA→SIP UA 経路だったのに NGN socket に {} 通漏れた (CLAUDE.md §6.1)",
+        ngn_hit_count.load(Ordering::SeqCst)
+    );
 
     // 後始末
     let _ = caller_up_tx;

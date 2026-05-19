@@ -1571,13 +1571,48 @@ PR #314 で landing 済み (production 結線):
    BYE を受けると UAS 層で処理されるが、 sabiden 発の BYE (= caller side の
    切断契機を反対 leg に伝搬) は dialog 保持が要る。 establish までは Issue #316
    / #317 で完了、 双方向 BYE 連動 (`webrtc_outbound_active` 相当の SIP-leg
-   dialog テーブル) は別 Issue に切り出す。
+   dialog テーブル + `dispatch_pwa_internal_call::ExtTransport::Sip` arm の
+   completion JoinHandle 内で drop されている dialog を `InternalCallEntry`
+   に保持する改修) は別 Issue に切り出す。 これが入ると、 PWA→SIP UA 経路で
+   PWA WS 切断時 / 内線 SIP UA からの BYE 受信時に、 反対 leg (= caller PWA
+   `peer.close()` または callee SIP UA `dialog.send_bye()`) を同期で tear-down
+   できる (RFC 3261 §15.1.1 同一 dialog 双方向 BYE)。
 9. **alphabetic AOR 対応 (PWA 側)** (`"alice"` 等): SIP UA caller 経路では既に
    alphabetic AOR が dispatcher まで届く (WS validator を通らない)。 PWA 側でも
    WS 入口 [`is_valid_dial_target`] の charset を拡張するか、 `[extensions]` に
    numeric ↔ alphabetic alias map を入れて WS validator は numeric のまま維持
    する設計選択。 CRLF injection / SIP smuggling 防御 (PR #146 review #1 🔴#1)
    を破らない範囲で対応する。
+
+#### Self-call gate (Issue #324、 RFC 3261 §16 / §21.4.18)
+
+SIP UA → 内線 AOR の dispatcher gate (`handle_invite` 冒頭) は、
+**`target_user == from_aor`** (= 自分自身が自分の AOR に INVITE) を
+`classify_dial_target` を通す手前で **480 Temporarily Unavailable** で
+fail-fast する。 旧コードでは self-call を Internal 経路の skip 条件として
+扱っていたため、 制御が下の rate_limiter → NGN proxy 経路に落ち、 NGN 側で
+AOR (例 `bob`) を NGN 番号として解釈して 404 が返る band-aid 挙動になっていた
+(RFC 3261 §16 loop detection 違反 / CLAUDE.md §6.1 band-aid)。
+
+```text
+INVITE (target_user == from_aor)
+       │
+       ▼
+handle_invite intercom gate
+       │
+       ├── target_user == from_aor (self-call) ──► 480 Temporarily Unavailable
+       │   (RFC 3261 §21.4.18 / §16 loop detection、 NGN 漏洩防止)
+       │
+       └── target_user != from_aor ────────────►  classify_dial_target → 通常経路
+```
+
+RFC 3261 §21.4.18 (480) は "callee's end system was contacted successfully
+but the callee is currently unavailable" の意であり、 「自分自身を呼ぶ」 状況
+は callee が論理的に unavailable と看做せる (= RFC 3261 §16 loop detection の
+SIP-level 相当)。 RFC 5853 §3.2.2 (B2BUA / SBC framework) でも、 同一管理
+ドメイン内の self-loop は外部 (NGN) にプロキシしないべき。 self-call gate は
+`intercom_service.is_enabled()` の状態に依らず常に動く (= キルスイッチ構成でも
+NGN 漏洩しない最低限の保証)。
 
 #### PWA → SIP UA full multi-leg シーケンス (Issue #316)
 
@@ -1711,10 +1746,11 @@ SIP UA (caller, alice)        sabiden                              PWA (callee, 
 |---|---|---|
 | PWA → PWA (numeric AOR) | ✅ full multi-leg orchestration (WS validator pass) | **WS-entry e2e**: `tests/intercom_integration.rs::ws_entry_numeric_aor_e2e_dispatches_to_intercom_not_ngn` (`process_client_message` 経由で numeric AOR `"101"` → validator pass → dispatcher → Internal、 NGN socket 0 件) |
 | PWA → PWA (dispatcher 単体) | dispatcher 層単体 (WS validator bypass、 trait API 直叩き) | **integration**: `tests/intercom_integration.rs::rfc5853_pwa_to_pwa_dispatcher_e2e_no_ngn_traffic_and_bridge_forwards_media` (`handle_pwa_outbound_offer` 経由で実 dispatcher → 実 WS Offer push → 実 bridge attach → caller→callee MediaFrame 配送、 NGN socket 到達 0 件) |
-| PWA → SIP UA | ✅ full multi-leg orchestration (Issue #316) | **integration**: `tests/intercom_integration.rs::issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic` (fake SIP UA = UdpSocket 直叩きで INVITE 受信 → 200 OK PCMU SDP 返却 → sabiden が `WebRtcAudioBridge` を attach → 双方向 PCMU RTP forward 観測、 NGN socket 0 件) + lib unit: `call::manager::tests::issue316_leg_inviter_default_invite_intercom_returns_err` (`LegInviter::invite_intercom` の default impl は unsupported Err を返すことの確認) |
+| PWA → SIP UA | ✅ full multi-leg orchestration (Issue #316) | **integration**: `tests/intercom_integration.rs::issue316_pwa_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic` (fake SIP UA = UdpSocket 直叩きで INVITE 受信 → 200 OK PCMU SDP 返却 → sabiden が `WebRtcAudioBridge` を attach → 双方向 PCMU RTP forward 観測、 NGN socket 0 件) + **Err path** (Issue #321): `tests/intercom_integration.rs::issue321_pwa_to_sip_ua_callee_486_reject_cleans_up_caller_no_ngn_traffic` (fake SIP UA が 486 Busy Here で reject → `caller_peer.close()` 呼出 + WS `intercom_callee_rejected` Error push + `CallManager` bridge 0 件 + NGN socket 0 件、 RFC 8829 §5.1 Connection Cleanup) + lib unit: `call::manager::tests::issue316_leg_inviter_default_invite_intercom_returns_err` (`LegInviter::invite_intercom` の default impl は unsupported Err を返すことの確認) |
 | SIP UA → SIP UA | ✅ full multi-leg orchestration (Issue #317) | **integration**: `tests/intercom_integration.rs::issue317_sip_ua_to_sip_ua_full_multi_leg_e2e_bidirectional_pcmu_no_ngn_traffic` (fake caller UDP socket → ExtensionUas → orchestrator dispatcher → `ext_inviter.invite_intercom` → fake callee UDP socket、 200 OK + PCMU SDP / 双方向 PCMU RTP relay (`MediaBridge::Relay`) を観測、 NGN socket 0 件) |
 | SIP UA → PWA | ✅ full multi-leg orchestration (Issue #317) | **integration**: `tests/intercom_integration.rs::issue317_sip_ua_to_pwa_full_multi_leg_e2e_pcmu_no_ngn_traffic` (fake caller UDP socket → ExtensionUas → orchestrator dispatcher → callee PWA `peer.create_offer` → WS Offer push → answer 受信 → `WebRtcAudioBridge` direct_pcmu_passthrough、 caller-leg socket ⇄ callee MediaFrame の双方向 PCMU 観測、 NGN socket 0 件) |
 | SIP UA → 内線 (intercom disabled) | dispatcher gate のみ (480、 `enabled = false`) | lib test: `call::orchestrator::tests::rfc3261_21_4_18_sip_ua_to_internal_aor_returns_480_when_intercom_disabled` (キルスイッチ経路: `enabled = false` のとき 480 fail-fast で NGN 漏洩防止) |
+| SIP UA → 自分自身 (self-call) | ✅ 480 fail-fast (Issue #324、 `enabled` 状態に依らず常時動く gate) | lib test: `call::orchestrator::tests::rfc3261_21_4_18_self_call_returns_480` (`target_user == from_aor` で 480 fail-fast、 NGN socket 0 件、 RFC 3261 §16 loop detection / §21.4.18) |
 | 容量上限 reject | ✅ full | integration: `tests/intercom_integration.rs::rfc3261_21_4_20_intercom_capacity_overflow_rejects_with_intercom_busy_error` |
 | caller cleanup (callee timeout) | ✅ `caller_peer.close()` on Err paths (RFC 8829 §5.1) | integration: `tests/intercom_integration.rs::dispatch_pwa_internal_call_closes_caller_peer_on_callee_timeout` |
 | Bridge primitive | ✅ | lib unit: `call::intercom::tests::rfc3551_webrtc_relay_bridge_forwards_pcmu_both_directions` 等 (旧名は "integration" を詐称していたため PR #314 review #1 で改名) |

@@ -690,6 +690,22 @@ async fn run_register(config_path: &str, trace_dir_override: Option<&str>) -> Re
         );
     }
 
+    // Issue #315: numeric → alphabetic AOR の alias map を注入する。
+    // PWA WS validator (`is_valid_dial_target`、 digit-only) を通過した
+    // numeric `"101"` を sabiden 内部で AOR `"alice"` に解決し、 NGN を
+    // 介さず内線 AOR に届けるための辞書。 `[dial_aliases]` セクション未設定
+    // 時は空 map で旧挙動を維持する (= alphabetic AOR は WS から dial 不可、
+    // CRLF injection 防御は破られない)。
+    {
+        let aliases = std::sync::Arc::new(full_config.dial_aliases.clone());
+        let alias_count = aliases.len();
+        uas_handler.set_dial_aliases(aliases).await;
+        info!(
+            alias_count = %alias_count,
+            "dial alias map 注入完了 (Issue #315)"
+        );
+    }
+
     uas_handler.spawn(uas_event_rx);
 
     // (8) UAS 受信ループ

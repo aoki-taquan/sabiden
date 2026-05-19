@@ -140,3 +140,18 @@ max_expires = 3600
 # [intercom]
 # enabled = true
 # max_concurrent_internal_calls = 4
+
+# numeric → alphabetic AOR の alias map (Issue #315、 任意)
+# PWA WS validator は `[0-9*#+]{1,32}` のみ (RFC 3261 §25.1 user 文法サブセット、
+# CRLF injection 防御、 PR #146) のため、 alphabetic AOR (`"alice"` 等) を PWA
+# Dialer から直接 dial できない。 本 alias map で PWA dial `"101"` → AOR
+# `"alice"` の解決を行う:
+# - PWA は引き続き numeric `"101"` を dial、 SOHO PBX 風の「内線番号 = 数字」UX
+# - sabiden 内部で alias 解決した AOR `"alice"` を `ExtensionRegistrar` で lookup
+# - alias map 未設定 (空) のときは旧挙動 (target をそのまま AOR として lookup) を維持
+# AOR キー (alias の右辺) は内線 UAS で REGISTER している username と一致させる。
+# WS validator は引き続き digit-only で運用 (CRLF injection / SIP smuggling 防御は破らない)。
+# [dial_aliases]
+# "101" = "alice"
+# "102" = "bob"
+# "103" = "iphone"

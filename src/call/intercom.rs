@@ -85,27 +85,117 @@ impl DialDestination {
     }
 }
 
+/// numeric dial target → alphabetic AOR の alias map (Issue #315)。
+///
+/// # 背景 (Issue #315)
+///
+/// PWA WS 入口 [`is_valid_dial_target`](crate::webrtc::signaling) は
+/// RFC 3261 §25.1 の `user` 文法サブセット `[0-9*#+]{1,32}` のみを許容
+/// (CRLF injection / SIP message smuggling 防御、 PR #146 review #1 🔴#1)。
+/// このため alphabetic AOR (`"alice"` / `"iphone"` 等) を PWA から直接 dial
+/// すると WS validator で reject されて dispatcher に届かない。
+///
+/// 本構造体は **numeric ↔ alphabetic alias** を持ち、 PWA が dial する
+/// 「内線番号」 `"101"` を sabiden 内部で AOR `"alice"` に解決してから
+/// `ExtensionRegistrar::lookup` を行う。 WS validator は digit-only のまま
+/// 維持され、 CRLF injection 防御は破られない。
+///
+/// # TOML 表記
+///
+/// ```toml
+/// [dial_aliases]
+/// "101" = "alice"
+/// "102" = "bob"
+/// "103" = "iphone"
+/// ```
+///
+/// # 解決順序 (RFC 引用なし: sabiden 内部の routing rule)
+///
+/// 1. `aliases.resolve(target)` が `Some(aor)` を返したらその AOR を使う
+/// 2. `None` のときは `target` をそのまま AOR として扱う (= 旧挙動と完全互換)
+///
+/// この順序で「alias map 未設定」 (= 空 HashMap) のときは `target` がそのまま
+/// AOR として扱われ、 numeric AOR (`"101"` を AOR にした古い構成) が壊れない。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ExtensionAliases {
+    /// dial target → AOR の対応表 (例 `"101" -> "alice"`)。
+    ///
+    /// `#[serde(flatten)]` で TOML の `[dial_aliases]` セクション直下の
+    /// key=value をそのまま map に取り込む。 これにより
+    /// `[dial_aliases]` `"101" = "alice"` の表記が可能になる。
+    #[serde(flatten)]
+    pub map: HashMap<String, String>,
+}
+
+impl ExtensionAliases {
+    /// 空 alias map (= 旧挙動 / 完全互換)。
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// `target` から alias 解決した AOR を返す。 hit しなければ `None`。
+    pub fn resolve<'a>(&'a self, target: &str) -> Option<&'a str> {
+        self.map.get(target).map(String::as_str)
+    }
+
+    /// alias map が空かどうか。
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// alias 数 (運用ログ用)。
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// dial target を [`ExtensionRegistrar`] に問合せて [`DialDestination`] を返す。
 ///
-/// # 判定ルール (RFC 3261 §10 / Issue #313)
+/// # 判定ルール (RFC 3261 §10 / Issue #313 / Issue #315)
 ///
-/// 1. `target` を AOR として `registrar.lookup(target)` する。 ヒットしたら
-///    [`DialDestination::Internal`] を返す。 期限切れ binding は registrar
-///    側で自動除外されるので、 ここでは追加のチェック不要。
-/// 2. ヒットしなければ [`DialDestination::Ngn`] を返す (= 従来挙動)。
+/// 1. `aliases.resolve(target)` で alias 解決。 hit したらその AOR で次に進む。
+///    hit しなければ `target` をそのまま AOR として扱う (= alias map 未設定時の
+///    旧挙動と完全互換)。
+/// 2. AOR を `registrar.lookup(aor)` する。 ヒットしたら
+///    [`DialDestination::Internal { aor, binding }`] を返す。 期限切れ binding は
+///    registrar 側で自動除外されるので、 ここでは追加のチェック不要。
+/// 3. ヒットしなければ [`DialDestination::Ngn { target }`] を返す (= 従来挙動)。
+///    NGN へは **元の `target` 文字列** を流す (= alias resolve 前の値)。 これは
+///    数字 dial を NGN プロキシ経路でも壊さないため (NGN は alphabetic
+///    request-URI を扱わない)。
+///
+/// alias hit / registrar hit の両方を考慮した分岐は以下のとおり:
+///
+/// | alias hit | registrar hit | 結果 |
+/// |---|---|---|
+/// | Yes (`101→alice`) | Yes (`alice` 登録済) | `Internal { aor: "alice", binding }` |
+/// | Yes (`101→alice`) | No (`alice` 未登録 / 期限切れ) | `Ngn { target: "101" }` (旧挙動) |
+/// | No | Yes (`alice` をそのまま AOR、 登録済) | `Internal { aor: "alice", binding }` |
+/// | No | No | `Ngn { target }` (旧挙動) |
 ///
 /// AOR がヒットしないケースは PSTN 番号 (`117`, `0312345678` 等) の他、
 /// 「存在しない内線番号」 も含む。 後者は NGN に投げて 404 で帰る挙動になるが、
 /// これは band-aid 禁止 (CLAUDE.md §6.1) の観点では「`target` が NGN 番号
 /// 文法に合うかは NGN 側で判断する」 設計選択。 sabiden 側は AOR ヒット
 /// 有無のみを単一の真理として使う。
-pub async fn classify_dial_target(target: &str, registrar: &ExtensionRegistrar) -> DialDestination {
-    match registrar.lookup(target).await {
+pub async fn classify_dial_target(
+    target: &str,
+    registrar: &ExtensionRegistrar,
+    aliases: &ExtensionAliases,
+) -> DialDestination {
+    // Step 1: alias resolve (numeric → AOR)。 alias 未設定なら target をそのまま使う。
+    let resolved_aor = aliases.resolve(target).unwrap_or(target);
+    // Step 2: registrar lookup。
+    match registrar.lookup(resolved_aor).await {
         Some(binding) => DialDestination::Internal {
             binding,
-            aor: target.to_string(),
+            aor: resolved_aor.to_string(),
         },
         None => DialDestination::Ngn {
+            // alias hit + registrar miss でも target をそのまま NGN へ流す。
+            // 「alice」 のような alphabetic を NGN Request-URI に載せると
+            // NGN P-CSCF が 404 で弾く (NGN は数字番号のみ)。 元の dial
+            // 文字列 (numeric "101") を載せる方が NGN 側のエラーが自然。
             target: target.to_string(),
         },
     }
@@ -468,7 +558,8 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        let dest = classify_dial_target("alice", &reg).await;
+        let aliases = ExtensionAliases::empty();
+        let dest = classify_dial_target("alice", &reg, &aliases).await;
         match dest {
             DialDestination::Internal { aor, binding } => {
                 assert_eq!(aor, "alice");
@@ -484,7 +575,8 @@ mod tests {
     #[tokio::test]
     async fn rfc3261_10_classify_falls_back_to_ngn_when_no_aor_match() {
         let reg = ExtensionRegistrar::new();
-        let dest = classify_dial_target("117", &reg).await;
+        let aliases = ExtensionAliases::empty();
+        let dest = classify_dial_target("117", &reg, &aliases).await;
         match dest {
             DialDestination::Ngn { ref target } => {
                 assert_eq!(target, "117");
@@ -509,7 +601,8 @@ mod tests {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let dest = classify_dial_target("ghost", &reg).await;
+        let aliases = ExtensionAliases::empty();
+        let dest = classify_dial_target("ghost", &reg, &aliases).await;
         assert!(
             matches!(dest, DialDestination::Ngn { .. }),
             "期限切れは NGN 扱い"
@@ -527,11 +620,114 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        let internal = classify_dial_target("bob", &reg).await;
+        let aliases = ExtensionAliases::empty();
+        let internal = classify_dial_target("bob", &reg, &aliases).await;
         assert_eq!(internal.internal_aor(), Some("bob"));
 
-        let ngn = classify_dial_target("0312345678", &reg).await;
+        let ngn = classify_dial_target("0312345678", &reg, &aliases).await;
         assert_eq!(ngn.internal_aor(), None);
+    }
+
+    /// Issue #315: `[dial_aliases]` で numeric `"101"` → AOR `"alice"` の
+    /// 解決が効くことを確認する。 PWA WS validator (digit-only) を通過した
+    /// `"101"` が dispatcher で alphabetic AOR `"alice"` に解決され、
+    /// `Internal { aor: "alice", binding }` を返す。
+    #[tokio::test]
+    async fn issue315_classify_resolves_numeric_to_alphabetic_aor_via_aliases() {
+        let reg = ExtensionRegistrar::new();
+        reg.register(
+            "alice",
+            "sip:alice@192.0.2.10:5060".to_string(),
+            addr("192.0.2.10:5060"),
+            Duration::from_secs(60),
+        )
+        .await;
+        let mut aliases = ExtensionAliases::empty();
+        aliases.map.insert("101".to_string(), "alice".to_string());
+
+        let dest = classify_dial_target("101", &reg, &aliases).await;
+        match dest {
+            DialDestination::Internal { aor, binding } => {
+                assert_eq!(aor, "alice", "alias resolve で alphabetic AOR に解決");
+                assert_eq!(binding.contact_uri, "sip:alice@192.0.2.10:5060");
+            }
+            DialDestination::Ngn { ref target } => {
+                panic!("alias resolve 失敗 (Ngn fallback): target={}", target)
+            }
+        }
+    }
+
+    /// Issue #315: alias hit するが AOR が registrar 未登録の場合は
+    /// `Ngn { target: <元の dial 値> }` で旧挙動どおり NGN へ流す。 NGN へ
+    /// 流す `target` は **元の numeric 値** (= alphabetic でない) であることが
+    /// 重要 (NGN は alphabetic Request-URI を扱えない)。
+    #[tokio::test]
+    async fn issue315_classify_alias_hit_but_aor_unregistered_falls_back_to_ngn_with_original_target(
+    ) {
+        let reg = ExtensionRegistrar::new();
+        let mut aliases = ExtensionAliases::empty();
+        aliases.map.insert("101".to_string(), "alice".to_string());
+        // `alice` を registrar に登録 *しない*。
+        let dest = classify_dial_target("101", &reg, &aliases).await;
+        match dest {
+            DialDestination::Ngn { ref target } => {
+                assert_eq!(
+                    target, "101",
+                    "alias hit + registrar miss は元の dial 文字列で NGN へ"
+                );
+            }
+            DialDestination::Internal { .. } => {
+                panic!("alice 未登録なので Ngn を期待")
+            }
+        }
+    }
+
+    /// Issue #315: alias map 空 (= 未設定構成) では旧挙動どおり target を
+    /// そのまま AOR として lookup する。 alphabetic AOR `"alice"` を AOR に
+    /// 直接登録した古い構成 (PR #314 までの挙動) が壊れない。
+    #[tokio::test]
+    async fn issue315_classify_with_empty_aliases_keeps_legacy_aor_lookup() {
+        let reg = ExtensionRegistrar::new();
+        reg.register(
+            "alice",
+            "sip:alice@192.0.2.10:5060".to_string(),
+            addr("192.0.2.10:5060"),
+            Duration::from_secs(60),
+        )
+        .await;
+        let aliases = ExtensionAliases::empty();
+        // alphabetic AOR をそのまま渡しても従来どおり Internal。
+        let dest = classify_dial_target("alice", &reg, &aliases).await;
+        assert!(
+            matches!(dest, DialDestination::Internal { .. }),
+            "alias 未設定 + alphabetic AOR 直渡しの旧挙動は維持"
+        );
+    }
+
+    /// Issue #315: `[dial_aliases]` セクションが TOML から HashMap として
+    /// パースできる (flatten + arbitrary key)。
+    #[test]
+    fn issue315_extension_aliases_parses_from_toml_flatten() {
+        let toml_str = r#"
+"101" = "alice"
+"102" = "bob"
+"103" = "iphone"
+"#;
+        let aliases: ExtensionAliases = toml::from_str(toml_str).expect("parse aliases");
+        assert_eq!(aliases.len(), 3);
+        assert_eq!(aliases.resolve("101"), Some("alice"));
+        assert_eq!(aliases.resolve("102"), Some("bob"));
+        assert_eq!(aliases.resolve("103"), Some("iphone"));
+        assert_eq!(aliases.resolve("999"), None);
+    }
+
+    /// Issue #315: `ExtensionAliases::empty()` は空 map / is_empty=true。
+    #[test]
+    fn issue315_extension_aliases_empty_is_empty() {
+        let aliases = ExtensionAliases::empty();
+        assert!(aliases.is_empty());
+        assert_eq!(aliases.len(), 0);
+        assert_eq!(aliases.resolve("anything"), None);
     }
 
     /// [`InternalCallRegistry`] は caller / callee 両 Call-ID からエントリを
@@ -733,7 +929,8 @@ max_concurrent_internal_calls = 8
                 std::time::Duration::from_secs(60),
             )
             .await;
-        match classify_dial_target("bob", &registrar).await {
+        let aliases = ExtensionAliases::empty();
+        match classify_dial_target("bob", &registrar, &aliases).await {
             DialDestination::Internal { aor, .. } => assert_eq!(aor, "bob"),
             other => panic!("Internal を期待: {:?}", other),
         }

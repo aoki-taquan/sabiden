@@ -3477,6 +3477,14 @@ pub struct UasEventHandler {
     /// 内線間 dispatch は完全 skip され、 旧挙動 (常に NGN プロキシ) を維持する。
     /// `set_intercom_service` で注入する。
     intercom_service: Mutex<Option<Arc<super::intercom::IntercomService>>>,
+    /// Issue #315: numeric → alphabetic AOR の alias map ([`ExtensionAliases`])。
+    ///
+    /// PWA WS validator は digit-only (`[0-9*#+]{1,32}`、 CRLF injection 防御)
+    /// なので、 alphabetic AOR (`"alice"` 等) を PWA から直接 dial できない。
+    /// 本 alias map で PWA dial `"101"` → AOR `"alice"` の解決を実現する。
+    /// 未注入時は `ExtensionAliases::empty()` 相当 (= 旧挙動: target を
+    /// そのまま AOR として lookup)。 `set_dial_aliases` で注入する。
+    dial_aliases: Mutex<Arc<super::intercom::ExtensionAliases>>,
 }
 
 impl UasEventHandler {
@@ -3503,6 +3511,7 @@ impl UasEventHandler {
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
             intercom_service: Mutex::new(None),
+            dial_aliases: Mutex::new(Arc::new(super::intercom::ExtensionAliases::empty())),
         })
     }
 
@@ -3547,6 +3556,7 @@ impl UasEventHandler {
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
             intercom_service: Mutex::new(None),
+            dial_aliases: Mutex::new(Arc::new(super::intercom::ExtensionAliases::empty())),
         })
     }
 
@@ -3579,6 +3589,7 @@ impl UasEventHandler {
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
             intercom_service: Mutex::new(None),
+            dial_aliases: Mutex::new(Arc::new(super::intercom::ExtensionAliases::empty())),
         })
     }
 
@@ -3703,6 +3714,27 @@ impl UasEventHandler {
         self.intercom_service.lock().await.clone()
     }
 
+    /// Issue #315: numeric → alphabetic AOR の alias map を注入する setter。
+    ///
+    /// `[dial_aliases]` セクションを `Config::load` で読んだ後、 main.rs から
+    /// 呼ぶ想定。 未注入時は `ExtensionAliases::empty()` 相当 (= alias 未設定 /
+    /// 旧挙動: target をそのまま AOR として lookup)。
+    ///
+    /// `set_intercom_service` / `set_call_log` と同じ pattern。 spawn 後でも
+    /// 安全に呼べる (`Mutex<Arc<_>>` で内側だけ差し替える)。
+    pub async fn set_dial_aliases(
+        self: &Arc<Self>,
+        aliases: Arc<super::intercom::ExtensionAliases>,
+    ) {
+        *self.dial_aliases.lock().await = aliases;
+    }
+
+    /// 注入済 / 未注入時の空 [`ExtensionAliases`](super::intercom::ExtensionAliases)
+    /// を `Arc` で返す helper。 dispatcher の `classify_dial_target` 呼出時に使う。
+    async fn dial_aliases_clone(&self) -> Arc<super::intercom::ExtensionAliases> {
+        self.dial_aliases.lock().await.clone()
+    }
+
     /// 注入済 message_log の Arc clone (PWA SMS 送信経路から push する helper)。
     async fn message_log_clone(&self) -> Option<Arc<super::message_log::MessageLog>> {
         self.message_log.lock().await.clone()
@@ -3741,6 +3773,7 @@ impl UasEventHandler {
             recording_recorder: Mutex::new(None),
             message_log: Mutex::new(None),
             intercom_service: Mutex::new(None),
+            dial_aliases: Mutex::new(Arc::new(super::intercom::ExtensionAliases::empty())),
         })
     }
 
@@ -3900,20 +3933,30 @@ impl UasEventHandler {
             {
                 let intercom_svc_opt = self.intercom_service_clone().await;
                 let ext_registrar_opt = self.ext_registrar.lock().await.clone();
+                let dial_aliases = self.dial_aliases_clone().await;
                 if let (Some(svc), Some(registrar)) =
                     (intercom_svc_opt.as_ref(), ext_registrar_opt.as_ref())
                 {
                     // Request-URI から user 部を抽出 (RFC 3261 §19.1.1)。
                     if let Some(target_user) = extract_user_from_sip_uri(&request.uri) {
+                        // Issue #315: alias 解決後 AOR (= 例 alice) も self-call
+                        // 判定に含める。 numeric dial `"101"` → alias 解決 `"alice"`
+                        // のとき from_aor が `"alice"` だったら self-call 扱い。
+                        let resolved_target = dial_aliases
+                            .resolve(&target_user)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| target_user.clone());
                         // Issue #324: self-call は **明示的に 480** で fail-fast。
                         // 旧コードは Internal 経路 skip だけで NGN proxy に落とす
                         // 挙動 (404 返却) になっていた (RFC 3261 §16 違反 / NGN 漏洩)。
-                        if target_user == from_aor {
+                        // alias 解決後・解決前のどちらでマッチしても弾く (#315 統合)。
+                        if resolved_target == from_aor || target_user == from_aor {
                             info!(
                                 %from_aor,
                                 target = %target_user,
-                                "self-call (caller == callee AOR) → 480 で fail-fast \
-                                 (RFC 3261 §21.4.18 / §16 loop detection、 Issue #324)"
+                                resolved = %resolved_target,
+                                "self-call (caller == callee AOR, alias 解決後を含む) → 480 で fail-fast \
+                                 (RFC 3261 §21.4.18 / §16 loop detection、 Issue #324 / #315)"
                             );
                             let _ = responder
                                 .quick(480, "Temporarily Unavailable")
@@ -3925,6 +3968,7 @@ impl UasEventHandler {
                         let dest = super::intercom::classify_dial_target(
                             &target_user,
                             registrar,
+                            dial_aliases.as_ref(),
                         )
                         .await;
                         if let super::intercom::DialDestination::Internal {
@@ -6955,11 +6999,17 @@ impl UasEventHandler {
         // 取れる。
         let intercom_svc_opt = self.intercom_service_clone().await;
         let ext_registrar_opt = self.ext_registrar.lock().await.clone();
+        let dial_aliases = self.dial_aliases_clone().await;
         if let (Some(svc), Some(registrar)) =
             (intercom_svc_opt.as_ref(), ext_registrar_opt.as_ref())
         {
             if svc.is_enabled() {
-                let dest = super::intercom::classify_dial_target(target, registrar).await;
+                // Issue #315: alias map で numeric → AOR を解決してから lookup。
+                // WS 入口 `is_valid_dial_target` (digit-only) を通過した numeric
+                // dial を内部 AOR (alphabetic) に解決し、 NGN を介さず内線へ。
+                let dest =
+                    super::intercom::classify_dial_target(target, registrar, dial_aliases.as_ref())
+                        .await;
                 if let super::intercom::DialDestination::Internal { binding, aor } = dest {
                     info!(
                         %target,

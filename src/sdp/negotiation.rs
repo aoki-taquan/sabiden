@@ -788,6 +788,57 @@ a=rtpmap:0 PCMU/8000\r\n";
         assert!(s.contains("a=sendonly\r\n"), "{s}");
     }
 
+    /// RFC 3605 §2 + Issue #325: `Negotiator::for_ngn().rewrite_offer(...)` で
+    /// `a=rtcp:<orig_port+1>` を inject した後、 `crate::sdp::builder::rewrite_rtp_endpoint`
+    /// で m=audio port を sabiden 側 socket port に書換える combined pipeline
+    /// (intercom 全経路: PR #320 / PR #323) で、 最終 SDP の `a=rtcp` が **新 port+1**
+    /// を指すこと。 旧実装 (PR #320 以降) は順序のせいで a=rtcp が旧 port+1 を
+    /// 指したままで、 strict-compliance peer が RTCP を旧 port に送ってしまう
+    /// (Issue #325) 問題を再現防止する。
+    #[test]
+    fn rfc3605_section2_negotiator_then_rewrite_pipeline_yields_new_port_plus_one() {
+        // PWA / Linphone 由来の典型 offer (PCMU + opus 等、 a=rtcp なし)。
+        let ext_offer = b"v=0\r\n\
+o=- 1 1 IN IP4 192.168.30.162\r\n\
+s=-\r\n\
+c=IN IP4 192.168.30.162\r\n\
+t=0 0\r\n\
+m=audio 54205 RTP/AVP 96 0\r\n\
+a=rtpmap:96 opus/48000/2\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendrecv\r\n";
+
+        // Step 1: Negotiator が PCMU only 化 + a=rtcp:<orig+1> inject。
+        let neg = Negotiator::for_ngn();
+        let pcmu_only = neg.rewrite_offer(ext_offer);
+        let mid = std::str::from_utf8(&pcmu_only).expect("utf8");
+        // この段階では a=rtcp:54206 が入っている (= orig 54205 + 1)。
+        assert!(
+            mid.contains("a=rtcp:54206\r\n"),
+            "Negotiator は a=rtcp:<orig_port+1> を inject すべき:\n{mid}"
+        );
+
+        // Step 2: rewrite_rtp_endpoint が m=audio port を sabiden 側 socket port
+        // (= 40000) に書換える。 a=rtcp もこれに合わせて更新されるはず (Issue #325)。
+        let sabiden_addr: std::net::IpAddr = "10.0.0.1".parse().expect("addr");
+        let final_sdp = crate::sdp::builder::rewrite_rtp_endpoint(&pcmu_only, sabiden_addr, 40000)
+            .expect("rewrite ok");
+        let s = std::str::from_utf8(&final_sdp).expect("utf8");
+
+        assert!(
+            s.contains("m=audio 40000 RTP/AVP 0\r\n"),
+            "m=audio port が 40000 に書換わっていない:\n{s}"
+        );
+        assert!(
+            s.contains("a=rtcp:40001\r\n"),
+            "RFC 3605 §2 違反: a=rtcp が新 port+1 (40001) を指していない:\n{s}"
+        );
+        assert!(
+            !s.contains("a=rtcp:54206\r\n"),
+            "旧 a=rtcp:54206 (orig port + 1) が残存している:\n{s}"
+        );
+    }
+
     /// 不正な SDP / UTF-8 はそのまま返す (`Negotiator` と同じ縮退方針)。
     #[test]
     fn apply_audio_direction_invalid_input_passthrough() {

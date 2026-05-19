@@ -503,6 +503,23 @@ pub fn rewrite_rtp_endpoint(sdp_bytes: &[u8], addr: IpAddr, port: u16) -> anyhow
     if let Some(audio) = sdp.media.iter_mut().find(|m| m.media == "audio") {
         audio.port = port;
         audio.connection = None;
+        // Issue #325: `a=rtcp:<port>` は m=audio の RTP port に対応する RTCP port を
+        // 厳密に広告する属性 (RFC 3605 §2、 RFC 5761 §5.1.3)。 上で m=audio port を
+        // 書換えた以上、 既存 `a=rtcp` は **旧 port + 1** を指したままになる。
+        // 厳格準拠 UA はこの値で RTCP を旧 port に送りつけ、 sabiden 側の RTCP
+        // ソケット (`port + 1` 想定) に届かない。 ここで現在の audio.port に
+        // 整合するよう RTCP port を再計算する。 オプションの `<nettype>
+        // <addrtype> <connection-address>` は session-level `c=` (上で `addr` に
+        // 設定済) と整合するため drop する (RFC 3605 §2.1: address parts are
+        // optional; omitting them defers to the session-level connection).
+        let new_rtcp_port = port.saturating_add(1).to_string();
+        for attr in audio.attributes.iter_mut() {
+            if let Attribute::Value { key, value } = attr {
+                if key == "rtcp" {
+                    *value = new_rtcp_port.clone();
+                }
+            }
+        }
     }
 
     Ok(sdp.to_string_crlf().into_bytes())
@@ -1619,6 +1636,112 @@ mod tests {
         // sess-id は 32-bit 超過のため NGN 互換に正規化 (元の 64-bit 値ではない)
         assert_ne!(parsed.origin.session_id, parsed_in.origin.session_id);
         assert!(parsed.origin.session_id <= u32::MAX as u64);
+    }
+
+    /// RFC 3605 §2 (Real Time Control Protocol (RTCP) attribute in SDP):
+    ///
+    /// > "The general form of this attribute is:
+    /// >     a=rtcp:<port> [<nettype> <addrtype> <connection-address>]"
+    ///
+    /// `a=rtcp` は **対応する m=audio の RTP port に対する RTCP port** を厳密に
+    /// 広告する属性であり、 strict-compliance peer はこの値で RTCP を送出する。
+    /// `rewrite_rtp_endpoint` で m=audio port を sabiden 側 socket port に書換える
+    /// 際に、 既存 `a=rtcp` を **新 port + 1** に更新しないと、 peer は旧 port + 1
+    /// に RTCP を送出してしまい sabiden に届かない (Issue #325)。
+    ///
+    /// 本テストは Negotiator が PCMU only 化と同時に `a=rtcp:<orig_port+1>` を
+    /// inject した SDP に対し、 続けて `rewrite_rtp_endpoint` を適用したときに
+    /// `a=rtcp` が新 port+1 を指すことを確認する (intercom 全経路で再現する
+    /// pre-existing pattern、 PR #320 / PR #323 / Issue #325)。
+    #[test]
+    fn rfc3605_section2_rewrite_updates_a_rtcp_to_new_port_plus_one() {
+        // Negotiator が a=rtcp:30001 を inject 済み (m=audio 30000 の +1)。
+        let pre_rewrite = b"v=0\r\n\
+                            o=- 1 1 IN IP4 192.0.2.1\r\n\
+                            s=sabiden\r\n\
+                            c=IN IP4 192.0.2.1\r\n\
+                            t=0 0\r\n\
+                            m=audio 30000 RTP/AVP 0\r\n\
+                            a=rtpmap:0 PCMU/8000\r\n\
+                            a=ptime:20\r\n\
+                            a=rtcp:30001\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(pre_rewrite, new_addr, 40000).unwrap();
+        let s = std::str::from_utf8(&rewritten).expect("utf8");
+
+        // RTP port は書換わっている
+        assert!(
+            s.contains("m=audio 40000 RTP/AVP 0\r\n"),
+            "m=audio が 40000 に書換わっていない:\n{s}"
+        );
+        // RFC 3605 §2: a=rtcp は新 port + 1 を指すべき (= 40001)
+        assert!(
+            s.contains("a=rtcp:40001\r\n"),
+            "a=rtcp が新 port+1 (40001) を指していない (旧 30001 のまま):\n{s}"
+        );
+        // 旧値 30001 が残っていないこと (stale advertisement の検出)
+        assert!(
+            !s.contains("a=rtcp:30001\r\n"),
+            "旧 a=rtcp:30001 が残存している (RFC 3605 §2 違反):\n{s}"
+        );
+        // a=rtcp 行は 1 つだけ (重複 inject 防止)
+        let rtcp_count = s.lines().filter(|l| l.starts_with("a=rtcp:")).count();
+        assert_eq!(rtcp_count, 1, "a=rtcp 行が複数:\n{s}");
+    }
+
+    /// RFC 3605 §2: 入力 SDP が `a=rtcp:<port> <nettype> <addrtype> <addr>`
+    /// 形式 (optional address part 付き) を持つ場合も、 port rewrite 時に
+    /// 新 port+1 だけが残り、 旧 address parts は drop される
+    /// (session-level c= が新 addr を指しているため不要、 RFC 3605 §2.1)。
+    #[test]
+    fn rfc3605_section2_rewrite_updates_a_rtcp_with_address_parts() {
+        let pre_rewrite = b"v=0\r\n\
+                            o=- 1 1 IN IP4 192.0.2.1\r\n\
+                            s=-\r\n\
+                            c=IN IP4 192.0.2.1\r\n\
+                            t=0 0\r\n\
+                            m=audio 62018 RTP/AVP 0\r\n\
+                            a=rtpmap:0 PCMU/8000\r\n\
+                            a=rtcp:62019 IN IP4 192.0.2.1\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(pre_rewrite, new_addr, 54200).unwrap();
+        let s = std::str::from_utf8(&rewritten).expect("utf8");
+
+        assert!(s.contains("m=audio 54200 RTP/AVP 0\r\n"), "{s}");
+        assert!(
+            s.contains("a=rtcp:54201\r\n"),
+            "a=rtcp が新 port+1 (54201) に更新されていない:\n{s}"
+        );
+        // 旧アドレス part は drop されている (session-level c= が新 addr を指す)
+        assert!(
+            !s.contains("a=rtcp:62019"),
+            "旧 a=rtcp:62019 ... が残存:\n{s}"
+        );
+        assert!(
+            !s.contains("192.0.2.1"),
+            "旧 c=/o=/a=rtcp の旧 IP が残存:\n{s}"
+        );
+    }
+
+    /// `a=rtcp` が無い SDP では `rewrite_rtp_endpoint` は a=rtcp を inject しない
+    /// (それは `Negotiator::ensure_a_rtcp` の責務、 順序として両者が組み合わさる
+    /// callsite で結果的に正しい port+1 が現れる)。
+    #[test]
+    fn rewrite_does_not_inject_a_rtcp_when_absent() {
+        let pre_rewrite = b"v=0\r\n\
+                            o=- 1 1 IN IP4 192.0.2.1\r\n\
+                            s=-\r\n\
+                            c=IN IP4 192.0.2.1\r\n\
+                            t=0 0\r\n\
+                            m=audio 30000 RTP/AVP 0\r\n\
+                            a=rtpmap:0 PCMU/8000\r\n";
+        let new_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let rewritten = rewrite_rtp_endpoint(pre_rewrite, new_addr, 40000).unwrap();
+        let s = std::str::from_utf8(&rewritten).expect("utf8");
+        assert!(
+            !s.contains("a=rtcp:"),
+            "a=rtcp を勝手に inject すべきでない:\n{s}"
+        );
     }
 
     fn make_dtls_params() -> DtlsIceParams {

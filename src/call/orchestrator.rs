@@ -3881,9 +3881,19 @@ impl UasEventHandler {
             // 以前の挙動 (= NGN proxy band-aid を防ぐ最低限の gate) を維持し、
             // 「intercom を意図的に切った構成でも内線 AOR が NGN に漏れない」
             // ことを保証する (RFC 3261 §21.4.18: "callee is currently
-            // unavailable to take the call")。 caller_aor へ self-call の場合も
-            // 480 (内線が自分自身を呼ぶ意味は無い、 RFC 3261 §16 loop detection
-            // 相当)。
+            // unavailable to take the call")。
+            //
+            // Self-call (target_user == from_aor) は **classify_dial_target を
+            // 通す前** に 480 で **明示的に fail-fast** する (Issue #324)。
+            // 旧コードでは self-call ガードが Internal 経路を skip するだけで、
+            // 制御が下の `outbound_rate_limiter` → NGN proxy 経路に落ち、 NGN 側で
+            // AOR (例: `bob`) を NGN 番号として解釈して 404 が返る意味不明な挙動を
+            // 取っていた (RFC 3261 §16 B2BUA は同一ドメイン内の self-loop を外部
+            // プロキシしない選択を取るべき)。 RFC 3261 §21.4.18 (480) は "callee's
+            // end system was contacted successfully but the callee is currently
+            // unavailable" の意であり、 「自分自身を呼ぶ」 状況は callee が論理的に
+            // unavailable と看做せる (= RFC 3261 §16 loop detection の SIP-level
+            // 相当)。 これにより `is_enabled = false` 構成と同様に NGN 漏洩を防ぐ。
             //
             // RFC 3261 §13.2.1 / RFC 5853 §3.2.2: B2BUA は dial target が同一
             // 管理ドメイン内なら外部 (NGN) へプロキシしない選択を取れる。
@@ -3895,53 +3905,67 @@ impl UasEventHandler {
                 {
                     // Request-URI から user 部を抽出 (RFC 3261 §19.1.1)。
                     if let Some(target_user) = extract_user_from_sip_uri(&request.uri) {
-                        // self-call は弾く (発信元 = 着信先 AOR)。
-                        if target_user != from_aor {
-                            let dest = super::intercom::classify_dial_target(
-                                &target_user,
-                                registrar,
-                            )
-                            .await;
-                            if let super::intercom::DialDestination::Internal {
-                                binding,
-                                aor: callee_aor,
-                            } = dest
-                            {
-                                if !svc.is_enabled() {
-                                    // intercom を意図的に切った構成: 480 で
-                                    // fail-fast (= NGN 漏洩防止だけ維持)。
-                                    info!(
-                                        %from_aor,
-                                        %callee_aor,
-                                        "intercom disabled → SIP UA → 内線 AOR を 480 で fail-fast \
-                                         (RFC 3261 §21.4.18、 NGN 漏洩防止 / Issue #317)"
-                                    );
-                                    let _ = responder
-                                        .quick(480, "Temporarily Unavailable")
-                                        .await;
-                                    self.metrics
-                                        .record_invite_extension(InviteResult::Error);
-                                    return Ok(());
-                                }
+                        // Issue #324: self-call は **明示的に 480** で fail-fast。
+                        // 旧コードは Internal 経路 skip だけで NGN proxy に落とす
+                        // 挙動 (404 返却) になっていた (RFC 3261 §16 違反 / NGN 漏洩)。
+                        if target_user == from_aor {
+                            info!(
+                                %from_aor,
+                                target = %target_user,
+                                "self-call (caller == callee AOR) → 480 で fail-fast \
+                                 (RFC 3261 §21.4.18 / §16 loop detection、 Issue #324)"
+                            );
+                            let _ = responder
+                                .quick(480, "Temporarily Unavailable")
+                                .await;
+                            self.metrics
+                                .record_invite_extension(InviteResult::Error);
+                            return Ok(());
+                        }
+                        let dest = super::intercom::classify_dial_target(
+                            &target_user,
+                            registrar,
+                        )
+                        .await;
+                        if let super::intercom::DialDestination::Internal {
+                            binding,
+                            aor: callee_aor,
+                        } = dest
+                        {
+                            if !svc.is_enabled() {
+                                // intercom を意図的に切った構成: 480 で
+                                // fail-fast (= NGN 漏洩防止だけ維持)。
                                 info!(
                                     %from_aor,
                                     %callee_aor,
-                                    "SIP UA → 内線 AOR を classify_dial_target が Internal と判定。 \
-                                     full multi-leg orchestration へ分岐 (Issue #317)"
+                                    "intercom disabled → SIP UA → 内線 AOR を 480 で fail-fast \
+                                     (RFC 3261 §21.4.18、 NGN 漏洩防止 / Issue #317)"
                                 );
-                                let result = self
-                                    .dispatch_sip_ua_internal_invite(
-                                        from_aor.clone(),
-                                        request.clone(),
-                                        remote,
-                                        responder.clone(),
-                                        binding,
-                                        callee_aor,
-                                        svc.clone(),
-                                    )
+                                let _ = responder
+                                    .quick(480, "Temporarily Unavailable")
                                     .await;
-                                return result;
+                                self.metrics
+                                    .record_invite_extension(InviteResult::Error);
+                                return Ok(());
                             }
+                            info!(
+                                %from_aor,
+                                %callee_aor,
+                                "SIP UA → 内線 AOR を classify_dial_target が Internal と判定。 \
+                                 full multi-leg orchestration へ分岐 (Issue #317)"
+                            );
+                            let result = self
+                                .dispatch_sip_ua_internal_invite(
+                                    from_aor.clone(),
+                                    request.clone(),
+                                    remote,
+                                    responder.clone(),
+                                    binding,
+                                    callee_aor,
+                                    svc.clone(),
+                                )
+                                .await;
+                            return result;
                         }
                     }
                 }
@@ -5620,8 +5644,44 @@ impl UasEventHandler {
     ///
     /// # シーケンス (`ExtTransport::Sip` callee = PWA→SIP UA)
     ///
-    /// 本 PR では未実装。 `intercom_sip_callee_unsupported` を返す。 follow-up Issue
-    /// (#313 の延長) で `ext_inviter` 経由 INVITE + WebRtcAudioBridge で接続する。
+    /// Issue #316 (PR #320) で full multi-leg orchestration を実装済:
+    ///
+    /// 1. caller `peer.handle_offer` で SAVPF answer を即時返却 (RFC 3264 §6 /
+    ///    RFC 8829)。 caller の trickle ICE を詰まらせない。
+    /// 2. caller `peer.take_media_rx` で MediaFrame source を吸う
+    ///    (RFC 8829 §4: str0m peer は rx を 1 回しか渡せない)。
+    /// 3. sabiden 内線 NIC 側 RTP socket を bind (`bridge_ext_bind_ip` か
+    ///    loopback fallback、 RFC 3550 §11)。
+    /// 4. caller SAVPF answer を `convert_savpf_to_avp` → `Negotiator::for_ngn` で
+    ///    PCMU only AVP に正規化し、 `rewrite_rtp_endpoint` で c=/o= / m=audio port
+    ///    を sabiden 内線 socket のものに書換える (RFC 3551 PT 0、 RFC 4566 §5.2 §5.7)。
+    /// 5. `ext_inviter.invite_intercom` で callee SIP UA (`binding.remote` 宛、
+    ///    RFC 5626) に INVITE 送出 (PCMU SDP offer 付き、 RFC 3261 §17.1)。
+    /// 6. 200 OK SDP から callee RTP endpoint を抽出 (RFC 3264 §6)。
+    /// 7. `WebRtcAudioBridge` を起動 (caller peer ↔ sabiden RTP socket ↔
+    ///    SIP UA endpoint) で双方向 PCMU 透過 (`direct_pcmu_passthrough = true`、
+    ///    sabiden str0m は PCMU only 構成のため transcode 不要)。
+    /// 8. `IntercomService::register_call` で `InternalCallRegistry` に登録。
+    ///
+    /// # Err path での caller cleanup (RFC 8829 §5.1 Connection Cleanup)
+    ///
+    /// caller peer は (1) で DTLS-SRTP / ICE が走り出しているため、 (5)〜(7)
+    /// いずれかの失敗で `caller_peer.close()` を best-effort で呼んで livelock
+    /// を防ぐ。 内線 SIP UA leg が 2xx で confirmed 後に bridge attach 失敗した
+    /// 場合は `dialog.send_bye()` で SIP UA 側にも BYE を撃って leak を防ぐ
+    /// (RFC 3261 §15.1.1)。 callee 486 reject / 500 / transport error 等の Err
+    /// path は `tests/intercom_integration.rs::issue321_pwa_to_sip_ua_callee_486_reject_cleans_up_caller`
+    /// で `caller_peer.close()` + `InternalCallRegistry` 空 + NGN socket 0 を assert。
+    ///
+    /// # Follow-up (sabiden 発 BYE 連動)
+    ///
+    /// 本 PR scope は establish までで、 sabiden 発の BYE (= PWA WS close 経路や
+    /// 内線 SIP UA からの BYE 受信で caller PWA を tear-down する経路) は別 Issue で
+    /// 追加する。 SIP UA からの BYE 受信は現状 `src/sip/uas.rs` の内線 UAS が処理
+    /// するが、 caller PWA leg の peer.close は連動しない (= bridge は alive のまま
+    /// callee 側だけ leak)。 NGN PWA 経路の `webrtc_outbound_active` 相当の
+    /// SIP-leg テーブル + dialog 保持 (`completion` JoinHandle 内 drop ではなく
+    /// `IntercomCallRegistry` に持たせる) が必要。
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_pwa_internal_call(
         &self,
@@ -10400,6 +10460,217 @@ mod tests {
             0,
             "SIP UA → 内線 AOR の INVITE が NGN socket に漏れた ({}通)。 \
              dispatcher gate が壊れている (band-aid regression)",
+            ngn_hits.load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        ngn_task.abort();
+    }
+
+    /// Issue #324: SIP UA → 自分自身 (= caller_aor == target_user) の self-call は
+    /// `handle_invite` 冒頭の intercom dispatcher gate で **480 Temporarily
+    /// Unavailable** で fail-fast し、 NGN socket に INVITE が 1 通も漏れない。
+    ///
+    /// 旧コード (PR #314 以前から累積) の挙動:
+    /// ```text
+    /// if target_user != from_aor {       // ← self-call の場合は Internal 経路 skip
+    ///     classify_dial_target(...).await;
+    ///     ...
+    /// }
+    /// // ↓ 制御がそのまま下の rate_limiter → NGN proxy 経路に落ちる
+    /// // → NGN は AOR `bob` を NGN 番号として解釈して 404 を返す (band-aid)
+    /// ```
+    ///
+    /// 修正後の挙動:
+    /// ```text
+    /// if target_user == from_aor {
+    ///     responder.quick(480, "Temporarily Unavailable").await;
+    ///     return Ok(());
+    /// }
+    /// ```
+    ///
+    /// RFC 3261 §21.4.18 (480): "callee's end system was contacted successfully
+    /// but the callee is currently unavailable" — 「自分自身を呼ぶ」 は callee が
+    /// 論理的に unavailable と看做せる (= RFC 3261 §16 loop detection の
+    /// SIP-level 相当)。 また RFC 5853 §3.2.2 (B2BUA / SBC): 同一管理ドメイン
+    /// 内の self-loop は外部 (NGN) にプロキシしないべき。
+    #[tokio::test]
+    async fn rfc3261_21_4_18_self_call_returns_480() {
+        use crate::sip::registrar::ExtensionRegistrar;
+        use crate::sip::transaction::ServerTransaction;
+        use crate::sip::uac::UacConfig;
+
+        // (1) NGN hit counter (この test では 0 でなければ regression: self-call が
+        //     NGN proxy 経路に漏れた証拠)
+        let fake_ngn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let fake_ngn_addr = fake_ngn.local_addr().unwrap();
+        let ngn_hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ngn_hits_c = ngn_hits.clone();
+        let fake_ngn_c = fake_ngn.clone();
+        let ngn_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match fake_ngn_c.recv_from(&mut buf).await {
+                    Ok((n, _)) if n > 0 => {
+                        ngn_hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // (2) sabiden NGN UAC + UasEventHandler
+        let ngn_client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ngn_layer, _ngn_rx) = TransactionLayer::spawn(ngn_client_sock.clone());
+        let ngn_uac = Arc::new(Uac::new(
+            UacConfig {
+                local_uri: "sip:0312345678@ntt-east.ne.jp".to_string(),
+                domain: "ntt-east.ne.jp".to_string(),
+                local_addr: ngn_client_sock.local_addr().unwrap(),
+                user_agent: "sabiden-test/0.1".to_string(),
+                auth_username: None,
+                auth_password: None,
+            },
+            ngn_layer,
+            fake_ngn_addr,
+        ));
+
+        // (3) ExtensionRegistrar に "alice" を登録 (= self-call の caller_aor)。
+        //     self-call gate は classify_dial_target を呼ぶ手前で動くので、
+        //     callee が registrar に居なくても (= dispatcher が Internal/External
+        //     のどちらに振り分けるかと無関係に) 480 が返るのが正しい。 念のため
+        //     alice を登録しておく (= 「自分自身が登録済」 という最も一般的な
+        //     構成)。
+        let registrar = ExtensionRegistrar::new();
+        registrar
+            .register(
+                "alice",
+                "sip:alice@192.0.2.10:5060".to_string(),
+                "192.0.2.10:5060".parse().unwrap(),
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+
+        // (4) UasEventHandler + IntercomService + ext_registrar 注入
+        //     intercom service は enabled = true (= 通常構成) で起動する。
+        //     self-call gate は enabled 状態に関係なく動くべき (Issue #324)。
+        let handler = UasEventHandler::new(ngn_uac);
+        let placeholder_uac = {
+            let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let (l, _r) = TransactionLayer::spawn(s.clone());
+            Arc::new(Uac::new(
+                UacConfig {
+                    local_uri: "sip:sabiden@internal".to_string(),
+                    domain: "internal".to_string(),
+                    local_addr: s.local_addr().unwrap(),
+                    user_agent: "sabiden-test/0.1".to_string(),
+                    auth_username: None,
+                    auth_password: None,
+                },
+                l,
+                "127.0.0.1:1".parse().unwrap(),
+            ))
+        };
+        let forker = Arc::new(crate::call::manager::UacForker {
+            uac: placeholder_uac,
+            targets: HashMap::new(),
+        });
+        handler.attach_ext_inviter(forker, registrar.clone()).await;
+        let svc =
+            crate::call::intercom::IntercomService::new(crate::call::intercom::IntercomConfig {
+                enabled: true,
+                max_concurrent_internal_calls: 4,
+            });
+        handler.set_intercom_service(svc).await;
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        handler.spawn(event_rx);
+
+        // (5) 内線 UAS socket と SIP UA side socket
+        let phone_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone_addr = phone_sock.local_addr().unwrap();
+        let sabiden_uas_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sabiden_uas_addr = sabiden_uas_sock.local_addr().unwrap();
+        let (_uas_layer, _uas_rx) = TransactionLayer::spawn(sabiden_uas_sock.clone());
+
+        // (6) 内線 UA (alice) が自分自身 (alice) を呼ぶ self-call。
+        //     Request-URI user 部 == From AOR == "alice"。
+        let mut invite = SipRequest::new(SipMethod::Invite, "sip:alice@192.168.20.239");
+        invite.headers.set(
+            "Via",
+            format!(
+                "SIP/2.0/UDP {};branch=z9hG4bKsipua-self-call-test",
+                phone_addr
+            ),
+        );
+        invite
+            .headers
+            .set("From", "<sip:alice@sabiden>;tag=alice-tag");
+        invite.headers.set("To", "<sip:alice@192.168.20.239>");
+        invite.headers.set("Call-ID", "self-call-480-test");
+        invite.headers.set("CSeq", "1 INVITE");
+        invite.headers.set("Content-Type", "application/sdp");
+        invite.body = b"v=0\r\n\
+                        o=alice 1 1 IN IP4 127.0.0.1\r\n\
+                        s=Talk\r\n\
+                        c=IN IP4 127.0.0.1\r\n\
+                        t=0 0\r\n\
+                        m=audio 12345 RTP/AVP 0\r\n\
+                        a=rtpmap:0 PCMU/8000\r\n"
+            .to_vec();
+        phone_sock
+            .send_to(&invite.to_bytes(), sabiden_uas_addr)
+            .await
+            .unwrap();
+
+        // (7) UAS socket 側で受信して responder を組み立て UasEvent を inject
+        //     (`from_aor = "alice"` で送る → Request-URI user 部も "alice" → self-call)
+        let mut buf = vec![0u8; 4096];
+        let (n, remote) =
+            tokio::time::timeout(Duration::from_secs(2), sabiden_uas_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let parsed = parse_message(&buf[..n]).unwrap();
+        let req = match parsed {
+            SipMessage::Request(r) => r,
+            _ => panic!("INVITE 期待"),
+        };
+        let stx = ServerTransaction::new(req.clone(), remote, sabiden_uas_sock.clone()).unwrap();
+        let responder = crate::testing::builders::responder_handle_for_test(stx);
+        event_tx
+            .send(UasEvent::Invite {
+                from_aor: "alice".to_string(),
+                request: req,
+                remote,
+                responder,
+            })
+            .unwrap();
+
+        // (8) phone_sock で sabiden の応答を待ち、 480 であることを確認
+        let (n, _peer) =
+            tokio::time::timeout(Duration::from_secs(3), phone_sock.recv_from(&mut buf))
+                .await
+                .expect("sabiden が応答を返さない (self-call gate が動いていない)")
+                .unwrap();
+        let resp = match parse_message(&buf[..n]).unwrap() {
+            SipMessage::Response(r) => r,
+            _ => panic!("Response 期待"),
+        };
+        assert_eq!(
+            resp.status_code, 480,
+            "self-call (caller_aor == target_user) は 480 Temporarily Unavailable で \
+             fail-fast されるべき (Issue #324 / RFC 3261 §21.4.18 / §16 loop detection)"
+        );
+        assert_eq!(resp.reason, "Temporarily Unavailable");
+
+        // (9) NGN socket には何も飛んでいない (= 旧コードでは self-call が NGN proxy
+        //     経路に落ちて 404 になる band-aid 挙動だった、 Issue #324 fix の決定的証拠)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ngn_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "self-call の INVITE が NGN socket に漏れた ({}通)。 \
+             self-call gate が壊れている (Issue #324 regression)",
             ngn_hits.load(std::sync::atomic::Ordering::SeqCst)
         );
 
